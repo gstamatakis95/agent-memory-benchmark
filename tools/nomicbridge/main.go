@@ -29,6 +29,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -41,6 +42,13 @@ import (
 const (
 	dims            = 768
 	upstreamTimeout = 30 * time.Second // model can queue under load
+
+	// The DMR llama.cpp endpoint hard-rejects inputs beyond its 512-token
+	// batch (HTTP 500), so long texts must be truncated here or they fail
+	// forever. ~1500 chars stays safely under 512 tokens for English text.
+	// Callers hash the FULL text for cache keys before the RPC, so a given
+	// full text still maps to one deterministic (truncated) vector.
+	maxEmbedChars = 1500
 )
 
 type server struct {
@@ -62,7 +70,15 @@ type embeddingsResponse struct {
 }
 
 func (s *server) Embed(ctx context.Context, req *embedv1.EmbedRequest) (*embedv1.EmbedResponse, error) {
-	body, err := json.Marshal(embeddingsRequest{Model: s.model, Input: req.GetText()})
+	text := req.GetText()
+	if len(text) > maxEmbedChars {
+		cut := maxEmbedChars
+		for cut > 0 && !utf8.RuneStart(text[cut]) { // don't split a rune
+			cut--
+		}
+		text = text[:cut]
+	}
+	body, err := json.Marshal(embeddingsRequest{Model: s.model, Input: text})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "marshal request: %v", err)
 	}

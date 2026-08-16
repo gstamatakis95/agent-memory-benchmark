@@ -139,7 +139,11 @@ func main() {
 	// permanent errors (wrong dims, double prefix) still dead-letter
 	// immediately via permanent=true, independent of this cap.
 	pgStore := enrich.NewPGStore(pool)
-	pgStore.MaxAttempts = 25
+	// High ceiling: with the 64s backoff cap, attempts are cheap, and a long
+	// upstream incident (e.g. the DMR 512-token rejection bug) can burn 25+
+	// attempts before the root cause is fixed. Poison items still dead-letter
+	// via permanent=true, which is attempt-independent.
+	pgStore.MaxAttempts = 200
 	acts := &enrich.Activities{
 		Store:    pgStore,
 		Source:   &s3TextSource{pool: pool, s3: s3c},

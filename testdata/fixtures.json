@@ -1,0 +1,33 @@
+{
+  "turns": [
+    {"id": "t1",  "session_id": "s1", "speaker": "alice", "text": "I finally adopted a golden retriever puppy from the shelter and named him Biscuit.", "date_time": "2023-05-02 10:15"},
+    {"id": "t2",  "session_id": "s1", "speaker": "bob",   "text": "That's wonderful news! How is the training going so far?", "date_time": "2023-05-02 10:16"},
+    {"id": "t3",  "session_id": "s1", "speaker": "alice", "text": "Biscuit already learned to sit, and my sourdough starter finally doubled overnight.", "date_time": "2023-05-02 10:18"},
+    {"id": "t4",  "session_id": "s1", "speaker": "bob",   "text": "I signed up for the Rotterdam marathon happening this October.", "date_time": "2023-05-02 10:20"},
+    {"id": "t5",  "session_id": "s1", "speaker": "alice", "text": "Impressive, I could never manage a distance like that.", "date_time": "2023-05-02 10:21"},
+    {"id": "t6",  "session_id": "s1", "speaker": "bob",   "text": "My physiotherapist recommended zinc supplements for my knee tendonitis.", "date_time": "2023-05-02 10:23"},
+    {"id": "t7",  "session_id": "s1", "speaker": "alice", "text": "Hope the knee holds up through all those kilometers.", "date_time": "2023-05-02 10:24"},
+
+    {"id": "t8",  "session_id": "s2", "speaker": "bob",   "text": "I finished refurbishing the vintage Olivetti typewriter I found at the flea market.", "date_time": "2023-05-18 19:02"},
+    {"id": "t9",  "session_id": "s2", "speaker": "alice", "text": "Does it actually still type properly?", "date_time": "2023-05-18 19:03"},
+    {"id": "t10", "session_id": "s2", "speaker": "bob",   "text": "Perfectly. I wrote my grandmother a letter on it yesterday.", "date_time": "2023-05-18 19:05"},
+    {"id": "t11", "session_id": "s2", "speaker": "alice", "text": "Sweet of you. Meanwhile Biscuit chewed through my headphone cable.", "date_time": "2023-05-18 19:07"},
+    {"id": "t12", "session_id": "s2", "speaker": "bob",   "text": "Ha! Anyway, I booked flights to Reykjavik to see the northern lights in November.", "date_time": "2023-05-18 19:09"},
+    {"id": "t13", "session_id": "s2", "speaker": "alice", "text": "Iceland is amazing, pack plenty of thermal layers.", "date_time": "2023-05-18 19:10"},
+    {"id": "t14", "session_id": "s2", "speaker": "bob",   "text": "Will do. My long run reached thirty kilometers this week.", "date_time": "2023-05-18 19:12"},
+
+    {"id": "t15", "session_id": "s3", "speaker": "alice", "text": "Big news: I got promoted to senior data engineer at Meridian Analytics.", "date_time": "2023-06-07 12:40"},
+    {"id": "t16", "session_id": "s3", "speaker": "bob",   "text": "Congratulations, you absolutely earned that.", "date_time": "2023-06-07 12:41"},
+    {"id": "t17", "session_id": "s3", "speaker": "alice", "text": "Thanks! We celebrated with fondue at the little Swiss place downtown.", "date_time": "2023-06-07 12:43"},
+    {"id": "t18", "session_id": "s3", "speaker": "bob",   "text": "Nice. My Reykjavik itinerary now includes the Blue Lagoon.", "date_time": "2023-06-07 12:45"},
+    {"id": "t19", "session_id": "s3", "speaker": "alice", "text": "Biscuit graduated from puppy obedience class on Saturday.", "date_time": "2023-06-07 12:47"},
+    {"id": "t20", "session_id": "s3", "speaker": "bob",   "text": "A scholar! I also sold the typewriter to a collector for four hundred euros.", "date_time": "2023-06-07 12:49"}
+  ],
+  "questions": [
+    {"id": "q1", "question": "What breed is the puppy that was adopted from the shelter?", "evidence": ["t1"], "question_date": "2023-06-10"},
+    {"id": "q2", "question": "In which city is the marathon happening in October?", "evidence": ["t4"], "question_date": "2023-06-10"},
+    {"id": "q3", "question": "What brand of vintage typewriter was refurbished from the flea market?", "evidence": ["t8"], "question_date": "2023-06-10"},
+    {"id": "q4", "question": "Which company promoted someone to senior data engineer?", "evidence": ["t15"], "question_date": "2023-06-10"},
+    {"id": "q5", "question": "What did the puppy graduate from last Saturday?", "evidence": ["t19"], "question_date": "2023-06-10"}
+  ]
+}

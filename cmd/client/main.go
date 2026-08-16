@@ -12,8 +12,10 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sort"
@@ -90,12 +92,14 @@ func cmdIngest(args []string) error {
 	if err != nil {
 		return err
 	}
-	total := 0
+	turns, rounds := 0, 0
 	for _, c := range convs {
-		total += len(c.Items)
+		turns += len(c.Items)
+		ri, _ := roundItemsOf(c)
+		rounds += len(ri)
 	}
-	log.Printf("ingest: dataset=%s conversations=%d memories=%d (target version %d)",
-		*dataset, len(convs), total, *version)
+	log.Printf("ingest: dataset=%s conversations=%d memories=%d (turns=%d rounds=%d, target version %d)",
+		*dataset, len(convs), turns+rounds, turns, rounds, *version)
 
 	conn, cli, err := dialServer()
 	if err != nil {
@@ -109,21 +113,34 @@ func cmdIngest(args []string) error {
 	if err != nil {
 		return err
 	}
+	send := func(c conversation, it item, granularity string) error {
+		env := envelopeOf(c.Num, it)
+		return stream.Send(&agentmemv1.Memory{
+			ConversationId: env.ConversationID,
+			SessionId:      env.SessionID,
+			TurnId:         env.TurnID,
+			Speaker:        env.Speaker,
+			Text:           env.Text,
+			Granularity:    granularity,
+			Metadata: map[string]string{
+				"date_time": env.DateTime,
+				"dataset":   *dataset,
+			},
+		})
+	}
 	for _, c := range convs {
 		for _, it := range c.Items {
-			env := envelopeOf(c.Num, it)
-			if err := stream.Send(&agentmemv1.Memory{
-				ConversationId: env.ConversationID,
-				SessionId:      env.SessionID,
-				TurnId:         env.TurnID,
-				Speaker:        env.Speaker,
-				Text:           env.Text,
-				Metadata: map[string]string{
-					"date_time": env.DateTime,
-					"dataset":   *dataset,
-				},
-			}); err != nil {
+			if err := send(c, it, "turn"); err != nil {
 				return fmt.Errorf("send: %w", err)
+			}
+		}
+		// Round-granularity rows (docs/01-retrieval.md Finding 1 / section 4.6
+		// step 4): index rounds alongside the turn rows kept for turn-level
+		// evidence scoring.
+		ri, _ := roundItemsOf(c)
+		for _, it := range ri {
+			if err := send(c, it, "round"); err != nil {
+				return fmt.Errorf("send round: %w", err)
 			}
 		}
 	}
@@ -222,6 +239,10 @@ func cmdEval(args []string) error {
 	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s")
 	version := fs.Int("version", 0, "enrichment version (required)")
 	retrieval := fs.String("retrieval", "hybrid", "bm25|dense|hybrid")
+	// docs/01-retrieval.md section 4.3 step 6 prescribes a per-session cap but
+	// no numeric value; 4 is a modest default that keeps room for multi-session
+	// evidence inside top-10 (0 = uncapped).
+	maxPerSession := fs.Int("max-per-session", 4, "MMR per-session result cap (0 = uncapped)")
 	_ = fs.Parse(args)
 	if *version <= 0 {
 		return fmt.Errorf("--version is required (no defaulting)")
@@ -241,10 +262,15 @@ func cmdEval(args []string) error {
 	}
 	defer conn.Close()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	defer cancel()
+
 	// Queries go through the SAME embedder service as the corpus, via the
 	// prefix-owning embed.Client (search_query:). Wrapped with the same
 	// bounded wrong-dims re-ask as the server so a randomly injected 512-dim
-	// response (chaos tier) cannot fail the eval.
+	// response (chaos tier) cannot fail the eval. Query embeds share the
+	// persistent embedding_cache when PG_DSN is available (compose always
+	// sets it); without it the client gracefully falls back to no cache.
 	var qemb retrieve.QueryEmbedder
 	if mode != retrieve.ModeBM25 {
 		addr := os.Getenv("EMBEDDER_ADDR")
@@ -256,18 +282,28 @@ func cmdEval(args []string) error {
 			return fmt.Errorf("dial embedder: %w", err)
 		}
 		defer econn.Close()
+		var edb embed.DB
+		if dsn := os.Getenv("PG_DSN"); dsn != "" {
+			pool, err := newPGPool(ctx, dsn)
+			if err != nil {
+				log.Printf("eval: WARN query embedding cache disabled (pg unavailable): %v", err)
+			} else {
+				defer pool.Close()
+				edb = pool
+			}
+		}
 		qemb = embed.NewClient(&dimsRetryEmbedder{
 			inner: embed.NewGRPCEmbedder(econn, nil), retries: 2,
-		}, nil)
+		}, edb)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
-	defer cancel()
 
 	var results []eval.QueryResult
 	fetchedRows, mappedRows := 0, 0
 	for _, c := range convs {
-		rows, nFetched, err := fetchCorpus(ctx, cli, c, int32(*version))
+		// Round rows are part of the corpus; expand maps a retrieved round id
+		// back to its member turn ids for turn-level evidence credit.
+		roundItems, expand := roundItemsOf(c)
+		rows, nFetched, err := fetchCorpus(ctx, cli, c, roundItems, int32(*version))
 		if err != nil {
 			return fmt.Errorf("conversation %s: %w", c.Name, err)
 		}
@@ -277,7 +313,10 @@ func cmdEval(args []string) error {
 		if err != nil {
 			return err
 		}
-		r, err := retrieve.NewRetriever(corpus, qemb, retrieve.Options{Mode: mode})
+		r, err := retrieve.NewRetriever(corpus, qemb, retrieve.Options{
+			Mode: mode,
+			MMR:  retrieve.MMROptions{MaxPerSession: *maxPerSession},
+		})
 		if err != nil {
 			return err
 		}
@@ -292,10 +331,7 @@ func cmdEval(args []string) error {
 			if err != nil {
 				return fmt.Errorf("question %s: %w", q.ID, err)
 			}
-			retrieved := make([]string, len(scored))
-			for i, s := range scored {
-				retrieved[i] = s.ID
-			}
+			retrieved := expandRetrieved(scored, expand)
 			results = append(results, eval.QueryResult{
 				ID: q.ID, Group: q.Group, Retrieved: retrieved, Gold: q.Evidence,
 			})
@@ -316,11 +352,16 @@ func cmdEval(args []string) error {
 }
 
 // fetchCorpus streams the version-pinned enriched rows of one conversation
-// and maps them back to dataset turn ids via the content hash of the
+// and maps them back to dataset turn/round ids via the content hash of the
 // recomputed blob (the wire rows carry only content_hash/s3_key identity).
-func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conversation, version int32) ([]retrieve.Row, int, error) {
-	byHash := make(map[string]item, len(c.Items))
-	for _, it := range c.Items {
+// roundItems are the client-assembled round-granularity twins uploaded
+// alongside the turns (see roundItemsOf).
+func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conversation, roundItems []item, version int32) ([]retrieve.Row, int, error) {
+	local := make([]item, 0, len(c.Items)+len(roundItems))
+	local = append(local, c.Items...)
+	local = append(local, roundItems...)
+	byHash := make(map[string]item, len(local))
+	for _, it := range local {
 		raw, err := envelopeOf(c.Num, it).Marshal()
 		if err != nil {
 			return nil, 0, err
@@ -338,8 +379,13 @@ func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conv
 	fetched := 0
 	for {
 		em, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
 		if err != nil {
-			break // io.EOF or terminal stream error; rows so far are checked below
+			// A mid-stream failure must fail the eval loudly: silently
+			// truncating the corpus would produce wrong metrics with exit 0.
+			return nil, fetched, fmt.Errorf("fetch stream (after %d rows): %w", fetched, err)
 		}
 		fetched++
 		it, ok := byHash[hex.EncodeToString(em.GetContentHash())]
@@ -363,11 +409,38 @@ func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conv
 			EmbeddingBytes: em.GetEmbedding(),
 		})
 	}
-	if len(rows) < len(c.Items) {
+	if len(rows) < len(local) {
 		log.Printf("eval: WARN conversation %s: %d/%d memories enriched at this version",
-			c.Name, len(rows), len(c.Items))
+			c.Name, len(rows), len(local))
 	}
 	return rows, fetched, nil
+}
+
+// expandRetrieved maps the ranked retrieval output to turn-level ids for
+// scoring: a retrieved round expands, in place and in member order, to its
+// member turn ids (a round containing an evidence turn counts as retrieving
+// that turn); turn rows pass through unchanged. The result is deduped while
+// preserving rank order, so a turn and the round containing it gain credit
+// only once, at the better rank.
+func expandRetrieved(scored []retrieve.Scored, expand map[string][]string) []string {
+	out := make([]string, 0, len(scored))
+	seen := make(map[string]bool, len(scored))
+	add := func(id string) {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	for _, s := range scored {
+		if members, ok := expand[s.ID]; ok {
+			for _, id := range members {
+				add(id)
+			}
+			continue
+		}
+		add(s.ID)
+	}
+	return out
 }
 
 func printReport(dataset, mode string, rep eval.Report, fetched, mapped int) {

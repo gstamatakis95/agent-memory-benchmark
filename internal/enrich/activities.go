@@ -176,6 +176,15 @@ func (p *progress) mark(i int) int {
 	return p.watermark
 }
 
+// current returns the watermark without advancing it — used to keep the
+// activity's heartbeat alive on transient-failure outcomes (which are NOT
+// terminal and must not move the resume point).
+func (p *progress) current() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.watermark
+}
+
 // ProcessBatch enriches one page of memory ids: fetch texts, embed with a
 // bounded errgroup over the unary embedder, append done/failed events.
 // Heartbeats carry the terminally-processed prefix length so a retry after a
@@ -244,6 +253,12 @@ func (a *Activities) ProcessBatch(ctx context.Context, in BatchInput) (BatchResu
 					activity.RecordHeartbeat(ctx, prog.mark(i)) // dead-lettered = terminal
 				} else {
 					failed.Add(1) // NOT terminal: a retry re-attempts it
+					// Still heartbeat (with the UNADVANCED watermark) so a
+					// sustained all-transient outage cannot starve the 15s
+					// HeartbeatTimeout and burn retry attempts faster than
+					// the outage clears. The resume point is unchanged: a
+					// retry re-attempts every non-terminal item.
+					activity.RecordHeartbeat(ctx, prog.current())
 				}
 				return nil
 			}

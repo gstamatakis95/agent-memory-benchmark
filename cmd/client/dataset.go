@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"example.com/agentmem/internal/blob"
 	"example.com/agentmem/internal/eval"
+	"example.com/agentmem/internal/pipeline"
 )
 
 // item is one raw memory to ingest (and, at eval time, the local twin of an
@@ -51,6 +53,52 @@ func envelopeOf(convNum int64, it item) blob.Envelope {
 		Text:           it.Text,
 		DateTime:       it.DateTime,
 	}
+}
+
+// roundItemsOf assembles the round-granularity twins of a conversation's turn
+// items via pipeline.AssembleRounds (docs/01-retrieval.md Finding 1: round is
+// the best indexed granularity; section 4.6 step 4: keep the turn rows for
+// turn-level evidence scoring). It is deterministic, so ingest and eval
+// recompute byte-identical round blobs:
+//   - id: member turn ids joined with "+" ("t1+t2") — stable and derivable;
+//   - text: one "speaker: text" line per member turn (Round.Text); the round
+//     row itself carries no speaker, and the server prefixes the date via
+//     pipeline.FormatForEmbedding exactly as for turns;
+//   - date: the first member turn's raw date string;
+//   - single-turn rounds are skipped — the turn row already covers them and a
+//     duplicate natural key would only be deduped server-side.
+//
+// The second return value maps round id -> member turn ids, used at eval time
+// to credit a retrieved round with its member turns.
+func roundItemsOf(c conversation) ([]item, map[string][]string) {
+	turns := make([]pipeline.Turn, len(c.Items))
+	dateOf := make(map[string]string, len(c.Items))
+	for i, it := range c.Items {
+		turns[i] = pipeline.Turn{
+			SessionID: it.SessionID,
+			TurnID:    it.TurnID,
+			Speaker:   it.Speaker,
+			Text:      it.Text,
+		}
+		dateOf[it.TurnID] = it.DateTime
+	}
+	var items []item
+	expand := make(map[string][]string)
+	for _, r := range pipeline.AssembleRounds(turns) {
+		if len(r.Turns) < 2 {
+			continue
+		}
+		id := strings.Join(r.TurnIDs(), "+")
+		items = append(items, item{
+			TurnID:    id,
+			SessionID: r.SessionID,
+			Speaker:   "", // speakers are inline in the round text
+			Text:      r.Text(),
+			DateTime:  dateOf[r.Turns[0].TurnID],
+		})
+		expand[id] = r.TurnIDs()
+	}
+	return items, expand
 }
 
 // findDataFile probes the candidate paths in order. run.sh mounts nothing

@@ -2,10 +2,6 @@ module example.com/agentmem
 
 go 1.25.7
 
-// artifacts/ holds frozen design-doc copies (including .go snippets) that are
-// not part of the build; ignore them for package pattern matching (Go 1.25+).
-ignore ./artifacts
-
 require (
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de
 	github.com/aws/aws-sdk-go-v2 v1.43.6

@@ -22,3 +22,7 @@ coverage.*
 *.swp
 
 # NOTE: genproto/ is intentionally NOT ignored — generated stubs are committed.
+
+# IDE
+.idea/
+*.iml

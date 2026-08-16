@@ -109,7 +109,6 @@ testdata/fixtures.json  Hand-built ~20-turn corpus with known evidence
 scripts/                init-temporal-dbs.sh, download-dataset.sh
 tools/mockembedder/     Deterministic hash-based mock embedder with fault injection
 docs/                   Frozen design docs 01-06 (the deep spec)
-artifacts/              Original source material — frozen, not part of the deliverable
 ```
 
 ## Design docs

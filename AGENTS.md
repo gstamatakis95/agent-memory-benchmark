@@ -24,7 +24,6 @@ your job is to keep them passing.
 ## Frozen files — do not edit
 
 - `docs/` — frozen design docs (the spec; code follows them, not vice versa)
-- `artifacts/` — original source material, not part of the deliverable
 - `tools/mockembedder/main.go` — provided deterministic mock
 - `internal/store/append_only_test.go` — the invariant safety net
 - `Makefile`, `docker-compose.yml`, `run.sh` — infra contracts

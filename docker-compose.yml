@@ -1,0 +1,95 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports: ["5432:5432"]
+    volumes:
+      # auto-setup needs its own DBs; created on first boot alongside `app`
+      - ./scripts/init-temporal-dbs.sh:/docker-entrypoint-initdb.d/10-temporal.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: app
+      MINIO_ROOT_PASSWORD: appsecret
+    ports: ["9000:9000", "9001:9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  mc-bootstrap:
+    image: minio/mc:latest
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 app appsecret &&
+      mc mb --ignore-existing local/memories &&
+      echo 'bucket ready'
+      "
+
+  temporal:
+    image: temporalio/auto-setup:1.28.0
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      - DB=postgres12          # schema plugin name; correct for PG16
+      - DB_PORT=5432
+      - POSTGRES_USER=app
+      - POSTGRES_PWD=app
+      - POSTGRES_SEEDS=postgres
+    ports: ["7233:7233"]
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    depends_on: [temporal]
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports: ["8080:8080"]
+
+  # Deterministic stand-in for the third-party unary nomic service.
+  # Fault injection via env: MOCK_LATENCY_MS, MOCK_FAIL_RATE, MOCK_FAIL_UNTIL, MOCK_BAD_DIMS_RATE
+  embedder-mock:
+    build: { context: ., dockerfile: tools/mockembedder/Dockerfile }
+    environment:
+      - MOCK_LATENCY_MS=${MOCK_LATENCY_MS:-50}
+      - MOCK_FAIL_RATE=${MOCK_FAIL_RATE:-0}
+      - MOCK_FAIL_UNTIL=${MOCK_FAIL_UNTIL:-0s}
+      - MOCK_BAD_DIMS_RATE=${MOCK_BAD_DIMS_RATE:-0}
+    ports: ["9100:9100"]
+
+  server:
+    build: { context: ., dockerfile: cmd/server/Dockerfile }
+    depends_on:
+      postgres:      { condition: service_healthy }
+      temporal:      { condition: service_healthy }
+      mc-bootstrap:  { condition: service_completed_successfully }
+    environment:
+      - PG_DSN=postgres://app:app@postgres:5432/app?sslmode=disable
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET=memories
+      - S3_ACCESS_KEY=app
+      - S3_SECRET_KEY=appsecret
+      - S3_PATH_STYLE=true
+      - TEMPORAL_HOSTPORT=temporal:7233
+      # point at the mock by default; override with the real service for Tier 4
+      - EMBEDDER_ADDR=${EMBEDDER_ADDR:-embedder-mock:9100}
+      - ENRICHMENT_VERSION=${ENRICHMENT_VERSION:-1}
+    ports: ["8081:8081"]

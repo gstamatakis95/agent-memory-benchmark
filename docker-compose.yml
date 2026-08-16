@@ -75,6 +75,16 @@ services:
       - MOCK_BAD_DIMS_RATE=${MOCK_BAD_DIMS_RATE:-0}
     ports: ["9100:9100"]
 
+  # Real embeddings: gRPC bridge to Docker Model Runner's OpenAI-compatible
+  # endpoint serving ai/nomic-embed-text-v1.5. Select it with
+  # EMBEDDER_ADDR=embedder-nomic:9100 (server is decoupled on purpose).
+  embedder-nomic:
+    build: { context: ., dockerfile: tools/nomicbridge/Dockerfile }
+    environment:
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://model-runner.docker.internal/engines/v1}
+      - EMBED_MODEL=${EMBED_MODEL:-ai/nomic-embed-text-v1.5}
+    ports: ["9101:9100"]
+
   server:
     build: { context: ., dockerfile: cmd/server/Dockerfile }
     depends_on:
@@ -92,4 +102,8 @@ services:
       # point at the mock by default; override with the real service for Tier 4
       - EMBEDDER_ADDR=${EMBEDDER_ADDR:-embedder-mock:9100}
       - ENRICHMENT_VERSION=${ENRICHMENT_VERSION:-1}
+    volumes:
+      # live datasets mount: no rebuild needed after downloading a dataset
+      # (testdata fixtures stay baked into the image)
+      - ./datasets:/app/datasets:ro
     ports: ["8081:8081"]

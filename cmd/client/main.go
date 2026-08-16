@@ -292,13 +292,22 @@ func cmdEval(args []string) error {
 				edb = pool
 			}
 		}
-		qemb = embed.NewClient(&dimsRetryEmbedder{
-			inner: embed.NewGRPCEmbedder(econn, nil), retries: 2,
+		// Chain (inner to outer): gRPC embedder -> bounded wrong-dims re-ask
+		// -> transient-failure retry with backoff -> persistent cache. A
+		// transient embedder outage retries in place instead of failing the
+		// whole eval; questions that still fail are skipped and counted below.
+		qemb = embed.NewClient(&transientRetryEmbedder{
+			inner: &dimsRetryEmbedder{
+				inner: embed.NewGRPCEmbedder(econn, nil), retries: 2,
+			},
+			retries: 2,
+			backoff: 500 * time.Millisecond,
 		}, edb)
 	}
 
 	var results []eval.QueryResult
 	fetchedRows, mappedRows := 0, 0
+	totalQuestions, embedSkipped := 0, 0
 	for _, c := range convs {
 		// Round rows are part of the corpus; expand maps a retrieved round id
 		// back to its member turn ids for turn-level evidence credit.
@@ -321,6 +330,7 @@ func cmdEval(args []string) error {
 			return err
 		}
 		for _, q := range c.Questions {
+			totalQuestions++
 			var qdate time.Time
 			if q.QuestionDate != "" {
 				if t, err := pipeline.ParseTimestamp(q.QuestionDate); err == nil {
@@ -329,7 +339,20 @@ func cmdEval(args []string) error {
 			}
 			scored, err := r.Search(ctx, q.Question, qdate)
 			if err != nil {
-				return fmt.Errorf("question %s: %w", q.ID, err)
+				// A context-level failure (timeout/cancel) is not a per-query
+				// blip — abort loudly rather than skipping the whole tail.
+				if ctx.Err() != nil {
+					return fmt.Errorf("question %s: %w", q.ID, err)
+				}
+				// The query embed already retried with backoff (see the
+				// transientRetryEmbedder chain above). Skip and count this
+				// question instead of killing the run; the skip count is
+				// reported next to the metrics and gates the exit code below.
+				embedSkipped++
+				if embedSkipped <= 5 {
+					log.Printf("eval: WARN question %s: search failed after retries; skipping: %v", q.ID, err)
+				}
+				continue
 			}
 			retrieved := expandRetrieved(scored, expand)
 			results = append(results, eval.QueryResult{
@@ -339,8 +362,19 @@ func cmdEval(args []string) error {
 	}
 
 	rep := eval.Evaluate(results, []int{5, 10})
-	printReport(*dataset, string(mode), rep, fetchedRows, mappedRows)
+	printReport(*dataset, string(mode), rep, fetchedRows, mappedRows, embedSkipped)
+	if embedSkipped > 0 {
+		fmt.Printf("eval: WARN skipped %d questions (embed failures)\n", embedSkipped)
+	}
 	reportCacheRows(ctx)
+
+	// Skipped questions are excluded from the metric denominators, so a large
+	// skip count would silently flatter the numbers: fail the run if more
+	// than 1% of the dataset's questions were skipped.
+	if totalQuestions > 0 && float64(embedSkipped) > 0.01*float64(totalQuestions) {
+		return fmt.Errorf("skipped %d/%d questions (embed failures) — exceeds the 1%% budget; metrics above are not trustworthy",
+			embedSkipped, totalQuestions)
+	}
 
 	if *dataset == "fixtures" {
 		if r5 := rep.Overall.Recall[5]; r5 < 0.999999 {
@@ -376,7 +410,7 @@ func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conv
 		return nil, 0, err
 	}
 	var rows []retrieve.Row
-	fetched := 0
+	fetched, noTwin := 0, 0
 	for {
 		em, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -390,8 +424,13 @@ func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conv
 		fetched++
 		it, ok := byHash[hex.EncodeToString(em.GetContentHash())]
 		if !ok {
-			log.Printf("eval: WARN row memory_id=%d (s3_key %s) has no local twin; skipping",
-				em.GetMemoryId(), em.GetS3Key())
+			// Cap the per-row output: a pathological mismatch (e.g. a stale
+			// volume) would otherwise drown the report in thousands of lines.
+			noTwin++
+			if noTwin <= 5 {
+				log.Printf("eval: WARN row memory_id=%d (s3_key %s) has no local twin; skipping",
+					em.GetMemoryId(), em.GetS3Key())
+			}
 			continue
 		}
 		var ts time.Time
@@ -408,6 +447,9 @@ func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conv
 			Timestamp:      ts,
 			EmbeddingBytes: em.GetEmbedding(),
 		})
+	}
+	if noTwin > 5 {
+		log.Printf("eval: WARN conversation %s: %d rows had no local twin (first 5 shown)", c.Name, noTwin)
 	}
 	if len(rows) < len(local) {
 		log.Printf("eval: WARN conversation %s: %d/%d memories enriched at this version",
@@ -443,11 +485,12 @@ func expandRetrieved(scored []retrieve.Scored, expand map[string][]string) []str
 	return out
 }
 
-func printReport(dataset, mode string, rep eval.Report, fetched, mapped int) {
+func printReport(dataset, mode string, rep eval.Report, fetched, mapped, embedSkipped int) {
 	fmt.Println("==================================================")
 	fmt.Printf("retrieval eval  dataset=%s  mode=%s\n", dataset, mode)
 	fmt.Printf("corpus rows fetched=%d mapped=%d\n", fetched, mapped)
-	fmt.Printf("queries scored=%d skipped(no evidence)=%d\n", rep.Overall.N, rep.Skipped)
+	fmt.Printf("queries scored=%d skipped(no evidence)=%d skipped(embed failures)=%d\n",
+		rep.Overall.N, rep.Skipped, embedSkipped)
 	fmt.Printf("overall   Recall@5=%.4f  Recall@10=%.4f  NDCG@5=%.4f  NDCG@10=%.4f  MRR=%.4f\n",
 		rep.Overall.Recall[5], rep.Overall.Recall[10],
 		rep.Overall.NDCG[5], rep.Overall.NDCG[10], rep.Overall.MRR)

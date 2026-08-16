@@ -39,31 +39,50 @@ case "$DATASET" in
     ;;
 
   longmemeval_s)
+    # The client expects datasets/longmemeval_s.json (cmd/client/dataset.go),
+    # but the HF dataset repo names the file exactly "longmemeval_s" — no
+    # .json extension — so the download is renamed into place below.
     OUT="$DIR/longmemeval_s.json"
+    RAW="$DIR/longmemeval_s"
     if [[ -s "$OUT" ]]; then
       echo "longmemeval_s: $OUT already present ($(wc -c <"$OUT") bytes)"
       exit 0
     fi
+    if [[ -s "$RAW" ]]; then
+      echo "longmemeval_s: found already-downloaded $RAW; renaming to $OUT"
+      mv "$RAW" "$OUT"
+      echo "longmemeval_s: saved $OUT ($(wc -c <"$OUT") bytes)"
+      exit 0
+    fi
     # Official distribution is the xiaowu0162/longmemeval HF dataset repo
-    # (also mirrored via a Google Drive link in the GitHub README). The HF
-    # download may require `huggingface-cli login` first.
-    if command -v huggingface-cli >/dev/null 2>&1; then
-      echo "longmemeval_s: downloading via huggingface-cli"
-      if huggingface-cli download xiaowu0162/longmemeval longmemeval_s.json \
-           --repo-type dataset --local-dir "$DIR"; then
-        echo "longmemeval_s: saved $OUT"
+    # (also mirrored via a Google Drive link in the GitHub README). The
+    # modern CLI binary is `hf`; huggingface-cli is the legacy name kept as
+    # a fallback. The download may require a prior `hf auth login`.
+    HF_CLI=""
+    if command -v hf >/dev/null 2>&1; then
+      HF_CLI="hf"
+    elif command -v huggingface-cli >/dev/null 2>&1; then
+      HF_CLI="huggingface-cli"
+    fi
+    if [[ -n "$HF_CLI" ]]; then
+      echo "longmemeval_s: downloading via $HF_CLI"
+      if "$HF_CLI" download xiaowu0162/longmemeval longmemeval_s \
+           --repo-type dataset --local-dir "$DIR" && [[ -s "$RAW" ]]; then
+        mv "$RAW" "$OUT"
+        echo "longmemeval_s: saved $OUT ($(wc -c <"$OUT") bytes)"
         exit 0
       fi
-      echo "longmemeval_s: huggingface-cli download failed (login/permissions?)" >&2
+      echo "longmemeval_s: $HF_CLI download failed (login/permissions?)" >&2
     else
-      echo "longmemeval_s: huggingface-cli not installed" >&2
+      echo "longmemeval_s: neither hf nor huggingface-cli is installed" >&2
     fi
     cat >&2 <<EOF
 longmemeval_s: could not download automatically. To fetch it:
   pip install -U "huggingface_hub[cli]"
-  huggingface-cli login            # if the repo requires auth
-  huggingface-cli download xiaowu0162/longmemeval longmemeval_s.json \\
+  hf auth login                    # if the repo requires auth
+  hf download xiaowu0162/longmemeval longmemeval_s \\
       --repo-type dataset --local-dir "$DIR"
+  mv "$DIR/longmemeval_s" "$OUT"
 (or use the Google Drive link in https://github.com/xiaowu0162/LongMemEval)
 Then re-run. Expected path: $OUT
 EOF

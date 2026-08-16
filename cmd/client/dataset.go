@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -33,13 +36,34 @@ type question struct {
 
 // conversation is one retrieval scope: LoCoMo sample, LongMemEval question
 // haystack, or the single fixtures conversation. Num is the numeric
-// conversation id used on the wire (FetchReq/ProgressReq carry int64 ids;
-// the ingest order makes the mapping deterministic on both sides).
+// conversation id used on the wire (FetchReq/ProgressReq carry int64 ids);
+// it is derived deterministically from dataset+sample id via
+// surrogateConvID, so ingest and eval agree without depending on ingest
+// order, and different datasets sharing one Postgres volume cannot
+// collide on ids.
 type conversation struct {
 	Num       int64
 	Name      string
 	Items     []item
 	Questions []question
+}
+
+// surrogateConvID derives the numeric wire conversation id from the
+// dataset name and the dataset-level sample/question id: the first 8
+// bytes of sha256("<dataset>/<sample_id>") read big-endian with the sign
+// bit masked (a non-negative int63). Both the ingest and the eval/progress
+// paths derive ids through this one function, so they always agree, and
+// two datasets ingested into the same Postgres volume can no longer
+// collide on ingest-order ids (collision probability at benchmark scale
+// is negligible). 0 is reserved as the global-progress sentinel, so it is
+// remapped in the (astronomically unlikely) case the hash lands there.
+func surrogateConvID(dataset, sampleID string) int64 {
+	sum := sha256.Sum256([]byte(dataset + "/" + sampleID))
+	id := int64(binary.BigEndian.Uint64(sum[:8]) & math.MaxInt64)
+	if id == 0 {
+		id = 1
+	}
+	return id
 }
 
 // envelopeOf rebuilds the exact blob the server writes for an item, so its
@@ -159,7 +183,7 @@ func loadFixtures(path string) ([]conversation, error) {
 	if err != nil {
 		return nil, err
 	}
-	conv := conversation{Num: 1, Name: "fixtures"}
+	conv := conversation{Num: surrogateConvID("fixtures", "fixtures"), Name: "fixtures"}
 	for _, t := range f.Turns {
 		conv.Items = append(conv.Items, item{
 			TurnID:    t.ID,
@@ -187,8 +211,8 @@ func loadLoCoMo(path string) ([]conversation, error) {
 		return nil, err
 	}
 	convs := make([]conversation, 0, len(samples))
-	for i, s := range samples {
-		conv := conversation{Num: int64(i + 1), Name: s.SampleID}
+	for _, s := range samples {
+		conv := conversation{Num: surrogateConvID("locomo", s.SampleID), Name: s.SampleID}
 		for _, sess := range s.Sessions {
 			sid := fmt.Sprintf("session_%d", sess.Index)
 			for _, turn := range sess.Turns {
@@ -220,8 +244,8 @@ func loadLongMemEval(path string) ([]conversation, error) {
 		return nil, err
 	}
 	convs := make([]conversation, 0, len(qs))
-	for i, q := range qs {
-		conv := conversation{Num: int64(i + 1), Name: q.QuestionID}
+	for _, q := range qs {
+		conv := conversation{Num: surrogateConvID("longmemeval_s", q.QuestionID), Name: q.QuestionID}
 		for si, sess := range q.HaystackSessions {
 			if si >= len(q.HaystackSessionIDs) {
 				break

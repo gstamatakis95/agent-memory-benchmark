@@ -14,6 +14,7 @@ coverage.*
 *.coverprofile
 
 # Datasets (downloaded by scripts/download-dataset.sh)
+/datasets/
 /data/
 
 # Editor / OS noise
@@ -24,5 +25,4 @@ coverage.*
 # NOTE: genproto/ is intentionally NOT ignored — generated stubs are committed.
 
 # IDE
-.idea/
 *.iml

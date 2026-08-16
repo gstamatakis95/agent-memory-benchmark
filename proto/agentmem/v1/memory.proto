@@ -1,0 +1,101 @@
+// MemoryService — ingest, version-pinned fetch/progress, and sweep trigger.
+//
+// Sources:
+//   - docs/01-retrieval.md §4.4  — Memory message + UploadMemories/FetchAllMemories shape
+//   - docs/02-storage.md  §E.8   — Memory gains s3_key + enrichment_status;
+//                                  fetch streams enriched ('done') rows only
+//   - docs/04-append-only.md §4  — version-pinned FetchReq / ProgressReq / Progress;
+//                                  every fetch and progress RPC takes an explicit
+//                                  enrichment_version (REQUIRED, no defaulting)
+syntax = "proto3";
+
+package agentmem.v1;
+
+option go_package = "example.com/agentmem/genproto/agentmem/v1;agentmemv1";
+
+service MemoryService {
+  // Client-streaming ingest: backpressure-friendly for 50k–500k rows.
+  // Server writes the S3 blob first, then the memories row; enrichment is
+  // async (pending is derived by absence of a 'done' ledger row).
+  rpc UploadMemories(stream Memory) returns (UploadAck);
+
+  // Server-streaming, version-pinned fetch of enriched rows only.
+  // enrichment_version is REQUIRED so a benchmark run never sees a
+  // mixed-version corpus.
+  rpc FetchAllMemories(FetchReq) returns (stream EnrichedMemory);
+
+  // Version-pinned progress: client polls until remaining == 0 (and fails
+  // loudly if dead > 0) before running retrieval + eval.
+  rpc GetProgress(ProgressReq) returns (Progress);
+
+  // Trigger the enrichment sweep Schedule immediately instead of waiting up
+  // to 60 s for the next tick (docs/03-temporal.md fast path).
+  rpc TriggerSweep(TriggerSweepReq) returns (TriggerSweepResp);
+}
+
+// Raw memory as uploaded by the client harness. The server fills derived
+// fields (normalized_text, lexemes, embedding, timestamp) asynchronously into
+// the append-only enrichment ledger; they are streamed back as EnrichedMemory.
+message Memory {
+  string id = 1;                     // stable hash of (conversation_id, dia_id/turn)
+  string conversation_id = 2;        // LoCoMo sample_id / LME question_id
+  string session_id = 3;             // "session_1" / haystack session id
+  string turn_id = 4;                // dia_id (LoCoMo) or synthesized turn index
+  string speaker = 5;                // speaker_a/b or user/assistant
+  string text = 6;                   // raw dialog text
+  string normalized_text = 7;        // server-filled: lowercased, unicode-normalized
+  int64 timestamp_unix = 8;          // parsed from session_N_date_time / haystack_dates
+  repeated float embedding = 9;      // server-filled (768 floats), or use bytes below
+  bytes embedding_bytes = 10;        // optional packed float32 for compactness
+  repeated string lexemes = 11;      // server-filled BM25 tokens
+  string granularity = 12;           // "turn" | "round" | "session"
+  bool has_answer = 13;              // eval-only ground-truth passthrough (LME)
+  map<string, string> metadata = 14; // category, question_type, dataset, etc.
+  string s3_key = 15;                // server-filled: content-addressed blob key
+  string enrichment_status = 16;     // server-filled: derived status at a version
+}
+
+message UploadAck {
+  uint64 accepted = 1;
+  uint64 deduped = 2;
+  string batch_id = 3;
+}
+
+// Version-pinned fetch request (docs/04-append-only.md §4).
+message FetchReq {
+  int64 conversation_id = 1;
+  int32 enrichment_version = 2; // version REQUIRED — no defaulting
+}
+
+// One enriched row, mirroring the version-pinned fetch SQL:
+//   SELECT e.memory_id, e.normalized_text, e.lexemes, e.ts, e.embedding,
+//          m.content_hash, m.s3_key ...
+message EnrichedMemory {
+  int64 memory_id = 1;
+  int32 enrichment_version = 2;
+  string normalized_text = 3;
+  repeated string lexemes = 4;
+  int64 ts_unix = 5;       // content-derived timestamp (unix seconds)
+  bytes embedding = 6;     // 3072-byte packed little-endian float32, L2-normalized
+  bytes content_hash = 7;  // sha256 of the source blob
+  string s3_key = 8;
+}
+
+// Version-pinned progress request (docs/04-append-only.md §4).
+message ProgressReq {
+  int64 conversation_id = 1;
+  int32 enrichment_version = 2; // version REQUIRED — no defaulting
+}
+
+message Progress {
+  int64 total = 1;
+  int64 done = 2;
+  int64 remaining = 3;
+  int64 dead = 4;
+}
+
+message TriggerSweepReq {}
+
+message TriggerSweepResp {
+  bool triggered = 1;
+}

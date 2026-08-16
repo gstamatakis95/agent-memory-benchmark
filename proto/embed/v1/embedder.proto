@@ -1,0 +1,25 @@
+// Improvised unary embedder proto (design doc 02-storage.md §E.3).
+//
+// The real nomic-embed-text-v1.5 service proto is unpublished; this minimal
+// placeholder is wrapped behind the Go Embedder interface so any concrete
+// proto can swap in. UNARY ONLY by design — one text per RPC, no batch or
+// stream; throughput is recovered with bounded goroutine concurrency.
+syntax = "proto3";
+
+package embed.v1;
+
+option go_package = "example.com/agentmem/genproto/embed/v1;embedv1";
+
+service Embedder {
+  // UNARY ONLY — one text per RPC, no batch/stream.
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+}
+
+message EmbedRequest {
+  string text = 1;       // caller has ALREADY prepended the task prefix
+  string task_type = 2;  // "search_document" | "search_query" (informational)
+}
+
+message EmbedResponse {
+  repeated float vector = 1;  // expect 768 dims
+}

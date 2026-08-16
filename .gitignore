@@ -1,0 +1,24 @@
+# Binaries and build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go workspace files (machine-local)
+go.work
+go.work.sum
+
+# Coverage
+coverage.*
+*.coverprofile
+
+# Datasets (downloaded by scripts/download-dataset.sh)
+/data/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+*.swp
+
+# NOTE: genproto/ is intentionally NOT ignored — generated stubs are committed.

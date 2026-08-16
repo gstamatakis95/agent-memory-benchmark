@@ -34,7 +34,7 @@ cleanup() { $KEEP_UP || docker compose down -v; }
 trap cleanup EXIT
 
 echo "==> [1/6] starting infrastructure"
-docker compose up -d postgres minio mc-bootstrap temporal temporal-ui embedder-mock
+docker compose up -d postgres minio mc-bootstrap temporal temporal-ui embedder-mock embedder-nomic
 docker compose up -d --wait postgres temporal minio
 
 echo "==> [2/6] running migrations"

@@ -32,6 +32,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	embedv1 "example.com/agentmem/genproto/embed/v1"
@@ -161,7 +162,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	g := grpc.NewServer()
+	// Clients ping every 30s (Time:30s, PermitWithoutStream:true); the gRPC
+	// server default enforcement MinTime of 5min would reply with GoAway
+	// ENHANCE_YOUR_CALM too_many_pings. Allow pings at that cadence.
+	g := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             20 * time.Second,
+		PermitWithoutStream: true,
+	}))
 	embedv1.RegisterEmbedderServer(g, s)
 	log.Printf("nomic bridge on :9100 (upstream=%s model=%s)", s.url, s.model)
 	log.Fatal(g.Serve(lis))

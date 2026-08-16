@@ -101,7 +101,7 @@ WHERE  NOT EXISTS (
   AND  COALESCE(f.has_permanent, false) = false
   AND  COALESCE(f.n_fail, 0) < $2
   AND  (f.last_fail IS NULL
-        OR f.last_fail < now() - ($3::interval * power(2, f.n_fail)))`
+        OR f.last_fail < now() - ($3::interval * power(2, LEAST(f.n_fail, 6))))`
 
 var (
 	pendingIDsSQL   = pendingCoreSQL + "\nORDER BY m.id\nLIMIT $4"

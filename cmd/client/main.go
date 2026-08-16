@@ -234,15 +234,58 @@ func cmdWaitEnriched(args []string) error {
 
 // ------------------------------------------------------------------ eval --
 
+// evalTuning is the resolved per-dataset retrieval configuration for one
+// eval run. Flags left at their sentinel values ("auto") resolve through
+// evalDefaults, so each dataset can carry its own tuned defaults without
+// changing another dataset's behavior.
+type evalTuning struct {
+	granularity   string // turn|round|all: which corpus rows enter the index
+	rrfK          int
+	candidates    int
+	topK          int
+	maxPerSession int
+}
+
+// evalDefaults returns the default tuning for a dataset.
+//   - Base defaults follow docs/01-retrieval.md section 4.3: RRF k=60,
+//     candidates=100, top-k=10, per-session cap 4, index all granularities.
+//   - LoCoMo overrides come from the 2026-08 one-variable-at-a-time sweep
+//     (real nomic embeddings, version 1): RRF k=10 (the section 4.3 step 4
+//     "k=10-30 for small haystacks" suggestion; hybrid R@5 0.645 -> 0.660)
+//     and an uncapped MMR per-session limit (LoCoMo evidence often
+//     concentrates in one session, so the cap evicts gold turns; combined
+//     with k=10: R@5 0.663, MRR 0.515). granularity=turn was tried and is
+//     clearly WORSE (R@5 0.583) — round rows carry helpful pair context and
+//     expansion credits their member turns — so "all" stays. candidates=200
+//     was a wash vs 100. LongMemEval defaults are untouched by that sweep.
+func evalDefaults(dataset string) evalTuning {
+	t := evalTuning{
+		granularity:   "all",
+		rrfK:          retrieve.DefaultRRFK,
+		candidates:    retrieve.DefaultCandidateN,
+		topK:          retrieve.DefaultTopK,
+		maxPerSession: 4,
+	}
+	if dataset == "locomo" {
+		t.rrfK = 10
+		t.maxPerSession = 0
+	}
+	return t
+}
+
 func cmdEval(args []string) error {
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
 	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s")
 	version := fs.Int("version", 0, "enrichment version (required)")
 	retrieval := fs.String("retrieval", "hybrid", "bm25|dense|hybrid")
 	// docs/01-retrieval.md section 4.3 step 6 prescribes a per-session cap but
-	// no numeric value; 4 is a modest default that keeps room for multi-session
-	// evidence inside top-10 (0 = uncapped).
-	maxPerSession := fs.Int("max-per-session", 4, "MMR per-session result cap (0 = uncapped)")
+	// no numeric value; 4 is the base default (0 = uncapped, -1 = dataset
+	// default), keeping room for multi-session evidence inside top-10.
+	maxPerSession := fs.Int("max-per-session", -1, "MMR per-session result cap (0 = uncapped, -1 = dataset default)")
+	rrfK := fs.Int("rrf-k", 0, "RRF fusion constant (0 = dataset default)")
+	candidates := fs.Int("candidates", 0, "per-list candidate depth N before fusion (0 = dataset default)")
+	topK := fs.Int("topk", 0, "final result depth (0 = dataset default; metrics report @5/@10, so keep >= 10)")
+	granularity := fs.String("granularity", "", "turn|round|all: which corpus rows enter the index (empty = dataset default)")
 	_ = fs.Parse(args)
 	if *version <= 0 {
 		return fmt.Errorf("--version is required (no defaulting)")
@@ -251,6 +294,30 @@ func cmdEval(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	tun := evalDefaults(*dataset)
+	if *granularity != "" {
+		tun.granularity = *granularity
+	}
+	switch tun.granularity {
+	case "turn", "round", "all":
+	default:
+		return fmt.Errorf("--granularity %q invalid (want turn|round|all)", tun.granularity)
+	}
+	if *rrfK > 0 {
+		tun.rrfK = *rrfK
+	}
+	if *candidates > 0 {
+		tun.candidates = *candidates
+	}
+	if *topK > 0 {
+		tun.topK = *topK
+	}
+	if *maxPerSession >= 0 {
+		tun.maxPerSession = *maxPerSession
+	}
+	log.Printf("eval: config granularity=%s rrf-k=%d candidates=%d topk=%d max-per-session=%d",
+		tun.granularity, tun.rrfK, tun.candidates, tun.topK, tun.maxPerSession)
 
 	convs, err := loadDataset(*dataset)
 	if err != nil {
@@ -317,14 +384,18 @@ func cmdEval(args []string) error {
 			return fmt.Errorf("conversation %s: %w", c.Name, err)
 		}
 		fetchedRows += nFetched
+		rows = filterGranularity(rows, expand, tun.granularity)
 		mappedRows += len(rows)
 		corpus, err := retrieve.NewCorpus(rows)
 		if err != nil {
 			return err
 		}
 		r, err := retrieve.NewRetriever(corpus, qemb, retrieve.Options{
-			Mode: mode,
-			MMR:  retrieve.MMROptions{MaxPerSession: *maxPerSession},
+			Mode:       mode,
+			TopK:       tun.topK,
+			CandidateN: tun.candidates,
+			RRFK:       tun.rrfK,
+			MMR:        retrieve.MMROptions{MaxPerSession: tun.maxPerSession},
 		})
 		if err != nil {
 			return err
@@ -456,6 +527,42 @@ func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conv
 			c.Name, len(rows), len(local))
 	}
 	return rows, fetched, nil
+}
+
+// filterGranularity restricts which corpus rows enter the retrieval index
+// (rows are still fetched and hash-mapped in full; this is an eval-side
+// filter, not an ingest change). expand maps round id -> member turn ids.
+//   - "all":   every row (turns + multi-turn rounds), the historical corpus;
+//   - "turn":  turn rows only — round rows are dropped so they cannot
+//     occupy top-k slots when evidence is turn-level (LoCoMo);
+//   - "round": round rows plus turns not covered by any multi-turn round
+//     (single-turn rounds are never ingested as round rows, so dropping
+//     their turn twin would make them unretrievable).
+func filterGranularity(rows []retrieve.Row, expand map[string][]string, granularity string) []retrieve.Row {
+	if granularity == "" || granularity == "all" {
+		return rows
+	}
+	covered := make(map[string]bool)
+	for _, members := range expand {
+		for _, id := range members {
+			covered[id] = true
+		}
+	}
+	out := rows[:0]
+	for _, r := range rows {
+		_, isRound := expand[r.ID]
+		switch granularity {
+		case "turn":
+			if !isRound {
+				out = append(out, r)
+			}
+		case "round":
+			if isRound || !covered[r.ID] {
+				out = append(out, r)
+			}
+		}
+	}
+	return out
 }
 
 // expandRetrieved maps the ranked retrieval output to turn-level ids for

@@ -61,7 +61,7 @@ docker compose run --rm server /app/client trigger-sweep
 
 # Poll the version-pinned progress until remaining == 0. Fail loudly on dead rows.
 docker compose run --rm server /app/client wait-enriched \
-  --version "$VERSION" --timeout 15m --fail-on-dead
+  --version "$VERSION" --timeout "${WAIT_TIMEOUT:-15m}" --fail-on-dead
 
 echo "==> [6/6] running retrieval eval (mode=$RETRIEVAL)"
 docker compose run --rm server /app/client eval \

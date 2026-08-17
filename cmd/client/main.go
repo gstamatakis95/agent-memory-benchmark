@@ -258,6 +258,19 @@ type evalTuning struct {
 //     clearly WORSE (R@5 0.583) — round rows carry helpful pair context and
 //     expansion credits their member turns — so "all" stays. candidates=200
 //     was a wash vs 100. LongMemEval defaults are untouched by that sweep.
+//   - LongMemEval-S overrides come from the 2026-08 one-variable-at-a-time
+//     sweep (real nomic embeddings, version 2, hybrid). Baseline (base
+//     defaults) R@5 0.7240. Single-variable results: rrf-k 30 -> 0.7401,
+//     rrf-k 10 -> 0.7245, max-per-session 0 -> 0.7226 (R@10 0.8448 though),
+//     max-per-session 2 -> 0.6996, candidates 200 -> 0.7240 (wash),
+//     granularity=turn -> 0.7322 (LME gold is turn-level; big
+//     temporal-reasoning gain 0.6622 -> 0.7005 at the cost of
+//     single-session-preference 0.556 -> 0.506). Combining the two winners
+//     (rrf-k=30 + granularity=turn) beat both singles on every overall
+//     metric: R@5 0.7430, R@10 0.8363, NDCG@5 0.6348, MRR 0.6688.
+//     Refinement probes around the winner: rrf-k 20 + turn -> 0.7381,
+//     rrf-k 40 + turn -> 0.7428, so k=30 is at/near the peak. Ablation at
+//     this config: bm25 R@5 0.6853, dense 0.6809 — hybrid 0.7430 beats both.
 func evalDefaults(dataset string) evalTuning {
 	t := evalTuning{
 		granularity:   "all",
@@ -269,6 +282,10 @@ func evalDefaults(dataset string) evalTuning {
 	if dataset == "locomo" {
 		t.rrfK = 10
 		t.maxPerSession = 0
+	}
+	if dataset == "longmemeval_s" {
+		t.rrfK = 30
+		t.granularity = "turn"
 	}
 	return t
 }

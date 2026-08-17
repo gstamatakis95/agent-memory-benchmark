@@ -433,7 +433,7 @@ func cmdEval(args []string) error {
 	}
 
 	rep := eval.Evaluate(results, []int{5, 10})
-	printReport(*dataset, string(mode), rep, fetchedRows, mappedRows, embedSkipped)
+	printReport(*dataset, string(mode), rep, len(convs), fetchedRows, mappedRows, embedSkipped)
 	if embedSkipped > 0 {
 		fmt.Printf("eval: WARN skipped %d questions (embed failures)\n", embedSkipped)
 	}
@@ -592,10 +592,15 @@ func expandRetrieved(scored []retrieve.Scored, expand map[string][]string) []str
 	return out
 }
 
-func printReport(dataset, mode string, rep eval.Report, fetched, mapped, embedSkipped int) {
+func printReport(dataset, mode string, rep eval.Report, conversations, fetched, mapped, embedSkipped int) {
 	fmt.Println("==================================================")
 	fmt.Printf("retrieval eval  dataset=%s  mode=%s\n", dataset, mode)
-	fmt.Printf("corpus rows fetched=%d mapped=%d\n", fetched, mapped)
+	// Retrieval is scoped per conversation: each conversation's questions
+	// search a corpus built from ONLY that conversation's fetched rows
+	// (LongMemEval: one haystack per question; LoCoMo: one sample's
+	// sessions). The counts below are aggregates across all per-
+	// conversation fetches, not one union fetch.
+	fmt.Printf("conversations=%d rows fetched=%d mapped=%d\n", conversations, fetched, mapped)
 	fmt.Printf("queries scored=%d skipped(no evidence)=%d skipped(embed failures)=%d\n",
 		rep.Overall.N, rep.Skipped, embedSkipped)
 	fmt.Printf("overall   Recall@5=%.4f  Recall@10=%.4f  NDCG@5=%.4f  NDCG@10=%.4f  MRR=%.4f\n",

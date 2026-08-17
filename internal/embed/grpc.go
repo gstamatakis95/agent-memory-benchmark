@@ -14,12 +14,16 @@ import (
 )
 
 // ServiceConfig is the grpc-go retry service config from docs/02-storage.md
-// section E.3, verbatim: UNAVAILABLE (and transient friends) retried with
-// exponential backoff + jitter, 5 attempts, 5s per-method timeout.
+// section E.3: UNAVAILABLE (and transient friends) retried with exponential
+// backoff + jitter, 5 attempts. The per-attempt timeout is 30s (raised from
+// the E.3 5s): the micro-batching bridge queues calls under saturation, so
+// with hundreds of unary calls in flight the queue's tail latency legitimately
+// exceeds 5s — a 5s deadline tail-kills healthy queued calls, and the retries
+// requeue and amplify the pile-up.
 const ServiceConfig = `{
   "methodConfig": [{
     "name": [{"service": "embed.v1.Embedder"}],
-    "timeout": "5s",
+    "timeout": "30s",
     "retryPolicy": {
       "maxAttempts": 5,
       "initialBackoff": "0.1s",

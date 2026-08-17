@@ -70,9 +70,8 @@ is not for CI.
   semicolons; without the annotations goose splits them mid-statement.
 - **`run.sh` tears down volumes.** Its EXIT trap runs `docker compose down -v` unless you pass
   `--keep-up` — anything in Postgres/MinIO dies with the run.
-- **Datasets must be baked into the image.** `run.sh` mounts no volumes: after
-  `./scripts/download-dataset.sh <name>`, run `docker compose build server` once or the
-  container won't see the dataset.
+- **Datasets are a read-only volume mount.** `datasets/` is mounted into the server container:
+  after `./scripts/download-dataset.sh <name>` no image rebuild is needed.
 - **Version bumps are free.** To re-enrich, bump `ENRICHMENT_VERSION`; the anti-join re-derives
   everything as pending. Never write a bulk re-enqueue UPDATE.
 - **Fault injection knobs** live on the mock embedder: `MOCK_LATENCY_MS`, `MOCK_FAIL_RATE`,
@@ -80,3 +79,17 @@ is not for CI.
   not retry forever.
 - **Ablation is the embedding-path integration test.** If hybrid doesn't beat bm25 by ~+9pp R@5
   on LongMemEval-S, suspect prefixes / L2 normalization / dims before tuning anything.
+- **compose-run env trap.** One-off `docker compose run server ...` commands default to the mock
+  embedder — always pass `-e EMBEDDER_ADDR=embedder-nomic:9100` for real-embedding evals
+  (and `-e PG_DSN=` to bypass a possibly stale query cache).
+- **The Temporal schedule pins its workflow args at creation.** An `ENRICHMENT_VERSION` bump
+  needs `temporal schedule delete --schedule-id enrichment-sweep` + server restart, or the sweep
+  keeps running the old version.
+- **The served nomic model hard-rejects >512-token inputs** (HTTP 500 "too large"). The bridge
+  truncates to 1200 chars and dead-letters items that still overflow; the embed client treats
+  embedder `INTERNAL` status as permanent by contract.
+- **zsh on this machine does not word-split unquoted variables.** Use `${=var}` when expanding a
+  space-separated list in a loop.
+- **Docker Desktop credential-helper leak.** `docker-credential-desktop` processes can
+  accumulate and exhaust the per-user process table (fork failures everywhere); fix by
+  restarting Docker Desktop or switching `~/.docker/config.json` `credsStore` to `osxkeychain`.

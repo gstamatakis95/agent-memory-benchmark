@@ -7,8 +7,10 @@ import (
 
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 
 	embedv1 "example.com/agentmem/genproto/embed/v1"
 )
@@ -93,6 +95,13 @@ func (g *GRPCEmbedder) Embed(ctx context.Context, text string) ([]float32, error
 	}
 	resp, err := g.cli.Embed(ctx, &embedv1.EmbedRequest{Text: text, TaskType: task})
 	if err != nil {
+		// The embedder service contract reserves INTERNAL for non-retryable
+		// conditions (malformed reply, wrong dims, text over the model's hard
+		// token limit). Classify it permanent so enrichment dead-letters the
+		// item instead of retrying it forever.
+		if status.Code(err) == codes.Internal {
+			return nil, &PermanentError{Err: err}
+		}
 		return nil, err
 	}
 	if len(resp.GetVector()) != Dims {

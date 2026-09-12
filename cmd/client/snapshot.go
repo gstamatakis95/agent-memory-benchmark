@@ -136,6 +136,37 @@ func cmdSearch(args []string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------- conv-id --
+
+// cmdConvID prints the numeric conversation ids (surrogateConvID) of a
+// dataset so `search --conversation` can be scoped without reading the
+// code. With --id only that conversation's id is printed, bare, for shell
+// substitution.
+func cmdConvID(args []string) error {
+	fs := flag.NewFlagSet("conv-id", flag.ExitOnError)
+	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s|path/to/custom.json")
+	id := fs.String("id", "", "conversation id within the dataset (empty = list all)")
+	_ = fs.Parse(args)
+	convs, err := loadDataset(*dataset)
+	if err != nil {
+		return err
+	}
+	for _, c := range convs {
+		if *id != "" {
+			if c.Name == *id {
+				fmt.Println(c.Num)
+				return nil
+			}
+			continue
+		}
+		fmt.Printf("%d\t%s\tturns=%d questions=%d\n", c.Num, c.Name, len(c.Items), len(c.Questions))
+	}
+	if *id != "" {
+		return fmt.Errorf("conversation %q not found in dataset %s", *id, *dataset)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------- eval helpers --
 
 // localTwins maps one conversation's local rows (turns + round twins, see

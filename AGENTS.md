@@ -65,7 +65,11 @@ your job is to keep them passing.
 - `migrations/` goose SQL (`00004_snapshots.sql` adds `snapshot_events` + the version sequence);
   `testdata/fixtures.json` the e2e corpus
 - `scripts/run-snapshot.sh` the snapshot-engine counterpart of `run.sh`: same infra/ingest steps,
-  then `build-snapshot` + `eval --engine snapshot` instead of `run.sh`'s single in-process eval
+  then `build-snapshot` + `eval --engine snapshot` instead of `run.sh`'s single in-process eval;
+  `scripts/preflight.sh` checks local prerequisites
+- Custom datasets: `--dataset path/to/file.json` in the `eval.Fixtures` format (single- or
+  multi-conversation, `docs/08-custom-datasets.md`); the file must sit under `datasets/` to be
+  visible inside the container; ids are salted by the file's base name (`datasetName`)
 
 ## How to verify changes (the tier ladder)
 

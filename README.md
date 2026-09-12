@@ -39,15 +39,38 @@ temporal boost → MMR (λ=0.7) with per-session caps. `--engine snapshot` inste
 serving" below); it has no MMR or pre-fusion temporal filter, only post-fusion recency boost and
 abstention.
 
-## Quickstart
+## Quickstart (everything runs locally)
 
-Prereqs: Docker (with compose), Go 1.25, `protoc` with the Go plugins (`protoc-gen-go`,
-`protoc-gen-go-grpc`).
+Prereqs: Docker with the compose plugin. Go 1.25 is only needed to run the unit tests or edit the
+code (the images build Go inside Docker); `protoc` + `protoc-gen-go`/`protoc-gen-go-grpc` only
+for `make proto`. The real embedding model is optional — the deterministic mock embedder is the
+compose default and every tier below works with it.
 
 ```bash
-make test            # tiers 0-2: unit + workflow + integration (testcontainers)
-./run.sh --fixtures  # tier 3: full stack e2e, asserts Recall@5 == 1.0
+./scripts/preflight.sh          # checks docker, compose, free ports, disk, optional model runner
+make test                       # tiers 0-2: unit + workflow + integration (testcontainers)
+./run.sh --fixtures             # tier 3: full stack e2e, in-process engine, asserts Recall@5 == 1.0
+./scripts/run-snapshot.sh --fixtures   # same on the snapshot (Bleve) engine
 ```
+
+Both run scripts bring the stack up, migrate, ingest, wait for enrichment, evaluate, and tear the
+volumes down unless you pass `--keep-up`.
+
+## Bring your own dataset
+
+`--dataset` takes a built-in name or the path of a JSON file: one or more conversations, each a
+list of turns (`id`, `session_id`, `speaker`, `text`, `date_time`) and optional questions with
+gold `evidence` turn ids. Drop the file under `datasets/` (mounted read-only into the server
+container, no rebuild) and run everything against it:
+
+```bash
+cp testdata/custom-example.json datasets/
+./scripts/run-snapshot.sh --dataset datasets/custom-example.json --keep-up
+docker compose run --rm server /app/client conv-id --dataset datasets/custom-example.json
+docker compose run --rm server /app/client search --query "iceberg compaction" --conversation <id>
+```
+
+Format, validation rules, and the manual step-by-step are in `docs/08-custom-datasets.md`.
 
 While the stack is up: Temporal UI at http://localhost:8080, MinIO console at
 http://localhost:9001 (app/appsecret), server gRPC on :8081.
@@ -216,7 +239,8 @@ internal/blob/          Content-addressed S3 blob envelope (byte-stable JSON)
 migrations/             Goose SQL migrations (ledger schema, partial unique index, views,
                         snapshot_events + version sequence)
 testdata/fixtures.json  Hand-built ~20-turn corpus with known evidence
-scripts/                init-temporal-dbs.sh, download-dataset.sh, run-snapshot.sh
+scripts/                preflight.sh, init-temporal-dbs.sh, download-dataset.sh, run-snapshot.sh
+testdata/custom-example.json  Two-conversation example of the bring-your-own dataset format
 tools/mockembedder/     Deterministic hash-based mock embedder with fault injection
 tools/nomicbridge/      Bridge from unary Embedder RPCs to Docker Model Runner (micro-batching)
 docs/                   Frozen design docs 01-06 (the deep spec) + 07 (snapshot serving)
@@ -234,6 +258,7 @@ The docs in `docs/` are the authoritative deep spec (frozen):
 - `06-testing.md` — the five test tiers and what each must assert
 - `07-snapshot-serving.md` — Bleve + flat-vector snapshot build/serve engine (alternative to the
   in-process retrieval path above)
+- `08-custom-datasets.md` — bring-your-own dataset format and how to run everything on it
 
 ## Hard design constraints
 

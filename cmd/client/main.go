@@ -14,6 +14,10 @@
 //	build-snapshot --version N
 //	snapshot-info
 //	search         --query "..." [--conversation ID] [--mode hybrid] ...
+//	conv-id        --dataset X [--id CONV]   print the numeric conversation ids
+//
+// --dataset accepts a built-in name or the path of a custom JSON file
+// (docs/08-custom-datasets.md).
 package main
 
 import (
@@ -80,6 +84,8 @@ func main() {
 		err = cmdSnapshotInfo(args)
 	case "search":
 		err = cmdSearch(args)
+	case "conv-id":
+		err = cmdConvID(args)
 	default:
 		usage()
 	}
@@ -89,7 +95,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: client <ingest|trigger-sweep|wait-enriched|eval|build-snapshot|snapshot-info|search> [flags]`)
+	fmt.Fprintln(os.Stderr, `usage: client <ingest|trigger-sweep|wait-enriched|eval|build-snapshot|snapshot-info|search|conv-id> [flags]`)
 	os.Exit(2)
 }
 
@@ -97,7 +103,7 @@ func usage() {
 
 func cmdIngest(args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
-	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s")
+	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s|path/to/custom.json")
 	version := fs.Int("version", 1, "enrichment version (informational; enrichment version is server-side)")
 	_ = fs.Parse(args)
 
@@ -137,7 +143,7 @@ func cmdIngest(args []string) error {
 			Granularity:    granularity,
 			Metadata: map[string]string{
 				"date_time": env.DateTime,
-				"dataset":   *dataset,
+				"dataset":   datasetName(*dataset),
 			},
 		})
 	}
@@ -305,7 +311,7 @@ func evalDefaults(dataset string) evalTuning {
 
 func cmdEval(args []string) error {
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
-	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s")
+	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s|path/to/custom.json")
 	version := fs.Int("version", 0, "enrichment version (required)")
 	retrieval := fs.String("retrieval", "hybrid", "bm25|dense|hybrid")
 	// engine=inprocess (default) is the original docs/01 path: fetch the
@@ -333,7 +339,7 @@ func cmdEval(args []string) error {
 		return err
 	}
 
-	tun := evalDefaults(*dataset)
+	tun := evalDefaults(datasetName(*dataset))
 	if *granularity != "" {
 		tun.granularity = *granularity
 	}
@@ -484,8 +490,12 @@ func cmdEval(args []string) error {
 		}
 	}
 
+	if totalQuestions == 0 {
+		log.Printf("eval: dataset %s has no questions — nothing to score (ingest/search still work; add questions with evidence to get metrics)", *dataset)
+		return nil
+	}
 	rep := eval.Evaluate(results, []int{5, 10})
-	printReport(*engine, *dataset, string(mode), rep, len(convs), fetchedRows, mappedRows, embedSkipped, snapVersion)
+	printReport(*engine, datasetName(*dataset), string(mode), rep, len(convs), fetchedRows, mappedRows, embedSkipped, snapVersion)
 	if embedSkipped > 0 {
 		fmt.Printf("eval: WARN skipped %d questions (embed failures)\n", embedSkipped)
 	}

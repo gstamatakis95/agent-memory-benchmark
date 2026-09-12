@@ -29,6 +29,7 @@ Usage: ./scripts/run-snapshot.sh [options]
   --fixtures                 tiny built-in corpus, asserts R@5 == 1.0   (default)
   --dataset locomo           LoCoMo (10 conversations)
   --dataset longmemeval_s    LongMemEval-S (500 questions)
+  --dataset datasets/x.json  your own corpus (docs/08-custom-datasets.md)
   --retrieval bm25|dense|hybrid   ablation mode (default: hybrid)
   --version N                enrichment version to target (default: 1)
   --keep-up                  leave the stack running after eval
@@ -58,10 +59,22 @@ echo "==> [2/7] running migrations"
 docker compose run --rm server /app/migrate up
 
 echo "==> [3/7] fetching dataset: $DATASET"
-if [[ "$DATASET" != "fixtures" ]]; then
-  ./scripts/download-dataset.sh "$DATASET"
-else
+if [[ "$DATASET" == "fixtures" ]]; then
   echo "    using built-in fixtures (testdata/fixtures.json)"
+elif [[ "$DATASET" == *.json || "$DATASET" == */* ]]; then
+  # Custom dataset (docs/08-custom-datasets.md): must live under ./datasets so
+  # the read-only /app/datasets mount makes it visible inside the container.
+  if [[ ! -f "$DATASET" ]]; then
+    echo "custom dataset file not found: $DATASET" >&2; exit 1
+  fi
+  case "$(cd "$(dirname "$DATASET")" && pwd)" in
+    "$(pwd)/datasets"*) ;;
+    *) echo "custom dataset must be under ./datasets/ (mounted into the container); got $DATASET" >&2; exit 1 ;;
+  esac
+  DATASET="datasets/$(basename "$DATASET")"
+  echo "    using custom dataset $DATASET"
+else
+  ./scripts/download-dataset.sh "$DATASET"
 fi
 
 echo "==> [4/7] starting server + Temporal worker (schedule created on boot)"

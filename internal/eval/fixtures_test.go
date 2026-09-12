@@ -45,3 +45,38 @@ func TestParseFixturesRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, f, f2)
 }
+
+func TestFixturesNormalize(t *testing.T) {
+	// Single-conversation form becomes one conversation named by the caller.
+	f, err := ParseFixtures([]byte(fixturesSample))
+	require.NoError(t, err)
+	convs, err := f.Normalize("fixtures")
+	require.NoError(t, err)
+	require.Len(t, convs, 1)
+	assert.Equal(t, "fixtures", convs[0].ID)
+	assert.Len(t, convs[0].Turns, 2)
+
+	// Multi-conversation form passes through; questions are optional.
+	multi := &Fixtures{Conversations: []FixtureConversation{
+		{ID: "a", Turns: []FixtureTurn{{ID: "t1", SessionID: "s", Text: "x"}}},
+		{ID: "b", Turns: []FixtureTurn{{ID: "t1", SessionID: "s", Text: "y"}},
+			Questions: []FixtureQuestion{{ID: "q", Question: "?", Evidence: []string{"t1"}}}},
+	}}
+	convs, err = multi.Normalize("ignored")
+	require.NoError(t, err)
+	require.Len(t, convs, 2)
+
+	bad := []Fixtures{
+		{Turns: f.Turns, Conversations: multi.Conversations},                                                                                                // both forms
+		{Conversations: []FixtureConversation{{ID: "", Turns: multi.Conversations[0].Turns}}},                                                               // no conv id
+		{Conversations: []FixtureConversation{{ID: "a"}}},                                                                                                   // no turns
+		{Conversations: []FixtureConversation{{ID: "a", Turns: []FixtureTurn{{ID: "t", Text: "x"}}}}},                                                       // no session
+		{Conversations: []FixtureConversation{{ID: "a", Turns: []FixtureTurn{{ID: "t", SessionID: "s", Text: "x"}, {ID: "t", SessionID: "s", Text: "y"}}}}}, // dup turn
+		{Conversations: []FixtureConversation{{ID: "a", Turns: []FixtureTurn{{ID: "t", SessionID: "s", Text: "x"}},
+			Questions: []FixtureQuestion{{ID: "q", Question: "?", Evidence: []string{"nope"}}}}}}, // dangling evidence
+	}
+	for i := range bad {
+		_, err := bad[i].Normalize("x")
+		assert.Error(t, err, "case %d", i)
+	}
+}

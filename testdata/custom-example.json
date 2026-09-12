@@ -1,0 +1,27 @@
+{
+  "conversations": [
+    {
+      "id": "team-standup",
+      "turns": [
+        {"id": "t1", "session_id": "2024-03-04", "speaker": "maria", "text": "I finished the Kafka consumer migration; lag is back under a second.", "date_time": "2024-03-04 09:05"},
+        {"id": "t2", "session_id": "2024-03-04", "speaker": "george", "text": "Nice. The Iceberg compaction job still fails on the events table, I'll look today.", "date_time": "2024-03-04 09:06"},
+        {"id": "t3", "session_id": "2024-03-11", "speaker": "george", "text": "Compaction is fixed: the manifest list had a stale snapshot reference.", "date_time": "2024-03-11 09:02"},
+        {"id": "t4", "session_id": "2024-03-11", "speaker": "maria", "text": "Great. I'm moving the dashboards to the new Postgres replica on Friday.", "date_time": "2024-03-11 09:04"}
+      ],
+      "questions": [
+        {"id": "q1", "question": "What was wrong with the Iceberg compaction job?", "evidence": ["t3"], "question_date": "2024-03-15"},
+        {"id": "q2", "question": "Who migrated the Kafka consumer?", "evidence": ["t1"]}
+      ]
+    },
+    {
+      "id": "personal-notes",
+      "turns": [
+        {"id": "n1", "session_id": "s1", "speaker": "me", "text": "Booked the dentist for the 22nd at 10am.", "date_time": "2024-05-02 18:30"},
+        {"id": "n2", "session_id": "s1", "speaker": "me", "text": "Need to renew the car insurance before June.", "date_time": "2024-05-02 18:31"}
+      ],
+      "questions": [
+        {"id": "q1", "question": "When is the dentist appointment?", "evidence": ["n1"], "question_date": "2024-05-10"}
+      ]
+    }
+  ]
+}

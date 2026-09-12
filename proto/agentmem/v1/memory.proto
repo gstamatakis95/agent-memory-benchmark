@@ -31,6 +31,79 @@ service MemoryService {
   // Trigger the enrichment sweep Schedule immediately instead of waiting up
   // to 60 s for the next tick (docs/03-temporal.md fast path).
   rpc TriggerSweep(TriggerSweepReq) returns (TriggerSweepResp);
+
+  // ---- Snapshot serving (docs/07-snapshot-serving.md) -------------------
+  // Immutable, versioned retrieval snapshots: a Temporal workflow reads the
+  // version-pinned enriched ledger, builds a Bleve (scorch) BM25 index plus a
+  // flat L2-normalized float32 vector file, seals them into a tar.zst and
+  // publishes to S3 (content-addressed key, then an atomic current.json
+  // pointer flip). The server downloads the current snapshot to local disk
+  // and serves hybrid BM25 + brute-force dot-product + RRF queries from it.
+
+  // Build and publish a new snapshot from the enriched rows at
+  // enrichment_version; blocks until the workflow completes and the server
+  // has loaded the new snapshot. enrichment_version is REQUIRED.
+  rpc BuildSnapshot(BuildSnapshotReq) returns (BuildSnapshotResp);
+
+  // Describe the snapshot currently loaded by this server (if any).
+  rpc GetSnapshot(GetSnapshotReq) returns (SnapshotInfo);
+
+  // Query the loaded snapshot: Bleve BM25 and the vector scan run
+  // concurrently over the same filter, fused with RRF, then an optional
+  // post-fusion recency boost and abstention threshold.
+  rpc Search(SearchReq) returns (SearchResp);
+}
+
+message BuildSnapshotReq {
+  int32 enrichment_version = 1; // REQUIRED — no defaulting
+}
+
+message BuildSnapshotResp {
+  SnapshotInfo snapshot = 1;
+}
+
+message GetSnapshotReq {}
+
+// Mirrors manifest.json inside the snapshot artifact.
+message SnapshotInfo {
+  bool   loaded             = 1;  // false => no snapshot is loaded (fields below empty)
+  int64  version            = 2;  // snapshot version (monotonic, from Postgres sequence)
+  int32  enrichment_version = 3;
+  int64  doc_count          = 4;
+  int32  vector_dim         = 5;
+  string embed_model        = 6;
+  string s3_key             = 7;  // snapshots/snapshot-v<version>.tar.zst
+  string created_at         = 8;  // RFC3339
+}
+
+message SearchReq {
+  string query           = 1;
+  int64  conversation_id = 2;  // 0 = no filter; otherwise applied to BOTH arms
+  int32  top_k           = 3;  // final result depth (0 => 10)
+  string mode            = 4;  // bm25 | dense | hybrid (empty => hybrid)
+  int32  depth           = 5;  // per-arm candidate depth before fusion (0 => 40)
+  int32  rrf_k           = 6;  // RRF constant (0 => 60)
+  // Post-fusion recency boost: final = rrf * (1 + B*exp(-ln2/half_life * age_days)).
+  double recency_boost   = 7;  // B; 0 = off
+  double half_life_days  = 8;  // (0 => 30)
+  double abstain_threshold = 9; // tau on the top fused score; 0 = off
+  int64  question_date_unix = 10; // reference "now" for recency (0 => wall clock)
+}
+
+message SearchHit {
+  int64  memory_id    = 1;
+  double score        = 2;  // fused (post-boost) score
+  bytes  content_hash = 3;  // sha256 of the source blob (client maps to turn ids)
+  string s3_key       = 4;
+  string session_id   = 5;
+  int64  ts_unix      = 6;  // content-derived timestamp; 0 = unknown
+}
+
+message SearchResp {
+  repeated SearchHit hits = 1;
+  int64 snapshot_version  = 2;
+  bool  abstained         = 3;  // top fused score < abstain_threshold
+  bool  lexical_only      = 4;  // dense arm skipped (embedder timeout/outage) — degraded
 }
 
 // Raw memory as uploaded by the client harness. The server fills derived

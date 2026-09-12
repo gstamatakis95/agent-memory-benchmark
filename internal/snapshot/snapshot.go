@@ -71,15 +71,22 @@ func ArtifactKey(version int64) string {
 // the enrichment version, which is recorded separately so a runtime can
 // refuse a snapshot built from a different pipeline version.
 type Manifest struct {
-	Version           int64     `json:"version"`
-	CreatedAt         time.Time `json:"created_at"`
-	DocCount          int64     `json:"doc_count"`
-	VectorDim         int       `json:"vector_dim"`
-	Metric            string    `json:"metric"`
-	EmbedModel        string    `json:"embed_model"`
-	EmbedModelRev     string    `json:"embed_model_rev,omitempty"`
-	EnrichmentVersion int16     `json:"enrichment_version"`
-	BleveVersion      string    `json:"bleve_version"`
+	Version   int64     `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
+	DocCount  int64     `json:"doc_count"`
+	// LexemeCount is the total number of lexemes across all rows. Bleve's
+	// BM25 length normalization derives the average field length from
+	// stats the caller can supply per request; without them it falls back
+	// to ceil(distinct terms / doc count), which is ~1 on any real corpus
+	// and turns BM25 into "shortest document wins". LexicalTopN feeds
+	// ceil(LexemeCount/DocCount) back in so the norm is the real average.
+	LexemeCount       int64  `json:"lexeme_count"`
+	VectorDim         int    `json:"vector_dim"`
+	Metric            string `json:"metric"`
+	EmbedModel        string `json:"embed_model"`
+	EmbedModelRev     string `json:"embed_model_rev,omitempty"`
+	EnrichmentVersion int16  `json:"enrichment_version"`
+	BleveVersion      string `json:"bleve_version"`
 }
 
 // Doc is the per-row payload (docs.jsonl). The index KEY (lexemes) and the

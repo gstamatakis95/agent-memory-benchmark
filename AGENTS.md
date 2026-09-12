@@ -31,15 +31,24 @@ your job is to keep them passing.
 ## Where things live
 
 - `proto/` source protos → `genproto/` generated stubs (`make proto`)
-- `cmd/server` gRPC server + embedded Temporal worker + schedule bootstrap;
-  `cmd/client` harness (ingest | trigger-sweep | wait-enriched | eval); `cmd/migrate` goose runner
+- `cmd/server` gRPC server + embedded Temporal worker + schedule bootstrap + snapshot build
+  worker + snapshot serving runtime;
+  `cmd/client` harness (ingest | trigger-sweep | wait-enriched | eval | build-snapshot |
+  snapshot-info | search); `cmd/migrate` goose runner
 - `internal/pipeline` normalize/tokenize/date-parse/round assembly (pure, deterministic)
 - `internal/store` ledger inserts + derived queries (no UPDATE/DELETE, by design)
 - `internal/embed` Embedder interface, gRPC adapter, prefixing, cache, BYTEA packing
 - `internal/enrich` sweep workflow + CountBacklog/PlanRanges/ProcessBatch activities
-- `internal/retrieve` cosine, BM25, RRF (k=60), temporal boost, MMR (λ=0.7)
+- `internal/retrieve` cosine, BM25, RRF (k=60), temporal boost, MMR (λ=0.7) — the in-process
+  (docs/01) retrieval engine
+- `internal/snapshot` (docs/07-snapshot-serving.md) immutable Bleve+flat-vector artifact
+  (builder/open/seal), S3 store, and the serving Runtime; `internal/snapshotflow` the Temporal
+  workflow that builds and publishes a snapshot version
 - `internal/eval` metrics + dataset loaders; `internal/blob` content-addressed S3 envelope
-- `migrations/` goose SQL; `testdata/fixtures.json` the e2e corpus
+- `migrations/` goose SQL (`00004_snapshots.sql` adds `snapshot_events` + the version sequence);
+  `testdata/fixtures.json` the e2e corpus
+- `scripts/run-snapshot.sh` the snapshot-engine counterpart of `run.sh`: same infra/ingest steps,
+  then `build-snapshot` + `eval --engine snapshot` instead of `run.sh`'s single in-process eval
 
 ## How to verify changes (the tier ladder)
 
@@ -93,3 +102,12 @@ is not for CI.
 - **Docker Desktop credential-helper leak.** `docker-credential-desktop` processes can
   accumulate and exhaust the per-user process table (fork failures everywhere); fix by
   restarting Docker Desktop or switching `~/.docker/config.json` `credsStore` to `osxkeychain`.
+- **Bleve is not the "no embedded databases" exception being made twice.** It is an in-memory/
+  on-disk *search index* artifact, not an embedded database in the sense of rule 3 —
+  docs/01-retrieval.md §4.3 names Bluge/Bleve as the sanctioned BM25 option. The snapshot it
+  builds (`internal/snapshot`) never replaces Postgres as the ledger; Postgres is still the only
+  source of truth, and a snapshot is a disposable, rebuildable projection of it.
+- **`snapshot_events` is append-only like every other ledger table.** Never `UPDATE`/`DELETE` a
+  row; "current" is derived as the latest `published` event (and mirrored to `current.json` in S3
+  so the runtime doesn't need a live Postgres round trip to find the pointer) — same shape as
+  `memory_enrichment_events`' derived pending/dead-letter state.

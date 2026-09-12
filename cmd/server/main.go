@@ -1,11 +1,26 @@
 // Command server is the single deployable of Phase 6: the MemoryService gRPC
 // server, the embedded Temporal enrichment worker, and the schedule
 // bootstrap (docs/02-storage.md E.1: "single binary"; docs/03-temporal.md).
+// It also embeds the snapshot-build Temporal worker and the snapshot-serving
+// runtime (docs/07-snapshot-serving.md): BuildSnapshot/GetSnapshot/Search.
 //
 // Configuration is environment-only (docker-compose.yml is the contract):
 //
 //	PG_DSN, S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY,
 //	S3_PATH_STYLE, TEMPORAL_HOSTPORT, EMBEDDER_ADDR, ENRICHMENT_VERSION
+//
+// Snapshot serving adds:
+//
+//	SNAPSHOT_CACHE_DIR   local dir the runtime downloads/extracts snapshots
+//	                     into (default /var/cache/agentmem/snapshots; falls
+//	                     back to $TMPDIR/agentmem-snapshots if MkdirAll fails)
+//	SNAPSHOT_WORK_DIR    local dir the build workflow writes a snapshot
+//	                     directory into before sealing (default
+//	                     $TMPDIR/agentmem-snapshot-build)
+//	SNAPSHOT_VECTOR_DIM  stored vector width, 1..embed.Dims (0/unset =>
+//	                     embed.Dims, no truncation; see docs/07 section 1)
+//	QUERY_EMBED_TIMEOUT  hard timeout on the query-time embed call before
+//	                     degrading to lexical-only (default 2s)
 package main
 
 import (
@@ -18,6 +33,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -39,6 +55,8 @@ import (
 	"example.com/agentmem/internal/embed"
 	"example.com/agentmem/internal/enrich"
 	"example.com/agentmem/internal/pipeline"
+	"example.com/agentmem/internal/snapshot"
+	"example.com/agentmem/internal/snapshotflow"
 	"example.com/agentmem/internal/store"
 )
 
@@ -52,6 +70,11 @@ type config struct {
 	temporalHostPort string
 	embedderAddr     string
 	version          int16
+
+	snapshotCacheDir  string
+	snapshotWorkDir   string
+	snapshotVectorDim int
+	queryEmbedTimeout time.Duration
 }
 
 func loadConfig() config {
@@ -69,6 +92,29 @@ func loadConfig() config {
 		}
 		version = n
 	}
+
+	snapshotVectorDim := 0 // 0 => resolved to embed.Dims below
+	if v := os.Getenv("SNAPSHOT_VECTOR_DIM"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > embed.Dims {
+			log.Fatalf("server: invalid SNAPSHOT_VECTOR_DIM %q (want 1..%d, or unset for %d)",
+				v, embed.Dims, embed.Dims)
+		}
+		snapshotVectorDim = n
+	}
+	if snapshotVectorDim == 0 {
+		snapshotVectorDim = embed.Dims
+	}
+
+	queryEmbedTimeout := 2 * time.Second
+	if v := os.Getenv("QUERY_EMBED_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			log.Fatalf("server: invalid QUERY_EMBED_TIMEOUT %q", v)
+		}
+		queryEmbedTimeout = d
+	}
+
 	return config{
 		pgDSN:            get("PG_DSN", "postgres://app:app@localhost:5432/app?sslmode=disable"),
 		s3Endpoint:       get("S3_ENDPOINT", "http://localhost:9000"),
@@ -79,11 +125,32 @@ func loadConfig() config {
 		temporalHostPort: get("TEMPORAL_HOSTPORT", "localhost:7233"),
 		embedderAddr:     get("EMBEDDER_ADDR", "localhost:9100"),
 		version:          int16(version),
+
+		snapshotCacheDir:  get("SNAPSHOT_CACHE_DIR", "/var/cache/agentmem/snapshots"),
+		snapshotWorkDir:   get("SNAPSHOT_WORK_DIR", filepath.Join(os.TempDir(), "agentmem-snapshot-build")),
+		snapshotVectorDim: snapshotVectorDim,
+		queryEmbedTimeout: queryEmbedTimeout,
 	}
+}
+
+// ensureSnapshotCacheDir creates dir, falling back to a tempdir sibling (and
+// logging the fallback) if that fails — a read-only or missing
+// /var/cache mount must not prevent the server from serving snapshots.
+func ensureSnapshotCacheDir(dir string) string {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fallback := filepath.Join(os.TempDir(), "agentmem-snapshots")
+		log.Printf("server: mkdir snapshot cache dir %q failed (%v); falling back to %q", dir, err, fallback)
+		if err := os.MkdirAll(fallback, 0o755); err != nil {
+			log.Fatalf("server: mkdir fallback snapshot cache dir %q: %v", fallback, err)
+		}
+		return fallback
+	}
+	return dir
 }
 
 func main() {
 	cfg := loadConfig()
+	cfg.snapshotCacheDir = ensureSnapshotCacheDir(cfg.snapshotCacheDir)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -157,6 +224,37 @@ func main() {
 	defer w.Stop()
 	log.Printf("server: enrichment worker started (task queue %q)", enrich.TaskQueue)
 
+	// Snapshot build worker + serving runtime (docs/07-snapshot-serving.md).
+	st := &snapshot.S3Store{Client: s3c, Bucket: cfg.s3Bucket}
+	sw := snapshotflow.NewWorker(tc, &snapshotflow.Activities{
+		DB:               pool,
+		S3:               st,
+		WorkDir:          cfg.snapshotWorkDir,
+		DefaultVectorDim: cfg.snapshotVectorDim,
+		EmbedModel:       embed.Model,
+	}, "")
+	if err := sw.Start(); err != nil {
+		log.Fatalf("server: snapshot worker start: %v", err)
+	}
+	defer sw.Stop()
+	log.Printf("server: snapshot worker started (task queue %q)", snapshotflow.TaskQueue)
+
+	rt := snapshot.NewRuntime(st, cfg.snapshotCacheDir, snapshot.Expectations{
+		VectorDim:  cfg.snapshotVectorDim,
+		EmbedModel: embed.Model,
+	})
+	defer rt.Close()
+	if m, loaded, err := rt.Reload(ctx); err != nil {
+		// Not fatal: a fresh deployment starts with no snapshot published;
+		// BuildSnapshot loads the first one.
+		log.Printf("server: snapshot reload: %v", err)
+	} else if !loaded {
+		log.Printf("server: no snapshot published yet")
+	} else {
+		log.Printf("server: loaded snapshot version=%d enrichment_version=%d doc_count=%d vector_dim=%d embed_model=%s",
+			m.Version, m.EnrichmentVersion, m.DocCount, m.VectorDim, m.EmbedModel)
+	}
+
 	// Schedule bootstrap AFTER the worker is running (AlreadyExists tolerated).
 	if err := enrich.EnsureSchedule(ctx, tc, enrich.ScheduleConfig{Version: cfg.version}); err != nil {
 		log.Fatalf("server: ensure schedule: %v", err)
@@ -171,6 +269,11 @@ func main() {
 	gs := grpc.NewServer()
 	agentmemv1.RegisterMemoryServiceServer(gs, &memoryService{
 		pool: pool, s3: s3c, temporal: tc, bucket: cfg.s3Bucket, version: cfg.version,
+		runtime:           rt,
+		embedder:          embedClient,
+		snapVectorDim:     cfg.snapshotVectorDim,
+		queryEmbedTimeout: cfg.queryEmbedTimeout,
+		snapIn:            snapshotflow.BuildInput{VectorDim: cfg.snapshotVectorDim},
 	})
 	go func() {
 		<-ctx.Done()
@@ -324,6 +427,13 @@ type memoryService struct {
 	temporal tclient.Client
 	bucket   string
 	version  int16
+
+	// Snapshot serving (docs/07-snapshot-serving.md).
+	runtime           *snapshot.Runtime
+	embedder          *embed.Client // owns the search_query: prefix + embedding_cache
+	snapVectorDim     int
+	queryEmbedTimeout time.Duration
+	snapIn            snapshotflow.BuildInput // per-build defaults (VectorDim); EnrichmentVersion set per-request
 }
 
 // UploadMemories: client-stream. Per memory: canonical blob -> S3 put (write
@@ -469,4 +579,151 @@ func (m *memoryService) TriggerSweep(ctx context.Context, _ *agentmemv1.TriggerS
 		return nil, status.Errorf(codes.Internal, "trigger sweep: %v", err)
 	}
 	return &agentmemv1.TriggerSweepResp{Triggered: true}, nil
+}
+
+// ---------------------------------------------------- snapshot serving --
+// docs/07-snapshot-serving.md.
+
+// snapshotInfo builds the wire SnapshotInfo for a loaded manifest. key is
+// the artifact's S3 key (ArtifactKey(m.Version), or the key a build just
+// returned).
+func snapshotInfo(m snapshot.Manifest, key string) *agentmemv1.SnapshotInfo {
+	return &agentmemv1.SnapshotInfo{
+		Loaded:            true,
+		Version:           m.Version,
+		EnrichmentVersion: int32(m.EnrichmentVersion),
+		DocCount:          m.DocCount,
+		VectorDim:         int32(m.VectorDim),
+		EmbedModel:        m.EmbedModel,
+		S3Key:             key,
+		CreatedAt:         m.CreatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+// BuildSnapshot runs the Temporal build workflow to completion (allocate
+// version -> stream the enriched ledger into a Bleve+vectors artifact ->
+// publish to S3 -> flip current.json), then loads the freshly published
+// version into this server's runtime before returning.
+func (m *memoryService) BuildSnapshot(ctx context.Context, req *agentmemv1.BuildSnapshotReq) (*agentmemv1.BuildSnapshotResp, error) {
+	v := req.GetEnrichmentVersion()
+	if v <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "enrichment_version is required (no defaulting)")
+	}
+	in := m.snapIn
+	in.EnrichmentVersion = int16(v)
+	res, err := snapshotflow.Run(ctx, m.temporal, in)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "build snapshot: %v", err)
+	}
+	if _, err := m.runtime.Load(ctx, snapshot.Pointer{Version: res.Version, Key: res.Key}); err != nil {
+		return nil, status.Errorf(codes.Internal, "load snapshot: %v", err)
+	}
+	return &agentmemv1.BuildSnapshotResp{Snapshot: snapshotInfo(res.Manifest, res.Key)}, nil
+}
+
+// GetSnapshot describes whatever this server currently has loaded, without
+// touching S3 or Temporal.
+func (m *memoryService) GetSnapshot(_ context.Context, _ *agentmemv1.GetSnapshotReq) (*agentmemv1.SnapshotInfo, error) {
+	man, ok := m.runtime.Current()
+	if !ok {
+		return &agentmemv1.SnapshotInfo{Loaded: false}, nil
+	}
+	return snapshotInfo(man, snapshot.ArtifactKey(man.Version)), nil
+}
+
+// Search runs the query path of docs/07 section 4: tokenize for the lexical
+// arm, embed (with a hard timeout and graceful lexical-only degradation)
+// for the dense arm, then delegate fusion/recency/abstention to the loaded
+// Snapshot under the runtime's read lock.
+func (m *memoryService) Search(ctx context.Context, req *agentmemv1.SearchReq) (*agentmemv1.SearchResp, error) {
+	mode, err := snapshot.ParseMode(req.GetMode())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	query := req.GetQuery()
+	if query == "" {
+		return nil, status.Error(codes.InvalidArgument, "query is required")
+	}
+	lexemes := pipeline.Tokenize(query)
+
+	var qvec []float32
+	lexicalOnly := false
+	if mode != snapshot.ModeBM25 {
+		ectx, cancel := context.WithTimeout(ctx, m.queryEmbedTimeout)
+		vec, err := m.embedder.EmbedQuery(ectx, query)
+		cancel()
+		switch {
+		case err != nil && mode == snapshot.ModeDense:
+			return nil, status.Errorf(codes.Unavailable, "embed query: %v", err)
+		case err != nil:
+			// Hybrid: degrade to lexical-only rather than fail the query
+			// (docs/07 section 4 — an embedder outage becomes degraded
+			// relevance, not a request failure).
+			log.Printf("server: search: query embed failed, degrading to lexical-only: %v", err)
+			lexicalOnly = true
+		default:
+			if m.snapVectorDim > 0 && m.snapVectorDim < len(vec) {
+				vec = embed.L2Normalize(append([]float32(nil), vec[:m.snapVectorDim]...))
+			}
+			qvec = vec
+		}
+	}
+
+	var conv string
+	if req.GetConversationId() != 0 {
+		conv = strconv.FormatInt(req.GetConversationId(), 10)
+	}
+	opts := snapshot.SearchOptions{
+		Mode:             mode,
+		TopK:             int(req.GetTopK()),
+		Depth:            int(req.GetDepth()),
+		RRFK:             int(req.GetRrfK()),
+		RecencyBoost:     req.GetRecencyBoost(),
+		HalfLifeDays:     req.GetHalfLifeDays(),
+		AbstainThreshold: req.GetAbstainThreshold(),
+	}
+	if req.GetQuestionDateUnix() != 0 {
+		opts.Now = time.Unix(req.GetQuestionDateUnix(), 0)
+	}
+
+	var (
+		res     snapshot.Result
+		version int64
+		hits    []*agentmemv1.SearchHit
+	)
+	err = m.runtime.Search(ctx, func(s snapshot.Snapshot) error {
+		f := s.ConversationFilter(conv)
+		var serr error
+		res, serr = s.Search(ctx, lexemes, qvec, f, opts)
+		if serr != nil {
+			return serr
+		}
+		version = s.Manifest().Version
+		hits = make([]*agentmemv1.SearchHit, 0, len(res.Hits))
+		for _, h := range res.Hits {
+			doc := s.Doc(h.Ordinal)
+			hits = append(hits, &agentmemv1.SearchHit{
+				MemoryId:    doc.MemoryID,
+				Score:       h.Score,
+				ContentHash: doc.ContentHash,
+				S3Key:       doc.S3Key,
+				SessionId:   doc.SessionID,
+				TsUnix:      doc.TSUnix,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, snapshot.ErrNoSnapshot) {
+			return nil, status.Error(codes.FailedPrecondition, "no snapshot loaded; call BuildSnapshot")
+		}
+		return nil, status.Errorf(codes.Internal, "search: %v", err)
+	}
+
+	return &agentmemv1.SearchResp{
+		Hits:            hits,
+		SnapshotVersion: version,
+		Abstained:       res.Abstained,
+		LexicalOnly:     res.LexicalOnly || lexicalOnly,
+	}, nil
 }

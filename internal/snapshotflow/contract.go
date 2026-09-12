@@ -70,7 +70,9 @@ const (
 	// BuildStartToClose bounds one BuildAndSeal attempt; a LongMemEval-S
 	// corpus (~250k rows) streams and indexes in minutes, not hours.
 	BuildStartToClose = 2 * time.Hour
-	// BuildHeartbeat: the builder heartbeats after every Bleve batch.
+	// BuildHeartbeat: the builder heartbeats after every Bleve batch. This is
+	// liveness only (detect a dead worker); a retried attempt rebuilds from
+	// scratch — see docs/07 section 3 for why that is the cheaper contract.
 	BuildHeartbeat = 60 * time.Second
 	// PublishStartToClose bounds the upload.
 	PublishStartToClose = 30 * time.Minute

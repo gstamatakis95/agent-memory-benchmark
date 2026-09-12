@@ -90,7 +90,10 @@ straight from Postgres into a `snapshot.Builder` writing to local disk — no pe
 payloads, no separate `EmbedBatch` step, because the dense vector for each row already lives in
 the ledger from the ordinary unary embedding sweep. The activity heartbeats after every Bleve
 batch (`snapshot.BatchSize`, low thousands — single-document `Index()` calls thrash the segment
-merger) so a retry resumes rather than restarts. `Builder.Close()` flushes the last batch, closes
+merger) so Temporal can tell a slow build from a dead worker (`BuildHeartbeat`). The heartbeat is
+liveness only, not a checkpoint: a retried attempt wipes the build directory and rebuilds from the
+first row, which is deliberate — Bleve is single-writer and the corpus vectors already sit in the
+ledger, so a restart costs minutes of Postgres streaming rather than any re-embedding. `Builder.Close()` flushes the last batch, closes
 the Bleve index (required before archiving — it flushes segments to disk), writes `manifest.json`,
 and re-opens the result to verify it before returning.
 

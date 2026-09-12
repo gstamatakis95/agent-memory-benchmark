@@ -200,9 +200,11 @@ func keepAtGranularity(id string, expand map[string][]string, covered map[string
 func runSnapshotEval(ctx context.Context, cli agentmemv1.MemoryServiceClient, mode retrieve.Mode, tun evalTuning, convs []conversation) (results []eval.QueryResult, hitsFetched, hitsMapped, totalQuestions, skipped int, snapVersion int64, err error) {
 	haveVersion := false
 	noTwin := 0
-	// Over-fetch depth so the client-side granularity filter below cannot
-	// starve the final top-k list.
-	overfetch := tun.topK
+	// Over-fetch so the client-side granularity filter and twin lookup
+	// below cannot starve the final top-k list: with granularity=turn about
+	// half the corpus rows (the round twins) are dropped, so ask for several
+	// times top-k, never fewer than 40.
+	overfetch := 4 * tun.topK
 	if overfetch < 40 {
 		overfetch = 40
 	}

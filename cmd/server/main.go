@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -606,8 +607,8 @@ func snapshotInfo(m snapshot.Manifest, key string) *agentmemv1.SnapshotInfo {
 // version into this server's runtime before returning.
 func (m *memoryService) BuildSnapshot(ctx context.Context, req *agentmemv1.BuildSnapshotReq) (*agentmemv1.BuildSnapshotResp, error) {
 	v := req.GetEnrichmentVersion()
-	if v <= 0 {
-		return nil, status.Error(codes.InvalidArgument, "enrichment_version is required (no defaulting)")
+	if v <= 0 || v > math.MaxInt16 {
+		return nil, status.Errorf(codes.InvalidArgument, "enrichment_version must be in 1..%d (no defaulting)", math.MaxInt16)
 	}
 	in := m.snapIn
 	in.EnrichmentVersion = int16(v)

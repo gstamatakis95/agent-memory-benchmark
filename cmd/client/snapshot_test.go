@@ -90,6 +90,7 @@ func TestRunSnapshotEvalMapsHitsToTurnIDs(t *testing.T) {
 		// Every request is scoped to the conversation and over-fetches.
 		for _, r := range fc.reqs {
 			require.Equal(t, c.Num, r.GetConversationId())
+			require.GreaterOrEqual(t, r.GetTopK(), int32(4*tun.topK))
 			require.GreaterOrEqual(t, r.GetTopK(), int32(40))
 			require.Equal(t, "hybrid", r.GetMode())
 		}

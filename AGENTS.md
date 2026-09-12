@@ -10,8 +10,25 @@ your job is to keep them passing.
    are *derived* by queries (anti-join + backoff predicate, views, functions) — never stored
    status flips. The test-only immutability trigger in `internal/store/append_only_test.go`
    must stay green.
-2. **No LLMs anywhere.** Embedding model only. No generative models, no cross-encoder
-   rerankers, no agentic loops. Classical IR only: BM25, RRF, MMR, rule-based date extraction.
+2. **External LLM allowed, but fenced.** (Rule changed 2026-09; it used to be "no LLMs
+   anywhere".) A generative model may be called only through an external API, behind one
+   client package (`internal/llm`, to be added) configured by env (`LLM_API_BASE`,
+   `LLM_API_KEY`, `LLM_MODEL`), never vendored or embedded in the image. Fences:
+   - **Write-time first.** LLM work belongs in enrichment (contextual prefixes, fact/entity
+     extraction, contradiction adjudication) where it is a pure function of a memory and can be
+     cached; every call is keyed by SHA-256 of (model, prompt version, input) in an append-only
+     `llm_cache` table, exactly like `embedding_cache`.
+   - **Query-time use must be bounded and optional.** Anything on the query path (query
+     decomposition, time-window extraction, reranking) needs a hard timeout with a graceful
+     fallback to the classical path, and an off switch.
+   - **Classical IR stays the baseline.** Every LLM-powered feature is a flag that defaults to
+     off until an ablation shows it beats the classical path on LongMemEval-S; eval output must
+     print which LLM features were on. Never let an LLM produce the benchmark answer itself —
+     these are retrieval benchmarks and the metric is evidence recall.
+   - **No agentic loops in the serving path.** One bounded call per stage, no tool use, no
+     retries that change the prompt.
+   - **Secrets via env only.** Never log prompts containing memory text at INFO; never commit
+     keys.
 3. **No pgvector, no embedded databases.** Vectors are `BYTEA` (packed little-endian float32),
    ranked client-side in Go.
 4. **The embedder is unary only.** One text per RPC — do not add batching. Recover throughput

@@ -7,8 +7,9 @@ index plus a flat L2-normalized `float32` vector file — publishes it to S3, an
 it into memory and serves `Search` over gRPC. Same classical-IR math (BM25, brute-force dot
 product, RRF, recency boost, abstention) as `internal/retrieve`; different serving shape.
 
-No LLMs anywhere in this path either. Bleve is a search-index *artifact*, not a database — see
-the "what this is not" gotcha in `AGENTS.md`.
+The classical core of this path uses no LLM; the LLM-powered extensions in section 6 are the
+next milestone under the (changed) `AGENTS.md` rule 2. Bleve is a search-index *artifact*, not a
+database — see the "what this is not" gotcha in `AGENTS.md`.
 
 ---
 
@@ -186,26 +187,36 @@ one thing bounded by its own timeout with a graceful fallback instead of failing
 
 ---
 
-## 6. What was deliberately not built, and why
+## 6. Not built yet: the LLM-powered extensions
 
-Everything below appears in the source design sketch for this feature but needs a generative model
-(forbidden outright by `AGENTS.md` rule 2) or is out of scope at this corpus scale:
+Everything below appears in the source design sketch and needs a generative model. Until
+2026-09 `AGENTS.md` rule 2 forbade that outright; the rule now permits an **external LLM API**
+under fences (one client package, append-only `llm_cache`, write-time first, bounded and optional
+at query time, flag-off until it wins an ablation). This is the planned order, matching the
+sketch's "implementation order" and its reported gains:
 
-- **Contextual retrieval prefixes / atomic fact extraction / entity extraction** — the sketch's
-  biggest reported wins come from an LLM writing a situating sentence or extracting facts into the
-  index key. No non-LLM equivalent was substituted; the index key here is exactly
-  `pipeline.Tokenize(normalized_text)`, matching what the in-process engine already indexes.
-- **Bi-temporal contradiction detection** (`t_valid_from`/`t_valid_to`, LLM-adjudicated contradiction
-  on a knowledge update) — needs a model to decide "does this new assertion contradict that old
-  one." The append-only ledger still keeps every version of a fact; there is just no automatic
-  superseding.
-- **Cross-encoder rerank** — a reranker is itself a (small) learned relevance model in the sense
-  this benchmark's "no LLMs" rule cares about, and the design sketch's own citation shows one
-  *degrading* nDCG by up to 3% on out-of-distribution corpora while adding 500–2000ms; not worth
-  the risk even if it were allowed.
-- **Query decomposition for multi-hop** — needs a model to split a query into sub-queries.
-- **ANN indexing** — ruled out by scale (section 0), not by the no-LLM constraint; revisit only if
-  the corpus grows into the millions of rows.
+1. **Contextual retrieval prefixes** (write-time, in `EnrichRound`-style enrichment) — an
+   LLM-written situating sentence prepended to the index key (`context ∥ verbatim round`); the
+   payload stays the verbatim round. Prompt-cache the session so all its rounds share one prefix.
+   Sketch: −35% top-20 retrieval failures with contextual embeddings, −49% adding contextual BM25.
+   Requires an `ENRICHMENT_VERSION` bump (the ledger re-derives everything as pending) so both
+   the embedding and the lexemes are recomputed over the augmented key.
+2. **Atomic fact extraction** into the index key (never replacing the round). Sketch: +4–9.4%
+   recall.
+3. **Time-window extraction** for explicitly temporal questions (query-time, bounded, falls back
+   to the existing rule-based `pipeline.ExtractQueryTime`), applied as a filter/boost to both
+   arms. Sketch: +6.8–11.3% recall on temporal questions.
+4. **Query decomposition** for multi-hop questions (query-time, bounded, one call, fan the
+   sub-queries into the same RRF).
+5. **Bi-temporal contradiction adjudication** (`t_valid_from`/`t_valid_to`, `t_created`/
+   `t_expired` as new append-only rows, never mutating the prior assertion) so retrieval can
+   prefer currently-valid assertions on knowledge-update questions.
+6. **Cross-encoder / LLM rerank** top-40 → top-10 — last, and A/B first: the sketch's own
+   citation shows off-the-shelf rerankers degrading nDCG by up to 3% out of distribution while
+   adding 500–2000 ms.
+
+Still out of scope regardless of the rule: **ANN indexing** (scale, section 0) and letting a model
+write the benchmark answer (these are retrieval benchmarks; the metric is evidence recall).
 
 ---
 

@@ -1,10 +1,12 @@
 # agent-memory-benchmark
 
 A Go gRPC agent-memory system evaluated on the [LoCoMo](https://arxiv.org/abs/2402.17753) and
-[LongMemEval](https://arxiv.org/abs/2410.10813) retrieval benchmarks. There are **no LLMs anywhere**
-in the pipeline — retrieval is classical IR only: hybrid BM25 + dense embeddings fused with RRF,
-rule-based temporal boosting, and MMR diversification. Storage is an S3 blob store plus an
-**append-only** Postgres enrichment ledger, with async enrichment driven by a Temporal schedule.
+[LongMemEval](https://arxiv.org/abs/2410.10813) retrieval benchmarks. The core retrieval path is
+classical IR: hybrid BM25 + dense embeddings fused with RRF, rule-based temporal boosting, and MMR
+diversification. An external LLM API may be used for optional, cached, write-time enrichment and
+bounded query-time helpers (see "Hard design constraints" and `AGENTS.md` rule 2); none of the
+numbers below used one. Storage is an S3 blob store plus an **append-only** Postgres enrichment
+ledger, with async enrichment driven by a Temporal schedule.
 
 ## Architecture
 
@@ -238,7 +240,10 @@ The docs in `docs/` are the authoritative deep spec (frozen):
 These are invariants, not preferences (see `AGENTS.md` for the working rules):
 
 - **Append-only Postgres** — never `UPDATE`/`DELETE` a memory or enrichment row; state is derived.
-- **No LLMs** — embedding model only; no generative models, no rerankers, no agentic loops.
+- **External LLM only, fenced** — one client package, env-configured API, every call cached
+  append-only by content hash, write-time enrichment first, query-time use bounded by a timeout
+  with a classical fallback, every LLM feature a flag that defaults to off until it wins an
+  ablation, and the eval report says which flags were on. No agentic loops in the serving path.
 - **Unary embedder** — one text per RPC; throughput comes from bounded goroutine concurrency.
 - **nomic prefixes mandatory** — `search_document: ` / `search_query: `, plus L2 normalization.
 - **No pgvector** — vectors are `BYTEA`, ranked client-side in Go.

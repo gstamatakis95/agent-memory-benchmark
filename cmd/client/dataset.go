@@ -148,8 +148,66 @@ func datasetsDir() string {
 	return "/app/datasets"
 }
 
-// loadDataset builds the ingest/eval view of a dataset.
+// isCustomDataset reports whether a --dataset value names a bring-your-own
+// JSON file (docs/08-custom-datasets.md) rather than a built-in dataset:
+// anything ending in .json, or containing a path separator.
+func isCustomDataset(name string) bool {
+	return strings.HasSuffix(name, ".json") || strings.ContainsAny(name, `/\`)
+}
+
+// datasetName is the stable name a --dataset value is ingested under (the
+// "dataset" metadata key and the surrogateConvID salt): built-in names pass
+// through; a custom file is named by its base name without the extension,
+// so moving the file (host path vs the /app/datasets mount) never changes
+// the ids the eval must match.
+func datasetName(name string) string {
+	if !isCustomDataset(name) {
+		return name
+	}
+	return strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
+}
+
+// loadCustom loads a bring-your-own dataset in the fixtures JSON format
+// (single- or multi-conversation, see eval.Fixtures). Conversation ids are
+// derived the same way as for the built-in datasets.
+func loadCustom(path string) ([]conversation, error) {
+	f, err := eval.LoadFixtures(path)
+	if err != nil {
+		return nil, err
+	}
+	name := datasetName(path)
+	fcs, err := f.Normalize(name)
+	if err != nil {
+		return nil, err
+	}
+	convs := make([]conversation, 0, len(fcs))
+	for _, fc := range fcs {
+		conv := conversation{Num: surrogateConvID(name, fc.ID), Name: fc.ID}
+		for _, t := range fc.Turns {
+			conv.Items = append(conv.Items, item{
+				TurnID: t.ID, SessionID: t.SessionID, Speaker: t.Speaker, Text: t.Text, DateTime: t.DateTime,
+			})
+		}
+		for _, q := range fc.Questions {
+			conv.Questions = append(conv.Questions, question{
+				ID: q.ID, Question: q.Question, QuestionDate: q.QuestionDate, Evidence: q.Evidence, Group: name,
+			})
+		}
+		convs = append(convs, conv)
+	}
+	return convs, nil
+}
+
+// loadDataset builds the ingest/eval view of a dataset: a built-in name
+// (fixtures|locomo|longmemeval_s) or the path of a custom JSON file.
 func loadDataset(name string) ([]conversation, error) {
+	if isCustomDataset(name) {
+		path, err := findDataFile("", name, filepath.Join("/app", name), filepath.Join(datasetsDir(), filepath.Base(name)))
+		if err != nil {
+			return nil, err
+		}
+		return loadCustom(path)
+	}
 	switch name {
 	case "fixtures":
 		path, err := findDataFile(os.Getenv("FIXTURES_PATH"),
@@ -175,7 +233,7 @@ func loadDataset(name string) ([]conversation, error) {
 		}
 		return loadLongMemEval(path)
 	}
-	return nil, fmt.Errorf("unknown dataset %q (want fixtures|locomo|longmemeval_s)", name)
+	return nil, fmt.Errorf("unknown dataset %q (want fixtures|locomo|longmemeval_s, or the path of a custom .json file)", name)
 }
 
 func loadFixtures(path string) ([]conversation, error) {

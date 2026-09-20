@@ -1,40 +1,76 @@
 # agent-memory-benchmark
 
 A Go gRPC agent-memory system evaluated on the [LoCoMo](https://arxiv.org/abs/2402.17753) and
-[LongMemEval](https://arxiv.org/abs/2410.10813) retrieval benchmarks. There are **no LLMs anywhere**
-in the pipeline — retrieval is classical IR only: hybrid BM25 + dense embeddings fused with RRF,
-rule-based temporal boosting, and MMR diversification. Storage is an S3 blob store plus an
-**append-only** Postgres enrichment ledger, with async enrichment driven by a Temporal schedule.
+[LongMemEval](https://arxiv.org/abs/2410.10813) retrieval benchmarks. The core retrieval path is
+classical IR: hybrid BM25 + dense embeddings fused with RRF, rule-based temporal boosting, and MMR
+diversification. An external LLM API may be used for optional, cached, write-time enrichment and
+bounded query-time helpers (see "Hard design constraints" and `AGENTS.md` rule 2); none of the
+numbers below used one. Storage is an S3 blob store plus an **append-only** Postgres enrichment
+ledger, with async enrichment driven by a Temporal schedule.
 
 ## Architecture
 
 ```
- client (ingest|trigger-sweep|wait-enriched|eval)
+ client (ingest|trigger-sweep|wait-enriched|eval|build-snapshot|snapshot-info|search)
     │ gRPC :8081
     ▼
- server ──► S3/MinIO (raw blobs, content-addressed)
-    │  └──► Postgres (memories rows + append-only memory_enrichment_events)
+ server ──► S3/MinIO (raw blobs, content-addressed; snapshot tarballs + current.json)
+    │  └──► Postgres (memories rows + append-only memory_enrichment_events + snapshot_events)
     │
- Temporal Schedule (1 min, overlap Skip)
-    └─► EnrichmentSweepWorkflow (50s soft deadline)
-          CountBacklog → PlanRanges → ProcessBatch ×K
-             └─► unary Embedder (mock or real nomic), errgroup limit 32
-                  └─► INSERT done/failed events + embedding_cache
+    ├─ Temporal Schedule (1 min, overlap Skip)
+    │    └─► EnrichmentSweepWorkflow (50s soft deadline)
+    │          CountBacklog → PlanRanges → ProcessBatch ×K
+    │             └─► unary Embedder (mock or real nomic), errgroup limit 32
+    │                  └─► INSERT done/failed events + embedding_cache
+    │
+    └─ Temporal task queue "snapshot" (triggered by BuildSnapshot RPC)
+         └─► BuildSnapshotWorkflow: AllocateVersion → BuildAndSeal → Publish
+               (streams the enriched ledger into a Bleve+vectors artifact,
+                seals it, uploads to S3, flips current.json)
+    server also embeds a snapshot.Runtime: loads current.json at boot and on
+    every successful BuildSnapshot, serves Search (BM25 ∥ dot-product scan → RRF
+    → recency boost → abstention) — see docs/07-snapshot-serving.md.
 ```
 
-Eval loads all enriched rows client-side and ranks in-process in Go: brute-force cosine over a
-contiguous `[]float32` arena + in-memory BM25 → RRF → temporal boost → MMR (λ=0.7) with
-per-session caps.
+Eval has two engines. `--engine inprocess` (default) loads all enriched rows client-side and ranks
+in-process in Go: brute-force cosine over a contiguous `[]float32` arena + in-memory BM25 → RRF →
+temporal boost → MMR (λ=0.7) with per-session caps. `--engine snapshot` instead sends one gRPC
+`Search` per question against the server's pre-built Bleve + flat-vector snapshot (see "Snapshot
+serving" below); it has no MMR or pre-fusion temporal filter, only post-fusion recency boost and
+abstention.
 
-## Quickstart
+## Quickstart (everything runs locally)
 
-Prereqs: Docker (with compose), Go 1.25, `protoc` with the Go plugins (`protoc-gen-go`,
-`protoc-gen-go-grpc`).
+Prereqs: Docker with the compose plugin. Go 1.25 is only needed to run the unit tests or edit the
+code (the images build Go inside Docker); `protoc` + `protoc-gen-go`/`protoc-gen-go-grpc` only
+for `make proto`. The real embedding model is optional — the deterministic mock embedder is the
+compose default and every tier below works with it.
 
 ```bash
-make test            # tiers 0-2: unit + workflow + integration (testcontainers)
-./run.sh --fixtures  # tier 3: full stack e2e, asserts Recall@5 == 1.0
+./scripts/preflight.sh          # checks docker, compose, free ports, disk, optional model runner
+make test                       # tiers 0-2: unit + workflow + integration (testcontainers)
+./run.sh --fixtures             # tier 3: full stack e2e, in-process engine, asserts Recall@5 == 1.0
+./scripts/run-snapshot.sh --fixtures   # same on the snapshot (Bleve) engine
 ```
+
+Both run scripts bring the stack up, migrate, ingest, wait for enrichment, evaluate, and tear the
+volumes down unless you pass `--keep-up`.
+
+## Bring your own dataset
+
+`--dataset` takes a built-in name or the path of a JSON file: one or more conversations, each a
+list of turns (`id`, `session_id`, `speaker`, `text`, `date_time`) and optional questions with
+gold `evidence` turn ids. Drop the file under `datasets/` (mounted read-only into the server
+container, no rebuild) and run everything against it:
+
+```bash
+cp testdata/custom-example.json datasets/
+./scripts/run-snapshot.sh --dataset datasets/custom-example.json --keep-up
+docker compose run --rm server /app/client conv-id --dataset datasets/custom-example.json
+docker compose run --rm server /app/client search --query "iceberg compaction" --conversation <id>
+```
+
+Format, validation rules, and the manual step-by-step are in `docs/08-custom-datasets.md`.
 
 While the stack is up: Temporal UI at http://localhost:8080, MinIO console at
 http://localhost:9001 (app/appsecret), server gRPC on :8081.
@@ -157,27 +193,57 @@ docker compose exec temporal temporal schedule delete \
   --schedule-id enrichment-sweep --address temporal:7233
 ```
 
+## Snapshot serving (Bleve)
+
+An alternative, server-side retrieval engine (`internal/snapshot` + `internal/snapshotflow`, full
+design in `docs/07-snapshot-serving.md`): a Temporal workflow builds an immutable, versioned
+artifact — a Bleve (scorch, pure Go) BM25 index plus a flat L2-normalized `float32` vector file —
+from the version-pinned enrichment ledger, seals it, and publishes it to S3 (content-addressed key,
+then an atomic `current.json` pointer flip). The server downloads the current snapshot to local
+disk and serves hybrid BM25 + brute-force dot-product + RRF `Search` over gRPC, instead of the
+eval client fetching the whole corpus and ranking in-process.
+
+```bash
+./scripts/run-snapshot.sh --fixtures                        # full stack, build, snapshot-engine eval
+docker compose run --rm server /app/client build-snapshot --version 1
+docker compose run --rm server /app/client snapshot-info
+docker compose run --rm server /app/client search --query "..." --conversation <id> --mode hybrid
+docker compose run --rm server /app/client eval --dataset fixtures --version 1 --engine snapshot
+```
+
+Server env: `SNAPSHOT_CACHE_DIR` (default `/var/cache/agentmem/snapshots`), `SNAPSHOT_WORK_DIR`
+(default a tempdir), `SNAPSHOT_VECTOR_DIM` (default `embed.Dims` = 768, no truncation),
+`QUERY_EMBED_TIMEOUT` (default `2s`, hard timeout before a hybrid query degrades to lexical-only).
+No benchmark numbers have been measured for this engine yet — see the honesty note in
+`docs/07-snapshot-serving.md` section 9.
+
 ## Project layout
 
 ```
 proto/                  Source .proto files (MemoryService, unary Embedder)
 genproto/               Generated protobuf/gRPC stubs (make proto)
-cmd/server/             gRPC server + embedded Temporal worker + schedule bootstrap
-cmd/client/             Harness CLI: ingest | trigger-sweep | wait-enriched | eval
+cmd/server/             gRPC server + embedded Temporal worker(s) + schedule bootstrap +
+                        snapshot build worker + snapshot serving runtime
+cmd/client/             Harness CLI: ingest | trigger-sweep | wait-enriched | eval |
+                        build-snapshot | snapshot-info | search
 cmd/migrate/            Goose migration runner
 internal/pipeline/      NFKC normalization, tokenize/stem, date parsing, round assembly
 internal/store/         Append-only Postgres ledger (pgx v5); derived views, no UPDATE/DELETE
 internal/embed/         Embedder interface, gRPC adapter, nomic prefixing, embedding_cache
 internal/enrich/        Temporal sweep workflow + activities + schedule bootstrap
-internal/retrieve/      Cosine, BM25, RRF, temporal boost, MMR — all in-process
+internal/retrieve/      Cosine, BM25, RRF, temporal boost, MMR — all in-process (docs/01 engine)
+internal/snapshot/      Bleve+vectors artifact, S3 store, serving runtime (docs/07 engine)
+internal/snapshotflow/  Temporal workflow that builds and publishes snapshots (docs/07)
 internal/eval/          Recall@k / NDCG@k / MRR by category / question_type; dataset loaders
 internal/blob/          Content-addressed S3 blob envelope (byte-stable JSON)
-migrations/             Goose SQL migrations (ledger schema, partial unique index, views)
+migrations/             Goose SQL migrations (ledger schema, partial unique index, views,
+                        snapshot_events + version sequence)
 testdata/fixtures.json  Hand-built ~20-turn corpus with known evidence
-scripts/                init-temporal-dbs.sh, download-dataset.sh
+scripts/                preflight.sh, init-temporal-dbs.sh, download-dataset.sh, run-snapshot.sh
+testdata/custom-example.json  Two-conversation example of the bring-your-own dataset format
 tools/mockembedder/     Deterministic hash-based mock embedder with fault injection
 tools/nomicbridge/      Bridge from unary Embedder RPCs to Docker Model Runner (micro-batching)
-docs/                   Frozen design docs 01-06 (the deep spec)
+docs/                   Frozen design docs 01-06 (the deep spec) + 07 (snapshot serving)
 ```
 
 ## Design docs
@@ -190,13 +256,19 @@ The docs in `docs/` are the authoritative deep spec (frozen):
 - `04-append-only.md` — immutable ledger, partial unique index invariant, derived views
 - `05-diagrams.md` — system, pipeline, retrieval, gRPC sequence, run flow diagrams
 - `06-testing.md` — the five test tiers and what each must assert
+- `07-snapshot-serving.md` — Bleve + flat-vector snapshot build/serve engine (alternative to the
+  in-process retrieval path above)
+- `08-custom-datasets.md` — bring-your-own dataset format and how to run everything on it
 
 ## Hard design constraints
 
 These are invariants, not preferences (see `AGENTS.md` for the working rules):
 
 - **Append-only Postgres** — never `UPDATE`/`DELETE` a memory or enrichment row; state is derived.
-- **No LLMs** — embedding model only; no generative models, no rerankers, no agentic loops.
+- **External LLM only, fenced** — one client package, env-configured API, every call cached
+  append-only by content hash, write-time enrichment first, query-time use bounded by a timeout
+  with a classical fallback, every LLM feature a flag that defaults to off until it wins an
+  ablation, and the eval report says which flags were on. No agentic loops in the serving path.
 - **Unary embedder** — one text per RPC; throughput comes from bounded goroutine concurrency.
 - **nomic prefixes mandatory** — `search_document: ` / `search_query: `, plus L2 normalization.
 - **No pgvector** — vectors are `BYTEA`, ranked client-side in Go.

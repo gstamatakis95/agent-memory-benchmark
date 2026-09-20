@@ -10,8 +10,25 @@ your job is to keep them passing.
    are *derived* by queries (anti-join + backoff predicate, views, functions) — never stored
    status flips. The test-only immutability trigger in `internal/store/append_only_test.go`
    must stay green.
-2. **No LLMs anywhere.** Embedding model only. No generative models, no cross-encoder
-   rerankers, no agentic loops. Classical IR only: BM25, RRF, MMR, rule-based date extraction.
+2. **External LLM allowed, but fenced.** (Rule changed 2026-09; it used to be "no LLMs
+   anywhere".) A generative model may be called only through an external API, behind one
+   client package (`internal/llm`, to be added) configured by env (`LLM_API_BASE`,
+   `LLM_API_KEY`, `LLM_MODEL`), never vendored or embedded in the image. Fences:
+   - **Write-time first.** LLM work belongs in enrichment (contextual prefixes, fact/entity
+     extraction, contradiction adjudication) where it is a pure function of a memory and can be
+     cached; every call is keyed by SHA-256 of (model, prompt version, input) in an append-only
+     `llm_cache` table, exactly like `embedding_cache`.
+   - **Query-time use must be bounded and optional.** Anything on the query path (query
+     decomposition, time-window extraction, reranking) needs a hard timeout with a graceful
+     fallback to the classical path, and an off switch.
+   - **Classical IR stays the baseline.** Every LLM-powered feature is a flag that defaults to
+     off until an ablation shows it beats the classical path on LongMemEval-S; eval output must
+     print which LLM features were on. Never let an LLM produce the benchmark answer itself —
+     these are retrieval benchmarks and the metric is evidence recall.
+   - **No agentic loops in the serving path.** One bounded call per stage, no tool use, no
+     retries that change the prompt.
+   - **Secrets via env only.** Never log prompts containing memory text at INFO; never commit
+     keys.
 3. **No pgvector, no embedded databases.** Vectors are `BYTEA` (packed little-endian float32),
    ranked client-side in Go.
 4. **The embedder is unary only.** One text per RPC — do not add batching. Recover throughput
@@ -31,15 +48,28 @@ your job is to keep them passing.
 ## Where things live
 
 - `proto/` source protos → `genproto/` generated stubs (`make proto`)
-- `cmd/server` gRPC server + embedded Temporal worker + schedule bootstrap;
-  `cmd/client` harness (ingest | trigger-sweep | wait-enriched | eval); `cmd/migrate` goose runner
+- `cmd/server` gRPC server + embedded Temporal worker + schedule bootstrap + snapshot build
+  worker + snapshot serving runtime;
+  `cmd/client` harness (ingest | trigger-sweep | wait-enriched | eval | build-snapshot |
+  snapshot-info | search); `cmd/migrate` goose runner
 - `internal/pipeline` normalize/tokenize/date-parse/round assembly (pure, deterministic)
 - `internal/store` ledger inserts + derived queries (no UPDATE/DELETE, by design)
 - `internal/embed` Embedder interface, gRPC adapter, prefixing, cache, BYTEA packing
 - `internal/enrich` sweep workflow + CountBacklog/PlanRanges/ProcessBatch activities
-- `internal/retrieve` cosine, BM25, RRF (k=60), temporal boost, MMR (λ=0.7)
+- `internal/retrieve` cosine, BM25, RRF (k=60), temporal boost, MMR (λ=0.7) — the in-process
+  (docs/01) retrieval engine
+- `internal/snapshot` (docs/07-snapshot-serving.md) immutable Bleve+flat-vector artifact
+  (builder/open/seal), S3 store, and the serving Runtime; `internal/snapshotflow` the Temporal
+  workflow that builds and publishes a snapshot version
 - `internal/eval` metrics + dataset loaders; `internal/blob` content-addressed S3 envelope
-- `migrations/` goose SQL; `testdata/fixtures.json` the e2e corpus
+- `migrations/` goose SQL (`00004_snapshots.sql` adds `snapshot_events` + the version sequence);
+  `testdata/fixtures.json` the e2e corpus
+- `scripts/run-snapshot.sh` the snapshot-engine counterpart of `run.sh`: same infra/ingest steps,
+  then `build-snapshot` + `eval --engine snapshot` instead of `run.sh`'s single in-process eval;
+  `scripts/preflight.sh` checks local prerequisites
+- Custom datasets: `--dataset path/to/file.json` in the `eval.Fixtures` format (single- or
+  multi-conversation, `docs/08-custom-datasets.md`); the file must sit under `datasets/` to be
+  visible inside the container; ids are salted by the file's base name (`datasetName`)
 
 ## How to verify changes (the tier ladder)
 
@@ -93,3 +123,12 @@ is not for CI.
 - **Docker Desktop credential-helper leak.** `docker-credential-desktop` processes can
   accumulate and exhaust the per-user process table (fork failures everywhere); fix by
   restarting Docker Desktop or switching `~/.docker/config.json` `credsStore` to `osxkeychain`.
+- **Bleve is not the "no embedded databases" exception being made twice.** It is an in-memory/
+  on-disk *search index* artifact, not an embedded database in the sense of rule 3 —
+  docs/01-retrieval.md §4.3 names Bluge/Bleve as the sanctioned BM25 option. The snapshot it
+  builds (`internal/snapshot`) never replaces Postgres as the ledger; Postgres is still the only
+  source of truth, and a snapshot is a disposable, rebuildable projection of it.
+- **`snapshot_events` is append-only like every other ledger table.** Never `UPDATE`/`DELETE` a
+  row; "current" is derived as the latest `published` event (and mirrored to `current.json` in S3
+  so the runtime doesn't need a live Postgres round trip to find the pointer) — same shape as
+  `memory_enrichment_events`' derived pending/dead-letter state.

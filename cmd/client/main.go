@@ -1,12 +1,23 @@
 // Command client is the benchmark harness CLI (docs/05-diagrams.md run
 // flow). Subcommands, all speaking gRPC to the server at SERVER_ADDR
-// (default "server:8081" — run.sh runs this binary inside the compose
-// network via `docker compose run --rm server /app/client ...`):
+// (default "server:8081" — run.sh / scripts/run-snapshot.sh run this binary
+// inside the compose network via `docker compose run --rm server /app/client ...`):
 //
-//	ingest        --dataset fixtures|locomo|longmemeval_s --version N
+//	ingest         --dataset fixtures|locomo|longmemeval_s --version N
 //	trigger-sweep
-//	wait-enriched --version N --timeout 15m [--fail-on-dead]
-//	eval          --dataset X --version N --retrieval bm25|dense|hybrid
+//	wait-enriched  --version N --timeout 15m [--fail-on-dead]
+//	eval           --dataset X --version N --retrieval bm25|dense|hybrid
+//	               [--engine inprocess|snapshot]
+//
+// Snapshot serving (docs/07-snapshot-serving.md; see also cmd/client/snapshot.go):
+//
+//	build-snapshot --version N
+//	snapshot-info
+//	search         --query "..." [--conversation ID] [--mode hybrid] ...
+//	conv-id        --dataset X [--id CONV]   print the numeric conversation ids
+//
+// --dataset accepts a built-in name or the path of a custom JSON file
+// (docs/08-custom-datasets.md).
 package main
 
 import (
@@ -67,6 +78,14 @@ func main() {
 		err = cmdWaitEnriched(args)
 	case "eval":
 		err = cmdEval(args)
+	case "build-snapshot":
+		err = cmdBuildSnapshot(args)
+	case "snapshot-info":
+		err = cmdSnapshotInfo(args)
+	case "search":
+		err = cmdSearch(args)
+	case "conv-id":
+		err = cmdConvID(args)
 	default:
 		usage()
 	}
@@ -76,7 +95,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: client <ingest|trigger-sweep|wait-enriched|eval> [flags]`)
+	fmt.Fprintln(os.Stderr, `usage: client <ingest|trigger-sweep|wait-enriched|eval|build-snapshot|snapshot-info|search|conv-id> [flags]`)
 	os.Exit(2)
 }
 
@@ -84,7 +103,7 @@ func usage() {
 
 func cmdIngest(args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
-	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s")
+	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s|path/to/custom.json")
 	version := fs.Int("version", 1, "enrichment version (informational; enrichment version is server-side)")
 	_ = fs.Parse(args)
 
@@ -124,7 +143,7 @@ func cmdIngest(args []string) error {
 			Granularity:    granularity,
 			Metadata: map[string]string{
 				"date_time": env.DateTime,
-				"dataset":   *dataset,
+				"dataset":   datasetName(*dataset),
 			},
 		})
 	}
@@ -292,13 +311,18 @@ func evalDefaults(dataset string) evalTuning {
 
 func cmdEval(args []string) error {
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
-	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s")
+	dataset := fs.String("dataset", "fixtures", "fixtures|locomo|longmemeval_s|path/to/custom.json")
 	version := fs.Int("version", 0, "enrichment version (required)")
 	retrieval := fs.String("retrieval", "hybrid", "bm25|dense|hybrid")
+	// engine=inprocess (default) is the original docs/01 path: fetch the
+	// whole conversation corpus and rank client-side. engine=snapshot
+	// (docs/07-snapshot-serving.md) queries the server's loaded Bleve+vector
+	// snapshot over gRPC instead — run `client build-snapshot` first.
+	engine := fs.String("engine", "inprocess", "inprocess|snapshot: inprocess ranks client-side (docs/01); snapshot queries the server's loaded snapshot via gRPC Search (docs/07) — run `build-snapshot` first")
 	// docs/01-retrieval.md section 4.3 step 6 prescribes a per-session cap but
 	// no numeric value; 4 is the base default (0 = uncapped, -1 = dataset
 	// default), keeping room for multi-session evidence inside top-10.
-	maxPerSession := fs.Int("max-per-session", -1, "MMR per-session result cap (0 = uncapped, -1 = dataset default)")
+	maxPerSession := fs.Int("max-per-session", -1, "MMR per-session result cap (0 = uncapped, -1 = dataset default; ignored with --engine snapshot)")
 	rrfK := fs.Int("rrf-k", 0, "RRF fusion constant (0 = dataset default)")
 	candidates := fs.Int("candidates", 0, "per-list candidate depth N before fusion (0 = dataset default)")
 	topK := fs.Int("topk", 0, "final result depth (0 = dataset default; metrics report @5/@10, so keep >= 10)")
@@ -307,12 +331,15 @@ func cmdEval(args []string) error {
 	if *version <= 0 {
 		return fmt.Errorf("--version is required (no defaulting)")
 	}
+	if *engine != "inprocess" && *engine != "snapshot" {
+		return fmt.Errorf("--engine %q invalid (want inprocess|snapshot)", *engine)
+	}
 	mode, err := retrieve.ParseMode(*retrieval)
 	if err != nil {
 		return err
 	}
 
-	tun := evalDefaults(*dataset)
+	tun := evalDefaults(datasetName(*dataset))
 	if *granularity != "" {
 		tun.granularity = *granularity
 	}
@@ -333,8 +360,11 @@ func cmdEval(args []string) error {
 	if *maxPerSession >= 0 {
 		tun.maxPerSession = *maxPerSession
 	}
-	log.Printf("eval: config granularity=%s rrf-k=%d candidates=%d topk=%d max-per-session=%d",
-		tun.granularity, tun.rrfK, tun.candidates, tun.topK, tun.maxPerSession)
+	log.Printf("eval: config engine=%s granularity=%s rrf-k=%d candidates=%d topk=%d max-per-session=%d",
+		*engine, tun.granularity, tun.rrfK, tun.candidates, tun.topK, tun.maxPerSession)
+	if *engine == "snapshot" && *maxPerSession >= 0 {
+		log.Printf("eval: WARN --max-per-session is ignored with --engine snapshot (query path is RRF -> recency -> abstention, docs/07)")
+	}
 
 	convs, err := loadDataset(*dataset)
 	if err != nil {
@@ -349,108 +379,123 @@ func cmdEval(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 
-	// Queries go through the SAME embedder service as the corpus, via the
-	// prefix-owning embed.Client (search_query:). Wrapped with the same
-	// bounded wrong-dims re-ask as the server so a randomly injected 512-dim
-	// response (chaos tier) cannot fail the eval. Query embeds share the
-	// persistent embedding_cache when PG_DSN is available (compose always
-	// sets it); without it the client gracefully falls back to no cache.
-	var qemb retrieve.QueryEmbedder
-	if mode != retrieve.ModeBM25 {
-		addr := os.Getenv("EMBEDDER_ADDR")
-		if addr == "" {
-			addr = "embedder-mock:9100"
-		}
-		econn, err := embed.Dial(addr)
-		if err != nil {
-			return fmt.Errorf("dial embedder: %w", err)
-		}
-		defer econn.Close()
-		var edb embed.DB
-		if dsn := os.Getenv("PG_DSN"); dsn != "" {
-			pool, err := newPGPool(ctx, dsn)
-			if err != nil {
-				log.Printf("eval: WARN query embedding cache disabled (pg unavailable): %v", err)
-			} else {
-				defer pool.Close()
-				edb = pool
-			}
-		}
-		// Chain (inner to outer): gRPC embedder -> bounded wrong-dims re-ask
-		// -> transient-failure retry with backoff -> persistent cache. A
-		// transient embedder outage retries in place instead of failing the
-		// whole eval; questions that still fail are skipped and counted below.
-		qemb = embed.NewClient(&transientRetryEmbedder{
-			inner: &dimsRetryEmbedder{
-				inner: embed.NewGRPCEmbedder(econn, nil), retries: 2,
-			},
-			retries: 2,
-			backoff: 500 * time.Millisecond,
-		}, edb)
-	}
+	var (
+		results                      []eval.QueryResult
+		fetchedRows, mappedRows      int
+		totalQuestions, embedSkipped int
+		snapVersion                  int64
+	)
 
-	var results []eval.QueryResult
-	fetchedRows, mappedRows := 0, 0
-	totalQuestions, embedSkipped := 0, 0
-	for _, c := range convs {
-		// Round rows are part of the corpus; expand maps a retrieved round id
-		// back to its member turn ids for turn-level evidence credit.
-		roundItems, expand := roundItemsOf(c)
-		rows, nFetched, err := fetchCorpus(ctx, cli, c, roundItems, int32(*version))
-		if err != nil {
-			return fmt.Errorf("conversation %s: %w", c.Name, err)
-		}
-		fetchedRows += nFetched
-		rows = filterGranularity(rows, expand, tun.granularity)
-		mappedRows += len(rows)
-		corpus, err := retrieve.NewCorpus(rows)
+	if *engine == "snapshot" {
+		results, fetchedRows, mappedRows, totalQuestions, embedSkipped, snapVersion, err = runSnapshotEval(ctx, cli, mode, tun, convs)
 		if err != nil {
 			return err
 		}
-		r, err := retrieve.NewRetriever(corpus, qemb, retrieve.Options{
-			Mode:       mode,
-			TopK:       tun.topK,
-			CandidateN: tun.candidates,
-			RRFK:       tun.rrfK,
-			MMR:        retrieve.MMROptions{MaxPerSession: tun.maxPerSession},
-		})
-		if err != nil {
-			return err
-		}
-		for _, q := range c.Questions {
-			totalQuestions++
-			var qdate time.Time
-			if q.QuestionDate != "" {
-				if t, err := pipeline.ParseTimestamp(q.QuestionDate); err == nil {
-					qdate = t
-				}
+	} else {
+		// Queries go through the SAME embedder service as the corpus, via the
+		// prefix-owning embed.Client (search_query:). Wrapped with the same
+		// bounded wrong-dims re-ask as the server so a randomly injected 512-dim
+		// response (chaos tier) cannot fail the eval. Query embeds share the
+		// persistent embedding_cache when PG_DSN is available (compose always
+		// sets it); without it the client gracefully falls back to no cache.
+		var qemb retrieve.QueryEmbedder
+		if mode != retrieve.ModeBM25 {
+			addr := os.Getenv("EMBEDDER_ADDR")
+			if addr == "" {
+				addr = "embedder-mock:9100"
 			}
-			scored, err := r.Search(ctx, q.Question, qdate)
+			econn, err := embed.Dial(addr)
 			if err != nil {
-				// A context-level failure (timeout/cancel) is not a per-query
-				// blip — abort loudly rather than skipping the whole tail.
-				if ctx.Err() != nil {
-					return fmt.Errorf("question %s: %w", q.ID, err)
-				}
-				// The query embed already retried with backoff (see the
-				// transientRetryEmbedder chain above). Skip and count this
-				// question instead of killing the run; the skip count is
-				// reported next to the metrics and gates the exit code below.
-				embedSkipped++
-				if embedSkipped <= 5 {
-					log.Printf("eval: WARN question %s: search failed after retries; skipping: %v", q.ID, err)
-				}
-				continue
+				return fmt.Errorf("dial embedder: %w", err)
 			}
-			retrieved := expandRetrieved(scored, expand)
-			results = append(results, eval.QueryResult{
-				ID: q.ID, Group: q.Group, Retrieved: retrieved, Gold: q.Evidence,
+			defer econn.Close()
+			var edb embed.DB
+			if dsn := os.Getenv("PG_DSN"); dsn != "" {
+				pool, err := newPGPool(ctx, dsn)
+				if err != nil {
+					log.Printf("eval: WARN query embedding cache disabled (pg unavailable): %v", err)
+				} else {
+					defer pool.Close()
+					edb = pool
+				}
+			}
+			// Chain (inner to outer): gRPC embedder -> bounded wrong-dims re-ask
+			// -> transient-failure retry with backoff -> persistent cache. A
+			// transient embedder outage retries in place instead of failing the
+			// whole eval; questions that still fail are skipped and counted below.
+			qemb = embed.NewClient(&transientRetryEmbedder{
+				inner: &dimsRetryEmbedder{
+					inner: embed.NewGRPCEmbedder(econn, nil), retries: 2,
+				},
+				retries: 2,
+				backoff: 500 * time.Millisecond,
+			}, edb)
+		}
+
+		for _, c := range convs {
+			// Round rows are part of the corpus; expand maps a retrieved round id
+			// back to its member turn ids for turn-level evidence credit.
+			roundItems, expand := roundItemsOf(c)
+			rows, nFetched, err := fetchCorpus(ctx, cli, c, roundItems, int32(*version))
+			if err != nil {
+				return fmt.Errorf("conversation %s: %w", c.Name, err)
+			}
+			fetchedRows += nFetched
+			rows = filterGranularity(rows, expand, tun.granularity)
+			mappedRows += len(rows)
+			corpus, err := retrieve.NewCorpus(rows)
+			if err != nil {
+				return err
+			}
+			r, err := retrieve.NewRetriever(corpus, qemb, retrieve.Options{
+				Mode:       mode,
+				TopK:       tun.topK,
+				CandidateN: tun.candidates,
+				RRFK:       tun.rrfK,
+				MMR:        retrieve.MMROptions{MaxPerSession: tun.maxPerSession},
 			})
+			if err != nil {
+				return err
+			}
+			for _, q := range c.Questions {
+				totalQuestions++
+				var qdate time.Time
+				if q.QuestionDate != "" {
+					if t, err := pipeline.ParseTimestamp(q.QuestionDate); err == nil {
+						qdate = t
+					}
+				}
+				scored, err := r.Search(ctx, q.Question, qdate)
+				if err != nil {
+					// A context-level failure (timeout/cancel) is not a per-query
+					// blip — abort loudly rather than skipping the whole tail.
+					if ctx.Err() != nil {
+						return fmt.Errorf("question %s: %w", q.ID, err)
+					}
+					// The query embed already retried with backoff (see the
+					// transientRetryEmbedder chain above). Skip and count this
+					// question instead of killing the run; the skip count is
+					// reported next to the metrics and gates the exit code below.
+					embedSkipped++
+					if embedSkipped <= 5 {
+						log.Printf("eval: WARN question %s: search failed after retries; skipping: %v", q.ID, err)
+					}
+					continue
+				}
+				retrieved := expandRetrieved(scored, expand)
+				results = append(results, eval.QueryResult{
+					ID: q.ID, Group: q.Group, Retrieved: retrieved, Gold: q.Evidence,
+				})
+			}
 		}
 	}
 
+	if totalQuestions == 0 {
+		log.Printf("eval: dataset %s has no questions — nothing to score (ingest/search still work; add questions with evidence to get metrics)", *dataset)
+		return nil
+	}
 	rep := eval.Evaluate(results, []int{5, 10})
-	printReport(*dataset, string(mode), rep, len(convs), fetchedRows, mappedRows, embedSkipped)
+	printReport(*engine, datasetName(*dataset), string(mode), rep, len(convs), fetchedRows, mappedRows, embedSkipped, snapVersion)
 	if embedSkipped > 0 {
 		fmt.Printf("eval: WARN skipped %d questions (embed failures)\n", embedSkipped)
 	}
@@ -479,16 +524,9 @@ func cmdEval(args []string) error {
 // roundItems are the client-assembled round-granularity twins uploaded
 // alongside the turns (see roundItemsOf).
 func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conversation, roundItems []item, version int32) ([]retrieve.Row, int, error) {
-	local := make([]item, 0, len(c.Items)+len(roundItems))
-	local = append(local, c.Items...)
-	local = append(local, roundItems...)
-	byHash := make(map[string]item, len(local))
-	for _, it := range local {
-		raw, err := envelopeOf(c.Num, it).Marshal()
-		if err != nil {
-			return nil, 0, err
-		}
-		byHash[hex.EncodeToString(blobHash(raw))] = it
+	byHash, err := localTwins(c, roundItems)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	stream, err := cli.FetchAllMemories(ctx, &agentmemv1.FetchReq{
@@ -539,9 +577,9 @@ func fetchCorpus(ctx context.Context, cli agentmemv1.MemoryServiceClient, c conv
 	if noTwin > 5 {
 		log.Printf("eval: WARN conversation %s: %d rows had no local twin (first 5 shown)", c.Name, noTwin)
 	}
-	if len(rows) < len(local) {
+	if len(rows) < len(byHash) {
 		log.Printf("eval: WARN conversation %s: %d/%d memories enriched at this version",
-			c.Name, len(rows), len(local))
+			c.Name, len(rows), len(byHash))
 	}
 	return rows, fetched, nil
 }
@@ -559,24 +597,11 @@ func filterGranularity(rows []retrieve.Row, expand map[string][]string, granular
 	if granularity == "" || granularity == "all" {
 		return rows
 	}
-	covered := make(map[string]bool)
-	for _, members := range expand {
-		for _, id := range members {
-			covered[id] = true
-		}
-	}
+	covered := coveredTurns(expand)
 	out := rows[:0]
 	for _, r := range rows {
-		_, isRound := expand[r.ID]
-		switch granularity {
-		case "turn":
-			if !isRound {
-				out = append(out, r)
-			}
-		case "round":
-			if isRound || !covered[r.ID] {
-				out = append(out, r)
-			}
+		if keepAtGranularity(r.ID, expand, covered, granularity) {
+			out = append(out, r)
 		}
 	}
 	return out
@@ -609,9 +634,12 @@ func expandRetrieved(scored []retrieve.Scored, expand map[string][]string) []str
 	return out
 }
 
-func printReport(dataset, mode string, rep eval.Report, conversations, fetched, mapped, embedSkipped int) {
+func printReport(engine, dataset, mode string, rep eval.Report, conversations, fetched, mapped, embedSkipped int, snapVersion int64) {
 	fmt.Println("==================================================")
-	fmt.Printf("retrieval eval  dataset=%s  mode=%s\n", dataset, mode)
+	fmt.Printf("retrieval eval  dataset=%s  mode=%s  engine=%s\n", dataset, mode, engine)
+	if engine == "snapshot" {
+		fmt.Printf("snapshot_version=%d\n", snapVersion)
+	}
 	// Retrieval is scoped per conversation: each conversation's questions
 	// search a corpus built from ONLY that conversation's fetched rows
 	// (LongMemEval: one haystack per question; LoCoMo: one sample's

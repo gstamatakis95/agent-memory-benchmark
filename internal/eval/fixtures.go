@@ -29,6 +29,74 @@ import (
 type Fixtures struct {
 	Turns     []FixtureTurn     `json:"turns"`
 	Questions []FixtureQuestion `json:"questions"`
+	// Conversations is the multi-conversation form of the same format, for
+	// bring-your-own datasets (docs/08-custom-datasets.md): each entry is
+	// one retrieval scope with its own turns and (optional) questions. When
+	// it is non-empty the top-level Turns/Questions must be empty.
+	Conversations []FixtureConversation `json:"conversations,omitempty"`
+}
+
+// FixtureConversation is one retrieval scope of a custom dataset. Questions
+// may be empty: such a dataset can be ingested and searched but yields no
+// eval metrics.
+type FixtureConversation struct {
+	ID        string            `json:"id"`
+	Turns     []FixtureTurn     `json:"turns"`
+	Questions []FixtureQuestion `json:"questions,omitempty"`
+}
+
+// Normalize returns the conversations of a document in the multi-
+// conversation form: the top-level turns/questions become one conversation
+// with the given default id. It validates ids (non-empty, unique per
+// conversation), that every turn carries a session id, and that every
+// evidence id names a turn of the same conversation.
+func (f *Fixtures) Normalize(defaultID string) ([]FixtureConversation, error) {
+	convs := f.Conversations
+	if len(f.Turns) > 0 || len(f.Questions) > 0 {
+		if len(convs) > 0 {
+			return nil, fmt.Errorf("eval: fixtures: use either top-level turns/questions or conversations, not both")
+		}
+		convs = []FixtureConversation{{ID: defaultID, Turns: f.Turns, Questions: f.Questions}}
+	}
+	seenConv := make(map[string]bool, len(convs))
+	for i := range convs {
+		c := &convs[i]
+		if c.ID == "" {
+			return nil, fmt.Errorf("eval: fixtures: conversation %d has no id", i)
+		}
+		if seenConv[c.ID] {
+			return nil, fmt.Errorf("eval: fixtures: duplicate conversation id %q", c.ID)
+		}
+		seenConv[c.ID] = true
+		if len(c.Turns) == 0 {
+			return nil, fmt.Errorf("eval: fixtures: conversation %q has no turns", c.ID)
+		}
+		turnIDs := make(map[string]bool, len(c.Turns))
+		for j, t := range c.Turns {
+			switch {
+			case t.ID == "":
+				return nil, fmt.Errorf("eval: fixtures: conversation %q turn %d has no id", c.ID, j)
+			case turnIDs[t.ID]:
+				return nil, fmt.Errorf("eval: fixtures: conversation %q has duplicate turn id %q", c.ID, t.ID)
+			case t.SessionID == "":
+				return nil, fmt.Errorf("eval: fixtures: conversation %q turn %q has no session_id", c.ID, t.ID)
+			case t.Text == "":
+				return nil, fmt.Errorf("eval: fixtures: conversation %q turn %q has empty text", c.ID, t.ID)
+			}
+			turnIDs[t.ID] = true
+		}
+		for _, q := range c.Questions {
+			if q.ID == "" || q.Question == "" {
+				return nil, fmt.Errorf("eval: fixtures: conversation %q has a question without id or text", c.ID)
+			}
+			for _, ev := range q.Evidence {
+				if !turnIDs[ev] {
+					return nil, fmt.Errorf("eval: fixtures: conversation %q question %q: evidence %q is not a turn id", c.ID, q.ID, ev)
+				}
+			}
+		}
+	}
+	return convs, nil
 }
 
 // FixtureTurn is one corpus turn.

@@ -51,7 +51,7 @@ a standalone design and is unrelated to the benchmark code that shares this repo
 |---|---|---|
 | Storage: a small dedicated PostgreSQL `engram_catalog` (streaming replica for HA). Tables: `tenants`, `shards`, `namespaces`, `namespace_moves`, `catalog_events`. | Same operational skill set; transactional epoch bumps. | etcd/Consul (another system; no transactions with tenant config). |
 | Cache: in-process `catalog.Resolver`, LRU 100 k entries, TTL 60 s, negative cache 5 s, invalidated by Postgres `LISTEN catalog_changes` (payload `{namespace_id, shard_id, epoch, state}`). | Sub-millisecond resolve on the hot path; near-instant invalidation on moves. | Redis (extra system; the shard-side fence already makes staleness safe). |
-| Catalog unavailable: serve cached entries up to `stale_max = 10 min`; a cache miss returns `UNAVAILABLE` with `RetryInfo{2 s}`. Workers never call the catalog on the hot path: workflow inputs carry `(namespace_id, tenant_id, shard_id, epoch)` and the shard's ownership row verifies them. | Correctness never depends on cache freshness (D2 row 4). | Fail-closed on any staleness (needless outage). |
+| Catalog unavailable: serve cached entries up to `stale_max = 10 min`; a cache miss returns `UNAVAILABLE` with `RetryInfo{2 s}`. Workers never call the catalog on the hot path (only the move executor's Plan/Freeze/Cutover activities do): workflow inputs carry `(namespace_id, tenant_id, shard_id, epoch)` and the shard's ownership row verifies them. | Correctness never depends on cache freshness (D2 row 4). | Fail-closed on any staleness (needless outage). |
 
 ## D5. Move protocol (per-namespace epoch fencing)
 
@@ -61,8 +61,8 @@ States in `namespace_moves.state`: `planned → copying → catching_up → froz
 2. **copy**: one `REPEATABLE READ` transaction on source records `p0 = max(outbox.seq)` for the namespace, then streams every namespace-scoped table (namespace-ordered `COPY`) into target; blobs are copied prefix→prefix (`{src}/{tenant}/{ns}/` → `{dst}/{tenant}/{ns}/`).
 3. **catch-up**: replay source `outbox` rows for the namespace with `seq > p0` onto target (each event idempotent by `(namespace_id, seq)`; target keeps `move_applied_seq`). Loop until lag < 100 events or < 5 s.
 4. **freeze**: catalog `state='frozen'`; source ownership `state='frozen'` (same epoch e). New source writes fail with `FAILED_PRECONDITION/NamespaceFrozen`; the API retries them with backoff for up to 30 s. Reads continue at source.
-5. **drain**: replay remaining outbox rows until `move_applied_seq = max(seq)`; terminate in-flight Temporal workflows for the namespace on the source task queue (all are restartable from durable per-chunk state) and record their `operation_id`s.
-6. **cutover** (one catalog transaction): `namespaces.shard_id = target, epoch = e+1, state='active'`; target ownership `state='active'`; source ownership `state='moved_out'`; `NOTIFY catalog_changes`. Restart recorded operations on the target task queue with the same `operation_id`s.
+5. **drain**: replay remaining outbox rows until `move_applied_seq = max(seq)`; terminate in-flight Temporal workflows for the namespace on the source task queue (all are restartable from durable per-chunk state) and record their **workflow ids** (operations carry an `operation_id`; the `consolidate` singleton and `page/{page_id}` workflows are restarted by workflow id).
+6. **cutover** (one catalog transaction): `namespaces.shard_id = target, epoch = e+1, state='active'`; target ownership `state='active'`; source ownership `state='moved_out'`; `NOTIFY catalog_changes`. Restart the recorded workflows on the target task queue with the same workflow ids (hence the same `operation_id`s).
 7. **cleanup**: after a 24 h grace, `engramctl` deletes the namespace's rows on source (admin role) and the old blob prefix.
 
 Safety argument: a write is accepted only inside a transaction that holds `FOR SHARE` on an ownership row with `state='active'` and the caller's epoch; source is set `frozen` **before** target is set `active`, so at no instant do two shards hold `active` for one namespace. Duplicates are impossible because the target applies outbox rows keyed by `(namespace_id, seq)`; loss is impossible because freeze precedes drain and drain precedes cutover.
@@ -72,7 +72,7 @@ Safety argument: a write is accepted only inside a transaction that holds `FOR S
 | Decision | Rationale | Rejected |
 |---|---|---|
 | Per-shard `outbox(seq bigint, namespace_id, epoch, event_type, payload bytea /*proto*/, created_at)` written in the **same transaction** as every state change. Payload type `engram.internal.events.v1.Event`. | Transactional outbox, never dual writes. It is also the change log a shard move replays. | Logical replication/CDC (Debezium) — another system, and per-namespace filtering is awkward. |
-| Relay: one active relay per shard in `engram-worker`, elected with `pg_try_advisory_lock`, reads in `seq` order in batches of 500. Consumers keep cursors in `outbox_cursors(consumer, last_seq)`. Consumers: `index` (no-op for the built-in Postgres index, the external-engine adapter otherwise), `kafka` (optional), `move:<ns>` (temporary, during a move). Rows below every cursor and older than 7 days are deleted daily in batches of 10 k. | | |
+| Relay: one active relay per shard in `engram-worker`, elected with `pg_try_advisory_lock`, reads in `seq` order in batches of 500 using the shard-level `engram_relay` role, which bypasses RLS for `SELECT` on `outbox`/`outbox_cursors` only (it must read every namespace in `seq` order; it never reads any other table). Consumers keep cursors in `outbox_cursors(consumer, last_seq)`. Consumers: `index` (no-op for the built-in Postgres index, the external-engine adapter otherwise), `kafka` (optional), `move:<ns>` (temporary, during a move). Rows below every cursor and older than 7 days are deleted daily in batches of 10 k. | | |
 | Sequence gaps: `seq` comes from a sequence, so a later `seq` can commit before an earlier one. The relay keeps a **gap watchlist**: a skipped `seq` is re-checked for `2 × statement_timeout` (statement_timeout = 30 s on writers), then declared aborted. | Bounded and provable (TLA+ `Outbox.tla`). | Serializing writers on a table lock (kills throughput); xmin-watermark tricks (wraparound-unsafe). |
 | **Kafka is optional and off by default.** When on: topic per shard `engram.events.shard-{id}`, key = `namespace_id`, value = the same `Event` proto, schema published to the buf registry (BSR) and referenced by header `schema=engram.internal.events.v1.Event`. Only justification: external consumers (analytics/CDC, an external search engine) that need replay and fan-out. | Temporal already provides durable orchestration and Postgres provides a per-shard ordered log. | Kafka as the ingest queue (would put a second durable store in the write path). |
 
@@ -80,7 +80,7 @@ Safety argument: a write is accepted only inside a transaction that holds `FOR S
 
 | Decision | Rationale | Rejected |
 |---|---|---|
-| MVP index = Postgres indexes on the shard: HNSW (`halfvec_cosine_ops`) on `facts.embedding` and `chunks.embedding`; **BM25 via pg_search** (`USING bm25`) on `facts.text` and `chunks.text`; pg_trgm GIN on `entities.canonical_name`. The `index.Index` interface is `Transactional` here (written in the same tx as facts) and `Async` for an external engine fed by the outbox `index` consumer. | One system, transactional, rebuildable (`REINDEX`). | tsvector + `ts_rank_cd` (not BM25; kept as a fallback implementation when pg_search is unavailable, documented as lower quality). External engine in MVP (extra system). |
+| MVP index = Postgres indexes on the shard: HNSW (`halfvec_cosine_ops`) on `facts.embedding`, `chunks.embedding` and `observation_versions.embedding`; **BM25 via pg_search** (`USING bm25`) on `facts.text`, `chunks.text` and `observation_versions.text` (observations are recalled through the semantic and lexical arms, D10); pg_trgm GIN on `entities.canonical_name`. The `index.Index` interface is `Transactional` here (written in the same tx as facts) and `Async` for an external engine fed by the outbox `index` consumer. | One system, transactional, rebuildable (`REINDEX`). | tsvector + `ts_rank_cd` (not BM25; kept as a fallback implementation when pg_search is unavailable, documented as lower quality). External engine in MVP (extra system). |
 
 ## D8. Document versions, delta retain, delete
 
@@ -151,7 +151,7 @@ internal/authz      internal/catalog     internal/router      internal/gateway  
 internal/store      internal/index       internal/chunk       internal/extract   internal/entity
 internal/link       internal/recall      internal/consolidate internal/reflect   internal/pages
 internal/workflows  internal/outbox      internal/move        internal/export    internal/quota
-internal/config     internal/telemetry   internal/api         internal/ledger
+internal/config     internal/telemetry   internal/api         internal/ledger    internal/errs
 adapters/mcp        adapters/connect
 formal/tla/*.tla    formal/lean/Engram/*.lean
 ```
@@ -175,3 +175,16 @@ formal/tla/*.tla    formal/lean/Engram/*.lean
 ## D17. Phasing and effort (used by the roadmap)
 
 Phase 0 foundations ≈ 6 engineer-weeks; Phase 1 MVP ≈ 30; Phase 2 (consolidation, reflect) ≈ 14; Phase 3 (pages, export, multi-cell, per-tenant config) ≈ 14; formal methods and evaluation harness run alongside ≈ 10. Total ≈ 74 engineer-weeks, 3 engineers ≈ 6 months.
+
+## D18. Decisions added during drafting (binding once listed here)
+
+| Id | Decision | Where it came from |
+|---|---|---|
+| N1 | Leaf package `internal/errs` holds typed errors and their gRPC/Connect/Temporal mapping; `internal/api` must not be imported by services, store or workflows. | §2 |
+| N2 | The move workflow `move/{namespace_id}/{epoch}` runs on the **target** shard's task queue `shard-{target}`; the executing worker opens a second, move-scoped pool to the source using the `engram_move` role. This is the only code path that holds two shard handles, and it is fenced by the move row. | §2, §5 |
+| N3 | A per-shard Temporal schedule `shard/{id}/op-sweeper` (every 60 s) starts workflows for `PENDING` operations older than 2 min that have no workflow. The API still returns `UNAVAILABLE` if `StartWorkflow` fails after the ledger commit; the ack is not weakened. | §2 |
+| N4 | The outbox relay reads with the `engram_relay` role (RLS bypass for `SELECT` on `outbox`, `outbox_cursors` only). | §2 |
+| N5 | Tenant mismatch or allowlist miss returns `NOT_FOUND` (anti-enumeration); `PERMISSION_DENIED` is reserved for a missing scope on a namespace the caller can see. | §2 |
+| N6 | `chunks.content_hash = sha256(text)` excludes the contextual header; the header hash is stored separately and compared at `FinalizeVersion` to decide re-embedding without re-extraction. | §2, §5 |
+| N7 | Raw bodies larger than 64 KiB are written to blob `{shard}/{tenant}/{ns}/ledger/{sha256}` before the ledger transaction; the ledger row stores the hash and the key. Smaller bodies are stored inline in the ledger row. | §2, §3 |
+| N8 | Streams fix `RequestScope` when opened; a JWT expiring mid-stream does not abort the stream (Reflect may run 300 s). | §2 |

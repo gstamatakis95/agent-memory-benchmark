@@ -110,6 +110,7 @@ Safety argument: a write is accepted only inside a transaction that holds `FOR S
 | Fusion | RRF with k = 60 over all arms; observations participate through semantic + lexical arms over `observation_versions`. |
 | Rerank | cross-encoder through the gateway (`models.rerank`, default `bge-reranker-v2-m3`) on the top 50/150/300 fused candidates. If the remaining deadline < 150 ms, rerank is skipped and results are marked `stage=FUSED`. |
 | Boosts | multiplicative, bounded: recency ≤ +10 %, temporal proximity ≤ +10 %, observation proof count ≤ +5 %; combined factor clamped to [0.75, 1.25]. |
+| Tag filter (5 modes, Hindsight-compatible) | `tag_match` ∈ {ANY, ANY_STRICT, ALL, ALL_STRICT, EXACT}; let Q = query tags, I = item tags. ANY: I = ∅ ∨ I ∩ Q ≠ ∅ (untagged items pass); ANY_STRICT: I ∩ Q ≠ ∅; ALL: I = ∅ ∨ Q ⊆ I; ALL_STRICT: Q ⊆ I ∧ I ≠ ∅; EXACT: I = Q. An unset filter matches everything. Tags are filters applied inside every arm, never security. |
 | Packing | greedy in rank order into `max_tokens` (default 4 k / 8 k / 16 k by budget); an item that does not fit is **skipped, not truncated**, and counted in `skipped_count`; packing never stops early. Token counting: `cl100k_base` via tiktoken-go. |
 | Streaming | `Recall` is server-streaming: batches of 10 results after the last stage that fits the deadline, then a trailing `RecallStats` message with per-stage timings. |
 

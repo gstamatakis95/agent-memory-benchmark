@@ -1,0 +1,207 @@
+// memory/v1/errors.proto
+//
+// Typed error details. Engram returns errors as `google.rpc.Status`
+// (code, message, details[]) — the standard gRPC rich-error model. The detail
+// messages are defined HERE instead of importing `google/rpc/error_details.proto`
+// because (a) the workspace must build without any BSR dependency and
+// (b) Engram needs domain-specific details (WrongShardOrEpoch, NamespaceFrozen)
+// that google.rpc does not have. At runtime the server packs them with
+// `status.WithDetails(...)`; on the wire they are `google.protobuf.Any`
+// entries in `Status.details` with type URL
+// `type.googleapis.com/memory.v1.<Name>`. For generic clients the server
+// additionally attaches the standard `google.rpc.RetryInfo` (from the
+// errdetails Go package, no proto import needed) whenever a `retry_after` is
+// present here.
+//
+// Each message comments the gRPC status code it is attached to. A response
+// carries at most one Engram detail plus (optionally) RetryInfo.
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/duration.proto";
+import "memory/v1/common.proto";
+
+option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+
+// ValidationError → INVALID_ARGUMENT. The request is malformed; fix it, do
+// not retry as-is. Also used when the call has no deadline (violation on the
+// pseudo-field "grpc-timeout") and when a field mask names an unknown path.
+message ValidationError {
+  // One entry per violated field; at least one.
+  repeated FieldViolation violations = 1;
+}
+
+// FieldViolation is one field-level validation failure.
+message FieldViolation {
+  // Path of the offending field in the request, proto field-name syntax with
+  // repeated indexes, e.g. "items[3].content", "tag_filter.mode",
+  // "read_mask.paths[1]". "grpc-timeout" denotes the missing deadline.
+  string field = 1;
+  // Human-readable description (English, not localised).
+  string description = 2;
+  // Stable machine code: "REQUIRED", "TOO_LONG", "OUT_OF_RANGE", "BAD_FORMAT",
+  // "UNKNOWN_ENUM_VALUE", "UNKNOWN_FIELD_MASK_PATH", "OUTPUT_ONLY",
+  // "MISSING_DEADLINE", "DEADLINE_TOO_LONG", "INCONSISTENT".
+  string reason = 3;
+}
+
+// QuotaExceeded → RESOURCE_EXHAUSTED. A per-tenant or per-namespace rate or
+// volume quota was hit at admission (decision D13: `recalls_per_min`,
+// `retains_per_min`). Volume quotas that are checked inside workflows
+// (`llm_tokens_per_day`, `max_facts`) do NOT produce this error: they defer
+// the operation (OperationState.DEFERRED). Client action: back off for
+// `retry_after`, then retry the identical request.
+message QuotaExceeded {
+  // Quota key as configured: "recalls_per_min", "retains_per_min",
+  // "max_namespaces", "max_request_bytes".
+  string quota = 1;
+  // Configured limit for the window.
+  int64 limit = 2;
+  // Observed usage that triggered the rejection (≥ limit).
+  int64 current = 3;
+  // Earliest time at which a retry can succeed; also emitted as
+  // google.rpc.RetryInfo.
+  google.protobuf.Duration retry_after = 4;
+  // Which level of the hierarchy was exhausted.
+  QuotaScope scope = 5;
+}
+
+// QuotaScope says which configured quota level rejected the request.
+enum QuotaScope {
+  QUOTA_SCOPE_UNSPECIFIED = 0;
+  QUOTA_SCOPE_TENANT = 1;
+  QUOTA_SCOPE_NAMESPACE = 2;
+}
+
+// ResourceKind names the kind of resource an error refers to.
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  RESOURCE_KIND_TENANT = 1;
+  RESOURCE_KIND_NAMESPACE = 2;
+  RESOURCE_KIND_MEMORY = 3;
+  RESOURCE_KIND_DOCUMENT = 4;
+  RESOURCE_KIND_DOCUMENT_VERSION = 5;
+  RESOURCE_KIND_OPERATION = 6;
+  RESOURCE_KIND_SNAPSHOT = 7;
+  RESOURCE_KIND_PAGE = 8;
+  RESOURCE_KIND_ENTITY = 9;
+  RESOURCE_KIND_SHARD = 10;
+  RESOURCE_KIND_MOVE = 11;
+}
+
+// NotFound → NOT_FOUND. The named resource does not exist in the caller's
+// namespace, was purged, or belongs to another tenant (cross-tenant access is
+// reported as NOT_FOUND on purpose, so that existence cannot be probed).
+// Client action: do not retry; the id is wrong or the resource is gone.
+message NotFound {
+  ResourceKind kind = 1;
+  // The id that was looked up (memory_id, document_id, operation_id, ...).
+  string id = 2;
+  // Namespace the lookup was scoped to (unset for tenant/shard lookups).
+  NamespaceRef namespace = 3;
+}
+
+// NamespaceState mirrors the catalog state of a namespace as seen by the
+// shard's ownership row, for diagnostics in WrongShardOrEpoch.
+enum NamespaceState {
+  NAMESPACE_STATE_UNSPECIFIED = 0;
+  // Being created; ownership row not yet active.
+  NAMESPACE_STATE_PROVISIONING = 1;
+  // Normal.
+  NAMESPACE_STATE_ACTIVE = 2;
+  // A shard move is copying/catching up; writes still accepted at the source.
+  NAMESPACE_STATE_MOVING = 3;
+  // Move freeze window: writes rejected (NamespaceFrozen), reads served.
+  NAMESPACE_STATE_FROZEN = 4;
+  // Delete in progress: reads and writes rejected.
+  NAMESPACE_STATE_DELETING = 5;
+  // Purged from every shard and the catalog keeps a tombstone.
+  NAMESPACE_STATE_DELETED = 6;
+}
+
+// WrongShardOrEpoch → FAILED_PRECONDITION. The shard that received the call
+// does not hold the namespace at the epoch the caller resolved (stale catalog
+// cache, a move cut over between resolve and execute, or a restore bumped the
+// epoch). The API retries this internally up to 3 times after invalidating
+// its catalog entry, so public clients see it only when retries are
+// exhausted. Epochs are exposed because they are the only actionable
+// diagnostic; the shard id is never exposed. Client action: retry the whole
+// call with backoff (new resolve), do not persist anything from this detail.
+message WrongShardOrEpoch {
+  string namespace_id = 1;
+  // Epoch the caller (API or worker) believed to be current.
+  int64 expected_epoch = 2;
+  // Epoch recorded in the shard's ownership row (0 if the shard has no row
+  // for the namespace, i.e. wrong shard).
+  int64 actual_epoch = 3;
+  // Ownership state on the shard that rejected the call.
+  NamespaceState namespace_state = 4;
+}
+
+// NamespaceFrozen → FAILED_PRECONDITION. The namespace is in the freeze
+// window of a shard move (decision D5 step 4) or a restore. Writes are
+// rejected; reads continue at the source. The API already retried with
+// backoff for up to 30 s before surfacing this. Client action: retry after
+// `retry_after` (also emitted as google.rpc.RetryInfo).
+message NamespaceFrozen {
+  string namespace_id = 1;
+  google.protobuf.Duration retry_after = 2;
+  // Why the namespace is frozen.
+  FreezeReason reason = 3;
+}
+
+// FreezeReason says why a namespace is frozen.
+enum FreezeReason {
+  FREEZE_REASON_UNSPECIFIED = 0;
+  FREEZE_REASON_MOVE = 1;
+  FREEZE_REASON_RESTORE = 2;
+}
+
+// OperationConflict → ABORTED (concurrent conflict) or ALREADY_EXISTS
+// (idempotency-key or operation_id reuse with a different payload). Client
+// action for ABORTED: wait for `existing_operation_id` (WaitOperation) and
+// resubmit; for ALREADY_EXISTS: use a fresh id, the stored one is bound to
+// a different request.
+message OperationConflict {
+  // Operation id or request id the caller supplied.
+  string operation_id = 1;
+  // The operation that owns the conflicting state (e.g. the purge running on
+  // the document you are retaining into).
+  string existing_operation_id = 2;
+  OperationConflictReason reason = 3;
+}
+
+// OperationConflictReason enumerates conflict causes.
+enum OperationConflictReason {
+  OPERATION_CONFLICT_REASON_UNSPECIFIED = 0;
+  // The same request_id/operation_id was reused with a different request
+  // hash within the retention window (ALREADY_EXISTS).
+  OPERATION_CONFLICT_REASON_IDEMPOTENCY_KEY_REUSED = 1;
+  // A purge (DeleteDocument) is running on the document (ABORTED).
+  OPERATION_CONFLICT_REASON_DOCUMENT_PURGING = 2;
+  // The namespace has a delete or move cutover in progress (ABORTED).
+  OPERATION_CONFLICT_REASON_NAMESPACE_BUSY = 3;
+  // A refresh of the same page is already running (ABORTED).
+  OPERATION_CONFLICT_REASON_PAGE_REFRESHING = 4;
+}
+
+// PreconditionFailed → FAILED_PRECONDITION. The request was well-formed but
+// the resource is in a state that forbids it (terminal operation cancelled,
+// etag mismatch, document still ingesting, namespace deleting). Client
+// action: read the current state, decide, resubmit; do not blindly retry.
+message PreconditionFailed {
+  repeated Precondition violations = 1;
+}
+
+// Precondition is one failed precondition.
+message Precondition {
+  // Stable type: "OPERATION_TERMINAL", "ETAG_MISMATCH", "DOCUMENT_INGESTING",
+  // "NAMESPACE_DELETING", "SNAPSHOT_BASE_UNAVAILABLE", "PAGE_NO_VERSION",
+  // "MEMORY_NOT_A_FACT", "ALREADY_INVALIDATED", "NOT_INVALIDATED".
+  string type = 1;
+  // Resource the precondition applies to (id).
+  string subject = 2;
+  // Human-readable explanation.
+  string description = 3;
+}

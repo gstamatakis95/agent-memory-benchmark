@@ -1,0 +1,583 @@
+// memory/v1/memory.proto
+//
+// MemoryService: the core write (Retain), read (Recall, GetMemory,
+// ListMemories, BatchGetMemories), reasoning (Reflect) and curation
+// (Invalidate, Restore) surface of Engram.
+//
+// Streaming decisions:
+//   * Retain is UNARY. Its ack means "the ingest-ledger row and the operation
+//     row are durable" (decision D16), nothing more; there is no incremental
+//     result to stream. Per-chunk visibility is observed through
+//     OperationService (GetOperation/WaitOperation), which keeps the
+//     long-lived state on the worker side instead of pinning a stream to one
+//     API replica for minutes behind a per-request load balancer.
+//   * Recall is SERVER-STREAMING: results are sent in rank order in flushes of
+//     10 after the last pipeline stage that fits the deadline, followed by one
+//     trailing RecallStats message (decision D10).
+//   * Reflect is SERVER-STREAMING: token deltas, tool calls/results and
+//     citations are emitted as they happen during a bounded agentic loop that
+//     may run for up to 300 s (decision D12).
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+import "memory/v1/operation.proto";
+
+option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+
+// MemoryService is the primary data-plane service. Every method requires a
+// deadline, an `authorization: Bearer <jwt>` metadata entry whose `tenant_id`
+// claim equals `namespace.tenant_id` and whose `ns` allowlist contains
+// `namespace.namespace_id`, and the scope noted per method.
+service MemoryService {
+  // Retain submits one or more items for asynchronous ingestion. Scope
+  // memory.write. Items are grouped by document_id; each distinct document_id
+  // becomes one document version and one Operation (kind RETAIN_DOCUMENT).
+  // The call returns as soon as the ingest-ledger rows and the operation rows
+  // are committed; facts become visible chunk by chunk afterwards. Not
+  // read-your-writes: use OperationService.WaitOperation as the read barrier.
+  rpc Retain(RetainRequest) returns (RetainResponse);
+  // Recall runs the no-LLM retrieval pipeline (semantic, lexical, graph,
+  // temporal and chunk arms in parallel → RRF k=60 → cross-encoder rerank →
+  // bounded boosts → token-budget packing) and streams the packed results in
+  // rank order, then one RecallStats. Scope memory.read. Deadline ≤ 10 s.
+  rpc Recall(RecallRequest) returns (stream RecallResponse);
+  // Reflect answers a question with a bounded agentic loop over observations,
+  // facts and pages (forced searches first, then ≤ 10 free iterations,
+  // ≤ 100k context tokens, ≤ 300 s wall). Scope memory.read. Streams token
+  // deltas, tool steps, verified citations, the final answer and stats.
+  // Deadline ≤ 330 s.
+  rpc Reflect(ReflectRequest) returns (stream ReflectResponse);
+  // GetMemory fetches one fact, observation or chunk by id. Scope memory.read.
+  rpc GetMemory(GetMemoryRequest) returns (GetMemoryResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListMemories pages through memories with structural filters (no
+  // relevance ranking). Scope memory.read.
+  rpc ListMemories(ListMemoriesRequest) returns (ListMemoriesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // BatchGetMemories fetches up to 100 memories by id in one round trip;
+  // missing ids are reported, not errors. Scope memory.read.
+  rpc BatchGetMemories(BatchGetMemoriesRequest) returns (BatchGetMemoriesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // Invalidate soft-hides one FACT from Recall/Reflect/Export (sets
+  // `invalidated_at`). Observations keep the source but are marked stale
+  // (decision D8). Scope memory.write. Synchronous.
+  rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
+  // Restore clears `invalidated_at` on a fact. Scope memory.write. Synchronous.
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
+}
+
+// RetainItem is one unit of raw input. Items sharing a document_id form one
+// document version, in list order.
+message RetainItem {
+  // Raw text or markdown, 1 byte to 1 MiB (UTF-8). Stored verbatim in the
+  // append-only ingest ledger and in blob storage.
+  string content = 1;
+  // When the content was produced (e.g. the message time). Required. Becomes
+  // the default `mentioned_at` of every fact and chunk extracted from it.
+  google.protobuf.Timestamp timestamp = 2;
+  // Free-text context given to the extractor ("chat with Alice about the
+  // Q3 plan"), ≤ 2 KiB. Not searchable; stored on the document version.
+  string context = 3;
+  // Client-chosen upsert key, ≤ 256 bytes, unique per namespace. Empty: the
+  // server mints a UUIDv7 and the item becomes a standalone document (its id
+  // is returned in Operation.target_id).
+  string document_id = 4;
+  // Tags applied to every fact and chunk of the item; ≤ 64 tags, each
+  // 1-64 bytes, exact-match strings. Filters, never security.
+  repeated string tags = 5;
+  // Free-form JSON object stored verbatim (≤ 16 KiB), returned on memories,
+  // filterable by top-level string equality.
+  google.protobuf.Struct metadata = 6;
+  // Optional entity hints for resolution.
+  repeated EntityHint entity_hints = 7;
+  // How this document version relates to the previous one. All items of a
+  // document_id in one request must agree, otherwise INVALID_ARGUMENT.
+  UpdateMode update_mode = 8;
+  // Overrides `timestamp` as the `mentioned_at` of extracted facts, for
+  // sources that quote older material (a forwarded e-mail). Must be ≤ now.
+  google.protobuf.Timestamp mentioned_at = 9;
+  // MIME-ish content type: "text/plain" (default) or "text/markdown" (enables
+  // heading-anchored chunking).
+  string content_type = 10;
+}
+
+// RetainRequest submits items. Limits: ≤ 100 items, ≤ 8 MiB total content.
+message RetainRequest {
+  NamespaceRef namespace = 1;
+  // request_id is the idempotency key of the whole call (24 h).
+  RequestMeta meta = 2;
+  repeated RetainItem items = 3;
+  // Optional client-chosen UUIDv7. With exactly one document in the request
+  // it is the Operation id verbatim; with several documents the per-document
+  // ids are derived as UUIDv5(operation_id, document_id). Resubmitting the
+  // same operation_id with the same request hash returns the existing
+  // operations; with a different hash fails with ALREADY_EXISTS.
+  string operation_id = 4;
+
+  // Removed in v1.0.0-rc2: `bool wait_for_visibility = 5` (synchronous
+  // retain). Replaced by OperationService.WaitOperation so that the API
+  // never holds a request open for the duration of an LLM pipeline.
+  reserved 5;
+  reserved "wait_for_visibility";
+
+  reserved 100 to 199;
+}
+
+// RetainResponse acknowledges durable acceptance: one Operation per distinct
+// document_id, in order of first appearance in `items`.
+message RetainResponse {
+  repeated Operation operations = 1;
+  // Ids of documents that were minted because the item had no document_id,
+  // aligned with `operations`.
+  repeated string document_ids = 2;
+
+  reserved 100 to 199;
+}
+
+// RecallRequest describes a retrieval.
+message RecallRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  // Natural-language query, 1-8 KiB. Embedded once with the
+  // `search_query: ` prefix; also tokenised for BM25 and date extraction.
+  string query = 3;
+  // Effort level; UNSPECIFIED = namespace default (MID).
+  Budget budget = 4;
+  // Overrides the budget's token budget for packing (cl100k_base tokens),
+  // 256-65536. 0 = budget default (4k/8k/16k). Items that do not fit are
+  // skipped (never truncated) and counted in RecallStats.skipped_count.
+  int32 max_tokens = 5;
+  // Restrict facts to these types; empty = both. Does not affect chunks.
+  repeated FactType fact_types = 6;
+  // Tag filter; unset = no tag filtering (see TagMatchMode).
+  TagFilter tag_filter = 7;
+  // Anchor for temporal reasoning: relative expressions in the query
+  // ("last week") are resolved against it and the temporal arm orders by
+  // distance to it. Default: server now. Does NOT hide anything.
+  google.protobuf.Timestamp query_timestamp = 8;
+  // Knowledge cut-off (decision D9). When set to T, every arm filters facts
+  // and chunks by `mentioned_at <= T` before ranking, and each observation
+  // (and page) is returned in the latest version whose `effective_at <= T`
+  // (none if the first version is later). Guarantee: nothing derived from
+  // content mentioned after T is returned. Unset = no cut-off. Independent
+  // of query_timestamp: as_of hides, query_timestamp anchors.
+  google.protobuf.Timestamp as_of = 9;
+  // Include raw chunks (fifth arm) in the results.
+  bool include_chunks = 10;
+  // Include consolidated observations in the results.
+  bool include_observations = 11;
+  // Hard cap on returned items after packing, 1-500; 0 = budget default
+  // (20/50/100). Packing may return fewer.
+  int32 max_results = 12;
+  // Run the cross-encoder rerank. Unset = true. When false, or when the
+  // remaining deadline is < 150 ms at rerank time, results carry
+  // Scores.stage = FUSED.
+  optional bool rerank = 13;
+  // Populate Scores.arm_ranks and per-stage candidate counts in RecallStats.
+  bool explain = 14;
+  // Explicit occurrence window for the temporal arm. Unset = derived from
+  // the query text by rule-based date extraction (may be empty, in which
+  // case the temporal arm is skipped).
+  TemporalWindow temporal_window = 15;
+  // Restrict to items whose metadata matches all of these (AND).
+  repeated MetadataFilter metadata_filters = 16;
+
+  // Removed in v1.0.0-rc3: `float min_score = 17`. A raw score threshold is
+  // not comparable across arms and rerankers; budgets and max_results are the
+  // supported knobs.
+  reserved 17;
+  reserved "min_score";
+
+  reserved 100 to 199;
+}
+
+// RecallResponse is one stream message: either a ranked result or the single
+// trailing stats message. Clients must tolerate results after stats never
+// occurring and stats being absent if the stream errors.
+message RecallResponse {
+  oneof payload {
+    RecallResult result = 1;
+    RecallStats stats = 2;
+  }
+}
+
+// RecallResult is one packed result in rank order.
+message RecallResult {
+  // 1-based final rank across the whole response.
+  int32 rank = 1;
+  // The memory with `scores` and `provenance` populated. Text fields are
+  // complete (packing skips, never truncates).
+  Memory memory = 2;
+  // cl100k_base tokens this item consumed from the budget.
+  int32 tokens = 3;
+}
+
+// RecallStats closes a Recall stream.
+message RecallStats {
+  // Distinct candidates after fusion (before rerank/packing).
+  int32 total_candidates = 1;
+  // Items streamed.
+  int32 returned_count = 2;
+  // Items that were ranked but did not fit the token budget (never
+  // truncated; packing continues past a skip).
+  int32 skipped_count = 3;
+  // Tokens consumed by returned items.
+  int32 tokens_used = 4;
+  // Effective token budget.
+  int32 max_tokens = 5;
+  // Last stage applied (FUSED when rerank was skipped).
+  RecallStage last_stage = 6;
+  // Why rerank was skipped ("deadline", "disabled", ""), if it was.
+  string rerank_skip_reason = 7;
+  // Wall time per stage, in pipeline order: "authz", "embed", "arm:semantic",
+  // "arm:lexical", "arm:graph", "arm:temporal", "arm:chunk", "fuse",
+  // "rerank", "boost", "pack".
+  repeated StageTiming stage_timings = 8;
+  // The cut-off actually applied (echo of as_of).
+  google.protobuf.Timestamp as_of_applied = 9;
+  // The occurrence window the temporal arm used (derived or explicit).
+  TemporalWindow temporal_window_applied = 10;
+  // Effective query_timestamp.
+  google.protobuf.Timestamp query_timestamp_applied = 11;
+  // Total server time from admission to last flush.
+  google.protobuf.Duration total = 12;
+}
+
+// StageTiming is one pipeline stage's timing and candidate counts.
+message StageTiming {
+  string stage = 1;
+  google.protobuf.Duration duration = 2;
+  // Candidates entering / leaving the stage (explain only, else 0).
+  int32 candidates_in = 3;
+  int32 candidates_out = 4;
+  // True when the stage was skipped (deadline, disabled, empty window).
+  bool skipped = 5;
+}
+
+// ObservationInfo is present on MEMORY_KIND_OBSERVATION memories.
+message ObservationInfo {
+  // Number of distinct source facts supporting the observation.
+  int32 proof_count = 1;
+  // Ids of the supporting facts (retired/invalidated ones are excluded from
+  // Recall views but kept in GetMemory with `include_hidden_sources`).
+  repeated string source_fact_ids = 2;
+  // Version returned (observations are versioned; see as_of).
+  int64 version = 3;
+  // max(mentioned_at) over the source facts cited by this version; the
+  // as_of visibility key.
+  google.protobuf.Timestamp effective_at = 4;
+  // True when a source was deleted/invalidated since this version was
+  // written and reconsolidation has not yet run.
+  bool stale = 5;
+  // Verbatim quotes from source facts, aligned with source_fact_ids where
+  // available.
+  repeated string quotes = 6;
+}
+
+// ChunkInfo is present on MEMORY_KIND_CHUNK memories.
+message ChunkInfo {
+  // Contextual header prepended for embedding/extraction:
+  // "[doc summary ≤ 200 chars] > [heading path]". Not part of `text`.
+  string header = 1;
+  // SHA-256 (hex) of the chunk text: its identity within the document.
+  string content_hash = 2;
+  // Number of facts extracted from the chunk.
+  int32 fact_count = 3;
+}
+
+// Memory is a fact, an observation or a chunk. Which sub-fields are set
+// depends on `kind`; the who/what/when/where/why fields are facts only.
+message Memory {
+  // UUIDv7 (memory_id, observation_id or chunk_id).
+  string id = 1;
+  MemoryKind kind = 2;
+  // Fact text / observation text / chunk text (≤ 8 KiB for chunks).
+  string text = 3;
+  // Facts only.
+  FactType fact_type = 4;
+  // Facts only: extracted 5W slots (any may be empty).
+  string who = 5;
+  string what = 6;
+  string when = 7;
+  string where = 8;
+  string why = 9;
+  // When the fact happened (facts; empty window for chunks/observations).
+  TemporalWindow occurred = 10;
+  // When the source said it; the as_of visibility key for facts and chunks.
+  google.protobuf.Timestamp mentioned_at = 11;
+  // Resolved entities (facts) or entities mentioned (chunks).
+  repeated EntityRef entities = 12;
+  repeated string tags = 13;
+  google.protobuf.Struct metadata = 14;
+  // Where it came from; for observations the provenance of the most recent
+  // cited source.
+  Provenance provenance = 15;
+  // Per-stage scores; only on Recall results (unset on Get/List).
+  Scores scores = 16;
+  // Observations only.
+  ObservationInfo observation = 17;
+  // Chunks only.
+  ChunkInfo chunk = 18;
+  // Set when the fact is soft-invalidated (hidden from Recall/Reflect/Export
+  // but readable by GetMemory).
+  google.protobuf.Timestamp invalidated_at = 19;
+  Timestamps timestamps = 20;
+  NamespaceRef namespace = 21;
+
+  reserved 100 to 199;
+}
+
+// GetMemoryRequest fetches one memory by id.
+message GetMemoryRequest {
+  NamespaceRef namespace = 1;
+  string memory_id = 2;
+  // Projection over Memory paths, e.g. ["text", "observation.source_fact_ids"].
+  google.protobuf.FieldMask read_mask = 3;
+  // Observations: also list source facts that are invalidated (never
+  // retired ones; those are gone).
+  bool include_hidden_sources = 4;
+
+  reserved 100 to 199;
+}
+
+// GetMemoryResponse wraps the memory.
+message GetMemoryResponse {
+  Memory memory = 1;
+
+  reserved 100 to 199;
+}
+
+// ListMemoriesOrder selects the sort order of ListMemories.
+enum ListMemoriesOrder {
+  // MENTIONED_AT_DESC.
+  LIST_MEMORIES_ORDER_UNSPECIFIED = 0;
+  LIST_MEMORIES_ORDER_MENTIONED_AT_DESC = 1;
+  LIST_MEMORIES_ORDER_MENTIONED_AT_ASC = 2;
+  LIST_MEMORIES_ORDER_CREATED_AT_DESC = 3;
+  LIST_MEMORIES_ORDER_OCCURRED_START_ASC = 4;
+}
+
+// ListMemoriesRequest is a structural listing (no query, no ranking).
+message ListMemoriesRequest {
+  NamespaceRef namespace = 1;
+  PagingRequest paging = 2;
+  // Kinds to include; empty = FACT only.
+  repeated MemoryKind kinds = 3;
+  repeated FactType fact_types = 4;
+  TagFilter tag_filter = 5;
+  // Restrict to one document.
+  string document_id = 6;
+  // Only items whose occurrence window overlaps this window.
+  TemporalWindow occurred_overlaps = 7;
+  // mentioned_at bounds (inclusive).
+  google.protobuf.Timestamp mentioned_after = 8;
+  google.protobuf.Timestamp mentioned_before = 9;
+  // Include soft-invalidated facts (default excluded).
+  bool include_invalidated = 10;
+  // Restrict to items mentioning this entity id.
+  string entity_id = 11;
+  ListMemoriesOrder order = 12;
+  google.protobuf.FieldMask read_mask = 13;
+  repeated MetadataFilter metadata_filters = 14;
+
+  reserved 100 to 199;
+}
+
+// ListMemoriesResponse is a page of memories.
+message ListMemoriesResponse {
+  repeated Memory memories = 1;
+  PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// BatchGetMemoriesRequest fetches up to 100 ids.
+message BatchGetMemoriesRequest {
+  NamespaceRef namespace = 1;
+  repeated string memory_ids = 2;
+  google.protobuf.FieldMask read_mask = 3;
+
+  reserved 100 to 199;
+}
+
+// BatchGetMemoriesResponse returns found memories in request order and the
+// ids that were not found (no error).
+message BatchGetMemoriesResponse {
+  repeated Memory memories = 1;
+  repeated string missing_ids = 2;
+
+  reserved 100 to 199;
+}
+
+// InvalidateRequest soft-hides a fact.
+message InvalidateRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  // Must be a MEMORY_KIND_FACT id, else FAILED_PRECONDITION
+  // {MEMORY_NOT_A_FACT}. Already-invalidated facts are a no-op success.
+  string memory_id = 3;
+  // Free-text audit reason, ≤ 1 KiB.
+  string reason = 4;
+
+  reserved 100 to 199;
+}
+
+// InvalidateResponse returns the updated fact.
+message InvalidateResponse {
+  Memory memory = 1;
+
+  reserved 100 to 199;
+}
+
+// RestoreRequest clears a soft invalidation.
+message RestoreRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  string memory_id = 3;
+
+  reserved 100 to 199;
+}
+
+// RestoreResponse returns the restored fact.
+message RestoreResponse {
+  Memory memory = 1;
+
+  reserved 100 to 199;
+}
+
+// ReflectRequest asks for a reasoned answer.
+message ReflectRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  // The question or task, 1-16 KiB.
+  string query = 3;
+  // Budget used by every internal search tool call.
+  Budget budget = 4;
+  TagFilter tag_filter = 5;
+  // Same semantics as RecallRequest.as_of, applied to every tool call of the
+  // session (forced and free), so the answer is leak-free at T.
+  google.protobuf.Timestamp as_of = 6;
+  google.protobuf.Timestamp query_timestamp = 7;
+  // Optional JSON Schema (draft 2020-12) the final answer must satisfy; the
+  // server validates and, on failure, retries once then reports
+  // ReflectAnswer.schema_valid = false.
+  google.protobuf.Struct output_schema = 8;
+  // Cap on free iterations, 1-10; 0 = namespace default (10).
+  int32 max_iterations = 9;
+  // Stream TokenDelta events (default true). When false only tool events,
+  // citations, the answer and stats are streamed.
+  optional bool stream_tokens = 10;
+  // Extra context the caller wants considered (e.g. the current conversation
+  // turn), ≤ 32 KiB; never retained.
+  string context = 11;
+  // Overrides the namespace mission for this call only, ≤ 4 KiB.
+  string mission_override = 12;
+
+  reserved 100 to 199;
+}
+
+// ReflectResponse is one event of the Reflect stream. Order: zero or more
+// {delta | tool_call | tool_result | citation} events, exactly one `answer`,
+// exactly one `stats` (last). On error the stream terminates with a gRPC
+// status and no `answer`.
+message ReflectResponse {
+  oneof event {
+    TokenDelta delta = 1;
+    ToolCall tool_call = 2;
+    ToolResult tool_result = 3;
+    Citation citation = 4;
+    ReflectAnswer answer = 5;
+    ReflectStats stats = 6;
+  }
+}
+
+// TokenDelta is a piece of generated text in emission order.
+message TokenDelta {
+  string text = 1;
+  // Iteration that produced it (0 = final synthesis).
+  int32 iteration = 2;
+}
+
+// ToolCall is an internal tool invocation by the reflect agent.
+message ToolCall {
+  string call_id = 1;
+  // "search_memories", "search_observations", "get_page", "expand_fact".
+  string tool = 2;
+  google.protobuf.Struct arguments = 3;
+  int32 iteration = 4;
+  // True for the two forced searches that precede the free iterations.
+  bool forced = 5;
+}
+
+// ToolResult summarises what a tool returned (ids only; the agent's context
+// is not streamed).
+message ToolResult {
+  string call_id = 1;
+  int32 result_count = 2;
+  // Ids returned; citations are only valid against this union.
+  repeated string memory_ids = 3;
+  google.protobuf.Duration duration = 4;
+  // Non-empty when the tool failed (per-tool deadline 10 s).
+  string error = 5;
+}
+
+// Citation links a span of the answer to a memory that was actually
+// retrieved during the session. Citations to ids never returned by a tool
+// are dropped server-side.
+message Citation {
+  string memory_id = 1;
+  MemoryKind kind = 2;
+  // Verbatim supporting quote from the memory text.
+  string quote = 3;
+  // Half-open [start, end) UTF-8 code-point offsets into ReflectAnswer.text.
+  int32 answer_start = 4;
+  int32 answer_end = 5;
+}
+
+// ReflectAnswer is the final answer.
+message ReflectAnswer {
+  // Prose answer (also the concatenation of all TokenDelta.text with
+  // iteration 0).
+  string text = 1;
+  // Present when output_schema was given; null when validation failed.
+  google.protobuf.Struct structured = 2;
+  // All citations retained after verification, in answer order.
+  repeated Citation citations = 3;
+  // False when output_schema validation failed after the retry.
+  bool schema_valid = 4;
+}
+
+// ReflectStopReason says why the loop ended.
+enum ReflectStopReason {
+  REFLECT_STOP_REASON_UNSPECIFIED = 0;
+  // The agent produced an answer.
+  REFLECT_STOP_REASON_ANSWERED = 1;
+  REFLECT_STOP_REASON_MAX_ITERATIONS = 2;
+  REFLECT_STOP_REASON_MAX_CONTEXT_TOKENS = 3;
+  REFLECT_STOP_REASON_WALL_TIME = 4;
+  REFLECT_STOP_REASON_CANCELLED = 5;
+}
+
+// ReflectStats closes a Reflect stream.
+message ReflectStats {
+  int32 iterations = 1;
+  int32 tool_calls = 2;
+  int32 context_tokens = 3;
+  int32 prompt_tokens = 4;
+  int32 completion_tokens = 5;
+  google.protobuf.Duration wall = 6;
+  ReflectStopReason stop_reason = 7;
+  // Citations dropped because their id was never retrieved.
+  int32 citations_rejected = 8;
+  // Model id used (resolved `models.reflect`).
+  string model = 9;
+}

@@ -1,0 +1,496 @@
+// memory/admin/v1/admin.proto
+//
+// Admin-only control-plane API (scope tenant.admin, served on the same port
+// as memory.v1 but behind the admin interceptor and a separate Envoy route
+// that is not exposed to tenants). Three services fixed by decision D1:
+//   TenantService — tenants, quotas, config, isolation;
+//   ShardService  — shard registry and namespace → shard resolution;
+//   MoveService   — the per-namespace move protocol of decision D5.
+// This is the ONLY place where shard ids and epochs appear in an API.
+syntax = "proto3";
+
+package memory.admin.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+import "memory/v1/errors.proto";
+import "memory/v1/operation.proto";
+
+option go_package = "example.com/engram/gen/go/memory/admin/v1;adminv1";
+
+// TenantService manages tenants.
+service TenantService {
+  // CreateTenant mints the tenant row; `tenant_id` is chosen by the control
+  // plane caller and must match `[a-z0-9-]{1,64}`.
+  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+  // GetTenant returns one tenant.
+  rpc GetTenant(GetTenantRequest) returns (GetTenantResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListTenants lists tenants by id.
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // UpdateTenant patches display_name, quotas, config and isolation.
+  // Changing isolation to DEDICATED does not move namespaces; it only
+  // constrains future placement (use MoveService to relocate).
+  rpc UpdateTenant(UpdateTenantRequest) returns (UpdateTenantResponse);
+  // DeleteTenant marks the tenant DELETING and starts a DELETE_NAMESPACE
+  // operation for every namespace.
+  rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
+}
+
+// ShardService manages the shard registry.
+service ShardService {
+  // RegisterShard adds a provisioned Postgres instance to the catalog.
+  rpc RegisterShard(RegisterShardRequest) returns (RegisterShardResponse);
+  // GetShard returns one shard.
+  rpc GetShard(GetShardRequest) returns (GetShardResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListShards lists shards with occupancy.
+  rpc ListShards(ListShardsRequest) returns (ListShardsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // DrainShard stops new namespace placement on the shard (state DRAINING).
+  // Moving existing namespaces off is a separate, explicit MoveService call
+  // per namespace so that the operator controls the pace.
+  rpc DrainShard(DrainShardRequest) returns (DrainShardResponse);
+  // UpdateShard patches capacity, cell and state (DRAINING → ACTIVE).
+  rpc UpdateShard(UpdateShardRequest) returns (UpdateShardResponse);
+  // ResolveNamespace returns the catalog's current placement of a namespace
+  // (shard, epoch, state) — the ops view that memory.v1 hides.
+  rpc ResolveNamespace(ResolveNamespaceRequest) returns (ResolveNamespaceResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+// MoveService drives namespace moves between shards (decision D5).
+service MoveService {
+  // StartMove plans a move and starts the move executor in engram-worker.
+  // One move per namespace at a time (ABORTED + OperationConflict).
+  rpc StartMove(StartMoveRequest) returns (StartMoveResponse);
+  // GetMove returns the move with progress.
+  rpc GetMove(GetMoveRequest) returns (GetMoveResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListMoves lists moves, newest first.
+  rpc ListMoves(ListMovesRequest) returns (ListMovesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // RollbackMove aborts a move that has not reached CUTOVER: the target's
+  // incoming ownership row is dropped, copied rows are purged, source is
+  // un-frozen if needed. After CUTOVER a rollback is a new move back.
+  rpc RollbackMove(RollbackMoveRequest) returns (RollbackMoveResponse);
+}
+
+// Isolation says whether a tenant's namespaces may share shards.
+enum Isolation {
+  // SHARED.
+  ISOLATION_UNSPECIFIED = 0;
+  // Namespaces are bin-packed onto the default pool with other tenants.
+  ISOLATION_SHARED = 1;
+  // Namespaces are placed only on shards flagged dedicated_tenant_id.
+  ISOLATION_DEDICATED = 2;
+}
+
+// TenantState is the lifecycle of a tenant.
+enum TenantState {
+  TENANT_STATE_UNSPECIFIED = 0;
+  TENANT_STATE_ACTIVE = 1;
+  // New namespaces and writes rejected; reads allowed.
+  TENANT_STATE_SUSPENDED = 2;
+  TENANT_STATE_DELETING = 3;
+  TENANT_STATE_DELETED = 4;
+}
+
+// Quotas are the enforceable limits (decision D13). 0 = inherit the system
+// default.
+message Quotas {
+  // Admission-time rate limits (RESOURCE_EXHAUSTED + QuotaExceeded).
+  int64 recalls_per_min = 1;
+  int64 retains_per_min = 2;
+  // Workflow-time volume limits (operation DEFERRED until window reset).
+  int64 llm_tokens_per_day = 3;
+  int64 max_facts = 4;
+  // Control-plane limit.
+  int32 max_namespaces = 5;
+  // Largest accepted RetainRequest in bytes.
+  int64 max_request_bytes = 6;
+}
+
+// Tenant is the control-plane resource.
+message Tenant {
+  string tenant_id = 1;
+  string display_name = 2;
+  TenantState state = 3;
+  Isolation isolation = 4;
+  // Tenant-level quotas (namespace overrides live in Namespace.config_overrides
+  // under `quota.*`, capped by these).
+  Quotas quotas = 5;
+  // Tenant-level config layered over the system config (decision D12 keys).
+  google.protobuf.Struct config = 6;
+  memory.v1.Timestamps timestamps = 7;
+  string etag = 8;
+  int32 namespace_count = 9;
+
+  reserved 100 to 199;
+}
+
+// CreateTenantRequest creates a tenant.
+message CreateTenantRequest {
+  memory.v1.RequestMeta meta = 1;
+  // tenant_id, display_name, isolation, quotas and config are read.
+  Tenant tenant = 2;
+
+  reserved 100 to 199;
+}
+
+// CreateTenantResponse returns the tenant.
+message CreateTenantResponse {
+  Tenant tenant = 1;
+
+  reserved 100 to 199;
+}
+
+// GetTenantRequest fetches one tenant.
+message GetTenantRequest {
+  string tenant_id = 1;
+  google.protobuf.FieldMask read_mask = 2;
+
+  reserved 100 to 199;
+}
+
+// GetTenantResponse wraps the tenant.
+message GetTenantResponse {
+  Tenant tenant = 1;
+
+  reserved 100 to 199;
+}
+
+// ListTenantsRequest lists tenants by id.
+message ListTenantsRequest {
+  memory.v1.PagingRequest paging = 1;
+  repeated TenantState states = 2;
+  string tenant_id_prefix = 3;
+
+  reserved 100 to 199;
+}
+
+// ListTenantsResponse is a page of tenants.
+message ListTenantsResponse {
+  repeated Tenant tenants = 1;
+  memory.v1.PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// UpdateTenantRequest patches a tenant.
+message UpdateTenantRequest {
+  memory.v1.RequestMeta meta = 1;
+  Tenant patch = 2;
+  // Allowed paths: display_name, isolation, quotas, quotas.*, config, state
+  // (ACTIVE ↔ SUSPENDED only).
+  google.protobuf.FieldMask update_mask = 3;
+  string etag = 4;
+
+  reserved 100 to 199;
+}
+
+// UpdateTenantResponse returns the updated tenant.
+message UpdateTenantResponse {
+  Tenant tenant = 1;
+
+  reserved 100 to 199;
+}
+
+// DeleteTenantRequest deletes a tenant and every namespace in it.
+message DeleteTenantRequest {
+  memory.v1.RequestMeta meta = 1;
+  string tenant_id = 2;
+  // Must equal tenant_id (typed confirmation).
+  string confirm_tenant_id = 3;
+
+  reserved 100 to 199;
+}
+
+// DeleteTenantResponse returns the tenant (DELETING) and the per-namespace
+// purge operations.
+message DeleteTenantResponse {
+  Tenant tenant = 1;
+  repeated memory.v1.Operation namespace_operations = 2;
+
+  reserved 100 to 199;
+}
+
+// ShardState is the lifecycle of a shard.
+enum ShardState {
+  SHARD_STATE_UNSPECIFIED = 0;
+  // Accepts new namespaces.
+  SHARD_STATE_ACTIVE = 1;
+  // Serves existing namespaces; no new placement.
+  SHARD_STATE_DRAINING = 2;
+  // Hosts no namespaces; may be decommissioned.
+  SHARD_STATE_EMPTY = 3;
+  // Unreachable or disabled by an operator; requests to its namespaces fail
+  // with UNAVAILABLE.
+  SHARD_STATE_DISABLED = 4;
+}
+
+// Shard is one dedicated PostgreSQL instance (decision D2).
+message Shard {
+  // Dense int32 assigned by the catalog; the metrics label.
+  int32 shard_id = 1;
+  ShardState state = 2;
+  // Cell (API + worker stack) that serves this shard; ≤ 32 shards per cell.
+  string cell_id = 3;
+  // Secret reference (not the DSN itself), e.g. "vault:engram/shards/7/dsn".
+  string dsn_secret_ref = 4;
+  // Blob key prefix, e.g. "shard-7". Keys are `{prefix}/{tenant}/{ns}/…`.
+  string blob_prefix = 5;
+  // Set when the shard is reserved for one tenant (isolation DEDICATED).
+  string dedicated_tenant_id = 6;
+  // Soft capacity used by the placer (default 10 M live facts).
+  int64 capacity_facts = 7;
+  int32 namespace_count = 8;
+  int64 live_facts = 9;
+  int64 volume_bytes = 10;
+  memory.v1.Timestamps timestamps = 11;
+  string etag = 12;
+  // Schema migration version applied on the shard.
+  string schema_version = 13;
+
+  reserved 100 to 199;
+}
+
+// RegisterShardRequest adds a shard.
+message RegisterShardRequest {
+  memory.v1.RequestMeta meta = 1;
+  // cell_id, dsn_secret_ref, blob_prefix, dedicated_tenant_id and
+  // capacity_facts are read; shard_id is assigned by the catalog.
+  Shard shard = 2;
+
+  reserved 100 to 199;
+}
+
+// RegisterShardResponse returns the shard with its id.
+message RegisterShardResponse {
+  Shard shard = 1;
+
+  reserved 100 to 199;
+}
+
+// GetShardRequest fetches one shard.
+message GetShardRequest {
+  int32 shard_id = 1;
+
+  reserved 100 to 199;
+}
+
+// GetShardResponse wraps the shard.
+message GetShardResponse {
+  Shard shard = 1;
+
+  reserved 100 to 199;
+}
+
+// ListShardsRequest lists shards by id.
+message ListShardsRequest {
+  memory.v1.PagingRequest paging = 1;
+  repeated ShardState states = 2;
+  string cell_id = 3;
+
+  reserved 100 to 199;
+}
+
+// ListShardsResponse is a page of shards.
+message ListShardsResponse {
+  repeated Shard shards = 1;
+  memory.v1.PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// DrainShardRequest sets a shard to DRAINING.
+message DrainShardRequest {
+  memory.v1.RequestMeta meta = 1;
+  int32 shard_id = 2;
+  string reason = 3;
+
+  reserved 100 to 199;
+}
+
+// DrainShardResponse returns the shard and the namespaces still on it.
+message DrainShardResponse {
+  Shard shard = 1;
+  repeated memory.v1.NamespaceRef remaining_namespaces = 2;
+
+  reserved 100 to 199;
+}
+
+// UpdateShardRequest patches a shard.
+message UpdateShardRequest {
+  memory.v1.RequestMeta meta = 1;
+  Shard patch = 2;
+  // Allowed paths: state, cell_id, capacity_facts, dedicated_tenant_id,
+  // dsn_secret_ref.
+  google.protobuf.FieldMask update_mask = 3;
+  string etag = 4;
+
+  reserved 100 to 199;
+}
+
+// UpdateShardResponse returns the updated shard.
+message UpdateShardResponse {
+  Shard shard = 1;
+
+  reserved 100 to 199;
+}
+
+// ResolveNamespaceRequest looks up placement.
+message ResolveNamespaceRequest {
+  memory.v1.NamespaceRef namespace = 1;
+
+  reserved 100 to 199;
+}
+
+// ResolveNamespaceResponse is the catalog's answer.
+message ResolveNamespaceResponse {
+  memory.v1.NamespaceRef namespace = 1;
+  int32 shard_id = 2;
+  int64 epoch = 3;
+  memory.v1.NamespaceState state = 4;
+  // Set while a move is in progress.
+  string move_id = 5;
+  // Target shard of the in-progress move, if any.
+  int32 target_shard_id = 6;
+
+  reserved 100 to 199;
+}
+
+// MoveState follows decision D5.
+enum MoveState {
+  MOVE_STATE_UNSPECIFIED = 0;
+  MOVE_STATE_PLANNED = 1;
+  MOVE_STATE_COPYING = 2;
+  MOVE_STATE_CATCHING_UP = 3;
+  MOVE_STATE_FROZEN = 4;
+  MOVE_STATE_CUTOVER = 5;
+  MOVE_STATE_CLEANING = 6;
+  MOVE_STATE_DONE = 7;
+  MOVE_STATE_ROLLED_BACK = 8;
+}
+
+// MoveProgress reports copy and catch-up progress.
+message MoveProgress {
+  int64 rows_copied = 1;
+  int64 bytes_copied = 2;
+  int64 blobs_copied = 3;
+  // Outbox position captured at copy start (p0) and last applied on target.
+  int64 copy_start_seq = 4;
+  int64 applied_seq = 5;
+  // Outbox events not yet replayed and their age.
+  int64 replay_lag_events = 6;
+  google.protobuf.Duration replay_lag = 7;
+  // Operation ids terminated during drain and restarted after cutover.
+  repeated string restarted_operation_ids = 8;
+  // Tables fully copied so far.
+  repeated string tables_done = 9;
+}
+
+// Move is one namespace relocation.
+message Move {
+  // UUIDv7.
+  string move_id = 1;
+  memory.v1.NamespaceRef namespace = 2;
+  int32 source_shard_id = 3;
+  int32 target_shard_id = 4;
+  // Epoch at source (e) and the epoch the target will own (e+1).
+  int64 source_epoch = 5;
+  int64 target_epoch = 6;
+  MoveState state = 7;
+  MoveProgress progress = 8;
+  memory.v1.Timestamps timestamps = 9;
+  google.protobuf.Timestamp frozen_at = 10;
+  google.protobuf.Timestamp cutover_at = 11;
+  // Set when state is ROLLED_BACK or the executor is retrying after an error.
+  string error = 12;
+  // Operation exposed to the tenant (kind MOVE_NAMESPACE).
+  string operation_id = 13;
+
+  reserved 100 to 199;
+}
+
+// StartMoveRequest plans a move.
+message StartMoveRequest {
+  memory.v1.RequestMeta meta = 1;
+  memory.v1.NamespaceRef namespace = 2;
+  int32 target_shard_id = 3;
+  // Operator note.
+  string reason = 4;
+  // Stop before FREEZE and wait for an explicit RollbackMove or a second
+  // StartMove with `resume = true`. Lets an operator schedule the freeze.
+  bool pause_before_freeze = 5;
+  // Continue a move paused before freeze.
+  bool resume = 6;
+
+  reserved 100 to 199;
+}
+
+// StartMoveResponse returns the move.
+message StartMoveResponse {
+  Move move = 1;
+
+  reserved 100 to 199;
+}
+
+// GetMoveRequest fetches a move.
+message GetMoveRequest {
+  string move_id = 1;
+
+  reserved 100 to 199;
+}
+
+// GetMoveResponse wraps the move.
+message GetMoveResponse {
+  Move move = 1;
+
+  reserved 100 to 199;
+}
+
+// ListMovesRequest lists moves, newest first.
+message ListMovesRequest {
+  memory.v1.PagingRequest paging = 1;
+  repeated MoveState states = 2;
+  memory.v1.NamespaceRef namespace = 3;
+  int32 shard_id = 4;
+
+  reserved 100 to 199;
+}
+
+// ListMovesResponse is a page of moves.
+message ListMovesResponse {
+  repeated Move moves = 1;
+  memory.v1.PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// RollbackMoveRequest aborts a move before cutover.
+message RollbackMoveRequest {
+  memory.v1.RequestMeta meta = 1;
+  string move_id = 2;
+  string reason = 3;
+
+  reserved 100 to 199;
+}
+
+// RollbackMoveResponse returns the move (ROLLED_BACK or rolling back).
+message RollbackMoveResponse {
+  Move move = 1;
+
+  reserved 100 to 199;
+}

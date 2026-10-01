@@ -199,18 +199,18 @@ ConsolidateRead(o) ==
   /\ ncons < MaxConsolidations
   /\ Live /= {}
   /\ obs' = [obs EXCEPT ![o].snap = Live, ![o].busy = TRUE]
-  /\ UNCHANGED <<fstate, vstate, vcontent, vpending, deleted, links, index, dirty, ncons>>
+  /\ ncons' = ncons + 1
+  /\ UNCHANGED <<fstate, vstate, vcontent, vpending, deleted, links, index, dirty>>
 
 ConsolidateApply(o) ==
   /\ obs[o].busy
-  /\ ncons' = ncons + 1
   /\ LET snap == obs[o].snap
          commit(S) == [obs EXCEPT ![o] = [st |-> "live", src |-> S, deriv |-> snap, snap |-> {}, busy |-> FALSE]]
          abort     == [obs EXCEPT ![o].snap = {}, ![o].busy = FALSE]
      IN CASE ApplyCheck = "batch" -> obs' = IF snap \subseteq Live THEN commit(snap) ELSE abort
           [] ApplyCheck = "cited" -> obs' = IF snap \cap Live /= {} THEN commit(snap \cap Live) ELSE abort
           [] ApplyCheck = "none"  -> obs' = commit(snap)
-  /\ UNCHANGED <<fstate, vstate, vcontent, vpending, deleted, links, index, dirty>>
+  /\ UNCHANGED <<fstate, vstate, vcontent, vpending, deleted, links, index, dirty, ncons>>
 
 -----------------------------------------------------------------------------
 (* Async index consumer *)

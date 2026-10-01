@@ -663,7 +663,7 @@ stateDiagram-v2
 | Worker dies after `ApplyBatch` committed, before the activity result is recorded | Retry re-runs `ApplyBatch`; every `op_key` conflicts in `consolidation_applied` → `already` | exactly-once effect (the §7 `Consolidation.tla` property) |
 | Worker dies during the LLM call | Retry repeats the call (temperature 0, not cached); a different valid answer is possible, but `batch_key`/`op_key`s are unchanged and application is one transaction per batch, so an earlier attempt applied every op or none | at most one application per batch |
 | Fact deleted between `SelectRound` and `ApplyBatch` | Re-validation drops the id; an op left without sources is skipped; the delete's own transaction already removed any `observation_sources` row citing it | no observation ever cites a deleted fact |
-| Model returns ids not shown | The op is rejected in validation; if every op is rejected the batch bisects; a persistent single-fact failure stamps `consolidation_failed_at` | bounded LLM spend (≤ 15 calls for a batch of 8) |
+| Model returns ids not shown | The op is rejected in validation; if every op is rejected the batch bisects; a persistent single-fact failure stamps `consolidation_note = 'failed'` | bounded LLM spend (≤ 15 calls for a batch of 8) |
 | Near-duplicate observations created by two parallel groups | Groups are different scopes by construction, so their observations are not duplicates *within a scope*; within a group, batches are sequential and dedup sees earlier creates | duplicates only across scopes, which is intended |
 | Namespace frozen during `ApplyBatch` | `P-frozen` retries until the mover terminates the singleton and restarts it by workflow id on the target (D5 step 5–6); the restarted execution re-selects the same unstamped facts and `consolidation_applied` rows moved with the namespace | no double application |
 | Scope at capacity | Retry with the capacity note; second overflow stamps the facts with `consolidation_note = 'capacity'` | facts stay recallable; no observation |
@@ -1040,7 +1040,7 @@ sequenceDiagram
 | Retain finalising concurrently | The advisory lock orders them: finalise-then-delete (the cascade retires what was just activated) or delete-then-finalise (`FinalizeVersion` sees `state = 'deleted'` → version `cancelled`) | never a visible resurrected version |
 | `CommitChunk` racing the cascade | It waits on the `documents` row lock; after the cascade commits it sees `deleted` → `aborted` | no post-ack insert |
 | Purge worker dies mid-batch | Transaction rolls back; retry repeats the predicate delete | exactly-once effect |
-| Consolidation `ApplyBatch` concurrent with the cascade | `ApplyBatch` step 3 locks the cited fact rows `FOR KEY SHARE`; a victim locked by the cascade blocks it, and after the cascade commits the re-read sees `retired_at` and drops the id | invariant holds under concurrency (the §7 `DeleteVsRetain.tla` case) |
+| Consolidation `ApplyBatch` concurrent with the cascade | `ApplyBatch` step 3 locks the cited fact rows `FOR KEY SHARE`; a victim locked by the cascade blocks it, and after the cascade commits the re-read sees `retired_at` and drops the id | invariant holds under concurrency (the §7 `DocLifecycle.tla` case) |
 | Blob store down during `PurgeBlobs` | `P-blob` retries; rows are already gone; operation stays `RUNNING` with `phase = purge-blobs` | eventual |
 | Namespace delete while a move is copying | Rejected at the API (`NAMESPACE_BUSY`); the operator aborts the move first | no interleaving |
 
@@ -1210,7 +1210,7 @@ namespace); a `control` queue (every worker would need every shard's credentials
 | `Copy` | activity | `(move_id, table)` — restart-per-table from heartbeat | `P-db` + `P-blob`, `ScheduleToClose` 24 h | target: `incoming` @ `e + 1` | source: one `REPEATABLE READ` snapshot; target: one tx per 10 k rows | — (the target's outbox is not written during copy) |
 | `CatchUp` | activity | `(namespace_id, seq)` in `move_applied`; cursor `move:{ns}` | `P-db`, `ScheduleToClose` 12 h | target: `incoming` @ `e + 1` | one target tx per batch of ≤ 500 events; cursor update after | — |
 | `Freeze` | activity (catalog-allowed) | state predicates (`active → frozen`) | `P-catalog` / `P-db` | source row lock waits for `FOR SHARE` holders | catalog tx; source tx | catalog event `NamespaceFrozen` |
-| `Drain` | activity | replay as `CatchUp`; `drained_workflows` upsert by workflow id; terminate idempotent | `P-db` / `P-temporal` | — | target tx per batch; catalog jsonb upsert (through `Plan`'s client) | — |
+| `Drain` | activity | replay as `CatchUp`; `terminated_workflows` upsert by workflow id; terminate idempotent | `P-db` / `P-temporal` | — | target tx per batch; catalog jsonb upsert (through `Plan`'s client) | — |
 | `Verify` | activity | pure recomputation | `P-db` | both sides static | read txs | — |
 | `Cutover` | activity (catalog-allowed) | three state-predicate updates | `P-catalog` / `P-db` | catalog `epoch = e AND state = 'frozen'` | target tx; **one catalog tx**; source tx | catalog event `NamespaceCutover` |
 | `Restart` | activity | workflow ids (`ALLOW_DUPLICATE`, `AlreadyStarted` ok) | `P-temporal` | — | none | — |

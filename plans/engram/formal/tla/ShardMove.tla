@@ -191,7 +191,7 @@ NextReplay ==
   IN {w \in cands : \A v \in cands : winfo[w].seq <= winfo[v].seq}
 
 Replay ==
-  /\ moverUp /\ mv.st \in {"catching_up", "drained"}
+  /\ moverUp /\ mv.st \in {"catching_up", "frozen"}
   /\ \E w \in NextReplay :
        /\ Resolved(mv.src, mv.ns, winfo[w].seq)
        /\ store' = [store EXCEPT ![mv.dst][mv.ns][w] = @ + 1]

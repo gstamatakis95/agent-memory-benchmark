@@ -197,7 +197,9 @@ message PreconditionFailed {
 message Precondition {
   // Stable type: "OPERATION_TERMINAL", "ETAG_MISMATCH", "DOCUMENT_INGESTING",
   // "NAMESPACE_DELETING", "SNAPSHOT_BASE_UNAVAILABLE", "PAGE_NO_VERSION",
-  // "MEMORY_NOT_A_FACT", "ALREADY_INVALIDATED", "NOT_INVALIDATED".
+  // "MEMORY_NOT_A_FACT", "ALREADY_INVALIDATED", "NOT_INVALIDATED",
+  // "TENANT_DELETING", "SCHEMA_VERSION_MISMATCH" (a move or migration refused
+  // because source and target shards run different schema versions).
   string type = 1;
   // Resource the precondition applies to (id).
   string subject = 2;

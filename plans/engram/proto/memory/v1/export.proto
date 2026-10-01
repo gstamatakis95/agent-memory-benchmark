@@ -180,4 +180,6 @@ message StreamSnapshotResponse {
   bool last = 4;
   // Hex SHA-256 of the whole file; set only when `last`.
   string sha256 = 5;
+
+  reserved 100 to 199;
 }

@@ -208,6 +208,8 @@ message RecallResponse {
     RecallResult result = 1;
     RecallStats stats = 2;
   }
+
+  reserved 100 to 199;
 }
 
 // RecallResult is one packed result in rank order.
@@ -498,6 +500,8 @@ message ReflectResponse {
     ReflectAnswer answer = 5;
     ReflectStats stats = 6;
   }
+
+  reserved 100 to 199;
 }
 
 // TokenDelta is a piece of generated text in emission order.

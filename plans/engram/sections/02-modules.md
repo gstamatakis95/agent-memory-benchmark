@@ -225,8 +225,9 @@ type NamespaceCarrier interface {
 }
 ```
 
-`Verify` failures map to `UNAUTHENTICATED`; a tenant mismatch or a namespace outside the allowlist maps to
-`NOT_FOUND` (deliberate, §1.3 step 5); a missing scope to `PERMISSION_DENIED`. For streams, the scope is fixed
+`Verify` failures map to `UNAUTHENTICATED`; a namespace of another tenant maps to `NOT_FOUND` (deliberate,
+§1.3 step 5: no existence oracle); a same-tenant namespace outside the allowlist, or a missing scope, maps to
+`PERMISSION_DENIED`; a namespace in state `deleting` maps to `FAILED_PRECONDITION`. For streams, the scope is fixed
 at open — a token expiring mid-stream does not abort the stream (Reflect can run 300 s; rejected: re-verifying
 per message, which would turn token expiry into partial results).
 
@@ -1578,7 +1579,7 @@ Mapping table (authoritative for §4 and for the retry policies in §2.2.17):
 | `errs.Kind` | gRPC code | Typed detail (`memory.v1`) | Retryable | Produced by |
 |---|---|---|---|---|
 | `Validation` | `INVALID_ARGUMENT` | `ValidationError` | no | api, chunk, extract, config, index (tags) |
-| `NotFound` | `NOT_FOUND` | `NotFound` | no | authz (tenant mismatch, by design), store |
+| `NotFound` | `NOT_FOUND` | `NotFound` | no | authz (cross-tenant namespace, by design), store |
 | `QuotaExceeded` | `RESOURCE_EXHAUSTED` | `QuotaExceeded` + `RetryInfo` | yes (after `retry_after`) | quota via authz (rates); workflows defer instead of failing (tokens/facts) |
 | `WrongShardOrEpoch` | `FAILED_PRECONDITION` | `WrongShardOrEpoch` | once (router re-resolve) | store ownership check, move fence |
 | `NamespaceFrozen` | `FAILED_PRECONDITION` | `NamespaceFrozen` | bounded (≤ 30 s) | store ownership check (write mode) |
@@ -1618,7 +1619,7 @@ workflows (the Temporal non-retryable list must be by type).
 | N2 | The move workflow `move/{namespace_id}/{epoch}` runs on task queue `shard-{target}`; the executing worker opens a second, move-scoped pool to the source (`engram_move` role: read + outbox read + ownership `FOR UPDATE`). It is the only code path allowed two shard handles. | Keeps "one task queue per shard"; the target worker is the one that must be healthy for the move to be useful. | A cell-wide `moves` queue (breaks the per-shard queue rule; harder to reason about pollers). |
 | N3 | Per-shard Temporal schedule `shard/{id}/op-sweeper` (every 60 s) starts a workflow for any `PENDING` operation older than 2 min with no workflow; the API still returns `UNAVAILABLE` when `StartWorkflow` fails after the ledger commit. | Closes the crash window between the ledger commit and `StartWorkflow` without weakening the ack. | Ack before `StartWorkflow` and rely solely on the sweeper (silently extends visibility lag). |
 | N4 | The outbox relay uses a shard-level `engram_relay` role that bypasses RLS for `SELECT` on `outbox` and `outbox_cursors` only. | The relay must read every namespace's events in `seq` order; per-namespace scans would be O(namespaces) per batch. | Running the relay under `engram_app` with a loop over namespaces. |
-| N5 | Tenant mismatch and allowlist misses return `NOT_FOUND`, not `PERMISSION_DENIED`; `PERMISSION_DENIED` is reserved for missing scopes on a namespace the caller can see. | Prevents namespace-id enumeration across tenants. | `PERMISSION_DENIED` for both (an existence oracle). |
+| N5 | A cross-tenant namespace returns `NOT_FOUND`; a same-tenant namespace outside the allowlist, or a missing scope, returns `PERMISSION_DENIED`; `deleting` returns `FAILED_PRECONDITION`. | Prevents namespace-id enumeration across tenants while keeping same-tenant misconfiguration diagnosable. | `PERMISSION_DENIED` for cross-tenant too (an existence oracle); `NOT_FOUND` for same-tenant (hides the real problem). |
 | N6 | Chunk `content_hash` = `sha256(text)` excluding the contextual header; the header hash is compared separately at `FinalizeVersion` to decide re-embedding. | Delta retain and the extraction cache survive summary drift. | Hashing header+text. |
 | N7 | Retain items with a raw body > 64 KiB store the body in blob (`…/ledger/{sha256}`) *before* the ledger transaction; the ledger row keeps the hash and key. | Keeps the ack transaction small; content addressing makes the pre-write idempotent. | Inline bodies of any size (bloats the ledger table and the tx). |
 | N8 | Streams fix `RequestScope` at open; token expiry mid-stream does not abort the stream. | Reflect may legitimately run 300 s. | Per-message re-verification. |

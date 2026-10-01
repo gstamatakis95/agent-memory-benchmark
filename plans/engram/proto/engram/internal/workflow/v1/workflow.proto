@@ -169,7 +169,8 @@ message ExtractedFact {
   // explicit "as said on" date.
   google.protobuf.Timestamp mentioned_at = 10;
   repeated EntityMention entities = 11;
-  // Extractor confidence in [0, 1]; facts < 0.3 are dropped before commit.
+  // Extractor confidence in [0, 1]; the pipeline section owns the drop
+  // threshold.
   float confidence = 12;
 }
 
@@ -248,8 +249,12 @@ message CommitChunkInput {
   EmbedChunkResult embeddings = 5;
   ResolveEntitiesResult entities = 6;
   BuildLinksResult links = 7;
-  // sha256(namespace_id ‖ epoch ‖ document_id ‖ version ‖ content_hash):
-  // the activity is a no-op when a chunk row with this key exists.
+  // sha256(namespace_id ‖ document_id ‖ version ‖ content_hash). The epoch
+  // is deliberately NOT part of the identity: after a move cutover the
+  // operation restarts at epoch e+1 on the target, where the chunks already
+  // committed at epoch e were copied, and CommitChunk must recognise them as
+  // done. The epoch is a fence (checked against namespace_ownership inside
+  // the transaction), not an identity component.
   string idempotency_key = 8;
 }
 
@@ -450,9 +455,10 @@ message ExportResult {
   bool delta_written = 4;
 }
 
-// MoveInput starts the move executor workflow (`move/{move_id}`) on the
-// worker's control task queue, not on a shard queue: it must outlive the
-// namespace's presence on either shard.
+// MoveInput starts the move executor workflow (`move/{namespace_id}/{epoch}`)
+// on the TARGET shard's task queue (`shard-{target_shard_id}`, register N2).
+// The executing worker opens a second, move-scoped pool to the source shard
+// (role `engram_move`); it is the only code path that holds two shard handles.
 message MoveInput {
   uint32 schema_version = 1;
   string move_id = 2;

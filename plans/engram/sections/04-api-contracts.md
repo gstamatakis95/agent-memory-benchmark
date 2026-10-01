@@ -1192,7 +1192,7 @@ transaction** — facts `retired_at`, `fact_links` and `entity_mentions` deleted
 `observation_sources` removed, observations with zero sources retired, observations that lost a
 source marked `stale`, `page_sources` removed and pages marked `stale_delete` — and the call
 returns only after that commits; blob deletion and physical row purge run asynchronously in the
-`PurgeWorkflow` the returned `Operation` (kind `DELETE_DOCUMENT`) tracks. The response also
+`PurgeDocument` the returned `Operation` (kind `DELETE_DOCUMENT`) tracks. The response also
 reports `facts_retired`, `observations_marked_stale` and `pages_marked_stale` so a client can see
 the cascade it caused. `expected_version` gives compare-and-delete. Deleting a document whose
 purge is already running returns the existing operation (idempotent), deleting an unknown one is

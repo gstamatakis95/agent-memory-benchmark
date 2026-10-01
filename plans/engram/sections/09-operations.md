@@ -504,7 +504,7 @@ and the command resumes from its last completed step):
    canary).
 
 **Blob GC honouring tombstones.** Deletes mark before they delete (`MarkDeleted` writes
-`{key}.tomb`, `PurgeWorkflow` then deletes both); `engramctl blob gc --shard N` runs daily,
+`{key}.tomb`, `PurgeDocument` then deletes both); `engramctl blob gc --shard N` runs daily,
 lists `{N}/**/*.tomb` older than the retire grace (1 h) and deletes object + marker; it
 is safe to run at any time, including mid-restore, because a marker is an instruction, not a
 state. Backups do not include blobs (the blob store is durable by contract, A-O12); the

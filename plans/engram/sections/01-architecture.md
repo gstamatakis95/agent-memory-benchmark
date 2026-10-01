@@ -260,7 +260,7 @@ visibility). The API does three things in one shard transaction and one Temporal
    `PENDING` operation older than 2 min with no workflow (new decision N3).
 
 The worker then executes the D11 activity chain. Every activity is idempotent by
-`(namespace_id, epoch, document_id, version, content_hash)`; per-chunk fan-out is bounded to
+`(namespace_id, document_id, version, content_hash)` (the epoch is a fence, never part of the key, D11); per-chunk fan-out is bounded to
 32 by the workflow (not by the worker's activity slots, so one large document cannot starve
 the queue).
 

@@ -91,7 +91,7 @@ message RetainItem {
   // server mints a UUIDv7 and the item becomes a standalone document (its id
   // is returned in Operation.target_id).
   string document_id = 4;
-  // Tags applied to every fact and chunk of the item; ≤ 64 tags, each
+  // Tags applied to every fact and chunk of the item; ≤ 32 tags (decision N32), each
   // 1-64 bytes, exact-match strings. Filters, never security.
   repeated string tags = 5;
   // Free-form JSON object stored verbatim (≤ 16 KiB), returned on memories,

@@ -63,6 +63,7 @@ message Event {
     RowsPurged rows_purged = 36;
     TokenUsageRecorded token_usage_recorded = 37;
     NamespacePurged namespace_purged = 38;
+    RestoreMarker restore_marker = 39;
   }
 }
 
@@ -220,4 +221,13 @@ message TokenUsageRecorded {
 message NamespacePurged {
   int64 rows_purged = 1;
   int64 blobs_purged = 2;
+}
+
+// RestoreMarker: the shard was restored from backup to `restored_to` and the
+// epoch of every namespace it hosts was bumped (decision N23); consumers
+// (external index, Kafka) reconcile from this point.
+message RestoreMarker {
+  int32 shard_id = 1;
+  google.protobuf.Timestamp restored_to = 2;
+  bool epoch_bump = 3;
 }

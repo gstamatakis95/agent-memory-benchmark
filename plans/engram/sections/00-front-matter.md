@@ -43,7 +43,7 @@ change that project's constraints.
   `as_of`, tag and type filters applied inside each arm; RRF (k = 60), a cross-encoder rerank, bounded boosts
   and token-budget packing follow; results stream as soon as the last stage that fits the deadline completes.
 - **Time travel is exact.** Facts carry `mentioned_at`; observations are versioned with
-  `effective_at = max(mentioned_at of sources)`; recall at `as_of = T` never returns anything derived from
+  `effective_at = max(mentioned_at of sources)`, clamped monotone across versions; recall at `as_of = T` never returns anything derived from
   content mentioned after T.
 - **Derived state is rebuildable and propagated through a transactional outbox** that doubles as the
   change log for shard moves. Kafka is optional and off by default.

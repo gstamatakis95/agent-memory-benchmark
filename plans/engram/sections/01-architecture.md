@@ -1,7 +1,7 @@
 ## 1. Architecture overview
 
 All names, numbers and package paths in this section come from the decision register
-(`00-decision-register.md`, cited as D1…D17). Assumptions are marked A-n; anything this
+(`00-decision-register.md`, cited as D1…D18). Assumptions are marked A-n; anything this
 section adds beyond the register is listed under "New decisions" at the end of §2.
 
 ### 1.1 Thesis, binaries and external infrastructure
@@ -25,7 +25,7 @@ every write (D2, D5), a transactional outbox is the only propagation mechanism (
 | Binary | Owns | Does *not* own | Scale unit |
 |---|---|---|---|
 | `engram-api` | gRPC + Connect on one h2c port; `authz.Interceptor`; `catalog.Resolver` cache; `router.ShardRouter` with one pgbouncer pool per shard in its cell; synchronous paths: `Recall`, `Retain` ack (ledger + operation + `StartWorkflow`), `Delete` synchronous cascade, `Get/List/Invalidate/Restore`, `NamespaceService`, `OperationService`, `ExportService.StreamSnapshot`, `PageService` reads, admin services; quota token buckets; cross-cell forwarding (phase 3). | Any LLM call except the recall reranker and the query embedding; any background loop. | N stateless replicas behind Envoy; caches are per-process and safe to lose. |
-| `engram-worker` | Temporal worker polling `shard-{id}` for every shard in its cell (2 pollers/queue, D3); all workflows and activities (`RetainDocument`, `Consolidate`, `PurgeDocument`, `PageRefresh`, `Export`, `Move`); the per-shard outbox relay (advisory-lock elected, D6); the move executor (activities of `move/{ns}/{epoch}`); the daily outbox trimmer. | Serving client RPCs; catalog calls on the hot path (D4: workflow inputs carry `(namespace_id, tenant_id, shard_id, epoch)`). | M replicas; any replica can host any queue of the cell; relays self-elect per shard. |
+| `engram-worker` | Temporal worker polling `shard-{id}` for every shard in its cell (2 pollers/queue, D3); all workflows and activities (`RetainDocument`, `Consolidate`, `PurgeDocument`, `PurgeNamespace`, `PageRefresh`, `ExportSnapshot`, `Move`); the per-shard outbox relay (advisory-lock elected, D6); the move executor (activities of `move/{ns}/{epoch}`); the daily outbox trimmer. | Serving client RPCs; catalog calls on the hot path (D4: workflow inputs carry `(namespace_id, tenant_id, shard_id, epoch)`). | M replicas; any replica can host any queue of the cell; relays self-elect per shard. |
 | `engram-mcp` | MCP server (streamable HTTP) exposing per-namespace endpoints `/mcp/{tenant_id}/{namespace_id}`; tool definitions derived from `memory.v1` protos; forwards the caller's JWT unchanged to `engram-api` over gRPC (D13). | Any authz decision, any storage access. | Stateless; scaled independently of the core. |
 | `engramctl` | Operator CLI: shard provisioning (create DB, roles, extensions, partitions, RLS policies), per-shard migration rollout, catalog registration, move start/status/rollback, backups/restores with epoch bump, namespace purge after move grace, outbox trim, cache flush. | Anything a client can do through the public API. | Run by humans/CI against the admin gRPC surface (`memory.admin.v1`) and, for DDL, directly against catalog and shard DBs with an admin role. |
 
@@ -163,13 +163,14 @@ open for every streaming call.
    whole cache once (a full flush after reconnect is the only way to guarantee no missed
    notification; rejected: replaying `catalog_events` since a watermark — more code for a
    rare event).
-5. **Ownership verify.** `entry.tenant_id == claims.tenant_id` and
-   (`"*" ∈ claims.ns` or `namespace_id ∈ claims.ns`); otherwise `NOT_FOUND` (not
+5. **Ownership verify.** `entry.tenant_id != claims.tenant_id` → `NOT_FOUND` (not
    `PERMISSION_DENIED`, so that namespace ids of other tenants are not enumerable — rationale:
    an oracle that distinguishes "exists but not yours" from "does not exist" leaks tenancy
-   information). Required scope for the method is checked next → `PERMISSION_DENIED`.
+   information). Same tenant but neither `"*" ∈ claims.ns` nor `namespace_id ∈ claims.ns` →
+   `PERMISSION_DENIED` (within a tenant, existence is not secret; N5). Required scope for the
+   method is checked next → `PERMISSION_DENIED`.
 6. **Quota gate.** Token bucket for `recalls_per_min` / `retains_per_min` keyed by tenant and
-   namespace (D13) → `RESOURCE_EXHAUSTED` + `QuotaFailure` + `RetryInfo`.
+   namespace (D13) → `RESOURCE_EXHAUSTED` + `QuotaExceeded` + `RetryInfo`.
 7. **Scope in context.** `RequestScope{tenant, namespace, shard, epoch, scopes, request_id}`
    is attached to the context; nothing downstream re-reads metadata.
 8. **Shard handle selection.** `router.For(scope)` returns the `ShardHandle` for
@@ -190,7 +191,8 @@ open for every streaming call.
 | Stale cache after a move cutover (`shard_id` or `epoch` changed) | Ownership check fails on the shard: row absent, `state='moved_out'`, or epoch mismatch → store returns `errs.WrongShardOrEpoch{expected, observed}` | The router invalidates the entry, re-resolves **once** (bypassing cache), and retries the whole handler once. A second `WrongShardOrEpoch` is returned to the client as `FAILED_PRECONDITION` + `WrongShardOrEpoch` detail (clients treat it as retryable after 1 s). Rejected: unbounded retry loops (mask catalog bugs). |
 | Namespace frozen (move step 4, D5) | Write-mode ownership check sees `state='frozen'` → `errs.NamespaceFrozen` | Writes are retried with jittered exponential backoff (100 ms → 2 s) for up to 30 s or the request deadline, whichever is earlier, re-resolving the catalog before each attempt so the retry lands on the target after cutover. Reads are not affected (frozen is readable). After the bound → `FAILED_PRECONDITION` + `NamespaceFrozen{retry_after}`. |
 | Catalog primary unavailable | Resolve miss cannot be served | Cached entries are served past TTL up to `stale_max = 10 min` (a `catalog_stale` gauge is raised); a miss (or entry older than 10 min) → `UNAVAILABLE` + `RetryInfo{2 s}` (D4). Correctness is unaffected because the shard's ownership row, not the cache, decides writability. |
-| Namespace `state ∈ {deleting, deleted}` | Catalog entry | `NOT_FOUND` for both reads and writes (D8). |
+| Namespace `state = deleting` | Catalog entry | `FAILED_PRECONDITION` + `PreconditionFailed{NAMESPACE_DELETING}` for both reads and writes while the purge runs (D8, N5). |
+| Namespace `state = deleted` (catalog tombstone) | Catalog entry | `NOT_FOUND` (the namespace is gone; within a tenant there is no existence oracle to protect). |
 | Namespace `state='moving'` (before freeze) | Catalog entry | No special handling: writes still go to the source at epoch e (D5 step 1). |
 | Shard not in this cell | `router.For` | Forward (phase 3) or `UNAVAILABLE` + `ErrorInfo{reason:"SHARD_NOT_LOCAL"}` in MVP (single cell, so this indicates a catalog misconfiguration). |
 
@@ -245,10 +247,10 @@ visibility). The API does three things in one shard transaction and one Temporal
 1. `store.WithNamespaceTx(write)`: insert `idempotency_keys(request_id)` (24 h, D1) — a
    duplicate returns the stored `operation_id` immediately; append the `ingest_ledger` row
    (raw item body ≤ 64 KiB inline, larger bodies referenced by blob key
-   `{shard}/{tenant}/{ns}/raw/{sha256}`; the blob `Put` happens *before* the transaction and
+   `{shard}/{tenant}/{ns}/ledger/{sha256}` (N7); the blob `Put` happens *before* the transaction and
    is content-addressed so a retry re-puts the same key); insert `documents`/`document_versions`
    (`status='ingesting'`, D8) and the `operations` row (`state=PENDING`); write one outbox
-   event `OperationSubmitted`. Commit.
+   event `DocumentVersionStarted`. Commit.
 2. `StartWorkflow(RetainDocument, id="ns/{namespace_id}/op/{operation_id}",
    task_queue="shard-{shard_id}", WorkflowIdReusePolicy=RejectDuplicate)` with input
    `(namespace_id, tenant_id, shard_id, epoch, document_id, version, ledger_ref)`;
@@ -276,7 +278,7 @@ sequenceDiagram
   participant G as AI gateway
 
   C->>API: Retain(items, request_id, deadline)
-  API->>B: Put raw/{sha256} (content-addressed, idempotent)
+  API->>B: Put ledger/{sha256} if body > 64 KiB (content-addressed, idempotent)
   API->>DB: tx: idempotency_keys, ingest_ledger, document_versions(ingesting), operations(PENDING), outbox
   DB-->>API: COMMIT
   API->>T: StartWorkflow RetainDocument id=ns/{ns}/op/{op} queue=shard-N
@@ -391,8 +393,8 @@ than an error, and the client can see `stage` per result.
    `observation_sources` rows citing those facts — the D12 trigger retires observations whose
    source count reaches 0, and observations that lost ≥ 1 source but still have sources are
    marked `stale=true`; delete `page_sources` rows and mark affected pages
-   `stale_delete=true`; insert `operations(kind=DELETE, state=RUNNING)`; write outbox events
-   `FactsRetired`, `DocumentDeleted`. Commit.
+   `stale_delete=true`; insert `operations(kind=DELETE_DOCUMENT, state=RUNNING)` and the `deletion_log` row (N21);
+   write the outbox event `DocumentDeleted`. Commit.
 2. `StartWorkflow(PurgeDocument, id="ns/{ns}/op/{operation_id}", queue shard-{id})` with
    grace 0 for explicit delete (1 h for retire-by-replace).
 3. Return `Operation{RUNNING}`.
@@ -416,9 +418,9 @@ the resource to span shards.
 |---|---|---|
 | Postgres database | One instance per shard, DB `engram`, role `engram_app` (`NOBYPASSRLS`), 16 hash partitions by `namespace_id` on the big tables | A connection belongs to one instance; `namespace_id` leads every PK/index; RLS policy on `current_setting('engram.namespace_id')`. |
 | pgbouncer | One sidecar per shard, transaction pooling; one pool per shard per process, 16 conns (D3) | `ShardHandle.Pool` is created from the shard's DSN only; there is no "any shard" pool. |
-| Blob prefix + credential | `{shard}/{tenant}/{ns}/{raw,xcache,pages,export,ledger-overflow}/…`; one credential per shard scoped to `{shard}/*` (A-4: the blob store supports prefix-scoped credentials; otherwise per-shard buckets) | `blob.Scoped(store, prefix)` rejects any key outside its prefix at the client; the credential rejects it at the server. |
+| Blob prefix + credential | `{shard}/{tenant}/{ns}/{ledger,xcache,docsum,consolidate,pages,export,staging}/…` (§3.6); one credential per shard scoped to `{shard}/*` (A-4: the blob store supports prefix-scoped credentials; otherwise per-shard buckets) | `blob.Scoped(store, prefix)` rejects any key outside its prefix at the client; the credential rejects it at the server. |
 | Search index | HNSW + BM25 + pg_trgm indexes on the shard's own tables (`Transactional`); for an external engine (`Async`), index name `engram-shard-{id}` fed only by that shard's outbox relay | The index object is a field of the `ShardHandle`; the relay for shard N only reads shard N's outbox. |
-| Temporal task queue + workflow ids | Queue `shard-{id}`. Ids: `ns/{namespace_id}/op/{operation_id}` (retain, delete/purge, export), `ns/{namespace_id}/consolidate` (singleton per namespace, `SignalWithStart`), `ns/{namespace_id}/page/{page_id}` (refresh), `shard/{id}/outbox-relay` (lease-holder record, not a workflow — the relay is a goroutine, see §2.2), `shard/{id}/op-sweeper` (schedule), `move/{namespace_id}/{epoch}` (runs on `shard-{target}`) | Workflow inputs carry `(namespace_id, tenant_id, shard_id, epoch)` and every activity re-derives its `ShardHandle` from `shard_id` and re-checks ownership; a workflow started on the wrong queue fails its first activity with `WrongShardOrEpoch` (non-retryable). |
+| Temporal task queue + workflow ids | Queue `shard-{id}`. Ids: `ns/{namespace_id}/op/{operation_id}` (retain, delete/purge, export), `ns/{namespace_id}/purge/{document_id}/{v}` (replace-retire purge child, §5.4.2), `ns/{namespace_id}/consolidate` (singleton per namespace, `SignalWithStart`), `ns/{namespace_id}/page/{page_id}` (refresh), `shard/{id}/outbox-relay` (lease-holder record, not a workflow — the relay is a goroutine, see §2.2), `shard/{id}/op-sweeper` (schedule), `move/{namespace_id}/{epoch}` (runs on `shard-{target}`) | Workflow inputs carry `(namespace_id, tenant_id, shard_id, epoch)` and every activity re-derives its `ShardHandle` from `shard_id` and re-checks ownership; a workflow started on the wrong queue fails its first activity with `WrongShardOrEpoch` (non-retryable). |
 | Kafka topic/key (optional) | Topic `engram.events.shard-{id}`, key `namespace_id`, value `engram.internal.events.v1.Event`, header `schema=…` (D6) | Producer is the shard's relay; per-namespace ordering follows from the key. |
 | In-process caches | Catalog resolver keyed by `namespace_id` (holds the shard, so it *maps* to shards, it does not span them); per-shard pools keyed by `shard_id`; embedding LRU keyed `(namespace_id, sha256(prefixed text))`; JWKS keyed by `kid`; extraction cache is in blob, per namespace | Cache keys include the namespace; a cache entry never carries data of another namespace, and the embedding cache stores a vector of the *query*, never of stored content. Rejected: a global embedding cache keyed by text (timing side channel between tenants, D11 rationale). |
 | Metrics labels | `shard="7"` on every metric; `tenant` only on metering counters; never `namespace` (D13) | Label values come from `ShardHandle.Metrics`; a linter in `internal/telemetry` rejects any metric registered with a `namespace` label. |
@@ -466,7 +468,7 @@ writing (A-5).
 | Retrieval arms | semantic, keyword (BM25), graph, temporal | the same four plus a raw-chunk arm (BM25 ∪ HNSW over chunks) | **improved** — text the extractor missed is still findable |
 | Fusion + rerank | RRF, cross-encoder rerank | RRF k=60, gateway cross-encoder on top 50/150/300 with deadline-aware skip | **same** idea; **improved** by streaming + explicit `stage` per result |
 | `as_of` | not a first-class query-time filter | `mentioned_at ≤ T` inside every arm; versioned observations with `effective_at` | **improved** — required for leak-free evals |
-| Observations | single evolving text with sources and history | `observation_versions` with `effective_at = max(mentioned_at of cited facts)`; never outlive sources (DB trigger) | **improved** — time-travel and a provable "no orphan observation" invariant |
+| Observations | single evolving text with sources and history | `observation_versions` with `effective_at = max(mentioned_at of cited facts)`, clamped monotone across versions (D9); never outlive sources (DB trigger) | **improved** — time-travel and a provable "no orphan observation" invariant |
 | Extraction | 1 structured LLM call per chunk, ~32 parallel | same, plus a content-addressed per-namespace extraction cache in blob and batch-API backfills | **improved** — re-indexing never re-pays extraction |
 | Chunking | ~3 000 chars, no overlap | heading-anchored content-defined boundaries + contextual header (summary + heading path) | **improved** — better section fidelity and embedding context |
 | Change propagation | direct writes to the store/index | transactional outbox per shard; index/Kafka/move are consumers | **different** — no dual writes; the outbox doubles as the move log |

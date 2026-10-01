@@ -13,13 +13,14 @@ a Hindsight prompt, the verified excerpts are kept and the rest is own text, mar
 **Registry.** Prompts live as files under `internal/<pkg>/prompts/<name>/v<N>.txt` with a
 sibling `v<N>.schema.json`, embedded with `embed.FS` and addressed by the string
 `PromptID = "<name>/v<N>"` (`extract/v1`, `summarize/v1`, `consolidate/v1`,
-`dedup_adjudicate/v1`, `reflect/v1`, `reflect_structured/v1`, `page_delta/v1`,
+`dedup_adjudicate/v1`, `reflect/v1`, `reflect_structured/v1`, `page/v1`,
 `page_full/v1`, `judge/v1`). A unit test pins `sha256(text ‖ schema)` per id: changing a
 file without bumping `N` fails CI. A file, once released, is never edited.
 
 **Where the version is stored.** `facts.prompt_version` and `chunks.extraction_key`
-(`prompt_version ‖ model ‖ schema_version`, PD-3), `observation_versions.prompt_version`,
-`page_versions.prompt_version`, `document_versions.summary_prompt_version`, every
+(`sha256(content_hash ‖ prompt_version ‖ model ‖ schema_version)`, N26), `observation_versions.prompt_version`,
+the page markdown's front matter (`page_versions` holds the blob key), `documents.summary_blob_key`
+(the `docsum/` key embeds the prompt version), every
 `token_usage_events` row (`op` = prompt id), and every cache key (`xcache`:
 `sha256(chunk_hash ‖ prompt_version ‖ model ‖ schema_version)`, D11).
 
@@ -38,7 +39,7 @@ when).
 
 **Model classes (D15).** `models.extract` / `models.consolidate`: a fast structured-output
 class (summarize, extract, consolidate, dedup, reflect_structured). `models.reflect`: a
-stronger class (reflect, page_delta, page_full). The judge used by evaluation is a third
+stronger class (reflect, page, page_full). The judge used by evaluation is a third
 pinned id (`evals/judge.lock`), never the model under test.
 
 **Output discipline.** Every structured prompt is called through
@@ -65,7 +66,7 @@ regression table of the prompt passes; results are committed next to the goldens
 | Model class | `models.extract` (fast structured) |
 | Temperature | 0.0 |
 | Inputs | `title` (optional), `outline` (heading paths, ≤ 50), `head` (first 6 000 chars), `tail` (last 1 000 chars), `language_hint` |
-| Cache | `xcache/sum-{sha256(document_hash ‖ "summarize/v1" ‖ model)}` |
+| Cache | `docsum/{sha256(document_hash ‖ "summarize/v1" ‖ model)}.json` (§3.6) |
 | Max output tokens | 120 |
 
 Output schema:
@@ -149,7 +150,7 @@ Output schema (JSON Schema, `schema_version = 1`):
         "type": "object", "additionalProperties": false, "required": ["name", "type"],
         "properties": {
           "name": { "type": "string", "maxLength": 256 },
-          "type": { "enum": ["person", "organization", "place", "product", "project",
+          "type": { "enum": ["person", "organization", "location", "product",
                              "event", "concept", "other"] } } } },
       "causal_relations": { "type": "array", "maxItems": 4, "items": {
         "type": "object", "additionalProperties": false,
@@ -255,7 +256,8 @@ relative expression.
 ENTITIES
 ══════════════════════════════════════════════════════════════════════════
 "entities" is an array of objects {"name", "type"}; use [] when the fact names nothing.
-Types: person, organization, place, product, project, event, concept, other.
+Types: person, organization, location, product, event, concept, other (a project or an
+initiative is a "concept"; these are the `entities.entity_type` values).
 Include people, organizations, places, key products/projects, and important abstract concepts
 (career, friendship). Always include {"name": "user", "type": "person"} when the fact is
 about the user. Use the fullest form of the name that appears in the content; never invent
@@ -655,9 +657,9 @@ answer is still returned).
 
 ---
 
-### 6.6 `page_delta/v1` and `page_full/v1`
+### 6.6 `page/v1` and `page_full/v1`
 
-#### 6.6.1 `page_delta/v1` — integrate evidence changes into an existing page
+#### 6.6.1 `page/v1` — integrate evidence changes into an existing page (the D15 page prompt)
 
 | Field | Value |
 |---|---|
@@ -813,7 +815,7 @@ chars/token) and include the system prompt.
 | `dedup_adjudicate/v1` | ≈ 150 | ≈ 250 | 100 (600) | fast |
 | `reflect/v1` | ≈ 1 200 (+ directives) | ≈ 6 000 per iteration of tool results, cumulative; typical session 6 iterations ≈ 40 k input total, 90 % cache-hit on the prefix | 1 500 (4 096) + tool-call tokens ≈ 600 | strong |
 | `reflect_structured/v1` | ≈ 120 | ≈ 2 000 | 300 (schema-bound) | fast |
-| `page_delta/v1` | ≈ 600 | ≈ 4 000 (page + evidence) | 800 (4 000) | strong |
+| `page/v1` | ≈ 600 | ≈ 4 000 (page + evidence) | 800 (4 000) | strong |
 | `page_full/v1` | ≈ 250 | ≈ 6 000 | 1 500 (`max_tokens`) | strong |
 
 | Unit of work | Calls | Cost (A-P3) |
@@ -825,5 +827,5 @@ chars/token) and include the system prompt.
 | One LongMemEval-S conversation (≈ 115 k tokens ≈ 150 chunks) retained + consolidated | 150 extracts + ≈ 40 consolidation batches | ≈ $0.11 + $0.03 ≈ **$0.14** (batch API ≈ $0.09); per question via Reflect ≈ $0.04 |
 
 Budget enforcement: `llm_tokens_per_day` (D13) counts prompt + completion tokens of every
-call above through `token_usage` (PD-1); the per-call caps in the first table bound the worst
+call above through `token_usage` (PD-1 / N25); the per-call caps in the first table bound the worst
 case of a single activity so one pathological chunk cannot consume a namespace's day.

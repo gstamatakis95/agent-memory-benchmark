@@ -6,7 +6,7 @@ is checked, where a transaction begins and ends, which outbox events leave the t
 what a crash at any point leaves behind. Tables are referenced by the names of §3 and messages
 by the names of §4; neither DDL nor protos are restated. Every decision that is not already a
 row of the register is collected under "New decisions" at the end (numbered `PD-n`,
-pipeline decisions, proposed for D18 as `N15+`; they never reuse a D18 number).
+pipeline decisions; the register's D18 adopted them as N25–N31, and the table says which).
 
 ### 5.0 Conventions shared by every pipeline
 
@@ -14,7 +14,7 @@ pipeline decisions, proposed for D18 as `N15+`; they never reuse a D18 number).
 than `workflow.Now`, no randomness other than `workflow.SideEffect`. Every activity is a method
 on a struct that holds a `router.ShardRouter`; it derives its `ShardHandle` from the
 `shard_id` in the workflow input (`ForShard`), never from the catalog (D4). Every workflow input
-embeds `workflowv1.NamespaceScope{namespace_id, tenant_id, shard_id, epoch}` and every
+embeds `workflowv1.WorkflowScope{namespace_id, tenant_id, shard_id, epoch, blob_prefix}` and every
 workflow sets the Temporal search attributes `NamespaceId`, `TenantId`, `Epoch`,
 `OperationKind`, `OperationId` at start (they are what the move drain and the namespace delete
 query, §5.4–5.5).
@@ -52,7 +52,7 @@ chain; `StartToClose` bounds one attempt):
 
 **Transaction-boundary column values.** `none` (pure or blob/gateway only), `read tx` (RLS,
 `active|frozen`), `write tx` (fenced, `active`), `target tx (incoming)` (move only),
-`catalog tx`, `admin tx` (role `engram_maint`, `BYPASSRLS`, used only by the mover's cleanup,
+`catalog tx`, `admin tx` (role `engram_admin`, `BYPASSRLS`, used only by the mover's cleanup,
 the namespace purge and per-shard sweepers that must enumerate namespaces).
 
 **Operation rows.** Activities update `operations` with absolute values (`state`,
@@ -106,7 +106,7 @@ UUIDv5 namespace (`uuid5(operation_id, document_id)`) when the request spans sev
 steps below run once per document, all documents of a request inside one shard transaction
 (step 4) so the ack is all-or-nothing for the request.
 
-1. **Validate**: `content` ≤ 4 MiB, `document_id` ≤ 256 B, ≤ 32 tags × 64 B, `timestamp`
+1. **Validate**: `content` ≤ 1 MiB (≤ 8 MiB per request, §4.1.8), `document_id` ≤ 256 B, ≤ 32 tags × 64 B (N32), `timestamp`
    parses (default `now()`), `update_mode ∈ {REPLACE, APPEND}`, `entities` hints ≤ 64,
    deadline present, scope `memory.write`. Failures → `INVALID_ARGUMENT` + `ValidationError`.
 2. **Rate quota**: `retains_per_min` token bucket, tenant then namespace →
@@ -120,17 +120,17 @@ steps below run once per document, all documents of a request inside one shard t
    1. `INSERT idempotency_keys(namespace_id, method, request_id, request_hash, operation_id, expires_at = now() + 24 h) ON CONFLICT (namespace_id, method, request_id) DO NOTHING` (D1: the key is scoped to tenant, namespace and method).
       Conflict → read the row: same `request_hash` → return its operation and stop;
       different → `ALREADY_EXISTS` + `OperationConflict{IDEMPOTENCY_KEY_REUSED}`.
-   2. `INSERT ingest_ledger(namespace_id, ledger_id uuidv7, document_id, content_hash, raw_inline | raw_key, item_timestamp, context, tags, metadata, entity_hints, update_mode, observation_scope, request_id, operation_id)`.
-   3. `INSERT documents(namespace_id, document_id, next_version = 1, current_version = 0, state = 'live') ON CONFLICT (namespace_id, document_id) DO UPDATE SET next_version = documents.next_version + 1 RETURNING next_version AS v, current_version, state`.
+   2. `INSERT ingest_ledger(namespace_id, ledger_id uuidv7, document_id, content_hash, content_bytes, body | body_blob_key, item_timestamp, context, tags, metadata, entity_hints, update_mode, request_id, operation_id)` (§3.3.3 column list).
+   3. `INSERT documents(namespace_id, document_id, current_version = 0, state = 'active') ON CONFLICT (namespace_id, document_id) DO UPDATE SET updated_at = now() RETURNING current_version, state` (the `DO UPDATE` takes the row lock), then `v = coalesce(max(version), 0) + 1` over `document_versions` of the document.
       This assigns the **version** under the document's row lock, so versions are dense and
-      monotone per document (D8). `state = 'deleted'` → `ABORTED` +
+      monotone per document (D8). `state <> 'active'` (`deleting`/`deleted`) → `ABORTED` +
       `OperationConflict{DOCUMENT_PURGING}` (the purge must finish before the id is reused).
       For `APPEND`, `append_base_version = current_version` is recorded on the ledger row.
    4. `INSERT document_versions(namespace_id, document_id, version = v, content_hash, status = 'ingesting', operation_id, ledger_id)`.
-   5. `INSERT operations(namespace_id, operation_id, kind = RETAIN_DOCUMENT, state = PENDING, target_id = document_id, request_id, config_snapshot)`.
+   5. `INSERT operations(namespace_id, operation_id, kind = RETAIN_DOCUMENT, state = PENDING, target_id = document_id, request_id, workflow_id, task_queue, submitted_epoch)` (the `config_snapshot` travels in the workflow input, N25, not in the row).
       A client-supplied `operation_id` that already exists with a different `request_hash`
       → `ALREADY_EXISTS` + `OperationConflict{IDEMPOTENCY_KEY_REUSED}`.
-   6. `INSERT outbox(namespace_id, epoch, event_type = OperationSubmitted, payload)`. Commit.
+   6. `INSERT outbox(event_type = DocumentVersionStarted, payload)` (`namespace_id`, `tenant_id` and `epoch` default from the transaction scope, §3.3.2). Commit.
 5. **Start the workflow**: `ExecuteWorkflow(RetainDocument, WorkflowID = "ns/{ns}/op/{op}",
    TaskQueue = "shard-{shard}", WorkflowIdReusePolicy = REJECT_DUPLICATE,
    WorkflowIdConflictPolicy = USE_EXISTING, input = {scope, document_id, version = v,
@@ -145,14 +145,15 @@ steps below run once per document, all documents of a request inside one shard t
    any `PENDING` operation older than 2 min without an execution.
 
 `config_snapshot` (≤ 1 KiB: model ids, prompt ids, `chunk.*`, quota keys) is resolved from the
-catalog entry at submit time and carried in the workflow input (PD-2). Rationale: workers must
+catalog entry at submit time and carried in the workflow input (PD-2, adopted as N25; in
+`RetainDocumentInput` it is the `models` + `chunk_target_chars` fields). Rationale: workers must
 not call the catalog (D4) and a configuration change must apply deterministically to
 operations submitted after it, not to a workflow mid-flight. Rejected: workers reading
 `namespaces.config` per activity (catalog on the hot path; non-deterministic mid-run changes).
 
 #### 5.1.2 Workflow `RetainDocument`
 
-Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode, mode, config_snapshot, resume{next_chunk, manifest_key, counters}}`.
+Input `RetainDocumentInput{scope, operation_id, document_id, version v, update_mode, ledger_ids, models, chunk_target_chars, tags, …}` (§4; `models` + `chunk_target_chars` are the N25 `config_snapshot`); the continue-as-new state `resume{next_chunk, manifest_key, counters}` is workflow-local.
 
 1. **`LoadItem`** (read tx + blob get): the ledger row (and raw blob), the current active
    version's chunk hash set (delta statistics), and for `APPEND` the base version's body
@@ -167,7 +168,7 @@ Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode
    activity result is `{manifest_key, chunk_count}` so the workflow payload stays under 2 KiB
    regardless of document size. Deterministic: a re-execution overwrites the same bytes.
 3. **`SummarizeDocument`** (gateway, cached): key
-   `{prefix}/xcache/sum-{sha256(document_hash ‖ "summarize/v1" ‖ model)}.json`. Miss →
+   `{prefix}/docsum/{sha256(document_hash ‖ "summarize/v1" ‖ model)}.json` (§3.6). Miss →
    `ChatStructured(summarize/v1)` → ≤ 200 chars → blob put. `PermanentLLMError` (content
    policy, schema refusal) is **not fatal**: the summary falls back to the first heading or
    the first 200 chars and the version is flagged `summary_fallback = true`.
@@ -176,8 +177,8 @@ Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode
    = ANY($1)` plus `document_version_chunks` membership for version `v`. Classifies each
    chunk as `member` (already committed for `v` — the restart path), `live` (unchanged:
    membership row only), `retired` (un-retire, no LLM), `stale_extraction` (same hash but an
-   older `extraction_key = prompt_version ‖ model ‖ schema_version` than the config
-   snapshot's: treated as `absent`, PD-3), or `absent`. Delta retain (D8) is this
+   older `extraction_key = sha256(content_hash ‖ prompt_version ‖ model ‖ schema_version)` than the config
+   snapshot's: treated as `absent`, PD-3 / N26), or `absent`. Delta retain (D8) is this
    classification. `content_hash = sha256(text)` excludes the contextual header (N6), so a
    changed document summary or heading path never causes re-extraction; the header hash is
    compared at `FinalizeVersion` (step 7) and only triggers re-embedding.
@@ -210,10 +211,11 @@ Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode
       indices point to earlier facts, timestamps parse, text ≤ 2 000 chars, language
       preserved) → blob put (same key: idempotent) → return `{facts, usage}`.
       `PermanentLLMError` or validation failure after one repair attempt → returns
-      `chunk_failed{reason}` as a *result*, not an error: the workflow records it in
-      `operation_errors(operation_id, content_hash, reason)` and continues; the operation
-      finishes `SUCCEEDED` with `progress.units_failed > 0` (the proto has no
-      `SUCCEEDED_WITH_ERRORS` state; §1.4's mention of one should read this way).
+      `chunk_failed{reason}` as a *result*, not an error: the workflow records the chunk's
+      `content_hash` and reason in the operation row (`operations.error`, the §3.3.7
+      `google.rpc.Status` JSON; there is no separate error table) and continues; the operation
+      finishes `SUCCEEDED` with `progress.units_failed > 0` (N35: the proto has no other state
+      for a partial failure).
    2. **`EmbedChunk`** (blob + gateway): texts = `search_document: {header}\n{fact.text}`
       for each fact and `search_document: {header}\n{chunk text}`; `EmbedBatch` ≤ 64 texts
       per call, L2-normalised by the client, `halfvec(768)`. Per-namespace embedding cache
@@ -224,8 +226,8 @@ Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode
    3. **`ResolveEntities`** (read tx): per extracted entity `{name, type}`: normalise (NFKC,
       collapse whitespace, trim, drop names > 256 chars as extraction artefacts), then
       (a) exact hit in `entity_aliases(namespace_id, alias_norm)`; else (b)
-      `SELECT entity_id, canonical_name, similarity(canonical_name_norm, $q) FROM entities
-      WHERE namespace_id = $1 AND type = $2 AND canonical_name_norm % $q ORDER BY 3 DESC
+      `SELECT entity_id, canonical_name, similarity(canonical_norm, $q) FROM entities
+      WHERE namespace_id = $1 AND entity_type = $2 AND merged_into IS NULL AND canonical_norm % $q ORDER BY 3 DESC
       LIMIT 5` with `SET LOCAL pg_trgm.similarity_threshold = 0.3`; accept the best
       candidate at similarity ≥ 0.6 for a matching type, ≥ 0.85 when either side's type is
       `unknown`; else (c) plan a create. Intra-chunk merge: two planned creates of the same
@@ -233,9 +235,9 @@ Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode
       item) are force-resolved with their given type. **Type match is mandatory**: `person`
       never merges with `organization`, whatever the string similarity. Output per mention:
       `{entity_id | new{canonical, type}, alias}`; the create-or-merge itself happens in
-      `CommitChunk` (`INSERT … ON CONFLICT (namespace_id, type, canonical_name_norm) DO UPDATE
-      SET mention_count = mention_count + 1 RETURNING entity_id` resolves both cases; aliases
-      `ON CONFLICT DO NOTHING`). Rationale for 0.6 over Hindsight's 0.15: trigram similarity
+      `CommitChunk` (`INSERT … ON CONFLICT (namespace_id, canonical_norm) WHERE merged_into IS NULL DO UPDATE
+      SET mention_count = entities.mention_count + 1, last_seen_at = now() RETURNING entity_id` resolves both
+      cases, §3.8; aliases `ON CONFLICT DO NOTHING`). Rationale for 0.6 over Hindsight's 0.15: trigram similarity
       at 0.15 merges "Ann" with "Anna Ng" and, worse, across tenants' worth of short names
       within a namespace; 0.6 plus the alias table keeps recall for spelling variants.
       Rejected: LLM adjudication of entity merges (cost per chunk, and the extractor already
@@ -250,26 +252,28 @@ Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode
       extraction, directed, weight 1.0. Links to retired or invalidated facts are never built.
    5. **`CommitChunk`** (fenced write tx), statement order:
       1. `WithNamespaceTx(write)` — ownership `FOR SHARE` at the caller's epoch.
-      2. `SELECT state, current_version FROM documents WHERE … FOR SHARE`. `state = 'deleted'`
+      2. `SELECT state, current_version FROM documents WHERE … FOR SHARE`. `state <> 'active'`
          → return `aborted{document_deleted}`; `current_version > v` → return `superseded`
          (the workflow skips straight to step 7 — this closes the window in which a slow
          older version could resurrect a chunk the newer version retired).
       3. `SELECT 1 FROM document_version_chunks WHERE (namespace_id, document_id, v, h)` →
          exists → `COMMIT`, return `already` (the exactly-once guard for this transaction).
-      4. `INSERT chunks(namespace_id, chunk_id uuidv7, document_id, content_hash = h, index,
-         text, header, heading_path, mentioned_at, embedding, extraction_key)
+      4. `INSERT chunks(namespace_id, chunk_id uuidv7, document_id, content_hash = h, header_hash, ordinal,
+         text, header, heading_path, tags, mentioned_at, embedding, embedding_model, extraction_key)
          ON CONFLICT (namespace_id, document_id, content_hash) DO UPDATE SET retired_at = NULL,
-         purge_after = NULL, index = EXCLUDED.index, extraction_key = EXCLUDED.extraction_key
-         RETURNING chunk_id, (xmax = 0) AS inserted`. `retired` → un-retired here, and
+         purge_after = NULL, ordinal = EXCLUDED.ordinal, header = EXCLUDED.header, header_hash = EXCLUDED.header_hash,
+         embedding = EXCLUDED.embedding, extraction_key = EXCLUDED.extraction_key
+         RETURNING chunk_id, (created_at = now()) AS inserted` (the §3.8 idiom: `xmax` is not
+         readable in `RETURNING` on a partitioned table). `retired` → un-retired here, and
          `UPDATE facts SET retired_at = NULL, purge_after = NULL WHERE chunk_id = … AND
          extraction_key = $current` (facts of an older extraction key stay retired).
       5. If `inserted` or the chunk has no live facts under the current `extraction_key`:
          `INSERT facts(memory_id uuidv7, …, mentioned_at, occurred_start, occurred_end, tags,
          embedding, prompt_version, extraction_key, document_id, chunk_id)`; entities
          (`ON CONFLICT DO UPDATE … RETURNING`); `entity_aliases`; `entity_mentions`;
-         `fact_links … ON CONFLICT DO NOTHING`, inserted in `(LEAST(from,to),
-         GREATEST(from,to), link_type, entity_id)` order so two concurrent chunks never
-         deadlock (undirected types are stored once with `from < to`; `causal` is directed).
+         `fact_links … ON CONFLICT DO NOTHING`, inserted in `(src_memory_id, dst_memory_id,
+         link_type)` order so two concurrent chunks never deadlock (undirected types are
+         stored once with `src_memory_id < dst_memory_id`; `causal` is directed, N34).
       6. `INSERT document_version_chunks(namespace_id, document_id, v, h, chunk_id)`.
       7. `token_usage_events` / `token_usage` for the extract and embed calls (PD-1);
          `UPDATE namespace_stats SET live_facts = live_facts + $n`;
@@ -283,8 +287,8 @@ Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode
 7. **`FinalizeVersion`** (fenced write tx) — the per-document serialisation point:
    1. ownership `FOR SHARE`.
    2. `SELECT pg_advisory_xact_lock(hashtextextended(namespace_id || '/' || document_id, 0))`.
-   3. `SELECT current_version AS c, state FROM documents … FOR UPDATE`. `state = 'deleted'`
-      → mark the version `cancelled`, operation `CANCELLED{document_deleted}`, commit, return.
+   3. `SELECT current_version AS c, state FROM documents … FOR UPDATE`. `state <> 'active'`
+      → mark the version `deleted`, operation `CANCELLED{document_deleted}`, commit, return.
    4. **Case `v > c` (this version wins):** `UPDATE chunks SET retired_at = now(),
       purge_after = now() + 1 h WHERE namespace_id AND document_id AND retired_at IS NULL AND
       content_hash NOT IN (SELECT content_hash FROM document_version_chunks WHERE version =
@@ -295,8 +299,8 @@ Input `RetainDocumentInput{scope, document_id, version v, ledger_id, update_mode
       they are invisible, and keeping them makes un-retire within the 1 h grace free.
       `documents.current_version = v`; `document_versions(v).status = 'active'`,
       `document_versions(c).status = 'superseded'`; `namespace_stats.live_facts` adjusted;
-      outbox `DocumentVersionActivated{document_id, v, retired_chunk_ids, retired_fact_ids}`
-      + `FactsRetired`. **Header check (N6)**: `SELECT content_hash FROM chunks WHERE
+      outbox `ChunksRetired{document_id, v, chunk_ids, fact_ids}` +
+      `DocumentVersionActivated{document_id, v, superseded_version}`. **Header check (N6)**: `SELECT content_hash FROM chunks WHERE
       namespace_id AND document_id AND retired_at IS NULL AND header_hash <> $new_header_hash`
       for the member chunks → returned as `reembed_hashes` (the chunk text is unchanged, so
       extraction is not repeated; only the header-prefixed embeddings are stale). Commit.
@@ -345,11 +349,11 @@ once) and only embedding/commit work is duplicated.
 |---|---|---|---|---|---|---|
 | API validate + quota | handler | — | client retry | authz interceptor resolves shard+epoch | none | — |
 | Raw blob put (> 64 KiB) | handler | `ledger/{sha256(content)}` (N7) | client retry | — | none | — |
-| Ledger + version + operation | handler | `(namespace_id, method, request_id)`; `(namespace_id, operation_id)` | client retry with same `request_id` | `FOR SHARE` active @ epoch | write tx | `OperationSubmitted` |
+| Ledger + version + operation | handler | `(namespace_id, method, request_id)`; `(namespace_id, operation_id)` | client retry with same `request_id` | `FOR SHARE` active @ epoch | write tx | `DocumentVersionStarted` |
 | Start workflow | handler | workflow id `ns/{ns}/op/{op}` (`USE_EXISTING`) | client retry; op-sweeper N3 | — | none | — |
 | `LoadItem` | activity | `(ns, doc, v)` | `P-db` | read fence | read tx | — |
 | `Chunk` | activity | `(ns, doc, v)` → same manifest bytes | `P-pure` | none | none | — |
-| `SummarizeDocument` | activity | xcache `sum-…` key | `P-llm` | none | none | — |
+| `SummarizeDocument` | activity | `docsum/…` key | `P-llm` | none | none | — |
 | `PlanChunks` | activity | `(ns, doc, v)` | `P-db` | read fence | read tx | — |
 | `CheckQuota` | activity | `(ns, doc, v, wave)` | `P-db` | read fence | read tx | — |
 | `ExtractChunk` | activity | xcache key `sha256(h ‖ prompt ‖ model ‖ schema)` | `P-llm` | none | none | — |
@@ -357,9 +361,9 @@ once) and only embedding/commit work is duplicated.
 | `ResolveEntities` | activity | `K` | `P-db` | read fence | read tx | — |
 | `BuildLinks` | activity | `K` | `P-db` | read fence | read tx | — |
 | `CommitChunk` | activity | `K` via `document_version_chunks` | `P-frozen` | `FOR SHARE` active @ epoch + document state | write tx | `ChunkCommitted` |
-| `FinalizeVersion` | activity | `(ns, doc, v)` + advisory lock | `P-frozen` | `FOR SHARE` active @ epoch | write tx | `DocumentVersionActivated`, `FactsRetired` |
-| `ReembedChunk` (N6) | activity | `(K, header_hash)` | `P-embed` / `P-frozen` | `FOR SHARE` active @ epoch | write tx | `ChunkReembedded` |
-| `MarkOperation` SUCCEEDED | activity | `(ns, op)` monotone state | `P-db` | `FOR SHARE` active @ epoch | write tx | `OperationFinished` |
+| `FinalizeVersion` | activity | `(ns, doc, v)` + advisory lock | `P-frozen` | `FOR SHARE` active @ epoch | write tx | `ChunksRetired`, `DocumentVersionActivated` |
+| `ReembedChunk` (N6) | activity | `(K, header_hash)` | `P-embed` / `P-frozen` | `FOR SHARE` active @ epoch | write tx | `ChunkCommitted` (re-emitted; consumers re-read the chunk by id) |
+| `MarkOperation` SUCCEEDED | activity | `(ns, op)` monotone state | `P-db` | `FOR SHARE` active @ epoch | write tx | — (operations are read by id) |
 | Nudge consolidate | workflow | signal is idempotent (debounced) | Temporal | — | none | — |
 
 #### 5.1.4 Sequence
@@ -378,10 +382,10 @@ sequenceDiagram
  T->>W: RetainDocument scope, doc, v
  W->>DB: LoadItem - read tx
   W->>B: Chunk writes manifests/{op}.json
-  W->>B: SummarizeDocument cache lookup sum-{hash}
+  W->>B: SummarizeDocument cache lookup docsum/{hash}
   alt summary miss
     W->>G: summarize/v1
-    W->>B: put sum-{hash}
+    W->>B: put docsum/{hash}
   end
   W->>DB: PlanChunks classify member/live/retired/absent
   loop waves of 32 chunks
@@ -417,14 +421,14 @@ sequenceDiagram
 | API crashes (or `ExecuteWorkflow` fails) after the tx commits | The client sees `UNAVAILABLE` + `RetryInfo{1 s}` (N3: the ack is never weakened); its retry with the same `request_id` → idempotency hit → only step 5 repeats; if the client never retries, the per-shard `shard/{id}/op-sweeper` schedule (60 s) starts the workflow for any `PENDING` operation older than 2 min | exactly one execution |
 | Worker dies during `ExtractChunk` after the gateway answered, before the blob put | Temporal retries on another worker; cache miss → the call is paid twice (bounded by one extra call per crash) | same facts (temperature 0 + schema; the cache key does not depend on the run) |
 | Worker dies inside `CommitChunk` | Transaction rolled back; retry re-runs; membership guard makes a re-run after a *committed* attempt a no-op | exactly-once commit per `(v, h)` |
-| Gateway returns 429/5xx for an hour | `P-llm` backs off to 60 s intervals for up to 6 h (`ScheduleToClose`); operation stays `RUNNING`; after 6 h the chunk is recorded in `operation_errors`, `units_failed++`, the rest of the document proceeds | no data loss; `engramctl op retry` re-runs failed chunks |
+| Gateway returns 429/5xx for an hour | `P-llm` backs off to 60 s intervals for up to 6 h (`ScheduleToClose`); operation stays `RUNNING`; after 6 h the chunk is recorded in `operations.error`, `units_failed++`, the rest of the document proceeds | no data loss; `engramctl op retry` re-runs failed chunks |
 | Gateway returns 4xx (schema refusal, content policy) | `PermanentLLMError` → one repair attempt → `chunk_failed` result; the chunk text is still stored and searchable through the chunk arm (D10) | partial extraction, visible in `progress.units_failed` |
 | Tenant daily token quota exhausted mid-document | Next wave's `CheckQuota` → `DEFERRED` with `resume_at`; already-committed chunks stay visible (per-chunk visibility is the documented model) | resumes at window reset |
 | Namespace frozen by a move during `CommitChunk` | Transaction gets `NamespaceFrozen` → `P-frozen` retries; the mover terminates the workflow within the freeze window and re-executes it on the target with the same id (§5.5 Restart); the new run's `PlanChunks` skips committed chunks | no duplicate facts (membership rows moved with the namespace) |
 | Stale execution still running on the source after cutover | Its next write meets `moved_out`/epoch mismatch → `WrongShardOrEpoch` (non-retryable) → workflow `FAILED`; the operation row on the target was already re-driven by the restarted execution | no write lands on the wrong shard |
 | Two versions `v₁ < v₂` submitted 1 s apart | Both run; `v₂` finalises → `current_version = v₂`; `v₁`'s remaining `CommitChunk`s return `superseded`; `v₁`'s finalise retires only its surplus chunks | higher version wins; no resurrection |
-| Document deleted mid-retain | Cascade sets `documents.state = 'deleted'` and cancels the workflow; a `CommitChunk` racing the cascade sees `deleted` (row lock ordering: the cascade holds the `documents` row) → `aborted`; `FinalizeVersion` marks the version `cancelled` | nothing from the document is visible after the delete ack |
-| `CancelOperation` | Cooperative at the next wave boundary; committed chunks stay; `FinalizeVersion(abort)` marks the version `cancelled` and retires chunks that belong only to `v` (1 h grace) | consistent partial state, reported `CANCELLED` |
+| Document deleted mid-retain | Cascade sets `documents.state = 'deleted'` and cancels the workflow; a `CommitChunk` racing the cascade sees `deleted` (row lock ordering: the cascade holds the `documents` row) → `aborted`; `FinalizeVersion` marks the version `deleted` | nothing from the document is visible after the delete ack |
+| `CancelOperation` | Cooperative at the next wave boundary; committed chunks stay; `FinalizeVersion(abort)` marks the version `superseded` and retires chunks that belong only to `v` (1 h grace) | consistent partial state, reported `CANCELLED` |
 
 #### 5.1.6 Throughput and batch mode
 
@@ -445,8 +449,8 @@ pre-warms the two caches and then runs ordinary `RetainDocument` children that h
 2. `PlanCacheMisses` (blob `Head` on every xcache key, batched 1 000 per activity) → the list
    of `(xcache_key, prompt input)` pairs.
 3. `SubmitExtractBatch`: idempotent through the shard table
-   `batch_jobs(namespace_id, batch_key = sha256(sorted xcache keys), job_id, kind)` — an
-   existing row returns its `job_id`; otherwise `SubmitBatch` (≤ 10 k requests, `custom_id =
+   `batch_jobs(namespace_id, batch_key = sha256(sorted xcache keys), gateway_job_id, kind)` — an
+   existing row returns its `gateway_job_id`; otherwise `SubmitBatch` (≤ 10 k requests, `custom_id =
    xcache_key`, model + `extract/v1`) and insert. Cache keys are identical to the online path.
 4. `PollBatch` (`P-poll`, heartbeat, `ScheduleToClose` 48 h).
 5. `ApplyBatchResults`: stream results; validate each exactly as `ExtractChunk` does; blob put
@@ -478,7 +482,7 @@ every 5 min instead of never. A second source of nudges is the per-shard nightly
 one admin-tx activity — `SELECT namespace_id FROM facts WHERE consolidated_at IS NULL AND
 retired_at IS NULL AND invalidated_at IS NULL GROUP BY 1` `UNION` the namespaces with
 `stale` observations — and signals each namespace's singleton with `Nudge{reason = sweep}`
-(PD-5). Rejected: one Temporal schedule per namespace (10 000+ schedules for a nightly poke; a
+(PD-5, adopted as N28). Rejected: one Temporal schedule per namespace (10 000+ schedules for a nightly poke; a
 namespace that never ingests would still be polled).
 
 The execution `ContinueAsNew`s after every round, carrying `{pending_nudge, debounce_until,
@@ -488,15 +492,15 @@ lost). An idle execution costs nothing; a namespace with no facts never starts o
 #### 5.2.2 One round
 
 1. **`SelectRound`** (read tx): ≤ 100 live unconsolidated facts — `WHERE consolidated_at IS
-   NULL AND retired_at IS NULL AND invalidated_at IS NULL AND (consolidation_failed_at IS NULL
-   OR consolidation_failed_at < now() − 7 d) ORDER BY created_at LIMIT 100` (D12) with their
-   `observation_scope` and tags — plus ≤ 25 stale observations (`stale = true`, `retired_at
+   NULL AND retired_at IS NULL AND invalidated_at IS NULL ORDER BY created_at LIMIT 100`
+   (`facts_unconsolidated_idx`, D12) with their tags — plus ≤ 25 stale observations (`stale = true`, `retired_at
    IS NULL`, `ORDER BY stale_since`) with their remaining live sources. Empty → the round ends
    without LLM calls.
 2. **`GroupBatches`** (pure, in-workflow): group key = *observation scope* — `combined`
    (default): the sorted tag set of the fact; `shared`: the empty set; `per_tag`: one group
-   per tag (a fact appears in several); `custom`: the item's explicit tag lists (§4
-   `RetainItem.observation_scope`; an item without the field is `combined`, A-P1). Facts of
+   per tag (a fact appears in several); `custom`: explicit tag lists; the scope is the namespace config key
+   `consolidate.observation_scope` (default `combined`; `RetainItem` has no per-item field,
+   A-P1). Facts of
    different scopes **never share an LLM call** (kept from Hindsight: it is the boundary that
    stops a `user:alice`-tagged fact from shaping a `user:bob` belief). Within a group,
    batches of 8 in `created_at` order; stale observations form separate batches of ≤ 8 with
@@ -525,8 +529,9 @@ lost). An idle execution costs nothing; a namespace with no facts never starts o
       `{failed: reason}`; transient gateway errors retry under `P-llm`.
    3. **Bisect** (workflow logic): batch failure with `len > 1` → split at `len/2`, push both
       halves to the front of the group's queue (8 → 4 → 2 → 1, D12); `len = 1` and still
-      failing → **`StampFailed`** (write tx: `facts.consolidation_failed_at = now()`); the
-      fact is retried after 7 days (a newer prompt version may succeed; PD-6). Rejected:
+      failing → **`StampFailed`** (write tx: `facts.consolidated_at = now(), consolidation_note =
+      'failed'`); the nightly sweep clears `consolidated_at` on `consolidation_note = 'failed'`
+      rows older than 7 days so the fact is retried (a newer prompt version may succeed; PD-6). Rejected:
       stamping `consolidated_at` on failure (hides the fact from every future round).
    4. **`Dedup`** (blob + gateway + read tx): embed each `create`/`update` text
       (`search_document:` prefix, ecache); kNN over live current observation versions in the
@@ -547,7 +552,7 @@ lost). An idle execution costs nothing; a namespace with no facts never starts o
          invalidate may have landed since `SelectRound`); dead ids are dropped from source
          lists; an op left with no sources is skipped and recorded as such; an
          `update`/`delete` whose target is now retired is skipped.
-      4. `create`: `INSERT observations(observation_id uuidv7, scope_tags, current_version = 1,
+      4. `create`: `INSERT observations(observation_id uuidv7, tags, current_version = 1,
          proof_count)`; `INSERT observation_versions(observation_id, version = 1, text,
          embedding, effective_at, prompt_version, model, reason, op_key)`;
          `INSERT observation_sources(observation_id, memory_id, quote, added_version = 1)`.
@@ -555,10 +560,11 @@ lost). An idle execution costs nothing; a namespace with no facts never starts o
          `DELETE FROM observation_sources WHERE observation_id = $1 AND memory_id <> ALL($new)`;
          `INSERT observation_sources … ON CONFLICT DO NOTHING`; `UPDATE observations SET
          current_version = v + 1, proof_count = (count), stale = false, stale_since = NULL`.
-         `delete`: `UPDATE observations SET retired_at = now(), retired_reason = $reason`;
+         `delete`: `UPDATE observations SET retired_at = now()`;
          `DELETE FROM observation_sources WHERE observation_id = $1` (the trigger would also
-         retire it; the explicit update records the reason).
-         **`effective_at` (D9, refined PD-7)**: `effective_at(v) = max(max(mentioned_at) over
+         retire it; the reason travels in the `consolidation_applied` row and the
+         `ObservationRetired` event).
+         **`effective_at` (D9, PD-7 / N29)**: `effective_at(v) = max(max(mentioned_at) over
          the version's cited sources, effective_at(v − 1))` — monotone across versions. The
          clamp is required, not cosmetic: the LLM that wrote `v` saw the text of `v − 1`,
          which may carry information from later-mentioned sources; without the clamp a
@@ -569,19 +575,21 @@ lost). An idle execution costs nothing; a namespace with no facts never starts o
          consolidated_at IS NULL` — the stamp and the writes it accounts for commit together
          (kept from Hindsight).
       6. `UPDATE pages SET stale_write = true, stale_seq = stale_seq + 1 WHERE
-         engram_tag_match(tag_filter, $touched_scope_tags)` (§5.3; `engram_tag_match` is the
+         engram_tag_match(tag_filter, $touched_tags)` (§5.3; `engram_tag_match` is the
          SQL twin of the Lean-verified decision procedure, §7).
       7. `token_usage_events` / `token_usage` for the consolidate and adjudicate calls.
-      8. outbox `ObservationCreated`, `ObservationVersionAdded`, `ObservationRetired`,
-         `FactsConsolidated{memory_ids}`. `COMMIT`.
+      8. outbox `ObservationUpserted{observation_id, version, source_fact_ids, effective_at, op_key,
+         created}` per create/update, `ObservationRetired{observation_id, op_key}` per delete,
+         `PagesMarkedStale{page_ids, stale_write}`. `COMMIT`.
       **Capacity**: if after step 4 the scope's live observation count exceeds
       `max_observations_per_scope`, the transaction is rolled back and the activity returns
       `capacity_exceeded`; the workflow re-runs `ConsolidateBatch` once with the capacity note
       in the prompt ("at capacity: only updates and deletes are allowed"); a second overflow
       stamps the facts `consolidated_at` with `consolidation_note = 'capacity'` (no
       observation is created; the facts remain recallable).
-4. **Round end**: `MarkRound` (write tx: `namespace_stats.consolidated_through = now()`,
-   `operations` row of kind `CONSOLIDATE` for observability of `consolidation_lag`);
+4. **Round end**: `MarkRound` (write tx: the `operations` row of kind `CONSOLIDATE` is marked
+   `SUCCEEDED`; its `finished_at` is the namespace's consolidation watermark, from which
+   `consolidation_lag` is derived);
    `SignalWithStart("ns/{ns}/page/{page_id}", Nudge{reason = consolidation})` for every page
    whose `refresh_policy.after_consolidation` is set and whose `stale_write` was raised in
    this round (§5.3); if the round selected a full 100 facts, the next round starts
@@ -594,12 +602,13 @@ or `delete`; removed sources are not shown, so they cannot be cited (validation 
 apply path clears `stale`. An observation whose last source disappears never reaches this
 path: the DB trigger retires it inside the deleting transaction.
 
-**Orphan trigger (D12).** `AFTER DELETE ON observation_sources REFERENCING OLD TABLE AS removed
-FOR EACH STATEMENT`: `UPDATE observations SET retired_at = now(), retired_reason = 'orphan'
-WHERE observation_id IN (SELECT DISTINCT observation_id FROM removed) AND NOT EXISTS (SELECT 1
-FROM observation_sources s WHERE s.observation_id = observations.observation_id)`; then
+**Orphan trigger (D12).** `AFTER DELETE ON observation_sources REFERENCING OLD TABLE AS deleted
+FOR EACH STATEMENT`: `UPDATE observations SET retired_at = now(), stale = false
+WHERE observation_id IN (SELECT DISTINCT observation_id FROM deleted) AND NOT EXISTS (SELECT 1
+FROM observation_sources s WHERE s.observation_id = observations.observation_id)` (and the same
+`retired_at` on their `observation_versions`); then
 `UPDATE observations SET stale = true, stale_since = coalesce(stale_since, now()) WHERE
-observation_id IN (removed) AND retired_at IS NULL`. It fires inside whichever transaction
+observation_id IN (deleted) AND retired_at IS NULL` (`engram_observation_sources_after_delete`, §3.3.6). It fires inside whichever transaction
 deleted the sources — the delete cascade, `ApplyBatch`, or the purge — so "no observation
 cites a deleted fact after the ack" is a property of a single commit.
 
@@ -617,10 +626,10 @@ response; ≤ 1 000 chars per observation; `WorkflowRunTimeout` 24 h per continu
 | `GroupBatches` | workflow (pure) | deterministic from selection | `P-pure` | — | none | — |
 | `FindCandidates` | activity | `batch_key` | `P-db` | read fence | read tx | — |
 | `ConsolidateBatch` | activity | `batch_key` (LLM call not cached: results depend on candidates) | `P-llm`; batch failure → bisect | none | none | — |
-| `StampFailed` | activity | `(ns, memory_id)` | `P-db` | `FOR SHARE` active @ epoch | write tx | `FactConsolidationFailed` |
+| `StampFailed` | activity | `(ns, memory_id)` | `P-db` | `FOR SHARE` active @ epoch | write tx | — |
 | `Dedup` | activity | `op_key` | `P-embed`/`P-llm`; failure → `keep` | read fence | read tx | — |
-| `ApplyBatch` | activity | `op_key` per op via `consolidation_applied` | `P-frozen` | `FOR SHARE` active @ epoch | write tx | `ObservationCreated`, `ObservationVersionAdded`, `ObservationRetired`, `FactsConsolidated` |
-| `MarkRound` | activity | `(ns, round_no)` | `P-db` | `FOR SHARE` active @ epoch | write tx | `ConsolidationRoundDone` |
+| `ApplyBatch` | activity | `op_key` per op via `consolidation_applied` | `P-frozen` | `FOR SHARE` active @ epoch | write tx | `ObservationUpserted`, `ObservationRetired`, `PagesMarkedStale` |
+| `MarkRound` | activity | `(ns, round_no)` | `P-db` | `FOR SHARE` active @ epoch | write tx | — |
 | Page nudges | workflow | signal debounced by the page workflow | Temporal | — | none | — |
 
 #### 5.2.4 State diagram
@@ -678,7 +687,7 @@ current_version, stale_write, stale_delete, stale_seq)`) is refreshed by the wor
 | Trigger | Who sends it | Condition |
 |---|---|---|
 | After consolidation | `Consolidate` round end (§5.2 step 4) | `refresh_policy.after_consolidation` and the page's `stale_write` was raised by this round (its `tag_filter` matched a touched scope, evaluated by `engram_tag_match` inside `ApplyBatch`) |
-| Cron | per-shard schedule `shard/{id}/page-cron` every 5 min (admin tx: `SELECT namespace_id, page_id FROM pages WHERE cron_next_due <= now()`) | `refresh_policy.cron` set; nudge only when `stale_write OR stale_delete` unless `refresh_policy.force_on_cron` |
+| Cron | per-shard schedule `shard/{id}/page-cron` every 5 min (admin tx: `SELECT namespace_id, page_id FROM pages WHERE refresh_policy ? 'cron' AND retired_at IS NULL`; each page's cron expression is evaluated against its current version's `page_versions.created_at`) | `refresh_policy.cron` set; nudge only when `stale_write OR stale_delete` unless `refresh_policy.force_on_cron` |
 | Manual | `PageService.RefreshPage` (creates an `operations` row of kind `REFRESH_PAGE`) | always |
 | Delete | delete cascade / invalidate (§5.4) | `refresh_policy.on_delete = immediate` (default true) — otherwise the page waits for cron |
 
@@ -689,7 +698,7 @@ with `stale_seq = stale_seq + 1`. A refresh captures `stale_seq` at evidence-gat
 clears the flags only with `WHERE stale_seq = $captured`; a mark that landed during the
 refresh leaves the page stale and a follow-up refresh runs. Debounce 60 s;
 `refresh_policy.min_interval` (default 10 min) is honoured by sleeping until
-`last_refreshed_at + min_interval` (manual refreshes bypass it).
+the current version's `page_versions.created_at + min_interval` (manual refreshes bypass it).
 
 #### 5.3.2 Steps
 
@@ -697,13 +706,13 @@ refresh leaves the page stale and a follow-up refresh runs. Debounce 60 s;
    (`{prefix}/pages/{page_id}/v{n}.md`), `page_sources`, `stale_seq`.
 2. **`GatherEvidence`** (read tx, no LLM): `recall.Planner` over `source_query` with the
    page's `tag_filter`, `as_of = now()`, `prefer_observations = true`, budget `mid`,
-   `max_tokens = 2 × page.max_tokens`. Diff against `page_sources`: **added** = retrieved
+   `max_tokens = 2 × refresh_policy.max_tokens`. Diff against `page_sources`: **added** = retrieved
    ids not in sources; **changed** = cited observations whose `current_version` advanced
    (old text and new text are both shown); **removed** = cited ids that are now retired or
    invalidated. Cited-but-not-retrieved live sources are *kept* ("absence is not
    contradiction"). If all three sets are empty and no flag is set → `NoChange`, no LLM call,
    no version.
-3. **`DeltaEdit`** (gateway, `page_delta/v1`, `models.reflect`, temperature 0.2): input =
+3. **`DeltaEdit`** (gateway, `page/v1`, `models.reflect`, temperature 0.2): input =
    the current markdown parsed into a structured document (sections by heading; blocks with
    stable ids `b{sha256(normalised block text)[:8]}`), the three evidence sets, the page
    `source_query`; output = `{operations: [replace_section | append_block | remove_block |
@@ -722,15 +731,16 @@ refresh leaves the page stale and a follow-up refresh runs. Debounce 60 s;
    `source_query` changed since the last version.
 6. **`CommitPageVersion`** (blob put, then fenced write tx): put
    `{prefix}/pages/{page_id}/v{n+1}.md` (idempotent key); `INSERT page_versions(page_id,
-   version = n + 1, markdown_blob_key, effective_at, prompt_version, model, based_on_seq,
-   mode = delta|full) ON CONFLICT (namespace_id, page_id, version) DO NOTHING` — zero rows
+   version = n + 1, markdown_blob_key, effective_at, evidence_hash) ON CONFLICT (namespace_id,
+   page_id, version) DO NOTHING` (prompt version, model and `mode = delta|full` go in the
+   markdown's front matter) — zero rows
    → a previous attempt committed → read it and return; `DELETE/INSERT page_sources`;
-   `UPDATE pages SET current_version = n + 1, last_refreshed_at = now(), stale_write =
+   `UPDATE pages SET current_version = n + 1, stale_write =
    false, stale_delete = false WHERE stale_seq = $captured` (else leave the flags);
    `token_usage_events`; `operations` (manual) → `SUCCEEDED{page_version}`; outbox
    `PageVersionCreated{page_id, version}`. `effective_at = max(effective_at of cited
    observation versions, mentioned_at of cited facts, effective_at(n))` — monotone, same
-   argument as PD-7 (the model saw the previous text).
+   argument as PD-7 / N29 (the model saw the previous text).
 7. `ContinueAsNew` with `{pending_nudge}`.
 
 #### 5.3.3 Step table
@@ -764,7 +774,7 @@ sequenceDiagram
   alt nothing changed
     Note over W: NoChange, no LLM call
   else delta
- W->>G: page_delta/v1 - previous doc + evidence sets
+ W->>G: page/v1 - previous doc + evidence sets
     W->>W: validate ops, ApplyDeltaOps
     opt validation failed twice
       W->>G: page_full/v1 rebuild
@@ -781,7 +791,7 @@ sequenceDiagram
 | Crash after the blob put, before the tx | Retry re-puts the same key and inserts the version | one version |
 | Crash after the tx, before the result is recorded | Retry hits `ON CONFLICT DO NOTHING` on `(page_id, n + 1)` → returns the committed version | one version |
 | A delete lands mid-refresh | The cascade bumps `stale_seq`; the commit leaves `stale_delete = true`; the delete's nudge triggers another refresh | the page converges within two refreshes |
-| Delta ops reference unknown blocks twice | Full rebuild; `page_versions.mode = 'full'` records it (alert if > 10 % of refreshes are full) | correctness over cost |
+| Delta ops reference unknown blocks twice | Full rebuild; the version's front matter (`mode: full`) records it (alert if > 10 % of refreshes are full) | correctness over cost |
 | Evidence exceeds the model context | `GatherEvidence` caps at `2 × max_tokens`; full rebuild uses the packer's skip-not-truncate rule | bounded prompt |
 | Two nudges 1 s apart | One workflow execution, one refresh (the signal handler coalesces) | no duplicate LLM spend |
 
@@ -805,10 +815,10 @@ single atomic commit rather than of a sequence of them.
 2. `SELECT pg_advisory_xact_lock(hashtextextended(namespace_id || '/' || document_id, 0))` —
    serialises against `FinalizeVersion` so a retain cannot activate a version after the
    delete has committed.
-3. `UPDATE documents SET state = 'deleted', delete_operation_id = $op WHERE namespace_id AND
-   document_id AND state <> 'deleted' RETURNING current_version` — zero rows → already
-   deleted → return the existing delete operation (idempotent); no row at all →
-   `NOT_FOUND`.
+3. `UPDATE documents SET state = 'deleting', deleted_at = now() WHERE namespace_id AND
+   document_id AND state = 'active' RETURNING current_version` — zero rows → already
+   `deleting`/`deleted` → return the existing delete operation (looked up by `target_id`;
+   idempotent); no row at all → `NOT_FOUND`.
 4. `UPDATE document_versions SET status = 'deleted' WHERE namespace_id AND document_id` —
    including any `ingesting` version (its workflow is cancelled in step 12; a racing
    `CommitChunk` sees `state = 'deleted'` in its step 2 because the `documents` row is locked
@@ -819,14 +829,14 @@ single atomic commit rather than of a sequence of them.
    invalidated_at = NULL WHERE memory_id IN victims` — **the visibility cut**: from this
    commit, every recall arm, `GetMemory`, `ListMemories`, Reflect tools and new exports
    exclude these rows (D8: `retired_at IS NULL` everywhere).
-7. `DELETE FROM fact_links WHERE namespace_id AND (from_id IN victims OR to_id IN victims)` —
+7. `DELETE FROM fact_links WHERE namespace_id AND (src_memory_id IN victims OR dst_memory_id IN victims)` —
    no orphan links (§7 invariant), both directions.
 8. `DELETE FROM entity_mentions WHERE namespace_id AND memory_id IN victims`;
    `UPDATE entities SET mention_count = mention_count − n` per entity (zero-count entities are
    pruned by the purge, not here — an in-flight `CommitChunk` may be about to mention them).
 9. `DELETE FROM observation_sources WHERE namespace_id AND memory_id IN victims` → the
-   statement trigger retires observations left with no source (`retired_reason = 'orphan'`)
-   and marks the others `stale = true`. After this statement, no `observation_sources` row
+   statement trigger retires observations left with no source (reported as
+   `ObservationRetired{zero_sources = true}`) and marks the others `stale = true`. After this statement, no `observation_sources` row
    references a victim, in this transaction's snapshot and therefore in every snapshot taken
    after commit.
 10. `DELETE FROM page_sources WHERE namespace_id AND (memory_id IN victims OR observation_id
@@ -837,8 +847,10 @@ single atomic commit rather than of a sequence of them.
 12. `INSERT operations(operation_id, kind = DELETE_DOCUMENT, state = RUNNING, target_id =
     document_id, progress.phase = 'purge')`; `UPDATE operations SET state = CANCELLED, error
     = {document_deleted} WHERE target_id = document_id AND kind = RETAIN_DOCUMENT AND state IN
-    (PENDING, RUNNING, DEFERRED)`; outbox `DocumentDeleted{document_id, fact_ids, chunk_ids,
-    observations_retired, observations_stale, pages_stale}` + `FactsRetired`. `COMMIT`.
+    (PENDING, RUNNING, DEFERRED)`; `INSERT deletion_log(namespace_id, tenant_id, kind = 'document',
+    subject_id = document_id, epoch, operation_id)` (N21); outbox `DocumentDeleted{document_id,
+    fact_ids, chunk_ids, observations_retired, observations_marked_stale, pages_marked_stale,
+    deleted_at}`. `COMMIT`.
 
 After the commit: `ExecuteWorkflow(PurgeDocument, id = "ns/{ns}/op/{op}", grace = 0,
 USE_EXISTING)`; `CancelWorkflow` for the cancelled retain operations' ids;
@@ -867,25 +879,25 @@ every statement is a predicate delete that re-runs to zero rows.
    the `retired_at IS NOT NULL` predicate is the un-retire protection: a chunk brought back
    by a concurrent `CommitChunk` clears `retired_at` and is skipped; `DELETE FROM chunks …`
    with the same predicate; `DELETE FROM document_version_chunks` for `deleted`/`superseded`
-   versions; outbox `RowsPurged{document_id, counts}`; commit; repeat until every statement
+   versions; outbox `RowsPurged{table, ids, document_id}` per table; commit; repeat until every statement
    deletes zero rows. Every 200 batches → `ContinueAsNew`.
 3. **`PurgeBlobs`** (blob + write tx): (a) the raw body — `ledger/{content_hash}` is
    content-addressed and may be shared by another document with the same body, so it is
    deleted only when no other live `ingest_ledger` row of the namespace references the hash;
-   (b) the ledger rows of the document are **scrubbed**: `raw_inline = NULL, raw_key = NULL`
-   and a `ledger_tombstones(ledger_id, deleted_at, operation_id)` row is inserted — the only
-   mutation the append-only ledger ever receives (PD-8; right-to-erasure outranks
-   append-only purity, and the ledger's replay role is void for a deleted document; the
-   metadata row and the tombstone preserve the audit trail); (c) `xcache`/`ecache` entries
+   (b) the ledger rows of the document are **deleted** under the admin role, the only role
+   the append-only trigger admits for `DELETE` (§3.1); there is no `ledger_tombstones` table —
+   the `deletion_log` row written by the cascade is the audit trail (N21). (PD-8 as reworded:
+   right-to-erasure outranks append-only purity, and the ledger's replay role is void for a
+   deleted document); (c) `xcache`/`ecache` entries
    whose chunk hash is no longer referenced by any live chunk of the namespace (they contain
-   extracted content); (d) the manifest. Each deletion is recorded in `blob_tombstones(key,
-   deleted_at)` so a concurrent move's blob copy cannot resurrect it (§5.5). Outbox
-   `BlobsDeleted{keys}`.
+   extracted content); (d) the manifest. Each key was recorded in `blob_tombstones` by the
+   cascade (§3.3.7), so a concurrent move's blob copy skips it (§5.5); the row is removed once
+   the object is gone.
 4. **`PruneEntities`** (fenced write tx): `DELETE FROM entity_aliases/entities WHERE
    namespace_id AND mention_count = 0 AND NOT EXISTS (SELECT 1 FROM entity_mentions …)`.
 5. **`MarkOperation`** → `SUCCEEDED{rows_purged, blobs_purged}` (counts are sums of actual
    `RETURNING` counts carried in workflow state, so a retried batch that deletes zero rows
-   does not inflate them). Outbox `OperationFinished`.
+   does not inflate them). No outbox event: operations are read by id.
 
 #### 5.4.3 Namespace delete
 
@@ -893,9 +905,11 @@ every statement is a predicate delete that re-runs to zero rows.
 `delete_operation_id`, `NOTIFY catalog_changes` (the resolver now rejects reads and writes
 with `FAILED_PRECONDITION` + `PreconditionFailed{NAMESPACE_DELETING}`); then
 `ExecuteWorkflow(PurgeNamespace, id = "ns/{ns}/op/{op}", queue = shard-{id})`. The
-operation for a namespace delete lives in the **catalog** (`namespaces.delete_state,
-delete_progress`) because the shard rows that would hold it are being purged;
-`OperationService.GetOperation` special-cases `DELETE_NAMESPACE` to read it there (PD-9).
+operation for a namespace delete is answered from the **catalog** because the shard rows that
+would hold it are being purged: `OperationService.GetOperation` special-cases
+`DELETE_NAMESPACE` and derives the state from `namespaces.state` (`deleting` → `RUNNING`,
+`deleted` → `SUCCEEDED` with `finished_at = deleted_at`; no progress counters, the catalog has
+no per-namespace progress column) (PD-9).
 
 1. **`FenceForDelete`** (shard tx, admin role): `UPDATE namespace_ownership SET state =
    'frozen', freeze_reason = 'delete' WHERE namespace_id AND state = 'active'` — blocks every
@@ -912,17 +926,18 @@ delete_progress`) because the shard rows that would hold it are being purged;
    batches) in dependency order: `page_sources, page_versions, pages, observation_sources,
    observation_versions, observations, fact_links, entity_mentions, facts, chunks,
    document_version_chunks, document_versions, documents, entity_aliases, entities,
-   consolidation_applied, batch_jobs, token_usage_events, token_usage, namespace_stats,
-   idempotency_keys, operation_errors, operations, ledger_tombstones, ingest_ledger,
-   blob_tombstones, export_versions`. `outbox` rows are **not** deleted here (the relay and
+   consolidation_applied, consolidation_batches, batch_jobs, token_usage_events, token_usage,
+   quota_counters, namespace_stats, idempotency_keys, operations, ingest_ledger,
+   blob_tombstones, export_snapshots, outbox_skipped, deletion_log` (§3.3; `deletion_log` rows
+   were already replicated to the catalog by the `deletion-log` consumer, N21). `outbox` rows are **not** deleted here (the relay and
    any Kafka consumer still need them in order; the daily trimmer removes them once every
    cursor has passed).
 4. **`PurgeBlobs`**: list `{shard}/{tenant}/{ns}/` with pagination (1 000 keys per page,
    continuation token in heartbeat details), delete per page; repeat the listing until empty.
 5. **`RemoveOwnership`** (shard tx): `DELETE FROM namespace_ownership WHERE namespace_id`.
 6. **`MarkDeleted`** (catalog tx — the one non-move worker→catalog call, executed through the
-   API's admin endpoint `NamespaceService.internalMarkDeleted` rather than a direct catalog
-   connection, to honour D4): `namespaces.state = 'deleted', deleted_at`; the row is kept as
+   admin RPC `memory.admin.v1.ShardService.ReleaseNamespace` on `engram-api` rather than a
+   direct catalog connection, to honour D4): `namespaces.state = 'deleted', deleted_at`; the row is kept as
    a tombstone (ids are UUIDv7 and never reused); `NOTIFY catalog_changes`.
 
 #### 5.4.4 Tenant delete
@@ -973,13 +988,13 @@ promises is about *deleted* documents, whose cascade removes the citations synch
 
 | Step | Workflow or Activity | Idempotency key | Retry policy | Fencing check | Transaction boundary | Outbox events |
 |---|---|---|---|---|---|---|
-| Cascade (§5.4.1) | API handler | `(namespace_id, method, request_id)`; `documents.state` guard | client retry | `FOR SHARE` active @ epoch + advisory lock | write tx | `DocumentDeleted`, `FactsRetired` |
+| Cascade (§5.4.1) | API handler | `(namespace_id, method, request_id)`; `documents.state` guard | client retry | `FOR SHARE` active @ epoch + advisory lock | write tx | `DocumentDeleted` |
 | Start purge + cancel retains + nudges | API handler | workflow id `ns/{ns}/op/{op}` (`USE_EXISTING`) | client retry / op-sweeper | — | none | — |
 | `Sleep(grace)` | workflow timer | — | — | — | none | — |
 | `PurgeBatch` | activity | predicate deletes; `(ns, doc, batch_no)` | `P-frozen` | `FOR SHARE` active @ epoch | write tx | `RowsPurged` |
-| `PurgeBlobs` | activity | key set is derived; `blob_tombstones` | `P-blob` then `P-db` | `FOR SHARE` active @ epoch | write tx (tombstones + ledger scrub) | `BlobsDeleted` |
-| `PruneEntities` | activity | predicate delete | `P-db` | `FOR SHARE` active @ epoch | write tx | `EntitiesPruned` |
-| `MarkOperation` | activity | monotone state | `P-db` | `FOR SHARE` active @ epoch | write tx | `OperationFinished` |
+| `PurgeBlobs` | activity | key set is derived; `blob_tombstones` | `P-blob` then `P-db` | `FOR SHARE` active @ epoch; ledger rows under `engram_admin` | write tx (tombstone rows) + admin tx (ledger rows) | — |
+| `PruneEntities` | activity | predicate delete | `P-db` | `FOR SHARE` active @ epoch | write tx | `RowsPurged{table = 'entities'}` |
+| `MarkOperation` | activity | monotone state | `P-db` | `FOR SHARE` active @ epoch | write tx | — |
 | `FenceForDelete` | activity (namespace) | predicate update | `P-db` | admin role | admin tx | — |
 | `DrainWorkflows` | activity (namespace) | terminate is idempotent | `P-temporal` | — | none | — |
 | `PurgeRows` | activity (namespace) | predicate deletes per table | `P-db` | admin role | admin tx | — |
@@ -1013,7 +1028,7 @@ sequenceDiagram
     W->>DB: PurgeBatch predicate deletes, outbox RowsPurged
   end
   W->>B: delete ledger blob if unreferenced, xcache, ecache, manifest
-  W->>DB: tombstones, ledger scrub, PruneEntities
+  W->>DB: clear blob_tombstones rows, delete ledger rows as admin, PruneEntities
   W->>DB: MarkOperation SUCCEEDED rows_purged, blobs_purged
 ```
 
@@ -1057,8 +1072,8 @@ namespace); a `control` queue (every worker would need every shard's credentials
 #### 5.5.1 Steps
 
 1. **`Plan`** (catalog tx + target tx; one of the three activities allowed to call the
-   catalog, D4): catalog `INSERT namespace_moves(move_id, namespace_id, source, target,
-   epoch_from = e, epoch_to = e + 1, state = 'planned')` — refused by the partial unique index
+   catalog, D4): catalog `INSERT namespace_moves(move_id, namespace_id, tenant_id, source_shard_id,
+   target_shard_id, from_epoch = e, to_epoch = e + 1, state = 'planned', created_by)` — refused by the partial unique index
    on `(namespace_id) WHERE state NOT IN ('done', 'rolled_back')` if a move is already
    running (`MovePrecondition`, non-retryable); `namespaces.state = 'moving'`; `NOTIFY`.
    Target: `INSERT namespace_ownership(namespace_id, tenant_id, epoch = e + 1, state =
@@ -1070,12 +1085,12 @@ namespace); a `control` queue (every worker would need every shard's credentials
    10 s with `{table_index, rows_done, blob_token}`): open one `REPEATABLE READ READ ONLY`
    transaction on the source and record `p0 = coalesce(max(seq), 0)` for the namespace and
    `snapshot_at = now()` (D5 step 2). Stream every namespace-scoped table in dependency
-   order — `documents, document_versions, ingest_ledger, ledger_tombstones, chunks,
+   order — `documents, document_versions, ingest_ledger, chunks,
    document_version_chunks, entities, entity_aliases, facts, entity_mentions, fact_links,
-   observations, observation_versions, observation_sources, consolidation_applied, pages,
-   page_versions, page_sources, operations, operation_errors, idempotency_keys,
-   token_usage_events, token_usage, namespace_stats, batch_jobs, blob_tombstones,
-   export_versions` — with `COPY (SELECT … WHERE namespace_id = $1 ORDER BY <pk>) TO STDOUT
+   observations, observation_versions, observation_sources, consolidation_batches,
+   consolidation_applied, pages, page_versions, page_sources, operations, idempotency_keys,
+   token_usage_events, token_usage, quota_counters, namespace_stats, batch_jobs,
+   blob_tombstones, export_snapshots, deletion_log, outbox_skipped` (§3.3) — with `COPY (SELECT … WHERE namespace_id = $1 ORDER BY <pk>) TO STDOUT
    BINARY` into the target, `COPY … FROM STDIN BINARY` in batches of **10 k rows**, each
    batch its own target transaction fenced by `state = 'incoming' AND epoch = e + 1` (the
    only writes ever accepted in `incoming`). On a retry the activity resumes at the heartbeat's
@@ -1101,7 +1116,8 @@ namespace); a `control` queue (every worker would need every shard's credentials
    thin and application is **key-based** (N12): for each event the mover re-reads the current
    rows it names from the source by id and upserts them into the target (`INSERT … ON
    CONFLICT DO UPDATE` with every column, including `retired_at`/`invalidated_at`), deletes
-   on `RowsPurged`/`BlobsDeleted`, and records `move_applied(namespace_id, seq)` in the same
+   on `RowsPurged` (blob deletions are `blob_tombstones` rows and replay like any row), and
+   records `move_applied(namespace_id, seq)` in the same
    target transaction; the source cursor `outbox_cursors('move:{ns}')` is advanced in a
    separate statement afterwards (a crash in between re-applies and `move_applied` dedups).
    Out-of-order application converges because every application writes the row's *current*
@@ -1115,7 +1131,7 @@ namespace); a `control` queue (every worker would need every shard's credentials
    (LLM calls, blob puts), all idempotent. New source writes fail `NamespaceFrozen`; the API
    retries them for ≤ 30 s (D5 step 4); reads continue. The workflow arms a **freeze
    watchdog** of 120 s: if `Cutover` has not committed by then, the workflow rolls back
-   (liveness bound, PD-15).
+   (liveness bound, D5 step 4 / PD-15).
 5. **`Drain`** (move pool + Temporal client): (a) replay until `move_applied_seq = max(seq)`
    for the namespace — nothing new can appear: writers are fenced out and the trimmer never
    passes the move cursor; (b) `ListWorkflow("NamespaceId = '{ns}' AND TaskQueue =
@@ -1127,7 +1143,8 @@ namespace); a `control` queue (every worker would need every shard's credentials
    hits the cache); correctness does not depend on it, since no listed workflow can commit on
    the source any more; (d) record for each: `{workflow_id, workflow_type, task_queue, input
    of the first history event, operation_id (if any)}` into
-   `namespace_moves.drained_workflows` (jsonb, upsert by workflow id — D5 step 5: the
+   `namespace_moves.terminated_workflows` (`text[]` of workflow ids, upserted by id; the
+   type and original input are read back from Temporal history at `Restart` — D5 step 5: the
    `consolidate` singleton and `page/{page_id}` workflows have no operation id and are
    restarted by workflow id); (e) `TerminateWorkflow(reason = "move:{move_id}")` each,
    ignoring already-closed. "Drained or redirected" therefore means, concretely: every write
@@ -1170,7 +1187,7 @@ namespace); a `control` queue (every worker would need every shard's credentials
    namespace. `namespace_moves.state = 'cleaning'`.
 9. **`Cleanup`**: `workflow.Sleep(24 h)` (or an early `Cleanup` signal from `engramctl move
    cleanup`), then — via the admin role, which only `engramctl` holds (D4/D5 step 7) — the
-   workflow's last activity calls the `MoveService.CleanupSource` admin RPC on the API, which
+   workflow's last activity calls the `MoveService.CleanupMove` admin RPC on the API, which
    deletes the namespace's rows on the source in the §5.4.3 table order (5 000 per batch),
    the `namespace_ownership` row (`moved_out`), the `outbox_cursors('move:{ns}')` row, the
    target's `move_applied` rows, and the old blob prefix; `namespace_moves.state = 'done'`
@@ -1240,7 +1257,7 @@ sequenceDiagram
   Note over API: resolver invalidated, stale callers get WrongShardOrEpoch once
   M->>TMP: Restart recorded workflows on shard-T with epoch e+1
   Note over M: sleep 24 h
-  M->>API: CleanupSource admin RPC: delete source rows, old prefix, cursor, state done
+  M->>API: CleanupMove admin RPC: delete source rows, old prefix, cursor, state done
 ```
 
 #### 5.5.4 Mover crash at each step
@@ -1290,8 +1307,8 @@ copy of the same log with weaker per-namespace filtering (D6's rejected row).
 
 **Election.** Each `engram-worker` runs one `relay.Run(shard)` goroutine per shard it serves.
 It acquires `pg_try_advisory_lock(hashtext('engram-outbox-relay'))` on a **dedicated direct
-connection** to the shard's Postgres, bypassing pgbouncer (PD-18: transaction pooling does
-not preserve session-level advisory locks); the loser sleeps 5 s and retries. The lock is
+connection** to the shard's Postgres, bypassing pgbouncer (PD-18, adopted as N15: transaction
+pooling does not preserve session-level advisory locks); the loser sleeps 5 s and retries. The lock is
 released when the connection drops, so a crashed leader is replaced within ≈ 5 s. The
 connection authenticates as `engram_relay` (N4): `SELECT` on `outbox` and `outbox_cursors`
 across every namespace, bypassing RLS for those two tables only, plus `UPDATE
@@ -1308,8 +1325,8 @@ loop re-queries `WHERE seq = ANY($watchlist)`; a gap that appears is delivered i
 older than `2 × statement_timeout = 60 s` is declared aborted and dropped. **No sink's
 cursor advances past an open gap**: the deliverable prefix of a batch ends at the first open
 gap, so ordering and no-loss per sink hold (the §7 `Outbox.tla` property). The watchlist is
-in memory; a new leader rebuilds it from its first batch (the 60 s bound restarts, which only
-delays, never loses).
+persisted in the relay's `outbox_cursors.gaps` row (≤ 1 000 entries, §3.3.2), so a new leader
+resumes it with its deadlines intact and failover never loses a late commit (§3.5).
 
 **Per-sink delivery.**
 
@@ -1335,7 +1352,7 @@ mover's cursor row is removed at cleanup or rollback.
 |---|---|
 | Leader crashes mid-batch | Lock released; new leader re-reads from the committed cursors; sinks see duplicates and dedup |
 | Postgres failover | Connections drop, lock lost, re-election against the new primary; cursors are in the database |
-| Poison event (payload fails to decode) | Retried 5 times, then written to `outbox_dead(seq, reason)` and skipped with an alert; the cursor advances (a stuck relay harms every namespace on the shard; one undecodable event harms one) |
+| Poison event (payload fails to decode, or a consumer rejects it deterministically) | Retried 5 times, then the relay alerts and stops advancing that consumer's cursor; an operator skips it with `engramctl outbox skip` (§9.6), which records `outbox_skipped(namespace_id, consumer, seq, reason, skipped_by)` and lets the cursor move on (a stuck consumer harms every namespace on the shard; one skipped event harms one) |
 | Two leaders (impossible by the lock; possible if an operator bypasses it) | Cursor updates are `last_seq < $s` guarded, so the worst case is duplicate delivery, which sinks dedup |
 | Clock skew on `created_at` | Irrelevant to ordering (`seq`), relevant only to the 7-day trim, which is conservative by design |
 
@@ -1366,14 +1383,14 @@ nothing inside Engram consumes it.
 `ExportService.CreateSnapshot(namespace, mode = FULL | INCREMENTAL)` creates an operation of
 kind `CREATE_SNAPSHOT` and runs workflow `ExportSnapshot`, id `ns/{ns}/op/{op}`.
 
-1. **`BeginSnapshot`** (read tx): `version n = max(export_versions.version) + 1`; for
+1. **`BeginSnapshot`** (read tx): `version n = max(export_snapshots.version) + 1`; for
    `INCREMENTAL`, the base is the latest `ready` version; it must be ≤ 7 days old and its
-   `outbox_hwm` must still be ≥ the shard's trimmed floor, else
+   `to_seq` must still be ≥ the shard's trimmed floor, else
    `PreconditionFailed{SNAPSHOT_BASE_UNAVAILABLE}` and the operation fails with a hint to run
    `FULL`.
 2. **`WriteFiles`** (one activity, one `REPEATABLE READ READ ONLY` transaction, heartbeat per
    1 MiB part, `StartToClose` 2 h): a single snapshot gives a consistent cut; `effective_as_of
-   = snapshot time` and `outbox_hwm = p_low − 1` computed as in §5.5 step 3 (the safe
+   = snapshot time` (recorded in the manifest) and `to_seq = p_low − 1` computed as in §5.5 step 3 (the safe
    watermark, so the next delta cannot miss a late committer). Files, each zstd-compressed
    and multipart-uploaded in 8 MiB parts to `{shard}/{tenant}/{ns}/export/v{n}/`:
    `facts.jsonl` (`retired_at IS NULL AND invalidated_at IS NULL`, ordered by `memory_id`;
@@ -1384,7 +1401,7 @@ kind `CREATE_SNAPSHOT` and runs workflow `ExportSnapshot`, id `ns/{ns}/op/{op}`.
    `chunks.jsonl` (`chunk_id, document_id, index, heading_path, header, text, mentioned_at`),
    `pages/{page_id}.md` (current version with YAML front matter: `page_id, version,
    effective_at, sources`). `INCREMENTAL` adds `delta-v{n−1}-v{n}.jsonl`: the outbox range
-   `(base.outbox_hwm, outbox_hwm]` reduced to one line per affected id — `{kind, id, op:
+   `(from_seq = base.to_seq, to_seq]` reduced to one line per affected id — `{kind, id, op:
    upsert | delete, row}` with the row's current state read by id (N12), sorted by id — and
    omits the full files. A retry after a crash restarts the activity with a **fresh**
    snapshot (and a fresh `effective_as_of`); partially uploaded parts are abandoned by the
@@ -1393,9 +1410,10 @@ kind `CREATE_SNAPSHOT` and runs workflow `ExportSnapshot`, id `ns/{ns}/op/{op}`.
    outbox_range, files[{name, bytes, sha256, rows}], schema_version, prompt_versions,
    model_ids, created_at}` written **last** — its presence is the commit point; a listing
    that finds `v{n}/` without a manifest treats it as garbage.
-4. **`RecordSnapshot`** (fenced write tx): `INSERT export_versions(namespace_id, version = n,
-   manifest_key, effective_as_of, outbox_hwm, bytes, state = 'ready') ON CONFLICT DO NOTHING`
-   (a retry after commit is a no-op); outbox `SnapshotCreated{version}`; operation
+4. **`RecordSnapshot`** (fenced write tx): `INSERT export_snapshots(namespace_id, version = n,
+   manifest_key, from_seq, to_seq, bytes, fact_count, observation_count, chunk_count,
+   page_count, state = 'ready', completed_at = now()) ON CONFLICT DO NOTHING`
+   (a retry after commit is a no-op); outbox `SnapshotCreated{version, manifest_blob_key, base_version}`; operation
    `SUCCEEDED{snapshot_version = n}`. Retention: the last 3 `FULL` versions and every delta
    since the oldest kept full; older prefixes are deleted by the weekly export-trim schedule.
 
@@ -1454,30 +1472,30 @@ it is retryable only under `P-frozen`; under `P-db` it is treated as non-retryab
 read-side activity never spins through a freeze (reads succeed on `frozen` anyway, so the
 case cannot arise there).
 
-### New decisions (proposed for D18 as N15+)
+### New decisions (beyond the register; adoption status per row)
 
-| Id | Decision | Where |
-|---|---|---|
-| PD-1 | Exactly-once token metering: `token_usage_events(usage_key)` with `ON CONFLICT DO NOTHING` feeding the `token_usage` rollup in the same transaction; crashes under-count by ≤ 1 call, never double-count. | §5.0 |
-| PD-2 | `config_snapshot` (models, prompt ids, chunk params, quota shares) is resolved at submit time and carried in the workflow input; workers never read config from the catalog. | §5.1.1 |
-| PD-3 | `chunks.extraction_key = prompt_version ‖ model ‖ schema_version`; a chunk with the same `content_hash` but an older key is re-extracted; the old facts are retired at `FinalizeVersion`. This is the only way a prompt bump changes stored facts (never in place). | §5.1.2, §6 |
-| PD-4 | Tenant-level `llm_tokens_per_day`/`max_facts` are enforced as per-namespace shares computed by the catalog (weighted by live facts, recomputed daily) because workers may not call the catalog (D4). | §5.1.2 |
-| PD-5 | Per-shard maintenance schedules (`consolidate-sweep`, `page-cron`, `purge-sweep`, `outbox-trim`, `op-sweeper`) with one admin-role read each, instead of per-namespace schedules. | §5.2.1 |
-| PD-6 | `consolidation_failed_at` facts are retried after 7 days. | §5.2.2 |
-| PD-7 | `observation_versions.effective_at` and `page_versions.effective_at` are monotone: `max(sources' mentioned_at, previous version's effective_at)`. Required for `as_of` leak-freedom because the model saw the previous version's text. | §5.2.2, §5.3.2 |
-| PD-8 | Document delete scrubs the raw payload of the document's `ingest_ledger` rows and inserts `ledger_tombstones`; metadata rows stay. | §5.4.2 |
-| PD-9 | The namespace-delete operation lives in the catalog row and is served by `GetOperation` from there. | §5.4.3 |
-| PD-10 | A cell-wide `control` task queue hosts the few non-shard workflows (`TenantDelete`). | §5.4.4 |
-| PD-11 | `Verify` runs between `Drain` and `Cutover`; counts always, full checksums ≤ 1 M facts, 1 % sample above. | §5.5.1 |
-| PD-12 | Move catch-up starts at the safe low watermark `p_low ≤ p0` and applies events by key-based re-read (consistent with N12); D5 step 3 should read `seq > p_low − 1`. | §5.5.1 |
-| PD-13 | The move consumer is a pull consumer run by the mover (own cursor row), not a sink of the elected relay. | §5.5.1, §5.6 |
-| PD-14 | Cutover order: target `active` → catalog tx → source `moved_out`. Same safety argument as D5; removes the read gap. | §5.5.1 |
-| PD-15 | Freeze watchdog 120 s → automatic rollback; `move.drain_wait` default 15 s, max 60 s. | §5.5.1 |
-| PD-16 | `namespace_moves.state = 'done'` and the source purge are performed by the `MoveService.CleanupSource` admin RPC (API side), invoked by the workflow after the 24 h grace or by `engramctl move cleanup`; `Rollback` reuses the `Freeze` activity's catalog path. | §5.5.1 |
-| PD-17 | `PurgeDocument` runs as an abandoned child of `RetainDocument` for replace-retires; an hourly `purge-sweep` deletes rows whose `purge_after` is > 24 h old as a backstop. | §5.4.2 |
-| PD-18 | The relay's advisory lock lives on a dedicated direct Postgres connection (not through pgbouncer). | §5.6 |
-| PD-19 | Export writes all files inside one snapshot transaction; the manifest is written last and is the commit point; the thin client applies deltas by sorted streaming merge. | §5.7 |
-| PD-20 | Stale observations are reconsolidated in dedicated batches that permit only `update`/`delete` and show only remaining live sources. | §5.2.2 |
-| PD-21 | Pages carry `stale_seq`; a refresh clears `stale_write`/`stale_delete` only if `stale_seq` is unchanged since evidence gathering. | §5.3.1 |
-| PD-22 | `RetainBackfill` only pre-warms the extraction and embedding caches through the gateway batch API (`batch_jobs` table for exactly-once submission) and then runs ordinary `RetainDocument` children. | §5.1.6 |
-| PD-23 | `CommitChunk` stops with `superseded` when `documents.current_version > v`, and `FinalizeVersion`/the delete cascade share one advisory lock per document. | §5.1.2, §5.4.1 |
+| Id | Decision | Where | Register |
+|---|---|---|---|
+| PD-1 | Exactly-once token metering: `token_usage_events(usage_key)` with `ON CONFLICT DO NOTHING` feeding the `token_usage` rollup in the same transaction; crashes under-count by ≤ 1 call, never double-count. | §5.0 | | N25 (adopted) |
+| PD-2 | `config_snapshot` (models, prompt ids, chunk params, quota shares) is resolved at submit time and carried in the workflow input; workers never read config from the catalog. | §5.1.1 | | N25 (adopted) |
+| PD-3 | `chunks.extraction_key = sha256(content_hash ‖ prompt_version ‖ model ‖ schema_version)`; a chunk with the same `content_hash` but an older key is re-extracted; the old facts are retired at `FinalizeVersion`. This is the only way a prompt bump changes stored facts (never in place). | §5.1.2, §6 | | N26 (adopted, reworded: `extraction_key = sha256(content_hash ‖ prompt_version ‖ model ‖ schema_version)`) |
+| PD-4 | Tenant-level `llm_tokens_per_day`/`max_facts` are enforced as per-namespace shares computed by the catalog (weighted by live facts, recomputed daily) because workers may not call the catalog (D4). | §5.1.2 | | D13 (the share rule is the register's "namespace's share"; not listed separately) |
+| PD-5 | Per-shard maintenance schedules (`consolidate-sweep`, `page-cron`, `purge-sweep`, `outbox-trim`, `op-sweeper`) with one admin-role read each, instead of per-namespace schedules. | §5.2.1 | | N28 (adopted; `op-sweeper` is N3) |
+| PD-6 | Facts stamped `consolidation_note = 'failed'` are retried after 7 days. | §5.2.2 | | section-local (reworded to the §3 columns: `consolidated_at` + `consolidation_note = 'failed'`) |
+| PD-7 | `observation_versions.effective_at` and `page_versions.effective_at` are monotone: `max(sources' mentioned_at, previous version's effective_at)`. Required for `as_of` leak-freedom because the model saw the previous version's text. | §5.2.2, §5.3.2 | | N29 (adopted) |
+| PD-8 | Document delete removes the document's `ingest_ledger` rows under the admin role at purge; the `deletion_log` row is the audit trail. | §5.4.2 | | **changed**: §3 has no `ledger_tombstones`; ledger rows are deleted by the purge under `engram_admin` and `deletion_log` (N21) is the audit trail |
+| PD-9 | The namespace-delete operation is served by `GetOperation` from the catalog row's state. | §5.4.3 | | not adopted; reworded to the catalog columns that exist (`namespaces.state`, `deleted_at`) |
+| PD-10 | A cell-wide `control` task queue hosts the few non-shard workflows (`TenantDelete`). | §5.4.4 | | section-local (D1's per-shard queue rule covers shard-scoped work only) |
+| PD-11 | `Verify` runs between `Drain` and `Cutover`; counts always, full checksums ≤ 1 M facts, 1 % sample above. | §5.5.1 | | D5 step 5 (adopted: verify counts/checksums before cutover) |
+| PD-12 | Move catch-up starts at the safe low watermark `p_low ≤ p0` and applies events by key-based re-read (consistent with N12); D5 step 3 should read `seq > p_low − 1`. | §5.5.1 | | D5 steps 2–3 (adopted: catch-up replays from `p_low`) |
+| PD-13 | The move consumer is a pull consumer run by the mover (own cursor row), not a sink of the elected relay. | §5.5.1, §5.6 | | N28 (adopted) |
+| PD-14 | Cutover order: target `active` → catalog tx → source `moved_out`. Same safety argument as D5; removes the read gap. | §5.5.1 | | refinement of D5 step 6 (same safety argument; not listed separately) |
+| PD-15 | Freeze watchdog 120 s → automatic rollback; `move.drain_wait` default 15 s, max 60 s. | §5.5.1 | | D5 step 4 (adopted: drain wait 15 s / 60 s max, watchdog 120 s) |
+| PD-16 | `namespace_moves.state = 'done'` and the source purge are performed by the `MoveService.CleanupMove` admin RPC (API side), invoked by the workflow after the 24 h grace or by `engramctl move cleanup`; `Rollback` reuses the `Freeze` activity's catalog path. | §5.5.1 | | section-local; the RPC is `memory.admin.v1.MoveService.CleanupMove` |
+| PD-17 | `PurgeDocument` runs as an abandoned child of `RetainDocument` for replace-retires; an hourly `purge-sweep` deletes rows whose `purge_after` is > 24 h old as a backstop. | §5.4.2 | | section-local (N28 names `purge-sweep`) |
+| PD-18 | The relay's advisory lock lives on a dedicated direct Postgres connection (not through pgbouncer). | §5.6 | | N15 (adopted) |
+| PD-19 | Export writes all files inside one snapshot transaction; the manifest is written last and is the commit point; the thin client applies deltas by sorted streaming merge. | §5.7 | | N30 (adopted) |
+| PD-20 | Stale observations are reconsolidated in dedicated batches that permit only `update`/`delete` and show only remaining live sources. | §5.2.2 | | N29 (adopted) |
+| PD-21 | Pages carry `stale_seq`; a refresh clears `stale_write`/`stale_delete` only if `stale_seq` is unchanged since evidence gathering. | §5.3.1 | | section-local |
+| PD-22 | `RetainBackfill` only pre-warms the extraction and embedding caches through the gateway batch API (`batch_jobs` table for exactly-once submission) and then runs ordinary `RetainDocument` children. | §5.1.6 | | N31 (adopted) |
+| PD-23 | `CommitChunk` stops with `superseded` when `documents.current_version > v`, and `FinalizeVersion`/the delete cascade share one advisory lock per document. | §5.1.2, §5.4.1 | | N27 (adopted) |

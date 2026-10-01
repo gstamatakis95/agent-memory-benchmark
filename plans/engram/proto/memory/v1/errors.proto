@@ -123,9 +123,8 @@ enum NamespaceState {
 // WrongShardOrEpoch → FAILED_PRECONDITION. The shard that received the call
 // does not hold the namespace at the epoch the caller resolved (stale catalog
 // cache, a move cut over between resolve and execute, or a restore bumped the
-// epoch). The API retries this internally up to 3 times after invalidating
-// its catalog entry, so public clients see it only when retries are
-// exhausted. Epochs are exposed because they are the only actionable
+// epoch). The API invalidates its catalog entry, re-resolves and retries the
+// call once, so public clients see it only when that retry also fails. Epochs are exposed because they are the only actionable
 // diagnostic; the shard id is never exposed. Client action: retry the whole
 // call with backoff (new resolve), do not persist anything from this detail.
 message WrongShardOrEpoch {

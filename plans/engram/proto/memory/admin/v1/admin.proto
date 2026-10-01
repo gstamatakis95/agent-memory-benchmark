@@ -66,6 +66,12 @@ service ShardService {
   rpc ResolveNamespace(ResolveNamespaceRequest) returns (ResolveNamespaceResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
+  // ReleaseNamespace records that a shard no longer holds a namespace: after
+  // the PurgeNamespace workflow removed the last rows it marks the catalog row
+  // DELETED (decision D8). Called by the purge workflow through engram-api
+  // because workers never write the catalog directly (decision D4).
+  // Idempotent.
+  rpc ReleaseNamespace(ReleaseNamespaceRequest) returns (ReleaseNamespaceResponse);
 }
 
 // MoveService drives namespace moves between shards (decision D5).
@@ -85,6 +91,12 @@ service MoveService {
   // incoming ownership row is dropped, copied rows are purged, source is
   // un-frozen if needed. After CUTOVER a rollback is a new move back.
   rpc RollbackMove(RollbackMoveRequest) returns (RollbackMoveResponse);
+  // CleanupMove runs decision D5 step 7 after the 24 h grace: deletes the
+  // namespace's rows and blob prefix on the source shard, drops its move
+  // cursor and the target's move_applied rows, and sets the move DONE. Called
+  // by the Move workflow (the worker never writes the catalog outside
+  // Plan/Freeze/Cutover) or earlier by `engramctl move cleanup`. Idempotent.
+  rpc CleanupMove(CleanupMoveRequest) returns (CleanupMoveResponse);
 }
 
 // Isolation says whether a tenant's namespaces may share shards.
@@ -372,6 +384,26 @@ message ResolveNamespaceResponse {
 }
 
 // MoveState follows decision D5.
+// ReleaseNamespaceRequest finalises a namespace delete (ShardService).
+message ReleaseNamespaceRequest {
+  memory.v1.RequestMeta meta = 1;
+  memory.v1.NamespaceRef namespace = 2;
+  int32 shard_id = 3;
+  // Epoch the purge ran under; FAILED_PRECONDITION if the catalog disagrees.
+  int64 epoch = 4;
+  string operation_id = 5;
+
+  reserved 100 to 199;
+}
+
+// ReleaseNamespaceResponse echoes the catalog state (DELETED).
+message ReleaseNamespaceResponse {
+  memory.v1.NamespaceRef namespace = 1;
+  google.protobuf.Timestamp deleted_at = 2;
+
+  reserved 100 to 199;
+}
+
 enum MoveState {
   MOVE_STATE_UNSPECIFIED = 0;
   MOVE_STATE_PLANNED = 1;
@@ -491,6 +523,25 @@ message RollbackMoveRequest {
 // RollbackMoveResponse returns the move (ROLLED_BACK or rolling back).
 message RollbackMoveResponse {
   Move move = 1;
+
+  reserved 100 to 199;
+}
+
+// CleanupMoveRequest purges the source side of a move in state CLEANING.
+message CleanupMoveRequest {
+  memory.v1.RequestMeta meta = 1;
+  string move_id = 2;
+  // Skip the remaining grace period (operator use).
+  bool skip_grace = 3;
+
+  reserved 100 to 199;
+}
+
+// CleanupMoveResponse returns the move (DONE, or CLEANING while batches run).
+message CleanupMoveResponse {
+  Move move = 1;
+  int64 rows_purged = 2;
+  int64 blobs_purged = 3;
 
   reserved 100 to 199;
 }

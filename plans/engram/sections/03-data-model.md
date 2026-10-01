@@ -80,7 +80,7 @@ Mutable versus append-only, per table group:
 | Group | Mutability | Physical delete |
 |---|---|---|
 | `ingest_ledger` | append-only (trigger) | purge after an acknowledged delete, namespace delete, move cleanup; `engram_admin`/`engram_move` only |
-| `facts`, `chunks` | `retired_at`, `purge_after`, `invalidated_at`, `consolidated_at`, tags/metadata on re-retain | `PurgeWorkflow` in batches of 1,000 once `purge_after <= now()` |
+| `facts`, `chunks` | `retired_at`, `purge_after`, `invalidated_at`, `consolidated_at`, tags/metadata on re-retain | `PurgeDocument` / `PurgeNamespace` in batches of 1,000 once `purge_after <= now()` |
 | `fact_links`, `entity_mentions`, `observation_sources`, `page_sources`, `document_version_chunks` | insert/delete only, never updated | synchronous in the delete cascade (D8) or purge |
 | `documents`, `document_versions`, `observations`, `observation_versions`, `pages`, `page_versions`, `entities`, `operations` | updated in place (state, counters, flags, versions) | purge / namespace delete |
 | `namespace_ownership`, `namespace_stats`, `outbox_cursors`, `token_usage`, `quota_counters` | hot updates, `fillfactor` 50 to 70 | never (ownership rows outlive the data for the fence) |
@@ -272,11 +272,13 @@ CREATE TABLE namespace_ownership (                -- the fence (D2 row 4, D5); m
   shard_id          integer NOT NULL,             -- the ONLY shard_id column on data tables; trigger-checked against shard_meta
   epoch             bigint NOT NULL CHECK (epoch >= 1),
   state             ownership_state NOT NULL,     -- incoming|active|frozen|moved_out
+  freeze_reason     text CHECK (freeze_reason IN ('move', 'delete', 'restore')),   -- why frozen (D2)
   move_id           uuid,
   move_applied_seq  bigint,                       -- target-side replay watermark (D5 step 3), folded in here
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (namespace_id, tenant_id),               -- FK target of every root table
-  CHECK (state <> 'incoming' OR move_id IS NOT NULL)
+  CHECK (state <> 'incoming' OR move_id IS NOT NULL),
+  CHECK (state <> 'frozen' OR freeze_reason IS NOT NULL)
 );
 CREATE TRIGGER namespace_ownership_check BEFORE INSERT OR UPDATE ON namespace_ownership
   FOR EACH ROW EXECUTE FUNCTION engram_check_ownership();   -- shard_id = shard_meta.shard_id; epoch never decreases
@@ -571,7 +573,7 @@ CREATE INDEX entity_mentions_entity_idx ON entity_mentions (namespace_id, entity
 The trigram index is a two-column GIN (`btree_gin` supplies the uuid operator class) so that
 even the fuzzy index leads with `namespace_id`; `canonical_norm % $q AND namespace_id = $ns`
 is one index scan. A merged entity keeps its row with `merged_into` set, so aliases resolve
-to the survivor without rewriting history; `EntityMerged` re-points `entity_mentions` rows.
+to the survivor without rewriting history; `EntitiesMerged` re-points `entity_mentions` rows.
 
 #### 3.3.6 Observations, consolidation, pages
 
@@ -825,26 +827,28 @@ defaulted from the transaction scope), `event_type` (the `Event` oneof case name
 filtering and dashboards), `payload` (the serialised `engram.internal.events.v1.Event`, ≤ 16 KiB),
 `created_at`.
 
-**Events** (`engram.internal.events.v1.Event { Envelope envelope = 1; oneof body { ... } }`,
-envelope = `namespace_id, tenant_id, epoch, seq, occurred_at, operation_id`). Events are thin
+**Events** (`engram.internal.events.v1.Event`: envelope fields `seq, namespace_id, tenant_id, epoch,
+occurred_at, schema_version, event_id, operation_id, shard_id`, then `oneof payload { ... }`; the
+oneof case name is what `event_type` stores). Events are thin
 (N12): ids, versions, hashes and flags, never text or vectors; a consumer that needs content
 reads the rows by id under the recorded namespace scope.
 
 | Event | Emitted by | Payload |
 |---|---|---|
-| `ChunkCommitted` | `CommitChunk` | `document_id, version, chunk_id, content_hash, memory_ids[], link_count, mention_count` |
-| `ChunkRetired`, `ChunkReembedded` | `FinalizeVersion` | `document_id, version, chunk_ids[]` |
-| `DocumentVersionActivated` | `FinalizeVersion` | `document_id, version, superseded_version` |
-| `FactsRetired` | `FinalizeVersion`, delete cascade | `document_id, memory_ids[] (≤ 500 per event, part/parts)` |
-| `FactInvalidated`, `FactRestored` | Invalidate/Restore | `memory_id, reason` |
-| `FactsConsolidated` | consolidation apply | `batch_key, memory_ids[]` |
-| `DocumentDeleted` | delete cascade | `document_id, version, memory_ids[], chunk_ids[], observation_ids_retired[], page_ids[]` plus the `deletion_log` key `(kind, subject_id, deleted_at)` |
-| `ObservationCreated`, `ObservationVersionAdded`, `ObservationRetired` | consolidation, cascade | `observation_id, version, effective_at, source_count` |
-| `PageStale`, `PageVersionCreated` | consolidation, cascade, refresh | `page_id, stale_seq / version, effective_at` |
-| `EntityMerged`, `EntitiesPruned` | resolver, purge | `survivor_id, merged_ids[]` |
-| `RowsPurged`, `BlobsDeleted` | purge | counts per table / keys |
-| `OperationFinished` | every workflow end | `operation_id, state` |
-| `NamespaceDeleted`, `RestoreMarker` | purge, restore | `deletion_log` key / `restored_to, epoch_bump` |
+| `DocumentVersionStarted` | retain ack | `document_id, version, content_hash, update_mode, chunks_planned` |
+| `ChunkCommitted` | `CommitChunk` (re-emitted by `ReembedChunk`) | `document_id, version, chunk_id, content_hash, fact_ids[], entity_ids[], links_written, mentioned_at` |
+| `ChunksRetired` | `FinalizeVersion` | `document_id, version, chunk_ids[], fact_ids[], retired_at` |
+| `DocumentVersionActivated` | `FinalizeVersion` | `document_id, version, superseded_version, fact_count, chunk_count` |
+| `DocumentDeleted` | delete cascade | `document_id, fact_ids[], chunk_ids[], observations_marked_stale[], observations_retired[], pages_marked_stale[], deleted_at` — the `deletion_log` key is derivable (`kind = document`, `subject_id = document_id`, `deleted_at`) |
+| `FactInvalidated`, `FactRestored` | Invalidate/Restore | `fact_id, invalidated_at, reason` / `fact_id` (`deletion_log` kind `memory`) |
+| `ObservationUpserted`, `ObservationRetired`, `ObservationsMarkedStale` | consolidation apply; cascade and trigger read-back | `observation_id, version, source_fact_ids[], effective_at, op_key, created` / `observation_id, op_key, zero_sources` / `observation_ids[], cause_fact_id` |
+| `EntityUpserted`, `EntitiesMerged` | `CommitChunk`, resolver | `entity_id, canonical_name, type, created` / `survivor_id, merged_ids[]` |
+| `PageVersionCreated`, `PageDeleted`, `PagesMarkedStale` | refresh, delete, consolidation/cascade | `page_id, version, markdown_blob_key, effective_at` / `page_id` / `page_ids[], stale_write, stale_delete` |
+| `SnapshotCreated` | export | `version, manifest_blob_key, base_version` |
+| `RowsPurged` | purge batches (facts, chunks, entities, namespace) | `table, ids[], document_id` |
+| `TokenUsageRecorded` | every metered commit | `day, op, model, prompt_tokens, completion_tokens, cost_micros` |
+| `NamespacePurged` | namespace purge | `rows_purged, blobs_purged` (`deletion_log` kind `namespace`) |
+| `RestoreMarker` | restore-from-backup (§9.3) | `shard_id, restored_to, epoch_bump` — tells every consumer to reconcile from the restore point (N23) |
 
 Field numbers, reserved ranges and the BSR schema reference are in section 4; the oneof case
 name is what `event_type` stores, and adding an event is a proto change plus nothing in SQL
@@ -907,7 +911,7 @@ to rotate).
 | Document summary | `docsum/{sha256(document_hash ‖ prompt_version ‖ model)}.json` | ≤ 200-char summary + heading tree | content-addressed, immutable | `SummarizeDocument` | tombstoned on document delete |
 | Consolidation result | `consolidate/{hex(batch_key)}.json` | raw LLM ops for the batch (bisect replays read it) | content-addressed by `batch_key` | `ConsolidateBatch` | 30 d sweep |
 | Page markdown | `pages/{page_id}/v{n}.md` | one immutable version | versioned, immutable | page refresh | tombstoned on page retire / namespace delete |
-| Export snapshot | `export/v{n}/manifest.json`, `facts.jsonl.zst`, `observations.jsonl.zst`, `chunks.jsonl.zst`, `pages/*.md`, `delta-v{n-1}-v{n}.jsonl.zst` | D12 | versioned, immutable | `ExportWorkflow` | `export_snapshots.expires_at` → tombstones |
+| Export snapshot | `export/v{n}/manifest.json`, `facts.jsonl.zst`, `observations.jsonl.zst`, `chunks.jsonl.zst`, `pages/*.md`, `delta-v{n-1}-v{n}.jsonl.zst` | D12 | versioned, immutable | `ExportSnapshot` workflow | `export_snapshots.expires_at` → tombstones |
 | Reflect transcript (optional) | `reflect/{operation_id}.jsonl` | tool calls and model turns of one Reflect | per operation, immutable | `Reflect` when `profile.keep_transcripts` | 7 d sweep |
 | Temporal staging (N13) | `staging/{operation_id}/{activity}.bin` | embeddings > 512 KiB in flight | per activity | activities | on operation end |
 
@@ -951,12 +955,13 @@ the `fact_links` PK ≈ 10 GB, ownership/stats/cursors negligible → ≈ 40 GB,
 `shared_buffers = 16 GB` plus the OS page cache; the 300 GB volume holds the total with room
 for one `REINDEX CONCURRENTLY` of the largest index (3.7 below).
 
-Two numbers disagree with the register's D3 row and are reported in the closing notes rather
-than silently changed: `fact_links` cannot be 25 GB at 300 M rows of three uuids (71 GB is the
-floor with the PK and the reverse index; a denser row is impossible without abandoning UUIDv7
-ids, which D1 fixes), and the register's 90 GB total omits the ledger (6 GB) and the
-observation sources. The practical lever is the link cap (section 5): 15 links per fact brings
-the shard to ≈ 123 GB, and the register's own "≈ 30/fact" is an assumption, not a measurement.
+These are the figures the register's D3 row now carries (≈ 71 GB of `fact_links`, ≈ 158 GB
+total, ≈ 123 GB at 15 links per fact, ≈ 40 GB hot): `fact_links` cannot be smaller at 300 M
+rows of three uuids (71 GB is the floor with the PK and the reverse index; a denser row is
+impossible without abandoning UUIDv7 ids, which D1 fixes), and the ledger (6 GB) and the
+observation sources are part of the total. The practical lever is the link cap (section 5):
+15 links per fact brings the shard to ≈ 123 GB, and "≈ 30/fact" (A-7) is an assumption, not a
+measurement.
 
 **Vacuum and bloat plan.**
 
@@ -970,7 +975,7 @@ the shard to ≈ 123 GB, and the register's own "≈ 30/fact" is an assumption, 
 
 Retire + purge pattern: a retire is an in-place update of `retired_at`/`purge_after` (not HOT,
 because both columns are in partial-index predicates, so each retire adds index entries to the
-two partial indexes and marks the old tuple dead). `PurgeWorkflow` deletes physical rows in
+two partial indexes and marks the old tuple dead). `PurgeDocument` deletes physical rows in
 batches of 1,000 (`WHERE namespace_id = $1 AND purge_after <= now() ... LIMIT 1000` over
 `facts_purge_idx`, FK cascades take links, mentions and sources with them) with a 50 ms pause
 between batches, so a 100 k-fact document delete spreads over ~10 s and never holds a long
@@ -1186,7 +1191,7 @@ INSERT INTO blob_tombstones (namespace_id, tenant_id, tombstone_id, blob_key, re
 SELECT $1, $t, engram_uuid_v7(), k, 'document_delete', $op FROM unnest($blob_keys) AS k;   -- docsum, ledger/{sha256} if unshared
 INSERT INTO operations (namespace_id, tenant_id, operation_id, kind, target_id, workflow_id, task_queue, submitted_epoch)
 VALUES ($1, $t, $op, 'purge', $2, 'ns/' || $1 || '/op/' || $op, $queue, $e);
-INSERT INTO outbox (event_type, payload) VALUES ('DocumentDeleted', $proto), ('FactsRetired', $proto2);
+INSERT INTO outbox (event_type, payload) VALUES ('DocumentDeleted', $proto);
 COMMIT;
 ```
 
@@ -1294,21 +1299,19 @@ shard-wide index on a 10 M-row table.
 
 ### 3.10 Notes for the other sections
 
-Items this section settled that neighbouring sections should align to, and divergences found
-while reading them:
+Items this section settled and that the neighbouring sections now follow (the divergences found
+while reading them were fixed in those sections during editing):
 
-- Section 5 uses `RETURNING (xmax = 0) AS inserted` on `chunks`; that is an error on a
-  partitioned table. Use `RETURNING chunk_id, (created_at = now()) AS inserted` (3.8).
-- Section 5 names `export_versions`, `operation_errors` and `ledger_tombstones`; this schema
-  has `export_snapshots`, an `operations.error` JSON column, and no ledger tombstones (ledger
-  rows are deleted by the purge path under `engram_admin`, so no tombstone is needed).
-- Section 5's `scope_tags` on observations is `observations.tags` here, so every arm filters
-  the same column name.
-- Section 8's static RLS check should allow the `relay_read_all` policy on `outbox` only (D6
-  N4 narrowed the relay to `outbox` and `outbox_cursors`; the deletion-log consumer reads the
-  `deletion_log` key fields from the `DocumentDeleted`/`NamespaceDeleted` events).
+- Section 5's `CommitChunk` uses `RETURNING chunk_id, (created_at = now()) AS inserted` (3.8);
+  `xmax` is not readable in `RETURNING` on a partitioned table.
+- Section 5 names `export_snapshots`, the `operations.error` JSON column and the admin-role
+  ledger delete at purge (there is no `ledger_tombstones` table: ledger rows are deleted by
+  the purge path under `engram_admin`, and `deletion_log` is the audit trail, N21).
+- Observation scope tags are `observations.tags`, so every arm filters the same column name.
+- Section 8's static RLS check allows the `relay_read_all` policy on `outbox` only (N4; the
+  deletion-log consumer reads the `deletion_log` key fields from the `DocumentDeleted`,
+  `FactInvalidated` and `NamespacePurged` events).
 - Section 9's `shard_meta` carries `shard_id` as well as the version columns; the ownership
   trigger depends on it, so provisioning must insert that row before the first namespace.
-- D3's `fact_links ≈ 25 GB` and `≈ 90 GB total` are not reachable with the register's own id
-  and link-count decisions; see 3.7 for the arithmetic (≈ 71 GB and ≈ 158 GB, or ≈ 123 GB at
-  15 links per fact).
+- The register's D3 row carries this section's sizing (≈ 71 GB of `fact_links`, ≈ 158 GB
+  total, ≈ 123 GB at 15 links per fact, ≈ 40 GB hot; see 3.7 for the arithmetic).

@@ -52,8 +52,8 @@ adapters/
   mcp/                   MCP tool definitions derived from protos; per-namespace endpoints; scope gating
   connect/               ConnectRPC handlers mounted on the same mux as gRPC
 formal/
-  tla/*.tla              Outbox, Move, DeleteVsRetain, Consolidation, AsOf specs (§7)
-  lean/Engram/*.lean     TagMatch, RRF, Packing, TemporalWindow proofs (§7)
+  tla/*.tla              Outbox, ShardMove, DocLifecycle, Consolidation, AsOf specs (§7)
+  lean/Engram/*.lean     TagMatch, RRF, Packer, TemporalWindow proofs (§7)
 ```
 
 **Dependency rule** (enforced by `go vet` + a `depguard` config in CI; a violation fails the build):
@@ -99,12 +99,9 @@ type Server struct {
 	Admin AdminServers                        // ShardService, MoveService, TenantService
 }
 type Options struct {
-	MaxDeadline map[string]time.Duration // full method → clamp (default 30 s
-	Recall 5 s
-	Reflect 300 s
-	StreamSnapshot 600 s) */
-	DefaultPageSize int32                // 50
-	MaxPageSize 500 */
+	MaxDeadline map[string]time.Duration // full method → cap (N11: default 30 s, Recall 10 s, Retain 30 s, Reflect 330 s, WaitOperation 65 s, StreamSnapshot 600 s); over the cap is INVALID_ARGUMENT, never clamped
+	DefaultPageSize int32                // 100 (§4.1.4)
+	MaxPageSize int32                    // 1000 (200 for ListMemories with text in the mask)
 	RequestIDTTL time.Duration           // 24 h (D1)
 }
 
@@ -142,14 +139,14 @@ type Idempotency interface {
 	Commit(ctx context.Context, tx store.Tx, requestID string, resp proto.Message) error
 }
 
-// DeadlineGuard is the unary/stream interceptor that rejects missing deadlines and clamps them.
+// DeadlineGuard is the unary/stream interceptor that rejects missing deadlines and deadlines over the per-method cap (N11).
 func DeadlineGuard(o Options) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor)
 ```
 
 Streaming helpers: `StreamBatcher[T]` groups results into batches of 10 and flushes on deadline pressure
 (`Recall`), `TokenStreamer` for `Reflect`, and `PartStreamer` (1 MiB parts) for `StreamSnapshot`. A `request_id`
-collision with a different request hash returns `ABORTED` + `OperationConflict` (a client reusing keys is a bug,
-not a retry).
+collision with a different request hash returns `ALREADY_EXISTS` + `OperationConflict{IDEMPOTENCY_KEY_REUSED}` (D1;
+a client reusing keys is a bug, not a retry).
 
 **(c) Dependencies.** `authz`, `router`, `recall`, `pages`, `export`, `quota`, `store`, `workflows` (client
 interface), `errs`, `telemetry`, `gen/go`.
@@ -444,8 +441,8 @@ func New(o Options) Client
 ```
 
 Error contract: HTTP 429/5xx → `errs.Unavailable` (retryable); 400/404/413/422 → `errs.PermanentLLMError{Status,
-Model}` (activities treat it as non-retryable and, for extraction, dead-letter the chunk into `operation_errors`
-with the chunk hash; the operation finishes `SUCCEEDED (with a non-empty `errors` list)`). Rationale: a schema-rejecting model will
+Model}` (activities treat it as non-retryable and, for extraction, record the chunk hash and reason in
+`operations.error`; the operation finishes `SUCCEEDED` with `progress.units_failed > 0`, N35). Rationale: a schema-rejecting model will
 not succeed on retry; a rate-limited one will.
 
 **(c) Dependencies.** `errs`, `telemetry`, `quota` (Meter via hook), `net/http`.
@@ -473,7 +470,7 @@ type Prefix struct { ShardID int32; TenantID string; NamespaceID string }
 func (p Prefix) String() string // "7/acme/018f…/"
 func (p Prefix) Key(parts ...string) string
 
-type Kind string // "raw" | "xcache" | "pages" | "export" | "ledger" | "backup"
+type Kind string // "ledger" | "xcache" | "docsum" | "consolidate" | "pages" | "export" | "staging" (§3.6)
 
 type ObjectInfo struct { Key string; Size int64; ETag string; SHA256 [32]byte; LastModified time.Time; Metadata map[string]string }
 type PutOptions struct { ContentType string; Metadata map[string]string; IfNoneMatch bool /* content-addressed puts: skip if present */ }
@@ -495,17 +492,18 @@ func Scoped(root Store, p Prefix, cred Credential) Store
 // ContentKey builds "{prefix}{kind}/{hex sha256}[.ext]".
 func ContentKey(p Prefix, k Kind, sum [32]byte, ext string) string
 
-// Tombstones make purges resumable: MarkDeleted writes "{key}.tomb" then Delete removes both.
+// Tombstones make purges resumable: the logical delete inserts a blob_tombstones row (§3.3.7) in its own
+// transaction; PurgeBlobs deletes the object and then the row, so a crash leaves a worklist, never a leak.
 type Tombstoner interface {
-	MarkDeleted(ctx context.Context, key string) error
-	PurgeMarked(ctx context.Context, prefix string, olderThan time.Duration) (int, error)
+	MarkDeleted(ctx context.Context, tx store.Tx, key, reason string) error
+	PurgeMarked(ctx context.Context, tx store.Tx, limit int) (int, error)
 }
 ```
 
-Key layout (§3 has the full table): `{shard}/{tenant}/{ns}/raw/{sha256}`,
-`…/xcache/{sha256(chunk_hash‖prompt_version‖model‖schema_version)}.json` (D11), `…/pages/{page_id}/v{n}.md`,
-`…/export/v{n}/…` (D12), `…/ledger/{ledger_id}` for oversized bodies, and `{shard}/backup/{ts}/…` at shard
-level.
+Key layout (§3.6 has the full table): `{shard}/{tenant}/{ns}/ledger/{sha256}` for raw bodies > 64 KiB (N7),
+`…/xcache/{sha256(chunk_hash‖prompt_version‖model‖schema_version)}.json` (D11), `…/docsum/…`, `…/pages/{page_id}/v{n}.md`,
+`…/export/v{n}/…` (D12), `…/staging/…` (N13); pgBackRest repositories live under `_backups/shard-{id}/`, outside
+every tenant prefix (N23).
 
 **(c) Dependencies.** `errs`, `telemetry`; the blob store SDK (A-8: S3-compatible API).
 
@@ -589,7 +587,7 @@ The ownership check is exactly the D2 statement; for `Read` it is `SELECT state 
 namespace_id=$1` and the store rejects `incoming`/`moved_out`/missing with `WrongShardOrEpoch` and accepts
 `active`/`frozen`. The write check compares the epoch; a mismatch is `WrongShardOrEpoch{Expected: scope.Epoch,
 Observed: row.Epoch}`. Because `FOR SHARE` conflicts with the move executor's `FOR UPDATE` when it flips the row
-to `frozen`, an in-flight write either commits before the freeze or observes it — the mechanism §7 `Move.tla`
+to `frozen`, an in-flight write either commits before the freeze or observes it — the mechanism §7 `ShardMove.tla`
 models.
 
 Repository summary (full DDL in §3):
@@ -602,7 +600,7 @@ Repository summary (full DDL in §3):
 | `EntityRepo` | `Similar(name, type, threshold)` (pg_trgm), `Insert`, `AddAlias`, `InsertMentions`, `DeleteMentionsByFacts` | per-namespace; merge writes aliases, never deletes entities |
 | `ObservationRepo` | `Insert`, `NewVersion`, `AddSources`, `DeleteSourcesByFacts`, `MarkStale`, `LatestAsOf(ids, T)` | D9 versioning; trigger retires at 0 sources (D12) |
 | `PageRepo` | `Insert`, `NewVersion`, `SetSources`, `DeleteSourcesByFacts`, `MarkStale(write|delete)` | markdown lives in blob |
-| `OperationRepo` | `Insert`, `Get`, `List`, `Transition(from,to)`, `SetStats`, `Defer(until)`, `PendingWithoutWorkflow(olderThan)` | states `PENDING/RUNNING/DEFERRED/SUCCEEDED/SUCCEEDED (with a non-empty `errors` list)/FAILED/CANCELLED` |
+| `OperationRepo` | `Insert`, `Get`, `List`, `Transition(from,to)`, `SetStats`, `Defer(until)`, `PendingWithoutWorkflow(olderThan)` | states `PENDING/RUNNING/DEFERRED/SUCCEEDED/FAILED/CANCELLED` (N35; a partial failure is `SUCCEEDED` with `progress.units_failed > 0`) |
 | `LedgerRepo` | `Append` | append-only; no update/delete method exists |
 | `IdempotencyRepo` | `Get`, `Put`, `Expire(olderThan)` | 24 h (D1) |
 | `TokenUsageRepo` | `Add(day, op, model, prompt, completion, cost)`, `SumDay` | moves with the namespace (D13) |
@@ -644,7 +642,7 @@ type Filter struct {
 	AsOf *time.Time               // mentioned_at ≤ AsOf, applied inside the predicate (D9)
 	FactTypes []memoryv1.FactType
 	Tags []string
-	TagMode memoryv1.TagMatchMode // ANY | ALL | STRICT | EXACT | NONE (§4)
+	TagMode memoryv1.TagMatchMode // ANY | ANY_STRICT | ALL | ALL_STRICT | EXACT (D10, §4.3)
 	DocumentIDs []string
 }
 type SemanticQuery struct { Vector []float32; Kinds []Kind /* facts and/or observation_versions */; Filter Filter; Limit int /* 50/150/400 by budget */; EfSearch int /* hnsw.ef_search, default 100 (D3) */ }
@@ -701,7 +699,7 @@ type Options struct { TargetChars int /* 3000 */; MinChars int /* 500 */; MaxCha
 type Chunk struct {
 	Ordinal int
 	ContentHash [32]byte                         // sha256(Text) — identity within the document (D8)
-	Text string                                  // stored in chunks.text (≤ 8 KB)
+	Text string                                  // stored in chunks.text (≤ 4,000 chars and ≤ 16 KiB, D8)
 	Header string                                // stored in chunks.header
 	prepended for embedding + extraction only */
 	HeadingPath []string
@@ -814,7 +812,7 @@ package entity
 type Mention struct { Name string; Type string; FactIdx int; Role string }
 type Candidate struct { EntityID string; Canonical string; Type string; Similarity float32 /* pg_trgm similarity, 0..1 */; Aliases []string; Mentions int64 }
 type Resolution struct { Mention Mention; EntityID string; Created bool; Method string /* "exact" | "alias" | "trigram" | "hint" | "new" */; Score float32 }
-type Options struct { Threshold float32 /* 0.62 trigram similarity (A-9, tuned in §8) */; MaxCandidates int /* 5 */; TypeStrict bool /* true: never merge across types */ }
+type Options struct { Threshold float32 /* 0.6 trigram similarity, 0.85 when a side's type is unknown (A-9, tuned in §8; §5.1.2) */; MaxCandidates int /* 5 */; TypeStrict bool /* true: never merge across types */ }
 
 type Resolver interface {
 	Resolve(ctx context.Context, tx store.Tx, mentions []Mention, hints []string, o Options) ([]Resolution, error)
@@ -848,7 +846,7 @@ package link
 type Kind string // "entity" | "temporal" | "semantic" | "causal"
 
 type Link struct { FromFactID string; ToFactID string; Kind Kind; Weight float32 /* cosine for semantic, 1/(1+days) for temporal, 1 otherwise */ }
-type LinkBudget struct { TemporalPerFact int /* 20 */; SemanticK int /* 10 */; SemanticMinCosine float32 /* 0.75 */; EntityPerFact int /* 50 (guards hub entities) */; MaxPerFact int /* 100 hard cap across kinds */ }
+type LinkBudget struct { TemporalPerFact int /* 20 */; SemanticK int /* 10 */; SemanticMinCosine float32 /* 0.75 */; EntityPerFact int /* 20: the 10 most recent facts per shared entity (guards hub entities) */; MaxPerFact int /* 60 hard cap across kinds (§5.1.2) */ }
 type BuildInput struct { Facts []store.Fact /* with ids and embeddings */; Resolutions []entity.Resolution; Causes map[int][]int /* fact index → cause indices (same chunk) */ }
 type BuildResult struct { Links []Link; Dropped map[Kind]int /* over-budget counts, reported in operation stats */ }
 
@@ -1104,35 +1102,35 @@ func OpSweeperID(shardID int32) string     // "shard/{id}/op-sweeper" (schedule)
 
 // Workflows (inputs/results are protos in engram.internal.workflow.v1).
 func RetainDocument(ctx workflow.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.RetainDocumentResult, error)
-func PurgeDocument(ctx workflow.Context, in *workflowv1.PurgeDocumentInput) error
-func Consolidate(ctx workflow.Context, in *workflowv1.ConsolidateInput) error   // long-lived; signal "wake"; debounce 30 s; ContinueAsNew every 100 rounds or 24 h
-func PageRefresh(ctx workflow.Context, in *workflowv1.PageRefreshInput) error
+func PurgeDocument(ctx workflow.Context, in *workflowv1.PurgeInput) (*workflowv1.PurgeResult, error) // PurgeNamespace: same input, PurgeTarget NAMESPACE
+func Consolidate(ctx workflow.Context, in *workflowv1.ConsolidateInput) error   // long-lived; signal Nudge (ConsolidateTrigger); debounce 30 s; ContinueAsNew after every round (§5.2.1)
+func PageRefresh(ctx workflow.Context, in *workflowv1.RefreshPageInput) (*workflowv1.RefreshPageResult, error)
 func ExportSnapshot(ctx workflow.Context, in *workflowv1.ExportInput) (*workflowv1.ExportResult, error)
 func Move(ctx workflow.Context, in *workflowv1.MoveInput) (*workflowv1.MoveResult, error)
 func OpSweeper(ctx workflow.Context, in *workflowv1.OpSweeperInput) error
 
-// Every activity input embeds workflowv1.NamespaceRef{namespace_id, tenant_id, shard_id, epoch};
+// Every activity input embeds workflowv1.WorkflowScope{namespace_id, tenant_id, shard_id, epoch, blob_prefix};
 // activities re-check ownership through store.WithNamespaceTx (D4).
 type RetainActivities interface {
-	Chunk(ctx context.Context, in *workflowv1.ChunkInput) (*workflowv1.ChunkOutput, error)
-	SummarizeDocument(ctx context.Context, in *workflowv1.SummarizeInput) (*workflowv1.SummarizeOutput, error)
-	ExtractChunk(ctx context.Context, in *workflowv1.ExtractInput) (*workflowv1.ExtractOutput, error)
-	EmbedChunk(ctx context.Context, in *workflowv1.EmbedInput) (*workflowv1.EmbedOutput, error)
-	ResolveEntities(ctx context.Context, in *workflowv1.ResolveInput) (*workflowv1.ResolveOutput, error)
-	BuildLinks(ctx context.Context, in *workflowv1.LinkInput) (*workflowv1.LinkOutput, error)
-	CommitChunk(ctx context.Context, in *workflowv1.CommitInput) (*workflowv1.CommitOutput, error)
-	FinalizeVersion(ctx context.Context, in *workflowv1.FinalizeInput) (*workflowv1.FinalizeOutput, error)
+	Chunk(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.ChunkPlan, error)
+	SummarizeDocument(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.SummarizeDocumentResult, error)
+	ExtractChunk(ctx context.Context, scope *workflowv1.WorkflowScope, w *workflowv1.ChunkWork) (*workflowv1.ExtractChunkResult, error)
+	EmbedChunk(ctx context.Context, scope *workflowv1.WorkflowScope, w *workflowv1.ChunkWork, x *workflowv1.ExtractChunkResult) (*workflowv1.EmbedChunkResult, error)
+	ResolveEntities(ctx context.Context, scope *workflowv1.WorkflowScope, x *workflowv1.ExtractChunkResult) (*workflowv1.ResolveEntitiesResult, error)
+	BuildLinks(ctx context.Context, scope *workflowv1.WorkflowScope, x *workflowv1.ExtractChunkResult, e *workflowv1.EmbedChunkResult, r *workflowv1.ResolveEntitiesResult) (*workflowv1.BuildLinksResult, error)
+	CommitChunk(ctx context.Context, in *workflowv1.CommitChunkInput) (*workflowv1.CommitChunkResult, error)
+	FinalizeVersion(ctx context.Context, in *workflowv1.FinalizeVersionInput) (*workflowv1.FinalizeVersionResult, error)
 }
 
 type ConsolidateActivities interface {
-	Round(ctx context.Context, in *workflowv1.RoundInput) (*workflowv1.RoundOutput, error)
-	CheckQuota(ctx context.Context, in *workflowv1.QuotaInput) (*workflowv1.QuotaOutput, error) // DEFERRED until window reset
+	ConsolidateBatch(ctx context.Context, in *workflowv1.ConsolidateBatchInput) (*workflowv1.ConsolidateBatchResult, error)
+	CheckQuota(ctx context.Context, scope *workflowv1.WorkflowScope) (*memoryv1.DeferredInfo, error) // non-nil → DEFERRED until window reset
 }
 
 type Client interface { // used by engram-api; wraps client.Client
 	StartRetain(ctx context.Context, in *workflowv1.RetainDocumentInput) error // AlreadyStarted → nil
-	StartPurge(ctx context.Context, in *workflowv1.PurgeDocumentInput) error
-	SignalConsolidate(ctx context.Context, ref *workflowv1.NamespaceRef) error // SignalWithStart
+	StartPurge(ctx context.Context, in *workflowv1.PurgeInput) error
+	SignalConsolidate(ctx context.Context, t *workflowv1.ConsolidateTrigger) error // SignalWithStart (Nudge)
 	Cancel(ctx context.Context, workflowID string) error
 	Describe(ctx context.Context, workflowID string) (*Status, error)
 }
@@ -1142,7 +1140,7 @@ Per-chunk fan-out in `RetainDocument` uses a workflow-side semaphore of 32; inte
 KiB (extraction results) are passed by blob key, not inline, to keep Temporal history small; `RetainDocument`
 `ContinueAsNew`s after 500 chunks.
 
-**Retry policies (activity → initial interval, backoff, max attempts, non-retryable):**
+**Retry policies (summary; the consolidated table in §5.8 is authoritative where the two differ):**
 
 | Activity | Initial | Backoff | Max attempts | Non-retryable error types |
 |---|---|---|---|---|
@@ -1150,11 +1148,11 @@ KiB (extraction results) are passed by blob key, not inline, to keep Temporal hi
 | `SummarizeDocument`, `ExtractChunk` | 2 s | ×2, cap 60 s | 8 | `PermanentLLMError`, `ValidationError` (after 1 re-prompt), `WrongShardOrEpoch` |
 | `EmbedChunk` | 1 s | ×2, cap 30 s | 8 | `PermanentLLMError` (incl. wrong dims), `WrongShardOrEpoch` |
 | `ResolveEntities`, `BuildLinks` | 1 s | ×2, cap 30 s | 5 | `WrongShardOrEpoch` |
-| `CommitChunk`, `FinalizeVersion` | 500 ms | ×2, cap 30 s | 10 | `WrongShardOrEpoch`; `NamespaceFrozen` is retryable but the *workflow* stops scheduling after 30 s and waits for the move's restart (D5 step 5) |
-| `Round` (consolidate) | 5 s | ×2, cap 5 min | 6 | `PermanentLLMError`, `WrongShardOrEpoch`; `QuotaExceeded` → workflow sleeps until reset (`DEFERRED`) |
+| `CommitChunk`, `FinalizeVersion` | 1 s | ×1.5, cap 5 s | unlimited within a 10 min `ScheduleToClose` (`P-frozen`, §5.8) | `WrongShardOrEpoch`; `NamespaceFrozen` is retryable because the mover terminates and restarts the workflow on the target within the freeze window (D5 step 5) |
+| `ConsolidateBatch` | 5 s | ×2, cap 5 min | 6 | `PermanentLLMError`, `WrongShardOrEpoch`; `QuotaExceeded` → workflow sleeps until reset (`DEFERRED`) |
 | `PurgeBlobs`, `PurgeRows` | 5 s | ×2, cap 10 min | unlimited (heartbeat) | `WrongShardOrEpoch` |
 | Move `Copy`, `CatchUp` | 5 s | ×2, cap 5 min | 20 | `WrongShardOrEpoch` (fence broken → rollback) |
-| Move `Freeze`, `Cutover` | 1 s | ×2, cap 10 s | 5 | `PreconditionFailed` (CAS lost → rollback) |
+| Move `Freeze`, `Cutover` | 1 s | ×2, cap 10 s | 5 | `MovePrecondition` (CAS lost → rollback) |
 | `Export*` | 5 s | ×2, cap 5 min | 10 | `ValidationError` |
 
 A `WrongShardOrEpoch` in any activity fails the workflow with a typed failure; the move executor restarts the
@@ -1181,21 +1179,21 @@ type Event struct { Seq int64; NamespaceID string; Epoch int64; Type string; Pay
 
 // Sink consumes events in seq order; Apply must be idempotent by (namespace_id, seq).
 type Sink interface {
-	Name() string // "index" | "kafka" | "move:<ns>"
+	Name() string // "index" | "kafka" — the move's "move:<ns>" cursor belongs to a pull consumer driven by the mover, not to a relay sink (N28)
 	Apply(ctx context.Context, events []Event) error
-	Filter() func(e Event) bool // move sinks filter by namespace
+	Filter() func(e Event) bool // optional per-sink filter; nil = every event
 }
 
-type RelayOptions struct { Batch int /* 500 */; PollInterval time.Duration /* 200 ms idle */; StatementTimeout time.Duration /* 30 s → gap watch 60 s */; LockKey int64 /* hashtext("engram.relay") — one per shard DB */ }
+type RelayOptions struct { Batch int /* 500 */; PollInterval time.Duration /* 200 ms idle */; StatementTimeout time.Duration /* 30 s → gap watch 60 s */; LockKey int64 /* hashtext("engram-outbox-relay") — one per shard DB (§5.6) */ }
 type Relay struct { /* handle, sinks, cursors, gaps, metrics */ }
 
 func NewRelay(h *router.ShardHandle, sinks []Sink, o RelayOptions) *Relay
 func (r *Relay) Run(ctx context.Context) error          // acquires the advisory lock on a dedicated conn; returns when lost
-func (r *Relay) AddSink(ctx context.Context, s Sink, fromSeq int64) error // used by move; cursor initialised at p0
+func (r *Relay) AddSink(ctx context.Context, s Sink, fromSeq int64) error // registers a push sink (index, kafka) at a cursor; the move's catch-up is not a sink (N28)
 func (r *Relay) RemoveSink(name string) error
 func (r *Relay) Lag(sink string) (int64, error)
 
-type GapWatch interface { Note(seq int64, seenAt time.Time); Due(now time.Time) []int64; Resolve(seq int64) } // re-probe skipped seqs for 2 × statement_timeout
+type GapWatch interface { Note(seq int64, seenAt time.Time); Due(now time.Time) []int64; Resolve(seq int64) } // re-probe skipped seqs for 2 × statement_timeout; persisted in outbox_cursors.gaps (relay row, ≤ 1 000 entries, §3.5)
 ```
 
 The relay holds a *shard-level* connection (`engram_relay` role, RLS-bypassing read on `outbox` only, since it
@@ -1206,16 +1204,16 @@ delivery is the contract and sinks are idempotent. Rejected: exactly-once via tw
 engine (not available; idempotent keys are cheaper and provable, §7 `Outbox.tla`).
 
 **(c) Dependencies.** `store`, `router`, `index` (Sink adapter), `errs`, `telemetry`, Kafka client (optional
-build tag `kafka`). **(d) Swappable.** Sinks: `IndexSink` (no-op for `Transactional` indexes), `KafkaSink`,
-`MoveSink`. **(e) Test seam.** Model-based test derived from `Outbox.tla`: random commit orderings with holes;
+build tag `kafka`). **(d) Swappable.** Sinks: `IndexSink` (no-op for `Transactional` indexes), `KafkaSink`; the mover's
+catch-up reads through `outbox.Reader` with its own `move:<ns>` cursor (N28). **(e) Test seam.** Model-based test derived from `Outbox.tla`: random commit orderings with holes;
 assert every seq is delivered exactly once to each sink or declared aborted after the watch window, in order per
 namespace.
 
 #### 2.2.19 `internal/move` — namespace move orchestrator (D5)
 
 **(a) Responsibility.** Implement the D5 state machine as Temporal workflow `move/{namespace_id}/{epoch}` on
-task queue `shard-{target}` (new decision N2) with activities `Plan, Copy, CatchUp, Freeze, Drain, Cutover,
-Cleanup, Rollback`, each re-checking the fence before acting. This is the only code path allowed two shard
+task queue `shard-{target}` (new decision N2) with activities `Plan, Copy, CatchUp, Freeze, Drain, Verify, Cutover,
+Restart, Cleanup, Rollback` (§5.5.1), each re-checking the fence before acting. This is the only code path allowed two shard
 handles at once; it never runs a statement that references both.
 
 **(b) Interfaces.**
@@ -1234,9 +1232,11 @@ type Activities interface {
 	Copy(ctx context.Context, f Fence) (*CopyResult, error)                       // REPEATABLE READ on source; p0 = max(outbox.seq); table-by-table COPY; blob prefix copy; heartbeats
 	CatchUp(ctx context.Context, f Fence, fromSeq int64) (*CatchUpResult, error) // replay outbox seq > fromSeq via MoveSink until lag < 100 events or < 5 s
 	Freeze(ctx context.Context, f Fence) error                                    // catalog 'frozen'; source ownership 'frozen' FOR UPDATE (same epoch)
-	Drain(ctx context.Context, f Fence) (*DrainResult, error)                     // replay to max(seq); terminate ns workflows on source queue; record operation ids
-	Cutover(ctx context.Context, f Fence, d *DrainResult) error                   // one catalog tx: shard=target, epoch=e+1, state='active'; target 'active'; source 'moved_out'; NOTIFY; restart ops on target queue
-	Cleanup(ctx context.Context, f Fence) error                                   // after 24 h grace: engramctl-equivalent purge of source rows + old blob prefix (admin role)
+	Drain(ctx context.Context, f Fence) (*DrainResult, error)                     // replay to max(seq); terminate ns workflows on source queue; record their workflow ids (D5 step 5)
+	Verify(ctx context.Context, f Fence) error                                    // both sides static: counts always, checksums ≤ 1 M facts, 1 % sample above; before Cutover (§5.5.1)
+	Cutover(ctx context.Context, f Fence) error                                   // target 'active' @ e+1; one catalog tx: shard=target, epoch=e+1, state='active'; source 'moved_out'; NOTIFY
+	Restart(ctx context.Context, f Fence, d *DrainResult) error                   // re-execute the recorded workflows on shard-{target} with the same ids and epoch e+1
+	Cleanup(ctx context.Context, f Fence) error                                   // after 24 h grace: MoveService.CleanupMove admin RPC purges source rows + old blob prefix (admin role, D5 step 7)
 	Rollback(ctx context.Context, f Fence, reason string) error                   // target ownership → moved_out/deleted rows; source 'active'; catalog 'active'; only before cutover
 }
 
@@ -1247,7 +1247,8 @@ type Orchestrator interface { // admin surface (MoveService)
 }
 
 type Options struct {
-	FreezeBound time.Duration   // 30 s: if Drain cannot finish, Rollback
+	DrainWait time.Duration     // 15 s default, 60 s max (D5 step 4)
+	FreezeWatchdog time.Duration // 120 s: Rollback if Cutover has not committed (D5 step 4)
 	CatchUpMaxLag int           // 100 events
 	CatchUpMaxAge time.Duration // 5 s
 	CleanupGrace time.Duration  // 24 h
@@ -1259,13 +1260,13 @@ Fencing details: `Copy` reads under `REPEATABLE READ` with the source ownership 
 epoch e; `Freeze` takes `FOR UPDATE` on that row and therefore waits for in-flight `FOR SHARE` writers to finish
 — after it commits, no new writer can pass the D2 check; `Cutover` is a CAS on `namespace_moves.state='frozen'`
 and `namespaces.epoch=e`, so a concurrent restore-from-backup (which also bumps epoch) causes the CAS to fail
-and the move rolls back rather than fighting. `Drain` restarts recorded operations with their original
-`operation_id`s and the new epoch; their per-chunk idempotency keys include the epoch, so already-committed
-chunks on the target (copied or replayed) are detected by content hash and skipped, not re-extracted.
+and the move rolls back rather than fighting. `Restart` re-executes the recorded workflows with their original
+ids (hence the same `operation_id`s) and the new epoch; per-chunk idempotency keys exclude the epoch (D11), so
+already-committed chunks on the target (copied or replayed) are detected by content hash and skipped, not re-extracted.
 
 **(c) Dependencies.** `catalog`, `router`, `store`, `blob`, `outbox` (MoveSink), `workflows` (client), `errs`,
 `telemetry`. **(d) Swappable.** `TemporalOrchestrator` → `InlineOrchestrator` (runs phases sequentially
-in-process for tests). **(e) Test seam.** Model-based test from `Move.tla` (§7) with `MemoryCatalog` + two
+in-process for tests). **(e) Test seam.** Model-based test from `ShardMove.tla` (§7) with `MemoryCatalog` + two
 `FakeTx` shards and randomised concurrent retain/consolidate/delete; chaos test on testcontainers kills the
 worker in every phase and asserts the invariants (one active owner, no loss/duplication, eventual
 done/rolled_back).
@@ -1406,14 +1407,14 @@ type Writer interface {
 type Reader interface { Get(ctx context.Context, tx store.Tx, ledgerID string) (*Entry, error); ListByDocument(ctx context.Context, tx store.Tx, documentID string, page store.Page) ([]Entry, string, error) }
 ```
 
-Namespace delete removes ledger rows via the admin purge role only (the trigger checks
-`current_setting('engram.purge')='on'`). **(c)** `store`, `blob`, `errs`. **(d)/(e)** see §2.3.
+Namespace delete and document purge remove ledger rows via the admin role only (the trigger
+admits `DELETE` for `engram_admin`/`engram_move` and nothing else, §3.1). **(c)** `store`, `blob`, `errs`. **(d)/(e)** see §2.3.
 
 #### 2.2.25 `adapters/mcp` — MCP server
 
 **(a) Responsibility.** Expose per-namespace MCP endpoints `/mcp/{tenant_id}/{namespace_id}` with tools derived
-from `memory.v1` (`retain`, `recall`, `reflect`, `get_memory`, `list_memories`, `invalidate`, `restore`,
-`get_page`, `list_pages`, `get_operation`); read tools are always listed, write tools are listed only when the
+from `memory.v1` (`recall`, `retain`, `reflect`, `get_memory`, `get_operation`, `list_documents`,
+`delete_document`, `get_page`, `list_pages` — the §4.6 mapping table is the golden list); read tools are always listed, write tools are listed only when the
 JWT carries `memory.write` (the core re-checks, so listing is a UX nicety, not security).
 
 ```go
@@ -1469,13 +1470,13 @@ Cobra commands (each maps to `memory.admin.v1` or to direct DB access with an ad
 
 | Command | Does |
 |---|---|
-| `shard provision --id 7 --cell a --dsn …` | creates DB, roles (`engram_app` NOBYPASSRLS, `engram_relay`, `engram_move`, `engram_admin`), extensions, partitions, RLS policies; registers in the catalog as `provisioning` |
+| `shard provision --id 7 --cell a --dsn …` (operator alias: `shard add`, §9.5) | creates DB, roles (`engram_app` NOBYPASSRLS, `engram_relay`, `engram_move`, `engram_admin`), extensions, partitions, RLS policies; registers in the catalog as `provisioning` |
 | `shard migrate --id 7 [--all --cell a]` | goose migrations per shard with lock; `--canary` runs one shard and stops (§9) |
 | `shard activate / drain / retire` | catalog `SetShardState` |
 | `shard stats --id 7` | live facts, partitions sizes, index bloat, outbox lag |
-| `namespace create / move / purge` | `CreateNamespace`; `MoveService.Start`; post-grace source purge (`Cleanup`) |
-| `move status / abort` | `MoveService` |
-| `backup create --shard 7` / `restore --shard 7 --to …` | pg_basebackup + WAL to `{shard}/backup/…`; restore bumps epoch for every namespace on the shard (D1) and re-applies delete tombstones recorded after the backup point (§9) |
+| `namespace create / move / purge` | `CreateNamespace`; `MoveService.StartMove`; post-grace source purge (`MoveService.CleanupMove`) |
+| `move status / abort / cleanup` | `MoveService.GetMove`, `RollbackMove`, `CleanupMove` |
+| `backup create --shard 7` / `restore --shard 7 --to …` | pgBackRest stanza per shard under `_backups/shard-{id}/` (N23); restore bumps the epoch of every namespace on the shard (D1) and re-applies the `deletion_log` entries recorded after the backup point (N21, §9.3) |
 | `outbox trim --shard 7` | manual trigger of the daily trim |
 | `catalog flush-cache` | admin RPC that broadcasts a synthetic `catalog_changes` flush |
 | `entity split` (phase 3) | repair a wrong merge |
@@ -1505,7 +1506,7 @@ function over interfaces; tests run against testcontainers Postgres.
 | `internal/pages` | `Service`, `Refresher` | `PageService`, `LLMRefresher` | `NoopRefresher` | testcontainers; staleness flag tests |
 | `internal/workflows` | workflow funcs, `*Activities` | Temporal SDK | `FakeActivities` | `testsuite`; chaos on testcontainers Temporal |
 | `internal/outbox` | `Relay`, `Sink` | `Relay` + `IndexSink` | `KafkaSink`, `MoveSink`, `MemSink` | model-based from `Outbox.tla` |
-| `internal/move` | `Orchestrator`, `Activities` | `TemporalOrchestrator` | `InlineOrchestrator` | model-based from `Move.tla`; phase-kill chaos |
+| `internal/move` | `Orchestrator`, `Activities` | `TemporalOrchestrator` | `InlineOrchestrator` | model-based from `ShardMove.tla`; phase-kill chaos |
 | `internal/export` | `SnapshotBuilder`, `Streamer` | blob-backed | `MemStore`-backed | manifest goldens; resume tests |
 | `internal/quota` | `Limiter`, `Meter`, `Deferral` | token bucket + `token_usage` | `UnlimitedLimiter` | fake clock; deferral round-trip |
 | `internal/config` | `Resolver` | JSON merge | — | golden merges; unknown-key rejection |
@@ -1532,10 +1533,10 @@ const (
 	KindValidation         Kind = iota + 1 // INVALID_ARGUMENT  + memoryv1.ValidationError{field_violations}
 	KindNotFound                           // NOT_FOUND         + memoryv1.NotFound{resource, id}
 	KindQuotaExceeded                      // RESOURCE_EXHAUSTED+ memoryv1.QuotaExceeded{quota, limit, retry_after} (+ google.rpc.RetryInfo)
-	KindWrongShardOrEpoch                  // FAILED_PRECONDITION + memoryv1.WrongShardOrEpoch{namespace_id, expected_epoch, observed_epoch, observed_state}
+	KindWrongShardOrEpoch                  // FAILED_PRECONDITION + memoryv1.WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state}
 	KindNamespaceFrozen                    // FAILED_PRECONDITION + memoryv1.NamespaceFrozen{namespace_id, retry_after}
-	KindOperationConflict                  // ABORTED           + memoryv1.OperationConflict{operation_id, request_id}
-	KindPreconditionFailed                 // FAILED_PRECONDITION + memoryv1.PreconditionFailed{description}
+	KindOperationConflict                  // ABORTED (concurrent conflict) or ALREADY_EXISTS (idempotency-key reuse, D1) + memoryv1.OperationConflict{operation_id, existing_operation_id, reason}
+	KindPreconditionFailed                 // FAILED_PRECONDITION + memoryv1.PreconditionFailed{violations[]{type, subject, description}}
 	KindUnavailable                        // UNAVAILABLE       + google.rpc.RetryInfo
 	KindPermanentLLM                       // INTERNAL (never retried) + google.rpc.ErrorInfo{reason:"PERMANENT_LLM_ERROR"}
 	KindUnauthenticated                    // UNAUTHENTICATED
@@ -1554,10 +1555,10 @@ func (e *Error) GRPCStatus() *status.Status // implements the interface grpc-go 
 func Validation(field, desc string) *Error
 func NotFound(resource, id string) *Error
 func QuotaExceeded(quota string, limit int64, retryAfter time.Duration) *Error
-func WrongShardOrEpoch(ns string, expected, observed int64, state string) *Error
+func WrongShardOrEpoch(ns string, expected, actual int64, state memoryv1.NamespaceState) *Error
 func NamespaceFrozen(ns string, retryAfter time.Duration) *Error
-func OperationConflict(operationID, requestID string) *Error
-func PreconditionFailed(desc string) *Error
+func OperationConflict(operationID, existingOperationID string, reason memoryv1.OperationConflictReason) *Error
+func PreconditionFailed(typ, subject, desc string) *Error
 func Unavailable(desc string, retryAfter time.Duration) *Error
 func PermanentLLM(model, status string, cause error) *Error
 func Wrap(kind Kind, msg string, cause error) *Error
@@ -1583,12 +1584,12 @@ Mapping table (authoritative for §4 and for the retry policies in §2.2.17):
 | `QuotaExceeded` | `RESOURCE_EXHAUSTED` | `QuotaExceeded` + `RetryInfo` | yes (after `retry_after`) | quota via authz (rates); workflows defer instead of failing (tokens/facts) |
 | `WrongShardOrEpoch` | `FAILED_PRECONDITION` | `WrongShardOrEpoch` | once (router re-resolve) | store ownership check, move fence |
 | `NamespaceFrozen` | `FAILED_PRECONDITION` | `NamespaceFrozen` | bounded (≤ 30 s) | store ownership check (write mode) |
-| `OperationConflict` | `ABORTED` | `OperationConflict` | no | api idempotency (same `request_id`, different payload), workflows (`operation_id` reuse) |
+| `OperationConflict` | `ABORTED` (concurrent conflict) / `ALREADY_EXISTS` (`IDEMPOTENCY_KEY_REUSED`, D1) | `OperationConflict` | no | api idempotency (same `request_id`/`operation_id`, different payload) → `ALREADY_EXISTS`; purge, cutover or refresh in progress → `ABORTED` |
 | `PreconditionFailed` | `FAILED_PRECONDITION` | `PreconditionFailed` | no | catalog CAS, move Cutover, field-mask/version checks |
 | `Unavailable` | `UNAVAILABLE` | `RetryInfo` | yes | catalog miss when down, gateway 429/5xx, Temporal start failure, shard down |
 | `PermanentLLM` | `INTERNAL` | `ErrorInfo` | no | gateway 4xx, wrong embedding dims, schema-invalid output after re-prompt |
 
-Every `Kind` has exactly one code; the reverse is not true (`FAILED_PRECONDITION` carries three details), which
+Every `Kind` has one code, except `OperationConflict`, whose `reason` selects `ABORTED` or `ALREADY_EXISTS`; the reverse is not true (`FAILED_PRECONDITION` carries three details), which
 is why clients must switch on the detail type, not the code (§4). Rejected: string-matching error messages in
 workflows (the Temporal non-retryable list must be by type).
 
@@ -1598,28 +1599,28 @@ workflows (the Temporal non-retryable list must be by type).
 |---|---|---|---|
 | Extraction concurrency (LLM structured calls) | 32 in flight per `RetainDocument`; 32 per worker process across workflows (`gateway` per-model semaphore) | workflow semaphore + `gateway.RateLimiter` | D3 formula; more only burns the RPM cap |
 | Embedding concurrency | 64 in flight per process; batch ≤ 64 texts per call | `gateway.RateLimiter` | embedding is cheap and fast; cap protects the gateway, not us |
-| Per-shard Postgres pool | 16 conns per process per shard; ≤ 32 shards per cell → ≤ 512 per process; pgbouncer `default_pool_size=64` per shard, `max_client_conn=2000` | `router.Options.PoolSize` | D3 cell bound |
+| Per-shard Postgres pool | 16 conns per process per shard; ≤ 32 shards per cell → ≤ 512 per process; pgbouncer `default_pool_size=24` per shard, `max_client_conn=500` (§9.1) | `router.Options.PoolSize` | D3 cell bound |
 | Recall arm parallelism | 5 arms, each one pooled conn; ≤ 50 QPS/shard target → ≤ 250 concurrent arm queries per shard ≤ pool headroom with p95 60 ms | `recall.Planner` | keeps the pool below saturation at target QPS |
 | Rerank batch | ≤ 300 pairs per call; 1 call per recall | `recall.GatewayReranker` | D15 |
 | Outbox relay batch | 500 rows per read; 1 relay per shard; sinks applied sequentially | `outbox.RelayOptions.Batch` | D6 |
-| Gap watchlist | ≤ 10 000 entries; entries expire after `2 × statement_timeout = 60 s` | `outbox.GapWatch` | bounded memory; beyond the cap the relay pauses and alerts |
-| Temporal pollers | 2 workflow + 2 activity pollers per `shard-{id}` queue; max concurrent activities 256 per worker | worker options | D3 |
+| Gap watchlist | ≤ 1 000 entries, persisted in `outbox_cursors.gaps` (§3.3.2); entries expire after `2 × statement_timeout = 60 s` | `outbox.GapWatch` | bounded and lossless across relay failover; beyond the cap the relay stops advancing and alerts |
+| Temporal pollers | 2 workflow + 2 activity pollers per `shard-{id}` queue; max concurrent activities 64 per worker (§5.1.6, §9.1) | worker options | D3 |
 | Consolidation | 8 facts per LLM call, ≤ 100 facts per round, 1 round in flight per namespace | `Consolidate` workflow (singleton id) | D12 |
 | Reflect | ≤ 10 iterations, ≤ 100 k context tokens, ≤ 300 s, tool deadline 10 s, ≤ 4 concurrent reflects per namespace (`RESOURCE_EXHAUSTED` beyond) | `reflect.Caps`, api semaphore | D12 |
 | Move copy | 10 000 rows per COPY segment; 1 move in flight per namespace; ≤ 4 concurrent moves per cell | `move.Options`, admin API | keeps freeze windows short and source IOPS bounded |
 | Catalog resolver | LRU 100 k entries; single-flight per key; LISTEN reconnect backoff 1 s → 30 s | `catalog.ResolverOptions` | D4 |
 | Embedding LRU (queries) | 10 000 entries per process, keyed `(namespace_id, sha256(prefixed text))` | `recall.QueryEmbedder` | repeat queries skip the 25 ms hop |
-| Streaming / request size | `Recall` batches of 10; `StreamSnapshot` 1 MiB parts; `Retain` ≤ 100 items, ≤ 4 MiB per call, raw body > 64 KiB to blob | `api` helpers and validation | D10, D12; keeps the ledger tx small |
+| Streaming / request size | `Recall` batches of 10; `StreamSnapshot` 1 MiB parts; `Retain` ≤ 100 items, ≤ 8 MiB total and ≤ 1 MiB per item (§4.1.8), raw body > 64 KiB to blob (N7) | `api` helpers and validation | D10, D12; keeps the ledger tx small |
 
 ### New decisions (beyond the register)
 
 | Id | Decision | Rationale | Rejected |
 |---|---|---|---|
-| N1 | Add leaf package `internal/errs` to the D14 layout: typed errors + gRPC/Connect/Temporal mapping; nothing under `internal/` may be imported by it. | Store, services and workflows produce typed errors but may not import `internal/api`. | `internal/api/errors.go` (violates the dependency rule). |
-| N2 | The move workflow `move/{namespace_id}/{epoch}` runs on task queue `shard-{target}`; the executing worker opens a second, move-scoped pool to the source (`engram_move` role: read + outbox read + ownership `FOR UPDATE`). It is the only code path allowed two shard handles. | Keeps "one task queue per shard"; the target worker is the one that must be healthy for the move to be useful. | A cell-wide `moves` queue (breaks the per-shard queue rule; harder to reason about pollers). |
-| N3 | Per-shard Temporal schedule `shard/{id}/op-sweeper` (every 60 s) starts a workflow for any `PENDING` operation older than 2 min with no workflow; the API still returns `UNAVAILABLE` when `StartWorkflow` fails after the ledger commit. | Closes the crash window between the ledger commit and `StartWorkflow` without weakening the ack. | Ack before `StartWorkflow` and rely solely on the sweeper (silently extends visibility lag). |
-| N4 | The outbox relay uses a shard-level `engram_relay` role that bypasses RLS for `SELECT` on `outbox` and `outbox_cursors` only. | The relay must read every namespace's events in `seq` order; per-namespace scans would be O(namespaces) per batch. | Running the relay under `engram_app` with a loop over namespaces. |
-| N5 | A cross-tenant namespace returns `NOT_FOUND`; a same-tenant namespace outside the allowlist, or a missing scope, returns `PERMISSION_DENIED`; `deleting` returns `FAILED_PRECONDITION`. | Prevents namespace-id enumeration across tenants while keeping same-tenant misconfiguration diagnosable. | `PERMISSION_DENIED` for cross-tenant too (an existence oracle); `NOT_FOUND` for same-tenant (hides the real problem). |
-| N6 | Chunk `content_hash` = `sha256(text)` excluding the contextual header; the header hash is compared separately at `FinalizeVersion` to decide re-embedding. | Delta retain and the extraction cache survive summary drift. | Hashing header+text. |
-| N7 | Retain items with a raw body > 64 KiB store the body in blob (`…/ledger/{sha256}`) *before* the ledger transaction; the ledger row keeps the hash and key. | Keeps the ack transaction small; content addressing makes the pre-write idempotent. | Inline bodies of any size (bloats the ledger table and the tx). |
-| N8 | Streams fix `RequestScope` at open; token expiry mid-stream does not abort the stream. | Reflect may legitimately run 300 s. | Per-message re-verification. |
+| N1 | Add leaf package `internal/errs` to the D14 layout: typed errors + gRPC/Connect/Temporal mapping; nothing under `internal/` may be imported by it. *(adopted as N1 in the register)* | Store, services and workflows produce typed errors but may not import `internal/api`. | `internal/api/errors.go` (violates the dependency rule). |
+| N2 | The move workflow `move/{namespace_id}/{epoch}` runs on task queue `shard-{target}`; the executing worker opens a second, move-scoped pool to the source (`engram_move` role: read + outbox read + ownership `FOR UPDATE`). It is the only code path allowed two shard handles. *(adopted as N2 in the register)* | Keeps "one task queue per shard"; the target worker is the one that must be healthy for the move to be useful. | A cell-wide `moves` queue (breaks the per-shard queue rule; harder to reason about pollers). |
+| N3 | Per-shard Temporal schedule `shard/{id}/op-sweeper` (every 60 s) starts a workflow for any `PENDING` operation older than 2 min with no workflow; the API still returns `UNAVAILABLE` when `StartWorkflow` fails after the ledger commit. *(adopted as N3 in the register)* | Closes the crash window between the ledger commit and `StartWorkflow` without weakening the ack. | Ack before `StartWorkflow` and rely solely on the sweeper (silently extends visibility lag). |
+| N4 | The outbox relay uses a shard-level `engram_relay` role that bypasses RLS for `SELECT` on `outbox` only (`outbox_cursors` has no namespace column); events carry every field a consumer needs, so the relay never reads another table. *(adopted as N4 in the register, reworded as here)* | The relay must read every namespace's events in `seq` order; per-namespace scans would be O(namespaces) per batch. | Running the relay under `engram_app` with a loop over namespaces. |
+| N5 | A cross-tenant namespace returns `NOT_FOUND`; a same-tenant namespace outside the allowlist, or a missing scope, returns `PERMISSION_DENIED`; `deleting` returns `FAILED_PRECONDITION`. *(adopted as N5 in the register)* | Prevents namespace-id enumeration across tenants while keeping same-tenant misconfiguration diagnosable. | `PERMISSION_DENIED` for cross-tenant too (an existence oracle); `NOT_FOUND` for same-tenant (hides the real problem). |
+| N6 | Chunk `content_hash` = `sha256(text)` excluding the contextual header; the header hash is compared separately at `FinalizeVersion` to decide re-embedding. *(adopted as N6 in the register)* | Delta retain and the extraction cache survive summary drift. | Hashing header+text. |
+| N7 | Retain items with a raw body > 64 KiB store the body in blob (`…/ledger/{sha256}`) *before* the ledger transaction; the ledger row keeps the hash and key. *(adopted as N7 in the register)* | Keeps the ack transaction small; content addressing makes the pre-write idempotent. | Inline bodies of any size (bloats the ledger table and the tx). |
+| N8 | Streams fix `RequestScope` at open; token expiry mid-stream does not abort the stream. *(adopted as N8 in the register)* | Reflect may legitimately run 300 s. | Per-message re-verification. |

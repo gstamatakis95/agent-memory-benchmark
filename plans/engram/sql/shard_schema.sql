@@ -242,12 +242,14 @@ CREATE TABLE namespace_ownership (
   shard_id          integer NOT NULL,
   epoch             bigint NOT NULL CHECK (epoch >= 1),
   state             ownership_state NOT NULL,
+  freeze_reason     text CHECK (freeze_reason IN ('move', 'delete', 'restore')),   -- why frozen (D2)
   move_id           uuid,
   move_applied_seq  bigint,
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
   UNIQUE (namespace_id, tenant_id),                -- FK target for the tenant_id denormalisation
-  CHECK (state <> 'incoming' OR move_id IS NOT NULL)
+  CHECK (state <> 'incoming' OR move_id IS NOT NULL),
+  CHECK (state <> 'frozen' OR freeze_reason IS NOT NULL)
 );
 
 CREATE TRIGGER namespace_ownership_check BEFORE INSERT OR UPDATE ON namespace_ownership
@@ -534,7 +536,7 @@ CREATE TABLE entities (
   mention_count   integer NOT NULL DEFAULT 0 CHECK (mention_count >= 0),
   first_seen_at   timestamptz NOT NULL DEFAULT now(),
   last_seen_at    timestamptz NOT NULL DEFAULT now(),
-  merged_into     uuid,                           -- set by EntityMerged; the row stays so aliases still resolve
+  merged_into     uuid,                           -- set by EntitiesMerged; the row stays so aliases still resolve
   created_at      timestamptz NOT NULL DEFAULT now(),
   updated_at      timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, entity_id),

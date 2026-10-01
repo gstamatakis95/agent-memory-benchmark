@@ -95,7 +95,7 @@ services:
   engram-mcp:
     <<: *engram
     command: ["engram-mcp", "--config", "/etc/engram/engram.yaml", "--upstream", "envoy:8080"]
-    ports: ["8090:8090"]                                # /mcp/{namespace_id}
+    ports: ["8090:8090"]                                # /mcp/{tenant_id}/{namespace_id}
     healthcheck: { test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/healthz"], interval: 10s, retries: 3 }
     depends_on: { envoy: { condition: service_healthy } }
     deploy: { resources: { limits: { cpus: "1", memory: 1g } } }
@@ -407,14 +407,14 @@ sets `NOT NULL` with `NOT VALID` + `VALIDATE CONSTRAINT`. Splitting a table: cre
 table, dual-write from `N+1`, backfill, read from new in `N+2`, drop in `N+3`. Changing a
 partition count: never in place; provision a new shard and move namespaces (§9.5).
 
-**Moves and migrations exclude each other.** `namespace_moves` carries `source_schema` and
-`target_schema` captured at `plan`; `engramctl move start` and the `Plan` activity refuse
+**Moves and migrations exclude each other.** `Plan` compares the two shards' `shard_meta.schema_version`
+(mirrored in the catalog's `shards.schema_version`); `engramctl move start` and the `Plan` activity refuse
 with `FAILED_PRECONDITION` + `PreconditionFailed{type: "SchemaVersionMismatch", subject:
 "shard/{src}→shard/{dst}", description: "14 ≠ 15"}` when `shard_meta.schema_version`
 differs (the `COPY` streams would otherwise map columns positionally). Conversely
 `engramctl migrate --shard N` refuses while any move touching `N` is non-terminal, unless
 `--rollback-moves` is passed, which rolls back moves still before `cutover` and waits for the
-others to finish. The check is repeated inside the `MoveWorkflow` at each phase boundary
+others to finish. The check is repeated inside the `Move` workflow (`move/{ns}/{epoch}`) at each phase boundary
 (cheap: one row read), because a migration could otherwise slip in between `plan` and
 `copy`.
 
@@ -462,12 +462,13 @@ and the command resumes from its last completed step):
    `RestoreMarker{shard, restored_to: T, epoch_bump: true}` event so downstream consumers can
    reconcile; any `move:<ns>` cursor is dropped and the move rolled back.
 4. **Honor deletes** (the point of `deletion_log`, ND-8). Every synchronous delete (document,
-   namespace, tenant, `Invalidate`) inserts `deletion_log(namespace_id, kind, document_id |
-   memory_id, deleted_at, epoch)` on the shard **in the same transaction** and emits a
-   `Deleted` outbox event; the `deletion-log` outbox consumer in `engram-worker` reads the row
-   by id under RLS (`SET LOCAL engram.namespace_id` from the thin event, N12) and replicates it
-   into the catalog table `deletion_log` (idempotent on `(namespace_id, kind, id,
-   deleted_at)`), lag alerted at 60 s. Restore reads the catalog rows with `deleted_at > T`
+   namespace, tenant, `Invalidate`) inserts `deletion_log(namespace_id, tenant_id, kind ∈
+   {document, memory, namespace, tenant}, subject_id, epoch, operation_id, deleted_at)` on the
+   shard **in the same transaction** (N21; `memory` is the Invalidate kind) and emits the matching
+   outbox event (`DocumentDeleted`, `FactInvalidated`, `NamespacePurged`), which carries the key
+   fields; the `deletion-log` outbox consumer in `engram-worker` replicates them into the catalog
+   table `deletion_log` without reading any other table (N4; idempotent on `(namespace_id, kind,
+   subject_id, deleted_at)`), lag alerted at 60 s. Restore reads the catalog rows with `deleted_at > T`
    for namespaces on `N` and re-applies the D8 synchronous cascade for each (idempotent; a
    document that never existed at `T` is a no-op), before the shard is re-enabled. Namespace
    and tenant deletes are re-applied the same way (the catalog already holds the namespace as
@@ -489,25 +490,26 @@ and the command resumes from its last completed step):
    `engramctl restore` lists the `operation_id`s seen in Temporal history but absent from the
    shard, and the report is sent to the affected tenants' contacts (A-O11: the control plane
    holds a contact per tenant).
-7. **Blob reconciliation.** Objects under `{N}/**/raw/` and `xcache/` not referenced by any
+7. **Blob reconciliation.** Objects under `{N}/**/ledger/` and `xcache/` not referenced by any
    restored `ingest_ledger`/chunk row are orphans from after `T`: `engramctl blob gc --shard
    N --reconcile` deletes them (they are content-addressed; a re-ingest recreates them).
    Conversely, blobs deleted after `T` for documents that still exist at `T` are gone: the
    ledger row exists but its blob does not → the row is marked `blob_missing` and the
-   document is reported alongside the lost operations. Tombstones (`.tomb`, §2.2.6) written
-   after `T` are honoured: the GC pass deletes the object and the marker regardless of what
-   the restored rows say — a delete that reached blob storage is never undone.
+   document is reported alongside the lost operations. Blob deletions requested after `T` are re-created by the deletion replay of step 4: each
+   re-applied cascade inserts its `blob_tombstones` rows again (§3.3.7), so a delete that was
+   acknowledged before the restore is never undone.
 8. **Re-enable.** Catalog namespaces `state='active'`, `NOTIFY catalog_changes`, backup
    stanza re-initialised from the new timeline (`pgbackrest stanza-upgrade`), a full backup
    started immediately, the old volume's 7-day timer started. Verification: `engramctl shard
    check N` (RLS, ownership rows = catalog, `WaitOperation` on a canary retain, recall of the
    canary).
 
-**Blob GC honouring tombstones.** Deletes mark before they delete (`MarkDeleted` writes
-`{key}.tomb`, `PurgeDocument` then deletes both); `engramctl blob gc --shard N` runs daily,
-lists `{N}/**/*.tomb` older than the retire grace (1 h) and deletes object + marker; it
-is safe to run at any time, including mid-restore, because a marker is an instruction, not a
-state. Backups do not include blobs (the blob store is durable by contract, A-O12); the
+**Blob GC honouring tombstones.** Deletes mark before they delete (the logical delete inserts
+`blob_tombstones` rows in its own transaction; `PurgeBlobs` then deletes the object and the row,
+§3.3.7); `engramctl blob gc --shard N` runs daily, processes `blob_tombstones` rows older than
+the retire grace (1 h) whose purge has not run (crashed or lost workflows) and deletes object +
+row; it is safe to run at any time, including mid-restore, because a tombstone row is an
+instruction, not a state. Backups do not include blobs (the blob store is durable by contract, A-O12); the
 deletion SLA for blobs is therefore the purge latency (minutes), and for Postgres rows it is
 the backup retention: **deleted data is unrecoverable from backups after 28 days**, which is
 the number stated in the tenant-facing deletion policy. Per-tenant crypto-shredding of
@@ -593,7 +595,7 @@ series marked ★; never `namespace`; cardinality is bounded by `#shards × #met
 | Retain operation success | 99.5 % of operations reach `SUCCEEDED` within 10 min for documents ≤ 20 chunks (A-O15) | `engram_operations` transitions |
 | Delete cascade latency | p95 < 500 ms | `engram_rpc_duration_seconds{method="DeleteDocument"}` |
 | Outbox lag | 99.9 % of minutes with `index` lag < 30 s and `deletion-log` lag < 60 s; `kafka` < 5 min | `engram_outbox_lag_seconds` |
-| Move | freeze window < 30 s (100 % — it is a hard bound); a 1 M-fact namespace moves in < 2 h (A-O16) | `engram_move_duration_seconds` |
+| Move | freeze window < 30 s (target: the API's write-retry budget, D5 step 4; the hard bound is the 120 s watchdog, after which the move rolls back); a 1 M-fact namespace moves in < 2 h (A-O16) | `engram_move_duration_seconds` |
 | Catalog resolve | p99 < 2 ms on hit; served-stale age never > 10 min | `engram_catalog_*` |
 
 **Alerts** (Prometheus rules under `deploy/prometheus/rules/`; severity `page` wakes someone,
@@ -607,7 +609,7 @@ series marked ★; never `namespace`; cardinality is bounded by `#shards × #met
 | `OutboxLagHigh` | `engram_outbox_lag_seconds{consumer="index"} > 60` for 5 min | page | §9.6 "outbox lag growing" |
 | `OutboxNoLeader` | `sum by (shard)(engram_outbox_relay_leader) == 0` for 2 min | page | relay election: check worker health, direct connection, advisory lock holder in `pg_locks` |
 | `OutboxTrimGuard` | oldest row > 5 days (`engram_outbox_rows` and lag) | ticket | a consumer is stuck (usually `kafka`); fix or disable the consumer before day 7 |
-| `MoveStuck` | `engram_move_phase{phase="catching_up"} == 1` for 30 min, or `phase="frozen"` for 60 s | page | §9.6 "move stuck in catching_up" |
+| `MoveStuck` | `engram_move_phase{phase="catching_up"} == 1` for 30 min, or `phase="frozen"` for 60 s (the drain wait is 15 s by default, 60 s at most; the watchdog rolls back at 120 s, D5) | page | §9.6 "move stuck in catching_up" |
 | `WrongShardOrEpochSpike` | rate > 1/s per shard for 5 min | page | catalog invalidation broken (LISTEN), or a stale cell map; check `engram_catalog_reresolve_total` |
 | `GatewayRateLimited` | `engram_gateway_ratelimited_seconds_total` rate > 0.5 (i.e. > 50 % of wall time waiting) for 10 min | ticket | §9.6 "gateway rate-limited" |
 | `OperationsDeferred` | `engram_operations{state="DEFERRED"} > 0` for 1 h for a tenant not at quota by policy | ticket | §9.6 "quota exhaustion" |
@@ -657,14 +659,16 @@ metering* (★ series); *Backups* (last success, WAL lag, repo size per shard).
    `x-engram` anchor, `docker compose up -d --no-deps engram-api engram-worker` one replica at
    a time (rolling restart; Envoy drains). `engramctl shard check 3` writes a canary namespace
    (`_canary/3`, tenant `_system`), retains, waits, recalls, deletes.
-5. **Register.** Catalog `UPDATE shards SET state='accepting', capacity_facts=…,
-   capacity_namespaces=150, dedicated_tenant_id=…, dsn_ref=…, blob_prefix='3/' WHERE id=3`.
+5. **Register.** Catalog `UPDATE shards SET state='active', soft_cap_facts=…,
+   max_namespaces=150, dedicated_tenant_id=…, dsn_secret_ref=…, blob_prefix='3' WHERE shard_id=3`
+   (§3.2 columns; `blob_prefix` is the bare shard id, `blob.Prefix` adds the `/`).
    From this point `CreateNamespace` may place namespaces on shard 3.
 
-Placement (`CreateNamespace`, D2): among `shards` with `state='accepting'` in the tenant's
-pool (dedicated shards for `isolation=dedicated` tenants, the default pool otherwise), choose
-the minimum of `score = live_facts/capacity_facts + 0.5 × namespaces/capacity_namespaces +
-0.25 × p95_recall_ms/300`, refreshed hourly by `engramctl stats`; ties by lowest `id`. A new
+Placement (`CreateNamespace`, D2): `pick_shard()` (§3.2) among `shards` with `state='active'`
+in the tenant's pool (dedicated shards for `isolation=dedicated` tenants, the default pool
+otherwise): lowest `facts_estimate / soft_cap_facts`, then `namespaces_count`, then `shard_id`,
+with `facts_estimate` refreshed hourly by `engramctl stats` (live load is deliberately not an
+input at creation time; hot namespaces are handled by moves, below). A new
 cell is added when every shard in the existing cells is `full` or a cell reaches 32 shards.
 
 **Capacity signals that change placement or trigger moves:**
@@ -679,16 +683,15 @@ cell is added when every shard in the existing cells is `full` or a cell reaches
 | pool wait p95 | > 50 ms for a day | hot-namespace playbook |
 | one namespace | > 40 % of the shard's recalls or retains, or > 3 M facts | candidate for a move (dedicated shard if the tenant is dedicated) |
 
-**Hot-namespace playbook.** Detect: `engramctl hot --shard 7` ranks namespaces by the last
-24 h of `namespace_activity(namespace_id, hour, recalls, retains, facts_added, llm_tokens)` —
-an hourly rollup written every 60 s by api/worker from in-process counters (ND-9), kept next
-to §5.1's `namespace_stats` (`live_facts`, `consolidated_through`) and `token_usage` in the
-shard DB, because Prometheus must not carry a `namespace` label (D13). Decide: if one namespace exceeds the thresholds above, pick a target with
+**Hot-namespace playbook.** Detect: `engramctl hot --shard 7` ranks namespaces by
+`namespace_stats` (`recalls_1h`, `retains_1h`, `live_facts`, flushed every 60 s by api/worker
+from in-process counters, §3.3.1) and `token_usage` (today's tokens) in the shard DB, because
+Prometheus must not carry a `namespace` label (D13; ND-9 as reworded). Decide: if one namespace exceeds the thresholds above, pick a target with
 `engramctl shard suggest --for-namespace X` (lowest score with headroom ≥ 2× the namespace's
-facts). Move: `engramctl move start --namespace X --target 9 [--max-freeze 30s]`; watch
+facts). Move: `engramctl move start --namespace X --target 9 [--drain-wait 15s]`; watch
 `engramctl move status X` (phase, lag, ETA) and the *Outbox & moves* dashboard; expect
-copy at ≈ 50 k facts/s (A-O17), catch-up to converge in < 5 min at ≤ 50 writes/s, freeze
-< 30 s. If catch-up does not converge, see §9.6. After `done`, verify with `engramctl shard
+copy at ≈ 50 k facts/s (A-O17), catch-up to converge in < 5 min at ≤ 50 writes/s, a freeze window
+< 30 s (drain wait 15 s, watchdog 120 s, D5). If catch-up does not converge, see §9.6. After `done`, verify with `engramctl shard
 check 9 --namespace X` and, after the 24 h grace, `engramctl move cleanup X` (automatic by
 default).
 
@@ -787,10 +790,10 @@ tenant's `engram_quota_events_total{action="resume"}` increments.
 
 | Id | Decision | Rationale | Rejected |
 |---|---|---|---|
-| ND-8 | `deletion_log` table on every shard, written in the delete transaction, replicated to a catalog `deletion_log` by a `deletion-log` outbox consumer; restore replays it before re-enabling the shard. | Backups must not resurrect deleted data; the catalog outlives any one shard. | Synchronous dual write to the catalog from the API; scanning Temporal history for delete operations (retention-bound). |
-| ND-9 | `namespace_activity` hourly rollup table per shard (from in-process counters flushed every 60 s) for hot-namespace detection, alongside §5.1's `namespace_stats`. | D13 forbids a `namespace` metric label; per-namespace load must live in the shard DB (it moves with the namespace). | Envoy access-log aggregation (no namespace in the path for gRPC; a second pipeline); widening `namespace_stats` (a size table) with time-series columns. |
-| ND-10 | `shard_meta(schema_version, engram_min_version, engram_max_version)` per shard; api/worker mark an out-of-range shard `unavailable` instead of refusing to start; moves refuse on version mismatch (`SchemaVersionMismatch`); `migrate --shard` refuses during a non-terminal move. | Blast radius of a botched rollout is one shard; positional `COPY` needs identical schemas. | Crash on mismatch; letting moves run across schema versions with column mapping. |
-| ND-11 | pgBackRest per shard, repo `_backups/shard-{id}/` in blob storage, AES-256 repo cipher, `archive_timeout=60` (RPO ≤ 60 s), retention 4 full sets (28 days) = the tenant-facing deletion SLA; blobs are not backed up. | Incremental backups, parallel restore and encryption out of the box; a stated deletion SLA. | `pg_basebackup` + custom WAL scripts; backing up blobs (content-addressed, the store is durable). |
-| ND-12 | Envoy retries only on a fixed allowlist of read methods and only for transport-level failures (`connect-failure, refused-stream, reset-before-request, unavailable`); all writes and long streams have `num_retries: 0`. | Writes are made idempotent by `request_id`/`operation_id` at the client, not by the proxy; a retried write without the key would be a duplicate. | Retrying everything with `retriable-status-codes`. |
-| ND-13 | Secrets are file-mounted (`/run/secrets`), re-read every 60 s and on `SIGHUP`; per-shard DSN rotation is a scripted `engramctl secret rotate` with pgbouncer `RELOAD` first. | No restarts for rotation; no secrets in `docker inspect`. | Environment-variable secrets; restart-to-rotate. |
-| ND-14 | Restore fences with `FreezeReason=RESTORE`, bumps the epoch of every namespace on the shard, restarts in-flight operations with the new epoch, resets consumer cursors beyond `max(seq)` and emits a Kafka `RestoreMarker`. | D1 requires the bump; the rest makes the restored state observable to every consumer. | Silent restore. |
+| ND-8 | `deletion_log` table on every shard, written in the delete transaction, replicated to a catalog `deletion_log` by a `deletion-log` outbox consumer; restore replays it before re-enabling the shard. *(adopted as N21; the SQL kinds are `document`, `memory` (= Invalidate), `namespace`, `tenant` in the register)* | Backups must not resurrect deleted data; the catalog outlives any one shard. | Synchronous dual write to the catalog from the API; scanning Temporal history for delete operations (retention-bound). |
+| ND-9 | Hot-namespace detection from `namespace_stats.recalls_1h`/`retains_1h` (flushed every 60 s from in-process counters) and `token_usage`, in the shard DB. *(not adopted as a separate register row; reworded to the §3 columns)* | D13 forbids a `namespace` metric label; per-namespace load must live in the shard DB (it moves with the namespace). | Envoy access-log aggregation (no namespace in the path for gRPC; a second pipeline); a separate `namespace_activity` time-series table (one more table to copy during a move). |
+| ND-10 | `shard_meta(schema_version, engram_min_version, engram_max_version)` per shard; api/worker mark an out-of-range shard `unavailable` instead of refusing to start; moves refuse on version mismatch (`SchemaVersionMismatch`); `migrate --shard` refuses during a non-terminal move. *(adopted as N22 in the register)* | Blast radius of a botched rollout is one shard; positional `COPY` needs identical schemas. | Crash on mismatch; letting moves run across schema versions with column mapping. |
+| ND-11 | pgBackRest per shard, repo `_backups/shard-{id}/` in blob storage, AES-256 repo cipher, `archive_timeout=60` (RPO ≤ 60 s), retention 4 full sets (28 days) = the tenant-facing deletion SLA; blobs are not backed up. *(adopted as N23 in the register)* | Incremental backups, parallel restore and encryption out of the box; a stated deletion SLA. | `pg_basebackup` + custom WAL scripts; backing up blobs (content-addressed, the store is durable). |
+| ND-12 | Envoy retries only on a fixed allowlist of read methods and only for transport-level failures (`connect-failure, refused-stream, reset-before-request, unavailable`); all writes and long streams have `num_retries: 0`. *(adopted as N24 in the register)* | Writes are made idempotent by `request_id`/`operation_id` at the client, not by the proxy; a retried write without the key would be a duplicate. | Retrying everything with `retriable-status-codes`. |
+| ND-13 | Secrets are file-mounted (`/run/secrets`), re-read every 60 s and on `SIGHUP`; per-shard DSN rotation is a scripted `engramctl secret rotate` with pgbouncer `RELOAD` first. *(adopted as N24 in the register)* | No restarts for rotation; no secrets in `docker inspect`. | Environment-variable secrets; restart-to-rotate. |
+| ND-14 | Restore fences with `FreezeReason=RESTORE`, bumps the epoch of every namespace on the shard, restarts in-flight operations with the new epoch, resets consumer cursors beyond `max(seq)` and emits a Kafka `RestoreMarker`. *(adopted as N23; `RestoreMarker` is an `events.proto` oneof case in the register)* | D1 requires the bump; the rest makes the restored state observable to every consumer. | Silent restore. |

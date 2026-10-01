@@ -13,8 +13,8 @@ the §9 operational artefacts; it excludes vacations and on-call. "Green" means 
 
 | Engineer | Primary ownership (packages, §2) | Alongside track |
 |---|---|---|
-| **E1 — storage & operations** | `store`, `ledger`, migrations, `outbox`, `move`, `engramctl`, compose, backups/restore, dashboards | `Outbox.tla`, `Move.tla`, trace validators (F.1) |
-| **E2 — pipelines** | `chunk`, `extract`, `entity`, `link`, `workflows`, `consolidate`, `reflect`, `pages`, `export`, prompts (§6) | `DeleteVsRetain.tla`, `Consolidation.tla`, `AsOf.tla` (F.2) |
+| **E1 — storage & operations** | `store`, `ledger`, migrations, `outbox`, `move`, `engramctl`, compose, backups/restore, dashboards | `Outbox.tla`, `ShardMove.tla`, trace validators (F.1) |
+| **E2 — pipelines** | `chunk`, `extract`, `entity`, `link`, `workflows`, `consolidate`, `reflect`, `pages`, `export`, prompts (§6) | `DocLifecycle.tla`, `Consolidation.tla`, `AsOf.tla` (F.2) |
 | **E3 — API, retrieval & evaluation** | `proto`/buf, `api`, `authz`, `catalog`, `router`, `gateway`, `recall`, `adapters/*`, `quota`, `telemetry` | Lean modules (F.3), bench harness and Hindsight comparison (B.1, B.2) |
 
 Rationale for three vertical owners rather than feature squads: every §2 package has one
@@ -47,8 +47,8 @@ Per-engineer load is balanced to ≤ 10.5 ew per engineer in Phase 1 (10 calenda
 | M1.2 | Recall: five arms over `PostgresIndex` (HNSW + pg_search), RRF k=60, gateway rerank with deadline skip, bounded boosts, packer, streaming + `RecallStats`, `as_of` inside every arm, 5 tag modes, type filters | E3 | 6.0 | §8.5 grid green at T3; p95 < 300 ms at mid budget on a synthetic 10 M-fact shard (`engram-bench synth`, 50 QPS); LME-S retrieval-only R@5 ≥ 0.93 (session level, real models) |
 | M1.3 | Delete cascade (D8) + `deletion_log` (ND-8), `PurgeDocument`, `Invalidate`/`Restore`, namespace and tenant delete | E1 (E2: invalidate/restore, namespace delete) | 3.0 | delete p95 < 500 ms; after-ack invisibility test on Recall/GetMemory/List/Export; `DeleteVsRetain` conformance test green |
 | M1.4 | Outbox relay (direct-connection election, ND-1; cursors; gap watchlist; 7-day trim), consumers `index` (no-op), `deletion-log`, `move:<ns>` | E1 | 2.0 | outbox property suite + T5 double-election green; relay drains 5 k events/s with lag < 30 s |
-| M1.5 | Move protocol (D5, N2): `MoveService`, `MoveWorkflow` on the target queue, copy/catch-up/freeze/drain/cutover/cleanup, rollback, `engramctl move start|status|rollback|cleanup`, schema-version refusal (ND-10) | E1 | 5.0 | §8.4 crash-mid-move table green at every phase under the load generator; freeze < 30 s; a 1 M-fact namespace moves in < 2 h in staging |
-| M1.6 | Adapters: Connect (generated, same port), MCP server (`/mcp/{namespace_id}`, read tools, write tools gated by scope), `engramctl` (migrate, shard add/check, secret rotate, stats, report) | E3 (E1: `engramctl` ops commands) | 3.0 | §8.3 isolation matrix 100 % green on every surface; MCP tool list equals §4's mapping table (golden) |
+| M1.5 | Move protocol (D5, N2): `MoveService`, the `Move` workflow (`move/{ns}/{epoch}`) on the target queue, copy/catch-up/freeze/drain/cutover/cleanup, rollback, `engramctl move start|status|rollback|cleanup`, schema-version refusal (ND-10) | E1 | 5.0 | §8.4 crash-mid-move table green at every phase under the load generator; freeze window < 30 s under load (watchdog 120 s, D5); a 1 M-fact namespace moves in < 2 h in staging |
+| M1.6 | Adapters: Connect (generated, same port), MCP server (`/mcp/{tenant_id}/{namespace_id}`, read tools, write tools gated by scope), `engramctl` (migrate, shard add/check, secret rotate, stats, report) | E3 (E1: `engramctl` ops commands) | 3.0 | §8.3 isolation matrix 100 % green on every surface; MCP tool list equals §4's mapping table (golden) |
 | M1.7 | Ops baseline: production compose (2 shards, Envoy policy ND-12), pgBackRest + restore drill with deletion replay and epoch bump (ND-11/ND-14), dashboards, alerts, runbooks, rate quotas in the interceptor | E1 (E3: dashboards, alerts, quota interceptor) | 3.0 | restore drill passes end to end; every §9.4 alert links a runbook; `OutboxLagHigh` and `MoveStuck` fire in `make e2e-chaos` |
 
 *Phase 1 exit (the MVP):* M1.1–M1.7; T0–T5 green; LME-S retrieval R@5 ≥ 0.93; recall p95
@@ -76,7 +76,7 @@ prices).
 | M3.2 | Export: snapshots (`manifest.json`, `*.jsonl.zst`, `pages/*.md`), deltas from the outbox range, `StreamSnapshot` 1 MiB parts, thin `engram-sync` client | E2 | 3.0 | round-trip property green; `grep` over a synced snapshot finds 100 % of facts; a 1 GB snapshot streams in < 2 min |
 | M3.3 | Multi-cell: one-hop forwarding (ND-3), peer clusters with mTLS, catalog `shards.cell`, placement across cells, 2-cell e2e profile | E3 (E1: compose/Envoy) | 3.0 | forwarded request adds ≤ 5 ms p95; misrouted-request chaos test green; `engram_forward_total{hops="2"} == 0` always |
 | M3.4 | Config inheritance system ⊂ tenant ⊂ namespace (`models.*`, `chunk.*`, `recall.*`, `quota.*`), `TenantService`, resolver-cached config | E3 | 2.0 | inheritance table tests; a namespace override of `models.extract` is in effect within 60 s |
-| M3.5 | Optional Kafka sink (`engram.events.shard-{id}`), BSR schema publishing, `RestoreMarker` (ND-14) | E1 | 1.0 | broker-down-for-1 h chaos drains without loss; schema resolvable from the BSR |
+| M3.5 | Optional Kafka sink (`engram.events.shard-{id}`), BSR schema publishing, `RestoreMarker` event (ND-14 / N23) | E1 | 1.0 | broker-down-for-1 h chaos drains without loss; schema resolvable from the BSR |
 | M3.6 | Hardening: shard decommission executed in staging, quarterly restore drills automated, `ExternalIndex` interface stub, A/B of `FixedChunker` vs `CDCChunker` recorded | E1 | 1.0 | `shard drain` → `remove` completes in staging; drill job scheduled |
 
 *Phase 3 exit:* M3.1–M3.6; one LME-M run completed under the $1,000 budget guard; each
@@ -86,9 +86,9 @@ prices).
 
 | Id | Deliverable | Owner | ew | Exit criterion |
 |---|---|---|---|---|
-| F.1 | `Outbox.tla`, `Move.tla` with TLC configs at §7's bounds; trace validators for the Go runs | E1 | 3.0 | `make formal` < 30 min; nightly trace validation green |
-| F.2 | `DeleteVsRetain.tla`, `Consolidation.tla`, `AsOf.tla` | E2 | 2.0 | same |
-| F.3 | Lean 4: `TagMatch`, `RRF`, `Packing`, `Temporal` + generated golden tables consumed by T1 | E3 | 1.0 | `lake build` in CI; Go parity tests read the tables |
+| F.1 | `Outbox.tla`, `ShardMove.tla` with TLC configs at §7's bounds; trace validators for the Go runs | E1 | 3.0 | `make formal` < 30 min; nightly trace validation green |
+| F.2 | `DocLifecycle.tla`, `Consolidation.tla`, `AsOf.tla` | E2 | 2.0 | same |
+| F.3 | Lean 4: `TagMatch`, `RRF`, `Packer`, `TemporalWindow` + generated golden tables consumed by T1 | E3 | 1.0 | `lake build` in CI; Go parity tests read the tables |
 | B.1 | `engram-bench` (ingest/query/judge/report), dataset loaders, judge pin + `bench.lock` (ND-4), smoke corpus | E3 | 2.5 | `make bench-smoke` on PRs; first LME-S + LoCoMo run at M1.2 exit |
 | B.2 | Hindsight compose profile + adapter (ND-5), ablation flags, weekly job and report | E3 | 1.5 | first side-by-side report at Phase 2 exit |
 

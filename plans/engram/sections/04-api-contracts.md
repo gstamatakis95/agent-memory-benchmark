@@ -55,7 +55,8 @@ and the Temporal history all see the same bytes. Rejected: `x-engram-namespace` 
 | Same tenant, namespace not in the `ns` allowlist | `PERMISSION_DENIED` | Within a tenant, existence is not secret; the caller should ask for a broader token. |
 | Scope missing for the method (table in 4.2) | `PERMISSION_DENIED` | Message names the missing scope. |
 | Admin API called with a tenant token | `PERMISSION_DENIED` | Admin services are additionally behind a separate Envoy route not exposed to tenants. |
-| Namespace `DELETING`/`DELETED` | `FAILED_PRECONDITION` + `PreconditionFailed{NAMESPACE_DELETING}` | Reads and writes are both rejected (D8). |
+| Namespace `DELETING` | `FAILED_PRECONDITION` + `PreconditionFailed{NAMESPACE_DELETING}` | Reads and writes are both rejected while the purge runs (D8, N5). |
+| Namespace `DELETED` (catalog tombstone) | `NOT_FOUND` + `NotFound{NAMESPACE}` | The namespace is gone; within the tenant there is no existence oracle to protect. |
 
 #### 4.1.2 Deadlines are mandatory
 
@@ -160,7 +161,7 @@ at most one Engram detail plus, when a retry hint exists, `RetryInfo`.
 | `ValidationError{violations[]}` | `INVALID_ARGUMENT` | Malformed request: missing/too-long field, bad enum value, inconsistent `TagFilter`, unknown mask path, **missing or over-cap deadline**, bad page token. | Fix the request. Never retry unchanged. |
 | `NotFound{kind, id, namespace}` | `NOT_FOUND` | Unknown memory/document/operation/page/snapshot id; namespace unknown **or belonging to another tenant**; page version absent at `as_of`. | Do not retry; the id is wrong or the resource is gone. |
 | `QuotaExceeded{quota, limit, current, retry_after, scope}` (+ `RetryInfo`) | `RESOURCE_EXHAUSTED` | Admission-time rate quotas `recalls_per_min`, `retains_per_min`, `max_request_bytes`, `max_namespaces` (D13). *Not* raised for `llm_tokens_per_day`/`max_facts`: those defer the operation (`DEFERRED`) instead. | Sleep `retry_after`, retry identical request. |
-| `WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state}` | `FAILED_PRECONDITION` | The shard's `namespace_ownership` row disagrees with the resolved (shard, epoch): stale catalog cache, move cut over between resolve and execute, restore bumped the epoch (D2 row 3). The API invalidates its catalog entry and retries the whole call **up to 3 times** before surfacing it. | Retry with backoff (a fresh resolve happens server-side). Never persist epochs. |
+| `WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state}` | `FAILED_PRECONDITION` | The shard's `namespace_ownership` row disagrees with the resolved (shard, epoch): stale catalog cache, move cut over between resolve and execute, restore bumped the epoch (D2 row 3). The API invalidates its catalog entry, re-resolves and retries the whole call **once** before surfacing it (§1.3; an unbounded loop would mask catalog bugs). | Retry with backoff (a fresh resolve happens server-side). Never persist epochs. |
 | `NamespaceFrozen{namespace_id, retry_after, reason}` (+ `RetryInfo`) | `FAILED_PRECONDITION` | Writes during the freeze window of a move or a restore (D5 step 4). The API already retried with backoff for up to 30 s. | Retry after `retry_after`. Reads are unaffected. |
 | `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: purge running on the document being retained, namespace cutover in progress, page already refreshing, snapshot already running. | `WaitOperation(existing_operation_id)` then resubmit. |
 | `OperationConflict{reason: IDEMPOTENCY_KEY_REUSED}` | `ALREADY_EXISTS` | `request_id`/`operation_id` reused with a different request hash; namespace/page `name` already taken. | Use a fresh id; the stored one is bound to a different request. |
@@ -205,7 +206,7 @@ it is convenience, not contract (only `value` is guaranteed).
 
 | Field | Limit |
 |---|---|
-| `RetainRequest.items` | ≤ 100 items, ≤ 8 MiB total content; `content` ≤ 1 MiB; `context` ≤ 2 KiB; `metadata` ≤ 16 KiB serialised; `tags` ≤ 64 × 64 B; `document_id` ≤ 256 B |
+| `RetainRequest.items` | ≤ 100 items, ≤ 8 MiB total content; `content` ≤ 1 MiB; `context` ≤ 2 KiB; `metadata` ≤ 16 KiB serialised; `tags` ≤ 32 × 64 B (N32); `document_id` ≤ 256 B |
 | `RecallRequest.query` | 1–8 KiB; `max_tokens` 256–65 536; `max_results` ≤ 500; `TagFilter.tags` ≤ 32 |
 | `ReflectRequest.query` | ≤ 16 KiB; `context` ≤ 32 KiB; `max_iterations` ≤ 10 |
 | `BatchGetMemoriesRequest.memory_ids` | ≤ 100 |
@@ -1347,14 +1348,15 @@ may be combined.
 | Default | server `now()` | unset (no cut-off) |
 | Effect | Resolves relative expressions in the query ("last week", "yesterday") and orders the temporal arm by distance to it; feeds the recency boost. | Filters **every arm** to `mentioned_at ≤ as_of` for facts and chunks, and selects, per observation and per page, the latest version with `effective_at ≤ as_of`. |
 | Can it change *which* items are eligible? | No — only ranks/scores. | Yes — it is a visibility boundary. |
-| Applied where | temporal arm, boosts | inside each arm's SQL (`WHERE mentioned_at <= $as_of` on `facts`/`chunks`; `observation_versions.effective_at <= $as_of` with `DISTINCT ON (observation_id) ORDER BY version DESC`), and in graph expansion when fetching neighbours, so an invisible fact cannot even be a hop. |
+| Applied where | temporal arm, boosts | inside each arm's SQL (`WHERE mentioned_at <= $as_of` on `facts`/`chunks`; `observation_versions.effective_at <= $as_of AND (superseded_at IS NULL OR superseded_at > $as_of)`, the precomputed form of "latest version with `effective_at ≤ T`", N33), and in graph expansion when fetching neighbours, so an invisible fact cannot even be a hop. |
 | Typical use | "what did I plan for next Tuesday?" asked on 2026-06-01 | leak-free evaluation: answer question *k* of a conversation as if later turns did not exist |
 
 Definitions (D9): a fact's `mentioned_at` is when the source *said* it (default: the item's
 `timestamp`; overridable per item); `occurred_start/end` is when it *happened*. Chunks carry
 `mentioned_at = item.timestamp`. An observation version's `effective_at = max(mentioned_at)` over
-the source facts that version cites; a page version's `effective_at` likewise over its cited
-evidence. The guarantee `as_of = T` gives is therefore: *no fact, chunk, observation version or
+the source facts that version cites, clamped to be ≥ the previous version's `effective_at` (D9,
+N29: the model that wrote it saw the previous text); a page version's `effective_at` likewise
+over its cited evidence, with the same clamp. The guarantee `as_of = T` gives is therefore: *no fact, chunk, observation version or
 page version derived from content mentioned after T is returned* — including through graph
 expansion and including the Reflect agent's tool calls (`ReflectRequest.as_of` is applied to every
 tool call of the session).
@@ -1714,3 +1716,15 @@ buf curl --protocol connect --schema plans/engram/proto \
 The output is the same sequence of `{"result":…}` messages and the trailing `{"stats":…}` as the
 gRPC call; an error mid-stream appears as the EndStreamResponse `{"error":{"code":…}}` after the
 results already delivered.
+
+### New decisions introduced by §4
+
+| Id | Decision | Register |
+|---|---|---|
+| — | Retain groups items by `document_id` and creates one Operation per document; a caller-supplied `operation_id` is used verbatim for one document and as the UUIDv5 namespace for several (4.1.3). | adopted as N9 |
+| — | The public `Namespace` message hides `shard_id` and `epoch`; the epoch appears only in `WrongShardOrEpoch` and in `memory.admin.v1` (4.2). | adopted as N10 |
+| — | Deadlines are mandatory and capped per method; over the cap is `INVALID_ARGUMENT`, never a silent clamp (4.1.2). | adopted as N11 |
+| — | Outbox events are thin: ids, versions and flags, never text or vectors (`events.proto`). | adopted as N12 |
+| — | Embeddings travel in Temporal payloads as little-endian float32 bytes and spill to a staging blob above 512 KiB (`workflow.proto`). | adopted as N13 |
+| — | `PageService` and `ExportService` are registered from day one and answer `UNIMPLEMENTED` until phase 3 (4.1.6). | adopted as N14 |
+| — | Authorization outcomes of 4.1.1: cross-tenant → `NOT_FOUND`; same-tenant allowlist or scope → `PERMISSION_DENIED`; `DELETING` → `FAILED_PRECONDITION`. | adopted as N5 |

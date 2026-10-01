@@ -418,7 +418,8 @@ CREATE UNIQUE INDEX document_versions_active_uq ON document_versions (namespace_
 CREATE INDEX document_versions_op_idx ON document_versions (namespace_id, operation_id);
 
 -- chunks (hash-partitioned). Identity within a document = content hash of the text (N6: the
--- contextual header is hashed separately). Chunk text <= 8 KB (4,000 chars max, multibyte).
+-- contextual header is hashed separately). Chunk text <= 4,000 characters, checked as
+-- <= 16 KiB of UTF-8 (D8; the chunker enforces the character bound).
 CREATE TABLE chunks (
   namespace_id     uuid NOT NULL,
   tenant_id        text NOT NULL,
@@ -430,7 +431,7 @@ CREATE TABLE chunks (
   ordinal          integer NOT NULL CHECK (ordinal >= 0),                    -- position in the latest version
   heading_path     text NOT NULL DEFAULT '' CHECK (octet_length(heading_path) <= 1024),
   header           text NOT NULL DEFAULT '' CHECK (octet_length(header) <= 1024),  -- "[doc summary] > [heading path]"
-  text             text NOT NULL CHECK (octet_length(text) BETWEEN 1 AND 8192),
+  text             text NOT NULL CHECK (octet_length(text) BETWEEN 1 AND 16384),
   tags             text[] NOT NULL DEFAULT '{}' CHECK (engram_tags_valid(tags)),
   tag_count        smallint GENERATED ALWAYS AS ((cardinality(tags))::smallint) STORED,
   mentioned_at     timestamptz NOT NULL,                                     -- = item timestamp (D9)
@@ -837,6 +838,7 @@ CREATE TABLE token_usage_events (
   day                date NOT NULL,
   op                 text NOT NULL CHECK (op IN ('extract', 'summarize', 'embed', 'consolidate', 'adjudicate', 'reflect', 'page', 'rerank')),
   model              text NOT NULL,
+  price_version      text NOT NULL,                  -- cost is computed at write time with this price list (N20)
   operation_id       uuid,
   prompt_tokens      bigint NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
   completion_tokens  bigint NOT NULL DEFAULT 0 CHECK (completion_tokens >= 0),
@@ -856,12 +858,13 @@ CREATE TABLE token_usage (
   day                date NOT NULL,
   op                 text NOT NULL,
   model              text NOT NULL,
+  price_version      text NOT NULL,
   calls              bigint NOT NULL DEFAULT 0 CHECK (calls >= 0),
   prompt_tokens      bigint NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
   completion_tokens  bigint NOT NULL DEFAULT 0 CHECK (completion_tokens >= 0),
   cost_micros        bigint NOT NULL DEFAULT 0 CHECK (cost_micros >= 0),
   updated_at         timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (namespace_id, day, op, model),
+  PRIMARY KEY (namespace_id, day, op, model, price_version),
   FOREIGN KEY (namespace_id, tenant_id) REFERENCES namespace_ownership (namespace_id, tenant_id)
 ) WITH (fillfactor = 70);
 
@@ -1017,9 +1020,9 @@ BEGIN
   END LOOP;
 END $$;
 
--- Relay role: all-namespace SELECT on the two tables it streams (D6/N4, section 8 allowlist).
-CREATE POLICY relay_read_all ON outbox       FOR SELECT TO engram_relay USING (true);
-CREATE POLICY relay_read_all ON deletion_log FOR SELECT TO engram_relay USING (true);
+-- Relay role: all-namespace SELECT on outbox only (D6/N4). The deletion-log consumer needs no
+-- other table: the DocumentDeleted/NamespaceDeleted events carry the deletion_log key fields.
+CREATE POLICY relay_read_all ON outbox FOR SELECT TO engram_relay USING (true);
 
 -- =============================================================================
 -- Grants. Only parent tables are granted: partitions stay ungranted, so a direct partition
@@ -1045,9 +1048,11 @@ GRANT SELECT, INSERT ON ingest_ledger TO engram_app;          -- append-only
 GRANT SELECT, INSERT ON outbox TO engram_app;                 -- never UPDATE/DELETE
 GRANT SELECT, INSERT ON deletion_log TO engram_app;
 GRANT SELECT ON namespace_ownership TO engram_app;            -- fence read (FOR SHARE) only
+GRANT UPDATE (updated_at) ON namespace_ownership TO engram_app;   -- row locks (FOR SHARE) require UPDATE on >= 1 column;
+                                                                  -- updated_at is harmless and the trigger sets it anyway
 
--- engram_relay: outbox + deletion_log stream, its own cursor rows; nothing else
-GRANT SELECT ON outbox, deletion_log TO engram_relay;
+-- engram_relay: the outbox stream and its own cursor rows; nothing else (D6)
+GRANT SELECT ON outbox TO engram_relay;
 GRANT SELECT, INSERT, UPDATE, DELETE ON outbox_cursors TO engram_relay;
 
 -- engram_move: everything a namespace copy/replay/cleanup needs, confined by RLS to the

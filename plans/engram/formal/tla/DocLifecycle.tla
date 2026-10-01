@@ -257,13 +257,20 @@ ObservationHasSources ==
 OneActiveVersion ==
   \A d \in Docs : Cardinality({v \in Versions : vstate[d][v] = "active"}) <= 1
 
-\* An active version's chunks are all live; every live fact belongs to an
-\* active or ingesting version (no stray content).
+\* An active version's chunks are all live; every live fact belongs to a
+\* version that exists and is not deleted; and once no version of a document
+\* is ingesting, its live facts are exactly the active version's chunks
+\* (chunks of a superseded version are visible only while a newer version is
+\* still ingesting -- the same transient as any per-chunk ingest, D16).
 VersionsConsistent ==
   /\ \A d \in Docs, v \in Versions :
        vstate[d][v] = "active" => \A h \in vcontent[d][v] : fstate[<<d, h>>] = "live"
   /\ \A f \in Live : \E v \in Versions :
-       vstate[f[1]][v] \in {"active", "ingesting"} /\ f[2] \in vcontent[f[1]][v]
+       vstate[f[1]][v] \notin {"none", "deleted"} /\ f[2] \in vcontent[f[1]][v]
+  /\ \A d \in Docs :
+       (\A v \in Versions : vstate[d][v] /= "ingesting") =>
+         \A f \in Live \cap FactsOf(d) : \E v \in Versions :
+           vstate[d][v] = "active" /\ f[2] \in vcontent[d][v]
 
 \* Liveness: once the writers quiesce the index equals the store.
 IndexConverges == <>[](Index = Live)

@@ -1,0 +1,175 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 82 and seed 8705965624698246814 with 4 workers on 4 cores with 5461MB heap and 64MB offheap memory [pid: 2387] (Linux 6.18.44-fc-v50 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/DocLifecycle.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module DocLifecycle
+Starting... (2026-10-01 11:18:10)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-01 11:18:10.
+Error: Invariant VersionsConsistent is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ fstate = ( <<d1, h1>> :> "absent" @@
+  <<d1, h2>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"none", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 2: <StartRetain line 103, col 3 to line 109, col 67 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "absent" @@
+  <<d1, h2>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 3: <StartRetain line 103, col 3 to line 109, col 67 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "absent" @@
+  <<d1, h2>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {h2}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "ingesting">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{h1}, {h2}>> @@ d2 :> <<{}, {}>>)
+
+State 4: <CommitChunk line 115, col 3 to line 123, col 54 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {h2}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "ingesting">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {h2}>> @@ d2 :> <<{}, {}>>)
+
+State 5: <CommitChunk line 115, col 3 to line 123, col 54 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "live" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {h2}>> @@ d2 :> <<{}, {}>>)
+/\ links = {{<<d1, h1>>, <<d1, h2>>}}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "ingesting">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 6: <FinalizeVersion line 139, col 3 to line 151, col 72 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "retired" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {h2}>> @@ d2 :> <<{}, {}>>)
+/\ links = {{<<d1, h1>>, <<d1, h2>>}}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"active", "ingesting">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 7: <FinalizeVersion line 139, col 3 to line 151, col 72 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "retired" @@
+  <<d1, h2>> :> "retired" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {h2}>> @@ d2 :> <<{}, {}>>)
+/\ links = {{<<d1, h1>>, <<d1, h2>>}}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"superseded", "active">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+8055 states generated, 3026 distinct states found, 2222 states left on queue.
+The depth of the complete state graph search is 8.
+The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 10 and the 95th percentile is 7).
+Finished in 01s at (2026-10-01 11:18:11)

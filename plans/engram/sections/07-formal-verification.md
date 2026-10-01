@@ -178,7 +178,7 @@ decides it: observations are allowed to lag *writes* by the consolidation deboun
 replace is a write, whereas a delete must be invisible at the ack. **Rule (ND-11):** a fact
 retired by replace keeps its `observation_sources` rows during the purge grace (an un-retire
 restores them for free), the observation is marked `stale_write` and stays visible until the
-next consolidation round rewrites it from the new version's facts; `PurgeWorkflow` deletes
+next consolidation round rewrites it from the new version's facts; `PurgeDocument` deletes
 the source rows and the existing trigger retires observations left with none. The invariant
 was restated to "every source row exists" (the model's `Purge` now cascades), and the delete
 path keeps the strict `src ∩ deleted = ∅`. The reported numbers for the design configurations
@@ -652,7 +652,7 @@ extraction function.
   trace with TLC (`-workers 1`, these are linear behaviours and take seconds each). A chaos
   run from section 8 that produces an unexplainable trace fails here, not in a dashboard.
 
-### New decisions (beyond the register; to be folded into D18)
+### New decisions (adopted in the register as D19: ND-1 → D6 (A-F1), ND-2 → N40, ND-3 → N41, ND-4 → D9, ND-5/ND-6/ND-7 → D5 and N45, ND-8 → N43, ND-9 → N44, ND-10 → N46, ND-11 → N42)
 
 | Id | Decision | Replaces / clarifies | Rejected alternative |
 |---|---|---|---|
@@ -665,5 +665,5 @@ extraction function.
 | ND-7 | Catch-up stops waiting for `lag < 100` after 10 rounds and freezes anyway; drain then runs longer but the move always reaches `frozen`. | D5 step 3 | unbounded catch-up (liveness fails under sustained writes). |
 | ND-8 | Consolidation proposals are persisted write-once in `consolidation_batches(batch_key, ops, created_observation_ids)` before any op is applied; the apply activity reads the stored proposal; `op_key = sha256(batch_key ‖ op_index)` over the stored list; each op's effect and its `consolidation_applied` row are one transaction. Failed LLM calls store nothing (bisect/retry). | D12 row 1 | keys over the live LLM output (TLC counterexample in 7.2.2). |
 | ND-9 | Every `index.Index` implementation's query results are joined with `facts.retired_at IS NULL AND invalidated_at IS NULL` (and the `as_of` predicate) before ranking; `Transactional` implementations may skip the join by contract only if the test suite proves it is redundant. | D7 | trusting the index. |
-| ND-11 | Replace-retire keeps `observation_sources` (and `page_sources`) rows during the purge grace and marks the citing observation `stale_write` (visible); `PurgeWorkflow` deletes the rows and the D12 trigger retires observations left with no source. Proof counts and `GetMemory` expansions count only sources with `retired_at IS NULL`. | D8 row 3, D12 (gap found by the `DocLifecycle` design run) | hiding observations on replace (would make every document update blank its observations for a consolidation cycle). |
+| ND-11 | Replace-retire keeps `observation_sources` (and `page_sources`) rows during the purge grace and marks the citing observation `stale_write` (visible); `PurgeDocument` deletes the rows and the D12 trigger retires observations left with no source. Proof counts and `GetMemory` expansions count only sources with `retired_at IS NULL`. | D8 row 3, D12 (gap found by the `DocLifecycle` design run) | hiding observations on replace (would make every document update blank its observations for a consolidation cycle). |
 | ND-10 | Formal artefacts are part of the definition of done: a PR that changes a modelled protocol changes the spec and the mapped test in the same PR (`formal/MANIFEST.md`, label escape hatch). | — | nightly-only checking. |

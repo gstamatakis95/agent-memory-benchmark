@@ -1,0 +1,357 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 96 and seed -3398202173785683217 with 4 workers on 4 cores with 5461MB heap and 64MB offheap memory [pid: 16551] (Linux 6.18.44-fc-v50 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/DocLifecycle.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module DocLifecycle
+Starting... (2026-10-01 07:08:03)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-01 07:08:03.
+Progress(8) at 2026-10-01 07:08:06: 101,842 states generated (101,842 s/min), 33,878 distinct states found (33,878 ds/min), 26,334 states left on queue.
+Progress(11) at 2026-10-01 07:09:06: 4,135,488 states generated (4,033,646 s/min), 1,309,737 distinct states found (1,275,859 ds/min), 976,480 states left on queue.
+Progress(11) at 2026-10-01 07:10:06: 8,183,017 states generated (4,047,529 s/min), 2,572,132 distinct states found (1,262,395 ds/min), 1,892,300 states left on queue.
+Progress(11) at 2026-10-01 07:11:06: 12,381,670 states generated (4,198,653 s/min), 3,875,626 distinct states found (1,303,494 ds/min), 2,867,132 states left on queue.
+Progress(12) at 2026-10-01 07:12:06: 16,498,833 states generated (4,117,163 s/min), 5,183,220 distinct states found (1,307,594 ds/min), 3,830,605 states left on queue.
+Progress(12) at 2026-10-01 07:13:06: 20,415,180 states generated (3,916,347 s/min), 6,309,754 distinct states found (1,126,534 ds/min), 4,649,524 states left on queue.
+Error: Invariant TypeOK is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ fstate = ( <<d1, h1>> :> "absent" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"none", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 2: <StartRetain line 103, col 3 to line 109, col 67 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "absent" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 3: <CommitChunk line 115, col 3 to line 123, col 54 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 4: <ConsolidateRead line 197, col 3 to line 202, col 90 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 0
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {<<d1, h1>>},
+        busy |-> TRUE ] @@
+  o2 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 5: <ConsolidateApply line 205, col 3 to line 213, col 83 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 1
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 6: <ConsolidateRead line 197, col 3 to line 202, col 90 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 1
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {<<d1, h1>>},
+        busy |-> TRUE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 7: <ConsolidateRead line 197, col 3 to line 202, col 90 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 1
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {<<d1, h1>>},
+        busy |-> TRUE ] @@
+  o2 :>
+      [ st |-> "absent",
+        src |-> {},
+        deriv |-> {},
+        snap |-> {<<d1, h1>>},
+        busy |-> TRUE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 8: <ConsolidateApply line 205, col 3 to line 213, col 83 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 2
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {<<d1, h1>>},
+        busy |-> TRUE ] @@
+  o2 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 9: <ConsolidateRead line 197, col 3 to line 202, col 90 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 2
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {<<d1, h1>>},
+        busy |-> TRUE ] @@
+  o2 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {<<d1, h1>>},
+        busy |-> TRUE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 10: <ConsolidateApply line 205, col 3 to line 213, col 83 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 3
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {<<d1, h1>>},
+        busy |-> TRUE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+State 11: <ConsolidateApply line 205, col 3 to line 213, col 83 of module DocLifecycle>
+/\ fstate = ( <<d1, h1>> :> "live" @@
+  <<d1, h2>> :> "absent" @@
+  <<d1, h3>> :> "absent" @@
+  <<d2, h1>> :> "absent" @@
+  <<d2, h2>> :> "absent" @@
+  <<d2, h3>> :> "absent" )
+/\ index = {}
+/\ dirty = {}
+/\ deleted = {}
+/\ ncons = 4
+/\ vcontent = (d1 :> <<{h1}, {}>> @@ d2 :> <<{}, {}>>)
+/\ links = {}
+/\ obs = ( o1 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o2 :>
+      [ st |-> "live",
+        src |-> {<<d1, h1>>},
+        deriv |-> {<<d1, h1>>},
+        snap |-> {},
+        busy |-> FALSE ] @@
+  o3 :>
+      [st |-> "absent", src |-> {}, deriv |-> {}, snap |-> {}, busy |-> FALSE] )
+/\ vstate = (d1 :> <<"ingesting", "none">> @@ d2 :> <<"none", "none">>)
+/\ vpending = (d1 :> <<{}, {}>> @@ d2 :> <<{}, {}>>)
+
+22048793 states generated, 6800447 distinct states found, 4995064 states left on queue.
+The depth of the complete state graph search is 12.
+The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 15 and the 95th percentile is 8).
+Finished in 05min 29s at (2026-10-01 07:13:32)

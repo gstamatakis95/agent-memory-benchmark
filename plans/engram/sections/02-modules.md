@@ -445,7 +445,7 @@ func New(o Options) Client
 
 Error contract: HTTP 429/5xx → `errs.Unavailable` (retryable); 400/404/413/422 → `errs.PermanentLLMError{Status,
 Model}` (activities treat it as non-retryable and, for extraction, dead-letter the chunk into `operation_errors`
-with the chunk hash; the operation finishes `SUCCEEDED_WITH_ERRORS`). Rationale: a schema-rejecting model will
+with the chunk hash; the operation finishes `SUCCEEDED (with a non-empty `errors` list)`). Rationale: a schema-rejecting model will
 not succeed on retry; a rate-limited one will.
 
 **(c) Dependencies.** `errs`, `telemetry`, `quota` (Meter via hook), `net/http`.
@@ -602,7 +602,7 @@ Repository summary (full DDL in §3):
 | `EntityRepo` | `Similar(name, type, threshold)` (pg_trgm), `Insert`, `AddAlias`, `InsertMentions`, `DeleteMentionsByFacts` | per-namespace; merge writes aliases, never deletes entities |
 | `ObservationRepo` | `Insert`, `NewVersion`, `AddSources`, `DeleteSourcesByFacts`, `MarkStale`, `LatestAsOf(ids, T)` | D9 versioning; trigger retires at 0 sources (D12) |
 | `PageRepo` | `Insert`, `NewVersion`, `SetSources`, `DeleteSourcesByFacts`, `MarkStale(write|delete)` | markdown lives in blob |
-| `OperationRepo` | `Insert`, `Get`, `List`, `Transition(from,to)`, `SetStats`, `Defer(until)`, `PendingWithoutWorkflow(olderThan)` | states `PENDING/RUNNING/DEFERRED/SUCCEEDED/SUCCEEDED_WITH_ERRORS/FAILED/CANCELLED` |
+| `OperationRepo` | `Insert`, `Get`, `List`, `Transition(from,to)`, `SetStats`, `Defer(until)`, `PendingWithoutWorkflow(olderThan)` | states `PENDING/RUNNING/DEFERRED/SUCCEEDED/SUCCEEDED (with a non-empty `errors` list)/FAILED/CANCELLED` |
 | `LedgerRepo` | `Append` | append-only; no update/delete method exists |
 | `IdempotencyRepo` | `Get`, `Put`, `Expire(olderThan)` | 24 h (D1) |
 | `TokenUsageRepo` | `Add(day, op, model, prompt, completion, cost)`, `SumDay` | moves with the namespace (D13) |

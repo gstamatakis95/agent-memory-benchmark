@@ -1,0 +1,47 @@
+## 12. Explicit non-goals
+
+What Engram deliberately does not do in this plan, with the reason and, where one exists,
+the thing that covers the need instead. "Not now" items may become a phase 4; "not ever"
+items contradict a register decision.
+
+| # | Non-goal | Status | Reason / what covers it instead |
+|---|---|---|---|
+| NG1 | A web UI or control-plane console (Hindsight ships one) | not now | `engramctl` + Grafana cover operators; a UI is a separate product with its own auth surface. |
+| NG2 | Kubernetes, Helm charts, Swarm | not ever | The task mandates Compose; cells scale by adding shards and cells, not pods (§9.1). |
+| NG3 | Supporting databases other than PostgreSQL 16+ (Oracle, MySQL, SQLite, embedded `pg0`) | not ever | The store is written against pgvector, pg_search, RLS and hash partitioning; abstraction over them would cost the guarantees of D2 and D7. |
+| NG4 | Multiple LLM providers or direct provider SDKs | not ever | The gateway is the only model endpoint (task); provider choice is a per-request model id (D15). |
+| NG5 | In-process embedding or reranking models (ONNX, llama.cpp, local cross-encoders) | not ever | Binaries stay model-free and CPU-only; `models.embed`/`models.rerank` go through the gateway (A18). |
+| NG6 | File conversion at ingest (PDF, DOCX, OCR, audio transcription, image VLM) | not now | Clients submit text/markdown; a converter would be a separate service in front of `Retain`. |
+| NG7 | Memory-defense PII/secret scrubbing with a regex pattern set | not now | A pre-retain hook point exists in the pipeline (§5.1); shipping 45 regexes without a policy owner is false comfort. |
+| NG8 | Read replicas on the recall path | not ever | D16's read barrier (`WaitOperation` then `Recall` sees every fact) relies on primary reads; replicas would reintroduce staleness we chose to exclude. |
+| NG9 | Cross-namespace or cross-shard search, federation, "search all my namespaces" | not ever | D2: no query spans shards; a client that wants it fans out namespace by namespace. |
+| NG10 | Namespace aliases (Hindsight bank aliases) | not now | Namespaces have a tenant-unique `name` already (D1); aliases complicate the catalog and the allowlist semantics. |
+| NG11 | `tag_groups` boolean tag expressions | not now | The five `tag_match` modes are proven in Lean (D10); boolean groups would need a new decision procedure and a new proof. |
+| NG12 | Webhooks | not now | Operation state is pollable and `WaitOperation` is the read barrier; external fan-out is the optional Kafka sink (D6). |
+| NG13 | Billing, invoicing, price negotiation | not ever | Engram meters tokens and cost per namespace (D13, ND-7); money is the control plane's business. |
+| NG14 | Identity provider, user management, API-key issuance | not ever | JWTs from an external IdP via JWKS (D13); Engram verifies, it does not mint. |
+| NG15 | Multi-region or active-active deployment, cross-cell replication | not now | A cell is one failure domain; disaster recovery is per-shard restore (§9.3), not replication across cells. |
+| NG16 | Autonomous rebalancing (moves triggered by an algorithm without an operator) | not now | Moves are operator-initiated from the playbook (§9.5); the capacity signals and `shard suggest` exist so a later autopilot has inputs. |
+| NG17 | A GraphQL or bespoke REST API beyond Connect's generated routes | not ever | The proto is the contract (§4); Connect is the only JSON surface. |
+| NG18 | Hand-written client SDKs | not now | Generated gRPC/Connect stubs in Go, TypeScript and Python are the SDKs; a convenience wrapper can come later. |
+| NG19 | Mounting pages as a filesystem (`hindsight fs mount`) | not ever | `ExportService` + the thin `engram-sync` client project snapshots to disk for grep-style search (D12). |
+| NG20 | Citus or any distributed-Postgres layer | not ever | Shards are independent instances by design; Citus would recentralise the planner and the failure domain. |
+| NG21 | An "opinion" fact type or confidence-scored beliefs | not ever | Fact types are `world` and `experience`; observations carry proof counts and versions (D9/D12), not confidence scalars. |
+| NG22 | Hindsight-compatible REST paths (`/v1/{tenant}/banks/...`) | not ever | The comparison harness has an adapter (§8.7); API compatibility would freeze us to another project's contract. |
+| NG23 | Formal verification of the chunker, entity resolver, prompts or the gateway client | not ever | Pure heuristics and I/O adapters; property tests and goldens are the right tool (§8.2), as §7 states. |
+| NG24 | Guaranteed consolidation latency or page freshness bounds | not ever | D16 exposes `consolidation_lag` and page staleness flags instead of promising a bound that LLM latency cannot keep. |
+| NG25 | Per-request model selection by clients | not now | Models are configured per operation at system/tenant/namespace level (D12); a per-request override is a cost-control hole. |
+| NG26 | Training, fine-tuning or hosting models | not ever | Engram consumes models through the gateway; it has no GPU and no training data pipeline. |
+| NG27 | An end-user chat product or agent runtime | not ever | Engram is the memory behind an agent, reached by gRPC/Connect/MCP; the agent loop (other than the bounded Reflect, D12) belongs to the caller. |
+| NG28 | Caching recall results (a "semantic cache" keyed by query) | not ever | Recall is ≈ 215 ms and its inputs change per chunk commit (D16); a result cache would reintroduce the staleness the read barrier removes. |
+| NG29 | Streaming ingestion of live transcripts (token-by-token `Retain`) | not now | Items are whole documents or appends (D8 `APPEND`); a streaming front end would buffer into those. |
+| NG30 | Guaranteed ordering or visibility across namespaces or shards | not ever | D16: no relationship whatsoever; anything that needs it must live in one namespace. |
+| NG31 | Backing up blob objects | not ever | The blob store is durable by contract (A-O12); tombstones make deletes durable (§9.3). |
+| NG32 | Running `engram-api` and `engram-worker` in one process for small deployments | not ever | D1 keeps them separate images; a single-shard dev cell is still two containers. |
+
+**Reopening a non-goal.** A "not now" row is reopened by a register row in D18 naming the
+phase and the owning engineer, plus a §11.1 risk row for what it adds to the critical path;
+a "not ever" row is reopened only by changing the register decision it cites, which means
+re-running the affected §7 model checks and §8 tiers before the plan is updated. The table
+is deliberately longer than the list of things we will build in phase 4: saying no in
+writing is cheaper than saying it in a review.

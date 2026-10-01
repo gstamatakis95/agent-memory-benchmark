@@ -664,8 +664,10 @@ service MemoryService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
   // Invalidate soft-hides one FACT from Recall/Reflect/Export (sets
-  // `invalidated_at`). Observations keep the source but are marked stale
-  // (decision D8). Scope memory.write. Synchronous.
+  // `invalidated_at`). Observations keep the source row but are marked
+  // stale_delete and hidden from Recall until reconsolidated (decisions D8,
+  // N41: their text was derived from the invalidated content). Scope
+  // memory.write. Synchronous.
   rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
   // Restore clears `invalidated_at` on a fact. Scope memory.write. Synchronous.
   rpc Restore(RestoreRequest) returns (RestoreResponse);
@@ -870,11 +872,16 @@ message ObservationInfo {
   repeated string source_fact_ids = 2;
   // Version returned (observations are versioned; see as_of).
   int64 version = 3;
-  // max(mentioned_at) over the source facts cited by this version; the
-  // as_of visibility key.
+  // The as_of visibility key (decision D9): max(mentioned_at) over every
+  // fact shown to the consolidation prompt that wrote this version (its
+  // inputs, a superset of source_fact_ids), clamped to be >= the effective_at
+  // of the observations shown and of the previous version.
   google.protobuf.Timestamp effective_at = 4;
-  // True when a source was deleted/invalidated since this version was
-  // written and reconsolidation has not yet run.
+  // True when evidence changed under this observation since this version
+  // was written and reconsolidation has not yet run (stale_write: a source
+  // was retired by a document replace or restored). Observations whose
+  // evidence was deleted or invalidated (stale_delete) are hidden from
+  // Recall until reconsolidated (N41) and only appear through GetMemory.
   bool stale = 5;
   // Verbatim quotes from source facts, aligned with source_fact_ids where
   // available.
@@ -1190,12 +1197,14 @@ id prefix, `updated_after`, metadata equality), `DeleteDocument`, `GetDocumentVe
 `DeleteDocument` is unary and returns an `Operation` because the delete has two halves (D8):
 everything Recall/Reflect/GetMemory/Export can see is removed **synchronously in one shard
 transaction** — facts `retired_at`, `fact_links` and `entity_mentions` deleted,
-`observation_sources` removed, observations with zero sources retired, observations that lost a
-source marked `stale`, `page_sources` removed and pages marked `stale_delete` — and the call
-returns only after that commits; blob deletion and physical row purge run asynchronously in the
-`PurgeDocument` the returned `Operation` (kind `DELETE_DOCUMENT`) tracks. The response also
-reports `facts_retired`, `observations_marked_stale` and `pages_marked_stale` so a client can see
-the cascade it caused. `expected_version` gives compare-and-delete. Deleting a document whose
+`observation_sources` and `observation_inputs` removed, observations with zero sources retired,
+observations that lost a source or an input marked `stale_delete` and hidden from Recall until
+reconsolidated (N41: their text was derived from the deleted content), `page_sources` removed
+and pages marked `stale_delete` — and the call returns only after that commits; blob deletion
+and physical row purge run asynchronously in the `PurgeDocument` the returned `Operation` (kind
+`DELETE_DOCUMENT`) tracks. The response also reports `facts_retired`,
+`observations_marked_stale` (the hidden ones) and `pages_marked_stale` so a client can see the
+cascade it caused. `expected_version` gives compare-and-delete. Deleting a document whose
 purge is already running returns the existing operation (idempotent), deleting an unknown one is
 `NOT_FOUND`. Full file under `plans/engram/proto/memory/v1/document.proto`.
 
@@ -1354,9 +1363,11 @@ may be combined.
 Definitions (D9): a fact's `mentioned_at` is when the source *said* it (default: the item's
 `timestamp`; overridable per item); `occurred_start/end` is when it *happened*. Chunks carry
 `mentioned_at = item.timestamp`. An observation version's `effective_at = max(mentioned_at)` over
-the source facts that version cites, clamped to be ≥ the previous version's `effective_at` (D9,
-N29: the model that wrote it saw the previous text); a page version's `effective_at` likewise
-over its cited evidence, with the same clamp. The guarantee `as_of = T` gives is therefore: *no fact, chunk, observation version or
+**every fact shown to the consolidation prompt** that wrote it (its inputs, of which the cited
+sources are a subset), clamped to be ≥ the `effective_at` of every observation shown and of the
+previous version (D9 as amended, N29: the model that wrote it saw all of them; TLC
+`AsOf_CitedOnly` shows the leak with cited sources only); a page version's `effective_at`
+likewise over every evidence item shown to the refresh prompt, with the same clamp. The guarantee `as_of = T` gives is therefore: *no fact, chunk, observation version or
 page version derived from content mentioned after T is returned* — including through graph
 expansion and including the Reflect agent's tool calls (`ReflectRequest.as_of` is applied to every
 tool call of the session).

@@ -7,8 +7,10 @@
 // DeleteDocument is UNARY and returns an Operation because the delete has two
 // halves (decision D8): everything Recall/Reflect/GetMemory/Export can see is
 // removed SYNCHRONOUSLY inside one shard transaction (facts retired, links
-// and mentions deleted, observation sources removed, dependent observations
-// and pages marked stale) and the call returns only after that commits; the
+// and mentions deleted, observation sources and inputs removed, observations
+// derived from the deleted content hidden as stale_delete until
+// reconsolidated, pages marked stale) and the call returns only after that
+// commits; the
 // blob deletion and the physical row purge run ASYNCHRONOUSLY in a Temporal
 // PurgeWorkflow that the returned Operation tracks. A client that needs
 // "storage reclaimed" waits on the Operation; a client that needs "no longer
@@ -182,7 +184,7 @@ message DeleteDocumentResponse {
   Operation operation = 1;
   // Facts retired by the synchronous cascade.
   int32 facts_retired = 2;
-  // Observations and pages marked stale by the cascade.
+  // Observations hidden (stale_delete) and pages marked stale by the cascade.
   int32 observations_marked_stale = 3;
   int32 pages_marked_stale = 4;
 

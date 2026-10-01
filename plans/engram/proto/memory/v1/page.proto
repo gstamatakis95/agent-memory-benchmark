@@ -78,8 +78,9 @@ message PageContent {
   int64 version = 1;
   // Markdown, ≤ 256 KiB.
   string markdown = 2;
-  // max(mentioned_at) over the evidence cited by this version; the as_of
-  // visibility key.
+  // The as_of visibility key (decision D9): max(mentioned_at / effective_at)
+  // over every evidence item shown to the refresh prompt that wrote this
+  // version (not only the cited ones), clamped >= the previous version.
   google.protobuf.Timestamp effective_at = 3;
   // Facts + observations cited.
   int32 source_count = 4;

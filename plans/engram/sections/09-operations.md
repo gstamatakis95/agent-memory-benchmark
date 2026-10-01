@@ -306,7 +306,7 @@ shards:                                                       # one block per sh
     direct: shard-1-postgres:5432                             # relay (ND-1), engramctl DDL/backups only
     dsn_file: /run/secrets/shard_1_dsn
     relay_dsn_file: /run/secrets/shard_1_relay_dsn
-    pool: { size: 16, acquire_timeout: 2s, statement_timeout: { write: 30s, read: 5s } }   # D6 writer timeout
+    pool: { size: 16, acquire_timeout: 2s, statement_timeout: { write: 30s, read: 5s }, idle_in_transaction_session_timeout: 30s }   # A-F1: both 30 s; outbox INSERT last
     blob: { prefix: "1/", credential_file: /run/secrets/shard_1_blob }
     task_queue: shard-1
     hnsw: { ef_search: 100, iterative_scan: relaxed_order, max_scan_tuples: 20000 }         # D3, applied with SET LOCAL
@@ -315,7 +315,7 @@ shards:                                                       # one block per sh
     direct: shard-2-postgres:5432
     dsn_file: /run/secrets/shard_2_dsn
     relay_dsn_file: /run/secrets/shard_2_relay_dsn
-    pool: { size: 16, acquire_timeout: 2s, statement_timeout: { write: 30s, read: 5s } }
+    pool: { size: 16, acquire_timeout: 2s, statement_timeout: { write: 30s, read: 5s }, idle_in_transaction_session_timeout: 30s }
     blob: { prefix: "2/", credential_file: /run/secrets/shard_2_blob }
     task_queue: shard-2
 blob: { endpoint: https://blob.internal, region: local, path_style: true }
@@ -575,6 +575,7 @@ series marked ★; never `namespace`; cardinality is bounded by `#shards × #met
 | `engram_move_phase` | gauge | shard (source), phase | 1 for the phase a move is in (one series per move; ≤ 4 concurrent) |
 | `engram_move_duration_seconds` | histogram | phase | per-phase duration |
 | `engram_move_lag_events` | gauge | shard | catch-up lag of the active move |
+| `engram_move_catchup_rounds` | gauge | shard | catch-up rounds so far; the move rolls back at 10 (D5 step 3, N45) |
 | `engram_move_rejected_events_total` | counter | shard | events rejected by the target (wrong namespace/epoch) |
 | `engram_pg_pool_in_use`, `engram_pg_pool_wait_seconds` | gauge, histogram | shard | pool pressure |
 | `engram_pg_tx_seconds` | histogram | shard, kind (`read`, `write`) | transaction duration |
@@ -609,7 +610,7 @@ series marked ★; never `namespace`; cardinality is bounded by `#shards × #met
 | `OutboxLagHigh` | `engram_outbox_lag_seconds{consumer="index"} > 60` for 5 min | page | §9.6 "outbox lag growing" |
 | `OutboxNoLeader` | `sum by (shard)(engram_outbox_relay_leader) == 0` for 2 min | page | relay election: check worker health, direct connection, advisory lock holder in `pg_locks` |
 | `OutboxTrimGuard` | oldest row > 5 days (`engram_outbox_rows` and lag) | ticket | a consumer is stuck (usually `kafka`); fix or disable the consumer before day 7 |
-| `MoveStuck` | `engram_move_phase{phase="catching_up"} == 1` for 30 min, or `phase="frozen"` for 60 s (the drain wait is 15 s by default, 60 s at most; the watchdog rolls back at 120 s, D5) | page | §9.6 "move stuck in catching_up" |
+| `MoveStuck` | `engram_move_phase{phase="catching_up"} == 1` for 30 min, or `engram_move_catchup_rounds >= 8` (the mover gives up and rolls back at 10, N45), or `phase="frozen"` for 60 s (the drain wait is 15 s by default, 60 s at most; the watchdog rolls back at 120 s, D5) | page | §9.6 "move stuck in catching_up" |
 | `WrongShardOrEpochSpike` | rate > 1/s per shard for 5 min | page | catalog invalidation broken (LISTEN), or a stale cell map; check `engram_catalog_reresolve_total` |
 | `GatewayRateLimited` | `engram_gateway_ratelimited_seconds_total` rate > 0.5 (i.e. > 50 % of wall time waiting) for 10 min | ticket | §9.6 "gateway rate-limited" |
 | `OperationsDeferred` | `engram_operations{state="DEFERRED"} > 0` for 1 h for a tenant not at quota by policy | ticket | §9.6 "quota exhaustion" |
@@ -737,7 +738,9 @@ data; the ownership epoch does not protect against two copies of the *same* epoc
 deferred operations resume.
 
 **Move stuck in `catching_up`.** *Symptoms:* `MoveStuck`; `engram_move_lag_events` not
-decreasing. *Checks:* `engramctl move status X` (lag, replay rate, last error); source write
+decreasing; `engram_move_catchup_rounds` climbing (the mover gives up after 10 rounds and
+rolls back by itself, N45 — this runbook is about getting the *next* attempt to converge).
+*Checks:* `engramctl move status X` (lag, replay rate, rounds, last error); source write
 rate for the namespace (`engramctl hot --shard src`); target health and pool wait; relay
 leader present on the source (`engram_outbox_relay_leader`). *Actions:* if the source write
 rate exceeds the replay rate (> 50 writes/s sustained), throttle: `engramctl move throttle X

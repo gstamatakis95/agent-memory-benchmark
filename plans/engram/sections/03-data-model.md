@@ -43,7 +43,7 @@ sets that grow (operation kinds, event names, reasons) are `text` with a `CHECK`
    whose vacuum is measured in hours).
 4. **Only `ingest_ledger` is append-only.** A trigger refuses `UPDATE` always and `DELETE` for
    every role except the purge path (`engram_admin`) and move cleanup (`engram_move`). Every
-   other table is ordinary mutable state: `retired_at`, `invalidated_at`, `stale`, version
+   other table is ordinary mutable state: `retired_at`, `invalidated_at`, `stale_write`/`stale_delete`, version
    pointers and counters are updated in place, and physical rows are purged asynchronously.
    Rationale: the ledger is the audit trail and the replay source; derived tables must be
    cheap to retire and un-retire (D8). Rejected: an append-only `facts` table with status

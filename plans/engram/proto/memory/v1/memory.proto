@@ -68,8 +68,10 @@ service MemoryService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
   // Invalidate soft-hides one FACT from Recall/Reflect/Export (sets
-  // `invalidated_at`). Observations keep the source but are marked stale
-  // (decision D8). Scope memory.write. Synchronous.
+  // `invalidated_at`). Observations keep the source row but are marked
+  // stale_delete and hidden from Recall until reconsolidated (decisions D8,
+  // N41: their text was derived from the invalidated content). Scope
+  // memory.write. Synchronous.
   rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
   // Restore clears `invalidated_at` on a fact. Scope memory.write. Synchronous.
   rpc Restore(RestoreRequest) returns (RestoreResponse);
@@ -274,11 +276,16 @@ message ObservationInfo {
   repeated string source_fact_ids = 2;
   // Version returned (observations are versioned; see as_of).
   int64 version = 3;
-  // max(mentioned_at) over the source facts cited by this version; the
-  // as_of visibility key.
+  // The as_of visibility key (decision D9): max(mentioned_at) over every
+  // fact shown to the consolidation prompt that wrote this version (its
+  // inputs, a superset of source_fact_ids), clamped to be >= the effective_at
+  // of the observations shown and of the previous version.
   google.protobuf.Timestamp effective_at = 4;
-  // True when a source was deleted/invalidated since this version was
-  // written and reconsolidation has not yet run.
+  // True when evidence changed under this observation since this version
+  // was written and reconsolidation has not yet run (stale_write: a source
+  // was retired by a document replace or restored). Observations whose
+  // evidence was deleted or invalidated (stale_delete) are hidden from
+  // Recall until reconsolidated (N41) and only appear through GetMemory.
   bool stale = 5;
   // Verbatim quotes from source facts, aligned with source_fact_ids where
   // available.

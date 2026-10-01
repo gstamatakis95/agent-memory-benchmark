@@ -123,7 +123,7 @@ graph TB
   RL7 -->|"read outbox in seq order"| PG7
   RL7 -.->|"kafka sink"| KF
   RL8 --> PG8
-  MV -->|"catalog cutover tx"| CAT
+  MV -->|"cutover step d: catalog switch and NOTIFY"| CAT
   MV --> PG7
   MV --> PG8
   BLOB7 --> BS
@@ -297,10 +297,10 @@ sequenceDiagram
     W->>G: EmbedChunk (facts + chunk, batch ≤ 64 texts, search_document: prefix)
     W->>DB: ResolveEntities (pg_trgm + alias table, read tx)
     W->>DB: BuildLinks (temporal ≤ 20/fact, semantic kNN k=10 ≥ 0.75, entity, causal)
-    W->>DB: CommitChunk: one tx — ownership FOR SHARE @ epoch, facts, links, mentions, outbox
+    W->>DB: CommitChunk: one tx — ownership FOR SHARE @ epoch, version row FOR SHARE status ingesting (N40), facts, links, mentions, outbox last
     Note over DB: facts of this chunk are now visible to Recall
   end
-  W->>DB: FinalizeVersion: retire chunks/facts not in new set, version active, operation SUCCEEDED, outbox
+  W->>DB: FinalizeVersion: newest version only (N40) — supersede older ingesting rows, retire chunks/facts not in new set, version active, outbox
   W->>T: SignalWithStart ns/{ns}/consolidate (debounced 30 s)
 ```
 
@@ -390,21 +390,29 @@ than an error, and the client can see `stage` per result.
 1. `WithNamespaceTx(write)`: ownership `FOR SHARE`; `document_versions.status='deleted'`;
    `facts.retired_at = now()` for every fact of the document; delete `fact_links` rows
    touching those facts (both directions); delete `entity_mentions`; delete
-   `observation_sources` rows citing those facts — the D12 trigger retires observations whose
-   source count reaches 0, and observations that lost ≥ 1 source but still have sources are
-   marked `stale=true`; delete `page_sources` rows and mark affected pages
+   `observation_sources` rows citing those facts and the `observation_inputs` rows of every
+   observation version whose prompt saw them (N41) — the D12 trigger retires observations
+   whose source count reaches 0, and every other observation that lost a source or an input
+   is marked `stale_delete` and **hidden from recall** until a consolidation round rewrites it
+   (its text was derived from the deleted content; `stale_write`, set by a replace, stays
+   visible — N42); delete `page_sources` rows and mark affected pages
    `stale_delete=true`; insert `operations(kind=DELETE_DOCUMENT, state=RUNNING)` and the `deletion_log` row (N21);
-   write the outbox event `DocumentDeleted`. Commit.
+   write the outbox event `DocumentDeleted` as the last statement (A-F1). Commit. The
+   `document_versions` update waits for every in-flight `CommitChunk` holding its version row
+   `FOR SHARE`, so no chunk of the document can be inserted after this commit (N40).
 2. `StartWorkflow(PurgeDocument, id="ns/{ns}/op/{operation_id}", queue shard-{id})` with
    grace 0 for explicit delete (1 h for retire-by-replace).
 3. Return `Operation{RUNNING}`.
 
 **What the ack guarantees (D16):** from the moment the ack is returned, nothing from the
 document is returned by `Recall`, `Reflect`, `GetMemory`, `ListMemories` or a *new* export
-(all of them filter `retired_at IS NULL`; observations and pages are visible but flagged
-stale). What it does *not* guarantee: physical row purge, blob deletion, index-engine
-convergence for an external (`Async`) index, and reconsolidation of stale observations —
-these complete asynchronously and are observable via the delete operation's state
+(all of them filter `retired_at IS NULL`; observations derived from the deleted content are
+hidden — `stale_delete`, N41 — until reconsolidated; pages stay visible but flagged
+`stale_delete`). An external (`Async`) index that has not caught up cannot leak either: every
+`index.Index` joins its hits with `facts.retired_at IS NULL AND invalidated_at IS NULL` at read
+time (N44). What it does *not* guarantee: physical row purge, blob deletion, index-engine
+convergence for an external index, and reconsolidation of the hidden observations — these
+complete asynchronously and are observable via the delete operation's state
 (`WaitOperation`). Rejected: deferring the cascade to the purge workflow (would leave a window
 where a deleted document is recalled — exactly the invariant §7 model-checks).
 
@@ -438,7 +446,25 @@ exposes `consolidation_lag` rather than promising a bound. *Delete*: the ack mea
 synchronous cascade committed; visibility is gone everywhere from that instant; purge is
 asynchronous and observable. *Cross-namespace and cross-shard*: no ordering or visibility
 relation of any kind. *Idempotency*: unary writes are idempotent for 24 h by `request_id`;
-async operations by `operation_id`; activities by their D11 key; consolidation by `op_key`.
+async operations by `operation_id`; activities by their D11 key; consolidation by `op_key`
+over a proposal persisted write-once before apply (N43 — a key over a volatile LLM answer is
+decorative).
+
+**What model checking changed (§7, register D19).** The TLA+ pass over this model found
+eight design flaws before any code existed, each with a counterexample configuration that
+now runs in CI and a paired Go test (N46): a late `CommitChunk` could resurrect deleted or
+superseded content and an older version finalising late could retire the newer version's
+chunks (N40: version-row `FOR SHARE` + `status = 'ingesting'`, newest version alone retires);
+an observation written with a later-deleted fact in view stayed visible after the delete ack
+(N41: `observation_inputs`, apply re-verification, `stale_delete` hides); a replace-retire
+had no rule at all (N42: sources kept during the grace, `stale_write` visible); consolidation
+idempotency keys named a volatile proposal and were written apart from the effect (N43);
+an async index could return a fact the store had already retired (N44); the move's copy
+snapshot lost writes that straddled it and the cutover order let a stale client read at the
+frozen source (N45: copy barrier, order (a)–(e)); and `effective_at` over cited sources only
+leaked a version written with a newer fact in view (D9 amended: inputs ∪ candidates ∪
+previous version). None of them changes the consistency promises above; each changes how a
+promise is kept.
 
 **Failure domains.** "Degrades" means the operation completes with reduced function and says
 so in the response; "fails" means a typed error with `RetryInfo`.
@@ -468,7 +494,7 @@ writing (A-5).
 | Retrieval arms | semantic, keyword (BM25), graph, temporal | the same four plus a raw-chunk arm (BM25 ∪ HNSW over chunks) | **improved** — text the extractor missed is still findable |
 | Fusion + rerank | RRF, cross-encoder rerank | RRF k=60, gateway cross-encoder on top 50/150/300 with deadline-aware skip | **same** idea; **improved** by streaming + explicit `stage` per result |
 | `as_of` | not a first-class query-time filter | `mentioned_at ≤ T` inside every arm; versioned observations with `effective_at` | **improved** — required for leak-free evals |
-| Observations | single evolving text with sources and history | `observation_versions` with `effective_at = max(mentioned_at of cited facts)`, clamped monotone across versions (D9); never outlive sources (DB trigger) | **improved** — time-travel and a provable "no orphan observation" invariant |
+| Observations | single evolving text with sources and history | `observation_versions` with `effective_at = max(mentioned_at over every fact shown to the prompt, effective_at of the observations shown)`, clamped monotone across versions (D9); never outlive sources, hidden when derived from deleted content (DB trigger, N41) | **improved** — time-travel and a provable "no orphan observation" invariant |
 | Extraction | 1 structured LLM call per chunk, ~32 parallel | same, plus a content-addressed per-namespace extraction cache in blob and batch-API backfills | **improved** — re-indexing never re-pays extraction |
 | Chunking | ~3 000 chars, no overlap | heading-anchored content-defined boundaries + contextual header (summary + heading path) | **improved** — better section fidelity and embedding context |
 | Change propagation | direct writes to the store/index | transactional outbox per shard; index/Kafka/move are consumers | **different** — no dual writes; the outbox doubles as the move log |

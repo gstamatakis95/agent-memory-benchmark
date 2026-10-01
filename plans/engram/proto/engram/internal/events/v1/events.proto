@@ -114,8 +114,9 @@ message DocumentDeleted {
   string document_id = 1;
   repeated string fact_ids = 2;
   repeated string chunk_ids = 3;
-  // Observations that lost ≥ 1 source (marked stale) and those retired
-  // because they lost every source.
+  // Observations that lost ≥ 1 source or prompt input (marked stale_delete,
+  // hidden until reconsolidated — N41) and those retired because they lost
+  // every source.
   repeated string observations_marked_stale = 4;
   repeated string observations_retired = 5;
   repeated string pages_marked_stale = 6;
@@ -152,7 +153,9 @@ message ObservationRetired {
   bool zero_sources = 3;
 }
 
-// ObservationsMarkedStale: sources changed under these observations.
+// ObservationsMarkedStale: evidence changed under these observations
+// (stale_write from a replace-retire or restore: still visible; stale_delete
+// from a delete, purge or invalidate: hidden until reconsolidated).
 message ObservationsMarkedStale {
   repeated string observation_ids = 1;
   string cause_fact_id = 2;

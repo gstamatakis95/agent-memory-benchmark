@@ -10,7 +10,7 @@ modelled on Hindsight (MIT). The plan is standalone and unrelated to the benchma
 | `sections/` | The individual sections that `PLAN.md` is assembled from. |
 | `proto/` | The protobuf contracts (`memory.v1`, `memory.admin.v1`, internal workflow and event schemas) with `buf.yaml`. |
 | `sql/` | DDL for the control-plane catalog and for one shard. |
-| `formal/tla/` | TLA+ specifications and TLC configs. `formal/lean/` Lean 4 developments. |
+| `formal/tla/` | TLA+ specifications and TLC configs; `formal/tla/results/` holds the TLC run logs behind the results table in §7. `formal/lean/` Lean 4 developments (not type-checked here: Lean was unavailable). |
 | `reference/hindsight-notes.md` | Research notes on Hindsight used as the reference; quoted prompt text is MIT-licensed, Copyright (c) 2025 Vectorize AI, Inc. |
 
 ## Validating the artifacts

@@ -283,7 +283,7 @@ type Catalog interface {
 	// Moves (D5); every transition is CAS on the current state.
 	PlanMove(ctx context.Context, namespaceID string, targetShard int32) (*Move, error)
 	AdvanceMove(ctx context.Context, moveID string, from, to MoveState) error
-	Cutover(ctx context.Context, p CutoverParams) error // one tx: namespaces.shard_id/epoch/state, NOTIFY
+	Cutover(ctx context.Context, p CutoverParams) error // D5 step 6(d) only — the catalog switch (namespaces.shard_id/epoch/state, NOTIFY) after both ownership rows were flipped by the move activities (N45)
 	RollbackMove(ctx context.Context, moveID string, reason string) error
 
 	// Shards and tenants (admin surface; details in §9): RegisterShard, SetShardState, ListShards, GetTenant, …
@@ -554,7 +554,7 @@ type Tx interface {
 	Ownership() OwnershipRepo // read-only for engram_app; writes are admin/move-only
 }
 
-type TxOptions struct { StatementTimeout time.Duration /* 30 s writers, 5 s recall (D6 gap watch depends on it) */; Isolation pgx.TxIsoLevel; ReadOnly bool }
+type TxOptions struct { StatementTimeout time.Duration /* 30 s writers (= idle_in_transaction_session_timeout, A-F1: the D6 gap watch and the D5 copy barrier depend on it), 5 s recall */; Isolation pgx.TxIsoLevel; ReadOnly bool }
 
 // WithNamespaceTx runs fn inside a transaction that (1) SET LOCALs engram.namespace_id,
 // engram.tenant_id, engram.epoch and statement_timeout, (2) performs the ownership check for
@@ -563,7 +563,8 @@ type TxOptions struct { StatementTimeout time.Duration /* 30 s writers, 5 s reca
 func WithNamespaceTx(ctx context.Context, p Pool, scope Scope, o TxOptions, fn func(ctx context.Context, tx Tx) error) error
 
 // OutboxRepo.Append is the only way to emit an event; it is called inside the same tx as the
-// state change (D6) and returns the seq assigned by the sequence.
+// state change (D6) and returns the seq assigned by the sequence. It MUST be the last statement
+// before commit (A-F1; engramlint sql fails a builder that runs anything after it).
 type OutboxRepo interface {
 	Append(ctx context.Context, ev *eventsv1.Event) (seq int64, err error)
 	ReadFrom(ctx context.Context, afterSeq int64, limit int) ([]OutboxRow, error)        // relay; no namespace fence (shard-level, admin conn)
@@ -598,7 +599,7 @@ Repository summary (full DDL in §3):
 | `ChunkRepo` | `LiveByHashes`, `RetiredByHashes`, `InsertBatch`, `Retire`, `Unretire` | identity `(ns, document_id, content_hash)` (D8) |
 | `LinkRepo` | `InsertBatch`, `DeleteTouching(factIDs)`, `Neighbours(seed, kinds, limit)` | `fact_links` hash-partitioned; graph arm uses `Neighbours` |
 | `EntityRepo` | `Similar(name, type, threshold)` (pg_trgm), `Insert`, `AddAlias`, `InsertMentions`, `DeleteMentionsByFacts` | per-namespace; merge writes aliases, never deletes entities |
-| `ObservationRepo` | `Insert`, `NewVersion`, `AddSources`, `DeleteSourcesByFacts`, `MarkStale`, `LatestAsOf(ids, T)` | D9 versioning; trigger retires at 0 sources (D12) |
+| `ObservationRepo` | `Insert`, `NewVersion`, `AddSources`, `AddInputs`, `DeleteSourcesByFacts`, `DeleteInputsByFacts`, `LockLiveInputs(factIDs)` (`FOR SHARE`, N41), `MarkStale(write|delete)`, `LatestAsOf(ids, T)` | D9 versioning; trigger retires at 0 sources and hides (`stale_delete`) on a lost source or input (D12, N41) |
 | `PageRepo` | `Insert`, `NewVersion`, `SetSources`, `DeleteSourcesByFacts`, `MarkStale(write|delete)` | markdown lives in blob |
 | `OperationRepo` | `Insert`, `Get`, `List`, `Transition(from,to)`, `SetStats`, `Defer(until)`, `PendingWithoutWorkflow(olderThan)` | states `PENDING/RUNNING/DEFERRED/SUCCEEDED/FAILED/CANCELLED` (N35; a partial failure is `SUCCEEDED` with `progress.units_failed > 0`) |
 | `LedgerRepo` | `Append` | append-only; no update/delete method exists |
@@ -669,7 +670,12 @@ type Sink interface {
 
 Search methods take the fenced `tx` so `SET LOCAL engram.namespace_id` (partition pruning + RLS) and `SET LOCAL
 hnsw.ef_search / hnsw.iterative_scan` apply. `Filter.AsOf` is rendered into the `WHERE` of every arm, never
-applied post hoc (D9). Tag semantics are implemented once in `index/tags.go` and mirrored by the Lean decision
+applied post hoc (D9). **Liveness join (N44):** every implementation's hits are joined with
+`facts.retired_at IS NULL AND invalidated_at IS NULL` (observation versions: `live`) at read time, inside `tx`,
+before ranking — `PostgresIndex`/`TsvectorIndex` do it inside the scan through the `live` column, `ExternalIndex`
+by a `WHERE memory_id = ANY($hits) AND live` re-read — so a hit the store no longer considers live is dropped even
+when the engine has not caught up (TLC `DocLifecycle_UnfilteredIndex`, §7); the contract test in §8 proves the
+join on every implementation. Tag semantics are implemented once in `index/tags.go` and mirrored by the Lean decision
 procedure (§7).
 
 **(c) Dependencies.** `store`, `errs`, `telemetry`, `gen/go`.
@@ -952,7 +958,8 @@ not fit, boost factor always in `[0.75, 1.25]`.
 
 **(a) Responsibility.** D12: build batches of 8 unconsolidated facts (≤ 100 per round), fetch top-10 candidate
 observations per batch by semantic similarity, ask the LLM for `create/update/delete` ops with cited
-`source_fact_ids`, validate, bisect on failure 8 → 4 → 2 → 1, apply idempotently by `op_key`.
+`source_fact_ids`, validate, bisect on failure 8 → 4 → 2 → 1, persist the proposal write-once (N43), apply
+idempotently by `op_key` over the stored list after re-verifying every input `FOR SHARE` (N41).
 
 **(b) Interfaces.**
 
@@ -983,10 +990,24 @@ type Validator interface {
 	Validate(ops []Op, b Batch, cands []store.Observation) error // errs.Validation → bisect
 }
 
+// Proposal is the write-once record of what the prompt saw and what it answered (N43).
+type Proposal struct { BatchKey [32]byte; Ops []Op /* op_index order; creates carry a pre-minted ObservationID */; InputFactIDs []string /* batch ∪ shown sources of every candidate */; CandidateVersions []store.ObservationVersionRef }
+
+type ProposalStore interface {
+	// Store inserts ON CONFLICT (namespace_id, batch_key) DO NOTHING and returns the stored proposal — the
+	// caller's own list when it won, an earlier attempt's otherwise (the stored list always wins).
+	Store(ctx context.Context, tx store.Tx, p Proposal) (stored Proposal, err error)
+	Load(ctx context.Context, tx store.Tx, batchKey [32]byte) (Proposal, error)
+	Discard(ctx context.Context, tx store.Tx, batchKey [32]byte) error // only before any op was applied (FK RESTRICT)
+}
+
 type Applier interface {
-	// Apply runs in one fenced tx: consolidation_applied(op_key) insert ON CONFLICT DO NOTHING gates each op;
-	// new observation_versions get effective_at = max(mentioned_at) of cited facts (D9); outbox events.
-	Apply(ctx context.Context, tx store.Tx, b Batch, ops []Op) (applied int, err error)
+	// Apply runs in one fenced tx over the STORED proposal: consolidation_applied(op_key) insert ON CONFLICT
+	// DO NOTHING gates each op and commits with the effects (N43); every InputFactIDs row is re-read FOR SHARE
+	// and must be live, else errs.ProposalDiscarded and nothing is written (N41); new observation_versions get
+	// effective_at = max(mentioned_at over inputs, effective_at over CandidateVersions, previous version) (D9)
+	// and their observation_inputs rows; outbox events last (A-F1).
+	Apply(ctx context.Context, tx store.Tx, p Proposal) (applied int, err error)
 }
 
 type Consolidator interface {
@@ -1124,6 +1145,8 @@ type RetainActivities interface {
 
 type ConsolidateActivities interface {
 	ConsolidateBatch(ctx context.Context, in *workflowv1.ConsolidateBatchInput) (*workflowv1.ConsolidateBatchResult, error)
+	StoreProposal(ctx context.Context, in *workflowv1.StoreProposalInput) (*workflowv1.StoreProposalResult, error) // write-once; returns the stored list (N43)
+	ApplyBatch(ctx context.Context, in *workflowv1.ApplyBatchInput) (*workflowv1.ApplyBatchResult, error)          // applied | already | discarded{missing_fact_ids} (N41)
 	CheckQuota(ctx context.Context, scope *workflowv1.WorkflowScope) (*memoryv1.DeferredInfo, error) // non-nil → DEFERRED until window reset
 }
 
@@ -1168,7 +1191,9 @@ asserts no duplicate facts.
 
 **(a) Responsibility.** D6: one active relay per shard elected with `pg_try_advisory_lock`, reading `outbox` in
 `seq` order in batches of 500, driving named sinks with independent cursors, tracking skipped sequence numbers
-in a gap watchlist for `2 × statement_timeout`.
+in a gap watchlist for `2 × statement_timeout` and delivering a strict prefix (no cursor passes an open gap;
+sound under A-F1: writers' outbox `INSERT` is their last statement and `statement_timeout =
+idle_in_transaction_session_timeout = 30 s`).
 
 **(b) Interfaces.**
 
@@ -1229,15 +1254,15 @@ type Fence struct { NamespaceID string; TenantID string; Source, Target int32; E
 
 type Activities interface {
 	Plan(ctx context.Context, f Fence) (*PlanResult, error)                       // target ownership(e+1, incoming); catalog namespaces.state='moving'
-	Copy(ctx context.Context, f Fence) (*CopyResult, error)                       // REPEATABLE READ on source; p0 = max(outbox.seq); table-by-table COPY; blob prefix copy; heartbeats
-	CatchUp(ctx context.Context, f Fence, fromSeq int64) (*CatchUpResult, error) // replay outbox seq > fromSeq via MoveSink until lag < 100 events or < 5 s
+	Copy(ctx context.Context, f Fence) (*CopyResult, error)                       // copy barrier (N45): FOR UPDATE on the source ownership row, REPEATABLE READ snapshot opened while holding it, lock released, p0 = max(outbox.seq) read inside the snapshot; table-by-table COPY; blob prefix copy; heartbeats
+	CatchUp(ctx context.Context, f Fence, fromSeq int64) (*CatchUpResult, error) // replay outbox seq > p0 via MoveSink until lag < 100 events or < 5 s; gives up after 10 rounds → Rollback (N45)
 	Freeze(ctx context.Context, f Fence) error                                    // catalog 'frozen'; source ownership 'frozen' FOR UPDATE (same epoch)
 	Drain(ctx context.Context, f Fence) (*DrainResult, error)                     // replay to max(seq); terminate ns workflows on source queue; record their workflow ids (D5 step 5)
 	Verify(ctx context.Context, f Fence) error                                    // both sides static: counts always, checksums ≤ 1 M facts, 1 % sample above; before Cutover (§5.5.1)
-	Cutover(ctx context.Context, f Fence) error                                   // target 'active' @ e+1; one catalog tx: shard=target, epoch=e+1, state='active'; source 'moved_out'; NOTIFY
+	Cutover(ctx context.Context, f Fence) error                                   // D5 step 6 order (N45): (a) namespace_moves 'cutover'; (b) target 'active' @ e+1; (c) source 'moved_out'; (d) catalog shard=target, epoch=e+1, state='active' + NOTIFY; then Restart = (e). Four txs in three databases, never one
 	Restart(ctx context.Context, f Fence, d *DrainResult) error                   // re-execute the recorded workflows on shard-{target} with the same ids and epoch e+1
 	Cleanup(ctx context.Context, f Fence) error                                   // after 24 h grace: MoveService.CleanupMove admin RPC purges source rows + old blob prefix (admin role, D5 step 7)
-	Rollback(ctx context.Context, f Fence, reason string) error                   // target ownership → moved_out/deleted rows; source 'active'; catalog 'active'; only before cutover
+	Rollback(ctx context.Context, f Fence, reason string) error                   // target ownership → moved_out/deleted rows; source 'active'; catalog 'active'; only before Cutover (a)
 }
 
 type Orchestrator interface { // admin surface (MoveService)
@@ -1251,16 +1276,19 @@ type Options struct {
 	FreezeWatchdog time.Duration // 120 s: Rollback if Cutover has not committed (D5 step 4)
 	CatchUpMaxLag int           // 100 events
 	CatchUpMaxAge time.Duration // 5 s
+	CatchUpMaxRounds int        // 10 (N45): then Rollback
 	CleanupGrace time.Duration  // 24 h
 	CopyBatchRows int           // 10 000 per COPY segment (heartbeat granularity)
 }
 ```
 
-Fencing details: `Copy` reads under `REPEATABLE READ` with the source ownership row selected (not locked) at
-epoch e; `Freeze` takes `FOR UPDATE` on that row and therefore waits for in-flight `FOR SHARE` writers to finish
-— after it commits, no new writer can pass the D2 check; `Cutover` is a CAS on `namespace_moves.state='frozen'`
-and `namespaces.epoch=e`, so a concurrent restore-from-backup (which also bumps epoch) causes the CAS to fail
-and the move rolls back rather than fighting. `Restart` re-executes the recorded workflows with their original
+Fencing details: `Copy` takes `FOR UPDATE` on the source ownership row for the few milliseconds it needs to open
+its `REPEATABLE READ` snapshot (the copy barrier, N45) and reads `p0` inside that snapshot, so no writer that
+drew a lower `seq` can commit after it (TLC `ShardMove_NoBarrier`); `Freeze` takes `FOR UPDATE` on the same row
+and therefore waits for in-flight `FOR SHARE` writers to finish — after it commits, no new writer can pass the D2
+check; `Cutover` (a) is a CAS on `namespace_moves.state='frozen'` and (d) on `namespaces.epoch=e`, so a
+concurrent restore-from-backup (which also bumps epoch) fails the CAS and the move fails loudly rather than
+fighting (a rollback is only possible before (a)). `Restart` re-executes the recorded workflows with their original
 ids (hence the same `operation_id`s) and the new epoch; per-chunk idempotency keys exclude the epoch (D11), so
 already-committed chunks on the target (copied or replayed) are detected by content hash and skipped, not re-extracted.
 

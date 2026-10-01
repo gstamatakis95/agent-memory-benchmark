@@ -693,7 +693,7 @@ is never lost.
 CREATE TABLE operations (
   namespace_id uuid NOT NULL, tenant_id text NOT NULL, operation_id uuid NOT NULL,
   kind text NOT NULL CHECK (kind IN ('retain','delete_document','delete_namespace','consolidate','reflect','page_refresh','export','purge','move')),
-  state operation_state NOT NULL DEFAULT 'PENDING',   -- PENDING|RUNNING|DEFERRED|SUCCEEDED|SUCCEEDED_WITH_ERRORS|FAILED|CANCELLED
+  state operation_state NOT NULL DEFAULT 'PENDING',   -- PENDING|RUNNING|DEFERRED|SUCCEEDED|FAILED|CANCELLED
   request_id text, target_id text,
   workflow_id text NOT NULL,                      -- ns/{namespace_id}/op/{operation_id} (D11)
   task_queue text NOT NULL,                       -- shard-{id} at submission; restarted on the target after a move
@@ -706,7 +706,7 @@ CREATE TABLE operations (
   PRIMARY KEY (namespace_id, operation_id),
   FOREIGN KEY (namespace_id, tenant_id) REFERENCES namespace_ownership (namespace_id, tenant_id),
   CHECK (state <> 'DEFERRED' OR deferred_until IS NOT NULL),
-  CHECK ((state IN ('SUCCEEDED','SUCCEEDED_WITH_ERRORS','FAILED','CANCELLED')) = (finished_at IS NOT NULL))
+  CHECK ((state IN ('SUCCEEDED','FAILED','CANCELLED')) = (finished_at IS NOT NULL))
 ) WITH (fillfactor = 70);
 CREATE INDEX operations_created_idx  ON operations (namespace_id, created_at DESC);                       -- ListOperations
 CREATE INDEX operations_active_idx   ON operations (namespace_id, state, deferred_until) WHERE state IN ('PENDING','RUNNING','DEFERRED');

@@ -65,7 +65,7 @@ CREATE TYPE document_state   AS ENUM ('active', 'deleting', 'deleted');
 CREATE TYPE version_status   AS ENUM ('ingesting', 'active', 'superseded', 'deleted');
 CREATE TYPE update_mode      AS ENUM ('replace', 'append');
 CREATE TYPE operation_state  AS ENUM ('PENDING', 'RUNNING', 'DEFERRED', 'SUCCEEDED',
-                                      'SUCCEEDED_WITH_ERRORS', 'FAILED', 'CANCELLED');
+                                      'FAILED', 'CANCELLED');
 
 -- -----------------------------------------------------------------------------
 -- Helper functions (prefixed engram_ because they live in public)
@@ -797,7 +797,7 @@ CREATE TABLE operations (
   PRIMARY KEY (namespace_id, operation_id),
   FOREIGN KEY (namespace_id, tenant_id) REFERENCES namespace_ownership (namespace_id, tenant_id),
   CHECK (state <> 'DEFERRED' OR deferred_until IS NOT NULL),
-  CHECK ((state IN ('SUCCEEDED', 'SUCCEEDED_WITH_ERRORS', 'FAILED', 'CANCELLED')) = (finished_at IS NOT NULL))
+  CHECK ((state IN ('SUCCEEDED', 'FAILED', 'CANCELLED')) = (finished_at IS NOT NULL))
 ) WITH (fillfactor = 70);
 
 CREATE INDEX operations_created_idx ON operations (namespace_id, created_at DESC);

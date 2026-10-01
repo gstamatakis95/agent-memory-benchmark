@@ -39,6 +39,7 @@ CONSTANTS Shards,        \* {s1, s2}
           MaxEpoch,      \* epochs are 1..MaxEpoch
           MaxMoves,      \* move attempts per behaviour
           MaxCrashes,    \* mover crashes per behaviour
+          MaxSeq,        \* outbox seqs drawn per shard per behaviour (bounds begin/abort retry cycles)
           CopyBarrier,   \* BOOLEAN
           CutoverOrder,  \* "safe" | "d5"
           NoActor        \* model value: actor of a write that has not begun
@@ -76,6 +77,7 @@ TypeOK ==
   /\ cache \in [Actors -> [NS -> [shard : Shards, epoch : 1..MaxEpoch]]]
   /\ store \in [Shards -> [NS -> [Writes -> 0..2]]]
   /\ wst \in [Writes -> {"idle", "holding", "committed"}]
+  /\ nextSeq \in [Shards -> 1..(MaxSeq + 1)]
   /\ mv.st \in MoveStates
   /\ moverUp \in BOOLEAN
 
@@ -112,7 +114,8 @@ Holding(s, n) == {w \in Writes : wst[w] = "holding" /\ winfo[w].shard = s /\ win
 BeginWrite(a, n, w) ==
   /\ wst[w] = "idle"
   /\ LET r == cache[a][n] IN
-     IF FenceOK(r.shard, n, r.epoch)
+     /\ nextSeq[r.shard] <= MaxSeq
+     /\ IF FenceOK(r.shard, n, r.epoch)
        THEN /\ wst' = [wst EXCEPT ![w] = "holding"]
             /\ winfo' = [winfo EXCEPT ![w] = [shard |-> r.shard, ns |-> n, seq |-> nextSeq[r.shard], actor |-> a]]
             /\ nextSeq' = [nextSeq EXCEPT ![r.shard] = @ + 1]

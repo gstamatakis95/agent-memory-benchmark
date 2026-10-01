@@ -30,19 +30,21 @@ deliverable and run in CI.
 | `Outbox.tla` | D6 outbox relay: sequence-drawn `seq`, out-of-order commit, statement timeout, cursor + gap watchlist, fan-out to index/kafka | `NoLossSafety`, `PerNamespaceOrder`, `OnlyCommittedDelivered`, `IdempotentConsumerState`, liveness `NoLossLive` | 3 writers, 2 namespaces, 2 consumers, 5 seqs, Timeout 2, Watch 4, 1 relay crash | `Outbox.cfg` (safety, symmetry); `Outbox_Live.cfg` (2 writers, 4 seqs, no symmetry) | **PASS** 17,243,719 generated / 5,557,863 distinct, depth 39, 1 min 38 s. Liveness: **PASS** 1,342,866 / 486,937, depth 31, 40 s |
 | `Outbox.tla` | same, watchlist removed (Watch 0) | `NoLossSafety` | same | `Outbox_NoWatch.cfg` | **FAIL as intended**, counterexample at depth 7 (7.2.3) |
 | `Outbox.tla` | same, horizon = 1 × timeout (Watch 2) | `NoLossSafety` | same | `Outbox_Watch1x.cfg` | **FAIL as intended**, depth 9, 106,588 distinct states before the violation, 3 s |
-| `Consolidation.tla` | D12 consolidation round: at-least-once activities, crashes, `batch_key`/`op_key`, bisect 4→2→1, concurrent fact delete, source-count trigger | `ExactlyOnceEffect`, `ObservationHasSources`, liveness `RoundTerminates` | 4 facts, 2 observations, proposals of ≤ 2 ops, 2 crashes, 1 delete | `Consolidation.cfg` (safety, symmetry on Obs); `Consolidation_Live.cfg` (1 observation, 1 crash) | PENDING_CONS_SAFETY / PENDING_CONS_LIVE |
+| `Consolidation.tla` | D12 consolidation round: at-least-once activities, crashes, `batch_key`/`op_key`, bisect 4→2→1, concurrent fact delete, source-count trigger | `ExactlyOnceEffect`, `ObservationHasSources`, liveness `RoundTerminates` | 4 facts, 2 observations, proposals of ≤ 2 ops, 2 crashes, 1 delete | `Consolidation.cfg` (full bounds, safety, symmetry on Obs); `Consolidation_Mid.cfg` (3 facts, 1 crash, safety); `Consolidation_Live.cfg` (2 facts, 1 observation, 1 crash, no symmetry, liveness) | Full bounds: **INCOMPLETE** — capped at 560 s after 66,544,363 generated / 16,517,034 distinct states (depth 9, 13.3M queued), no violation. `Consolidation_Mid.cfg`: **NOT RUN** (queued when the session's time budget ended). Liveness `Consolidation_Live.cfg`: **PASS** 62,991 / 19,108, depth 12, 4 s, `RoundTerminates` included |
 | `Consolidation.tla` | proposal not persisted before apply | `ExactlyOnceEffect` | same | `Consolidation_VolatileProposal.cfg` | **FAIL as intended**, depth 6, 2 s |
 | `Consolidation.tla` | effect and `consolidation_applied` insert in separate transactions | `ExactlyOnceEffect` | same | `Consolidation_NonAtomicKey.cfg` | **FAIL as intended**, depth 5, 2 s |
 | `AsOf.tla` | D9 `as_of`: `mentioned_at`, observation versions, `effective_at`, recall(T) | `NoLeak`, `EffectiveCoversCited`, action property `OlderVersionStable` | 3 facts, 2 observations, times 1..3, 2 versions each | `AsOf.cfg` (symmetry) | **PASS** 1,687,878 / 332,776, depth 8, 1 min 22 s (run concurrently with another check) |
 | `AsOf.tla` | `effective_at` from cited sources only (D9 as first written) | `NoLeak` | same | `AsOf_CitedOnly.cfg` | **FAIL as intended**, depth 4, 1 s (7.2.4) |
-| `DocLifecycle.tla` | D8/D11/D12/D7: replace/delete vs per-chunk commits, consolidation read/apply, purge, transactional and async index | `NoOrphanLinks`, `NoObservationCitesDeletedAfterAck`, `NoDeletedContentRecalled`, `ObservationHasSources`, `OneActiveVersion`, `VersionsConsistent`, liveness `IndexConverges` | 2 documents, 3 hashes, 2 versions, 3 observations, 3 consolidations | `DocLifecycle.cfg` (async index, symmetry); `DocLifecycle_Tx.cfg` (transactional index); `DocLifecycle_Live.cfg` (2 hashes, 1 observation, no symmetry) | PENDING_DOC_ASYNC / PENDING_DOC_TX / PENDING_DOC_LIVE |
-| `DocLifecycle.tla` | five single-knob simplifications (7.2.1) | the invariant each one breaks | 2 documents, 2 hashes, 2 observations | `DocLifecycle_NoCommitCheck/_NoFinalizeCheck/_CitedOnly/_NoApplyCheck/_UnfilteredIndex.cfg` | **all FAIL as intended**, depths 5/7/9/6/5, ≤ 3 s each (re-run after ND-11) |
-| `ShardMove.tla` | D5 + N2 move: plan, barrier copy, catch-up, freeze, drain, four-step cutover, rollback, mover crash/restart, stale caches, pinned workflows, concurrent retain/consolidate/delete writes | `SingleWritableOwner`, `WritesOnlyAtOwner`, `NoLossNoDup`, `NoDupAnywhere`, `ReadsFresh`, liveness `MoveTerminates` | 2 shards, 2 namespaces (1 movable), 2 API clients, 1 workflow, 3 writes, epochs ≤ 3, 2 move attempts, 1 crash | `ShardMove.cfg` (symmetry on clients/writes); `ShardMove_Live.cfg` (1 namespace, 1 client, 2 writes, epochs ≤ 2) | PENDING_MOVE_SAFETY / PENDING_MOVE_LIVE |
+| `DocLifecycle.tla` | D8/D11/D12/D7: replace/delete vs per-chunk commits, consolidation read/apply, purge, transactional and async index | `NoOrphanLinks`, `NoObservationCitesDeletedAfterAck`, `NoDeletedContentRecalled`, `ObservationHasSources`, `OneActiveVersion`, `VersionsConsistent`, liveness `IndexConverges` | 2 documents, 3 hashes, 2 versions, 3 observations, 3 consolidations | `DocLifecycle.cfg` / `DocLifecycle_Tx.cfg` (full bounds, async / transactional index, symmetry); `DocLifecycle_Mid.cfg` / `_TxMid.cfg` (2 observations, 2 consolidations); `DocLifecycle_Live.cfg` (1 document, 2 hashes, 1 observation, 1 consolidation, no symmetry, liveness) | Async full bounds: **INCOMPLETE** — capped at 560 s after 36,540,880 / 10,922,004 (depth 12), no design invariant violated. Transactional full bounds: the run found the `ncons` model bug (7.2.6) at depth 11 after 22,048,793 / 6,800,447 in 5 min 29 s with no design invariant violated; `DocLifecycle_TxMid.cfg` on the fixed spec was still running and `DocLifecycle_Mid.cfg` **NOT RUN** when the time budget ended. Liveness `DocLifecycle_Live.cfg`: **PASS** 108,665 / 23,771, depth 14, 3 s, `IndexConverges` included |
+| `DocLifecycle.tla` | five single-knob simplifications (7.2.1) | the invariant each one breaks | 2 documents, 2 hashes, 2 observations | `DocLifecycle_NoCommitCheck/_NoFinalizeCheck/_CitedOnly/_NoApplyCheck/_UnfilteredIndex.cfg` | **all FAIL as intended**, depths 4/7/8/6/6, ≤ 3 s each (re-run on the final spec) |
+| `ShardMove.tla` | D5 + N2 move: plan, barrier copy, catch-up, freeze, drain, four-step cutover, rollback, mover crash/restart, stale caches, pinned workflows, concurrent retain/consolidate/delete writes | `SingleWritableOwner`, `WritesOnlyAtOwner`, `NoLossNoDup`, `NoDupAnywhere`, `ReadsFresh`, liveness `MoveTerminates` | 2 shards, 2 namespaces (1 movable), 2 API clients, 1 workflow, 3 writes, epochs ≤ 3, 2 move attempts, 1 crash, 4 seq draws per shard | `ShardMove.cfg` (full bounds, symmetry on clients/writes); `ShardMove_Mid.cfg` (1 namespace, 1 move attempt); `ShardMove_Live.cfg` (1 namespace, 2 clients, 1 workflow, 2 writes, epochs ≤ 2, 3 draws, no symmetry, liveness) | Full bounds: **NOT RUN** on the bounded spec (queued; the earlier run on the unbounded spec explored 128M / 8,792,181 distinct states without violation but could not terminate, 7.2.6). `ShardMove_Mid.cfg`: **PASS** 4,532,796 / 507,282, depth 31, 38 s. Liveness `ShardMove_Live.cfg`: **PASS** 655,704 / 81,804, depth 26, 20 s, `MoveTerminates` included |
 | `ShardMove.tla` | copy snapshot without barrier (D5 step 2 as first written) | `NoLossNoDup` | 1 namespace, 2 writes | `ShardMove_NoBarrier.cfg` | **FAIL as intended**, depth 12, 1 s (7.2.5) |
 | `ShardMove.tla` | catalog switched before source `moved_out` (D5 step 6 order) | `ReadsFresh` | same | `ShardMove_D5Order.cfg` | **FAIL as intended**, depth 8, 1,523 distinct states, 3 s (7.2.5) |
 
-Reading the table: every design configuration that finished passed, every counterexample
-configuration failed on exactly the invariant it was built to break, and each failure maps
+Reading the table: every design configuration that finished passed (eight of them, all
+liveness ones included), the three full-bound safety configurations are too large for a
+10-minute cap and are reported with the states they explored without violation, every
+counterexample configuration failed on exactly the invariant it was built to break, and each failure maps
 to a concrete rule in the Go code (7.4). Bounds were chosen as the smallest that exercise
 every race of interest twice (two documents so that links and consolidation batches cross a
 delete boundary; three writers so that a gap can sit between two committed seqs; two move
@@ -135,7 +137,7 @@ NoDeletedContentRecalled ==
 
 **What the counterexamples say.** Each is a four-to-eight step trace TLC printed:
 
-1. `CommitChecksVersion = FALSE` (depth 5): `StartRetain(d1,1)`, `Delete(d1)` acked,
+1. `CommitChecksVersion = FALSE` (depth 4): `StartRetain(d1,1)`, `Delete(d1)` acked,
    `CommitChunk(d1,1,h)` — the in-flight retain resurrects the deleted document; the fact is
    live and belongs only to a deleted version, and the next recall returns it. **Rule:**
    `CommitChunk` locks the `document_versions` row `FOR SHARE` and requires
@@ -147,7 +149,7 @@ NoDeletedContentRecalled ==
    the next retain. **Rule:** `FinalizeVersion(u)` first reads `documents.current_version`
    and the set of started versions `FOR UPDATE`; if a newer version exists it only marks `u`
    superseded; the retire set is computed by the newest version only (ND-2).
-3. `ApplyCheck = "cited"` (depth 9): consolidation reads a batch spanning d1 and d2; d1 is
+3. `ApplyCheck = "cited"` (depth 8): consolidation reads a batch spanning d1 and d2; d1 is
    deleted and acked; the apply transaction drops the deleted sources but keeps the text,
    which was written with d1's facts in the prompt. `NoDeletedContentRecalled` fails on the
    observation. `ApplyCheck = "none"` (depth 6) fails one step earlier on
@@ -159,7 +161,7 @@ NoDeletedContentRecalled ==
    reconsolidated (ND-3). This is the one place the model changed the register's behaviour:
    D8 as written keeps a stale observation visible, which contradicts D16's "nothing from the
    document is returned after the ack".
-4. `FilterIndexByStore = FALSE` (depth 5): `CommitChunk`, `Relay` (index has f), `Delete`
+4. `FilterIndexByStore = FALSE` (depth 6): `CommitChunk`, `Relay` (index has f), `Delete`
    acked — the store retired f, the index has not caught up, recall returns f. **Rule:**
    results from an `Async` index are joined with `facts.retired_at IS NULL AND
    invalidated_at IS NULL` before ranking (ND-9); the transactional MVP index does not need
@@ -383,7 +385,7 @@ bound. Pages get the same rule through `page_sources` (inputs, not citations).
 (the ownership row on each shard); `cache[a][n] = [shard, epoch]` for API clients (refreshed
 by `LISTEN`/TTL or after a `FAILED_PRECONDITION`) and workflows (pinned at start, re-pinned only
 by the mover); `store[s][n]` as a bag `Writes → ℕ` so a duplicate shows as a count of 2;
-per-write `wst`/`winfo` (shard, namespace, outbox seq, actor); `nextSeq[s]`; `accepted[n]`
+per-write `wst`/`winfo` (shard, namespace, outbox seq, actor); `nextSeq[s]` (draws are bounded by `MaxSeq`, which bounds begin/abort retry cycles); `accepted[n]`
 (acked writes); the mover record `mv` (persisted state machine, `p0`, applied seqs); `moverUp`;
 counters; `readViolation`.
 
@@ -466,6 +468,21 @@ restart the recorded workflows on the target queue. In the window between the so
 the catalog switch every request for the namespace fails with
 `FAILED_PRECONDITION/WrongShardOrEpoch`, which the API already retries (D5 step 4); nothing
 can be stale because nothing is served.
+
+#### 7.2.6 What the checks caught in the models themselves
+
+Three of the failures TLC reported were bugs in the models, not in the design, and they are
+worth recording because each is the kind of mistake the Go model tests of 7.4 would make
+too: (1) `DocLifecycle` counted consolidation attempts at apply time but bounded them at read
+time, so three concurrent reads overran `TypeOK` at depth 11 (counting at read time fixed
+it); (2) `ShardMove` enabled `Replay` in `{catching_up, drained}` instead of
+`{catching_up, frozen}`, so the drain could never run — the safety configurations passed
+because the cutover path with pending replays was simply unreachable, and only the liveness
+check (`MoveTerminates`, a stuttering cycle after `Freeze`) exposed it; (3) `ShardMove` let
+`nextSeq` grow without bound through begin/abort retry cycles, making the state space
+infinite (TLC reached depth 713 with a single write) — bounded by `MaxSeq`. The lesson that
+goes into 7.6: every spec runs a liveness configuration in CI, however small, because a
+safety-only run of a model with an unreachable branch is green for the wrong reason.
 
 ### 7.3 Lean 4 theorems
 
@@ -610,8 +627,11 @@ extraction function.
   `*_VolatileProposal.cfg`, `*_NonAtomicKey.cfg`, `*_D5Order.cfg`, `*_UnfilteredIndex.cfg`)
   must end with "Invariant … is violated" on the invariant named in the cfg's first comment
   line; anything else (timeout, parse error, a *different* invariant failing) fails the job.
-  Logs and `-dump dot` state graphs of the counterexamples are uploaded as artefacts. The
-  runtime budget from the measured runs is about 25 minutes on 4 cores.
+  Logs and `-dump dot` state graphs of the counterexamples are uploaded as artefacts. From
+  the measured runs: the completed configurations sum to about 7 minutes on 4 cores; the
+  three full-bound safety configurations (`Consolidation.cfg`, `DocLifecycle.cfg`/`_Tx.cfg`,
+  `ShardMove.cfg`) each exceed 10 minutes and run only nightly with a 30-minute cap on 8
+  cores, while the `_Mid` and `_Live` configurations are the PR-job set.
 - **PR job `formal-quick`**: parses every spec (`tlc2.TLC -parse` equivalent via SANY),
   runs the counterexample configurations and the `_Live` configurations (all under two
   minutes in the measured runs) so a spec edit that breaks parsing or silently weakens an

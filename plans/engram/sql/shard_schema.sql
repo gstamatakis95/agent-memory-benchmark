@@ -18,6 +18,12 @@
 -- RLS policies read engram.namespace_id: unset -> ERROR 42704, empty -> ERROR 22P02
 -- (fail closed, verified in section 8's RLS canary).
 --
+-- Write-transaction protocol (D6 invariant A-F1, model-checked in section 7): writers run with
+-- statement_timeout = idle_in_transaction_session_timeout = 30 s and the outbox INSERT is the
+-- LAST statement before COMMIT, so a drawn outbox.seq is committed or aborted within one
+-- timeout of being drawn; the relay's 60 s gap watchlist and the move's copy barrier
+-- (D5 step 2) both rely on it.
+--
 -- Roles (LOGIN; passwords are set by provisioning from the shard secret, section 9):
 --   engram_migrate  owner of every object; DDL only (BYPASSRLS so data migrations can run)
 --   engram_app      API + worker per-namespace transactions; NOBYPASSRLS
@@ -171,16 +177,20 @@ BEGIN
   RETURN NEW;
 END $$;
 
--- Observations never outlive their sources (D12): after any deletion of observation_sources
--- rows, observations left with zero sources are retired (and so are their versions);
--- observations that lost >= 1 source are marked stale for reconsolidation. The application
--- emits the matching outbox events after reading the affected rows back; this trigger is
--- the invariant, not the event source. Fires for explicit deletes and for FK cascades alike.
+-- Observations never outlive their sources (D12) and never stay visible after their evidence
+-- is gone (N41): after any deletion of observation_sources or observation_inputs rows (both
+-- triggers call this function), observations left with zero sources are retired (and so are
+-- their versions); every other affected observation is marked stale_delete, which hides it
+-- from recall (observation_versions.live is false) until a consolidation round rewrites it
+-- from the remaining evidence. stale_write (new evidence under a visible observation) is set
+-- by FinalizeVersion / consolidation apply, never here. The application emits the matching
+-- outbox events after reading the affected rows back; this trigger is the invariant, not the
+-- event source. Fires for explicit deletes, for the purge and for FK cascades alike.
 CREATE FUNCTION engram_observation_sources_after_delete() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   UPDATE observations o
-     SET retired_at = now(), stale = false, updated_at = now()
+     SET retired_at = now(), stale_write = false, stale_delete = false, stale_since = NULL, updated_at = now()
    WHERE (o.namespace_id, o.observation_id) IN (SELECT DISTINCT d.namespace_id, d.observation_id FROM deleted d)
      AND o.retired_at IS NULL
      AND NOT EXISTS (SELECT 1 FROM observation_sources s
@@ -192,11 +202,27 @@ BEGIN
      AND NOT EXISTS (SELECT 1 FROM observation_sources s
                       WHERE s.namespace_id = v.namespace_id AND s.observation_id = v.observation_id);
   UPDATE observations o
-     SET stale = true, stale_since = coalesce(o.stale_since, now()), updated_at = now()
+     SET stale_delete = true, stale_since = coalesce(o.stale_since, now()), updated_at = now()
    WHERE (o.namespace_id, o.observation_id) IN (SELECT DISTINCT d.namespace_id, d.observation_id FROM deleted d)
      AND o.retired_at IS NULL
-     AND o.stale = false;
+     AND o.stale_delete = false;
+  UPDATE observation_versions v
+     SET stale_delete = true
+   WHERE (v.namespace_id, v.observation_id) IN (SELECT DISTINCT d.namespace_id, d.observation_id FROM deleted d)
+     AND v.retired_at IS NULL
+     AND v.stale_delete = false;
   RETURN NULL;
+END $$;
+
+-- consolidation_proposals is write-once (N43): the op list an op_key was computed over must
+-- never change. UPDATE is refused for every role; DELETE is left to the FK from
+-- consolidation_applied (RESTRICT), which admits it only while no op of the batch has been
+-- applied — the discard path of section 5.2 (apply re-verification failed, N41).
+CREATE FUNCTION engram_forbid_proposal_update() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'consolidation_proposals is write-once (UPDATE by % refused)', current_user
+    USING ERRCODE = '42501';
 END $$;
 
 -- =============================================================================
@@ -417,6 +443,14 @@ CREATE TABLE document_versions (
 -- at most one active version per document
 CREATE UNIQUE INDEX document_versions_active_uq ON document_versions (namespace_id, document_id)
   WHERE status = 'active';
+-- Lock protocol on the version row (N40, model-checked in section 7): CommitChunk(v) takes
+-- SELECT status FROM document_versions WHERE (namespace_id, document_id, version = v) FOR SHARE
+-- and proceeds only when status = 'ingesting'. FinalizeVersion and the delete cascade UPDATE
+-- that row (to superseded/active/deleted), so they wait for every in-flight commit of v and
+-- a commit that starts afterwards sees the terminal status and stops; FinalizeVersion(v)
+-- marks v 'superseded' without retiring anything when a newer version row already exists —
+-- only the newest version computes the retire set. No DDL beyond the status column is
+-- needed; the self-check below only pins the enum.
 CREATE INDEX document_versions_op_idx ON document_versions (namespace_id, operation_id);
 
 -- chunks (hash-partitioned). Identity within a document = content hash of the text (N6: the
@@ -585,8 +619,9 @@ CREATE TABLE observations (
   tenant_id         text NOT NULL,
   observation_id    uuid NOT NULL,
   current_version   integer NOT NULL DEFAULT 0 CHECK (current_version >= 0),
-  proof_count       integer NOT NULL DEFAULT 0 CHECK (proof_count >= 0),
-  stale             boolean NOT NULL DEFAULT false,      -- needs reconsolidation (source lost/invalidated)
+  proof_count       integer NOT NULL DEFAULT 0 CHECK (proof_count >= 0),   -- sources with retired_at IS NULL (N42)
+  stale_write       boolean NOT NULL DEFAULT false,      -- evidence changed under it (replace-retire, restore); still visible (N42)
+  stale_delete      boolean NOT NULL DEFAULT false,      -- lost a source or an input (delete, purge, invalidate); HIDDEN until reconsolidated (N41)
   stale_since       timestamptz,
   tags              text[] NOT NULL DEFAULT '{}' CHECK (engram_tags_valid(tags)),   -- consolidation scope tags
   created_at        timestamptz NOT NULL DEFAULT now(),
@@ -594,22 +629,28 @@ CREATE TABLE observations (
   retired_at        timestamptz,
   PRIMARY KEY (namespace_id, observation_id),
   FOREIGN KEY (namespace_id, tenant_id) REFERENCES namespace_ownership (namespace_id, tenant_id),
-  CHECK (stale = (stale_since IS NOT NULL))
+  CHECK ((stale_write OR stale_delete) = (stale_since IS NOT NULL))
 ) WITH (fillfactor = 80);
 
-CREATE INDEX observations_stale_idx ON observations (namespace_id, stale_since)
-  WHERE stale AND retired_at IS NULL;
+CREATE INDEX observations_stale_idx ON observations (namespace_id, stale_delete DESC, stale_since)
+  WHERE (stale_write OR stale_delete) AND retired_at IS NULL;      -- hidden ones first (section 5.2)
 CREATE INDEX observations_tags_gin ON observations USING gin (namespace_id, tags) WHERE retired_at IS NULL;
 
 CREATE TRIGGER observations_touch BEFORE UPDATE ON observations
   FOR EACH ROW EXECUTE FUNCTION engram_touch_updated_at();
 
--- Version v is visible at as_of = T iff effective_at <= T AND (superseded_at IS NULL OR
--- superseded_at > T), where superseded_at = min(effective_at) over later versions
--- (maintained when a later version is inserted). This is D9's "latest version with
+-- Recall visibility predicate for an observation version: live AND effective_at <= T AND
+-- (superseded_at IS NULL OR superseded_at > T), where live = retired_at IS NULL AND
+-- stale_delete = false (N41: an observation whose evidence was deleted is hidden until
+-- reconsolidated; stale_write stays visible) and superseded_at = min(effective_at) over later
+-- versions (maintained when a later version is inserted). This is D9's "latest version with
 -- effective_at <= T", precomputed so it is a plain filter for HNSW and BM25 scans.
--- tags and retired_at are denormalised from observations so both observation arms are
--- single-table queries (Top-K pushdown needs that).
+-- tags, retired_at and stale_delete are denormalised from observations so both observation
+-- arms are single-table queries (Top-K pushdown needs that).
+-- effective_at(v) = max(max(mentioned_at) over observation_inputs(v) — every fact shown to
+-- the prompt, not only the cited sources — , max(effective_at) over the candidate observation
+-- versions shown, effective_at(v - 1)) (D9 as amended; TLC AsOf_CitedOnly shows the leak
+-- with cited sources only).
 CREATE TABLE observation_versions (
   namespace_id      uuid NOT NULL,
   tenant_id         text NOT NULL,
@@ -619,16 +660,17 @@ CREATE TABLE observation_versions (
   text              text NOT NULL CHECK (octet_length(text) BETWEEN 1 AND 8192),
   embedding         halfvec(768) NOT NULL,
   embedding_model   text NOT NULL,
-  effective_at      timestamptz NOT NULL,             -- max(mentioned_at) over cited sources, clamped >= previous version (section 5)
+  effective_at      timestamptz NOT NULL,             -- D9 rule above (inputs ∪ candidates ∪ previous version), monotone across versions
   superseded_at     timestamptz,
   source_count      integer NOT NULL CHECK (source_count >= 1),
+  stale_delete      boolean NOT NULL DEFAULT false,     -- = observations.stale_delete (denormalised, N41)
   tags              text[] NOT NULL DEFAULT '{}' CHECK (engram_tags_valid(tags)),
   tag_count         smallint GENERATED ALWAYS AS ((cardinality(tags))::smallint) STORED,
   prompt_version    text NOT NULL,
   model             text NOT NULL,
   created_at        timestamptz NOT NULL DEFAULT now(),
   retired_at        timestamptz,
-  live              boolean GENERATED ALWAYS AS (retired_at IS NULL) STORED,
+  live              boolean GENERATED ALWAYS AS (retired_at IS NULL AND NOT stale_delete) STORED,   -- the recall predicate (N41)
   PRIMARY KEY (namespace_id, observation_id, version),
   UNIQUE (ov_id),                                     -- single-column uniqueness required by the BM25 key_field
   FOREIGN KEY (namespace_id, observation_id) REFERENCES observations (namespace_id, observation_id),
@@ -656,6 +698,33 @@ CREATE TRIGGER observation_sources_orphans AFTER DELETE ON observation_sources
   REFERENCING OLD TABLE AS deleted
   FOR EACH STATEMENT EXECUTE FUNCTION engram_observation_sources_after_delete();
 
+-- observation_inputs (N41): every fact shown to the consolidation prompt that produced
+-- version v of the observation — the batch facts plus the source facts of every candidate
+-- observation shown — whether or not the version cites it. Cited sources are a subset.
+-- Used by (1) the delete/purge cascade: removing a row marks the observation stale_delete
+-- (hidden) through the trigger below, because its text was derived from the deleted content;
+-- (2) the apply transaction, which re-verifies every input FOR SHARE (live) before writing;
+-- (3) effective_at (D9). A REPLACE-retired fact keeps its rows during the purge grace (N42).
+-- The FK to facts cascades so the physical purge of a fact can never leave a dangling input.
+CREATE TABLE observation_inputs (
+  namespace_id    uuid NOT NULL,
+  tenant_id       text NOT NULL,
+  observation_id  uuid NOT NULL,
+  version         integer NOT NULL CHECK (version >= 1),
+  fact_id         uuid NOT NULL,                       -- = facts.memory_id
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (namespace_id, observation_id, version, fact_id),
+  FOREIGN KEY (namespace_id, observation_id, version)
+    REFERENCES observation_versions (namespace_id, observation_id, version),
+  FOREIGN KEY (namespace_id, fact_id) REFERENCES facts (namespace_id, memory_id) ON DELETE CASCADE
+);
+
+CREATE INDEX observation_inputs_fact_idx ON observation_inputs (namespace_id, fact_id);
+
+CREATE TRIGGER observation_inputs_lost AFTER DELETE ON observation_inputs
+  REFERENCING OLD TABLE AS deleted
+  FOR EACH STATEMENT EXECUTE FUNCTION engram_observation_sources_after_delete();
+
 -- consolidation_batches / consolidation_applied: exactly-once effect (D12)
 CREATE TABLE consolidation_batches (
   namespace_id      uuid NOT NULL,
@@ -664,7 +733,7 @@ CREATE TABLE consolidation_batches (
   round_id          uuid NOT NULL,
   memory_ids        uuid[] NOT NULL CHECK (cardinality(memory_ids) BETWEEN 1 AND 8),
   state             text NOT NULL DEFAULT 'pending'
-                    CHECK (state IN ('pending', 'running', 'applied', 'bisected', 'failed')),
+                    CHECK (state IN ('pending', 'running', 'proposed', 'applied', 'discarded', 'bisected', 'failed')),
   attempts          integer NOT NULL DEFAULT 0,
   model             text NOT NULL,
   prompt_version    text NOT NULL,
@@ -679,6 +748,32 @@ CREATE TABLE consolidation_batches (
 
 CREATE INDEX consolidation_batches_round_idx ON consolidation_batches (namespace_id, round_id);
 
+-- consolidation_proposals (N43): the validated, deduplicated op list of a batch, persisted
+-- write-once BEFORE any op is applied. op_key = sha256(batch_key || op_index) is computed over
+-- THIS stored list (never over the live LLM output), and ApplyBatch reads it from here.
+-- ops is a JSON array in op_index order: {kind, observation_id (pre-minted for creates), text,
+-- source_fact_ids[], quotes[], reason}. input_fact_ids = batch facts ∪ source facts of every
+-- candidate shown; candidate_versions = the (observation_id, version) pairs shown — together
+-- they are the observation_inputs rows and the effective_at inputs of every version the batch
+-- creates (D9). A retry that finds a row keeps the stored list and discards its own.
+CREATE TABLE consolidation_proposals (
+  namespace_id        uuid NOT NULL,
+  tenant_id           text NOT NULL,
+  batch_key           bytea NOT NULL CHECK (octet_length(batch_key) = 32),
+  ops                 jsonb NOT NULL CHECK (jsonb_typeof(ops) = 'array'),
+  op_count            integer NOT NULL CHECK (op_count BETWEEN 0 AND 16),
+  input_fact_ids      uuid[] NOT NULL CHECK (cardinality(input_fact_ids) >= 1),
+  candidate_versions  jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(candidate_versions) = 'array'),
+  prompt_version      text NOT NULL,
+  model               text NOT NULL,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (namespace_id, batch_key),
+  FOREIGN KEY (namespace_id, batch_key) REFERENCES consolidation_batches (namespace_id, batch_key)
+);
+
+CREATE TRIGGER consolidation_proposals_write_once BEFORE UPDATE ON consolidation_proposals
+  FOR EACH ROW EXECUTE FUNCTION engram_forbid_proposal_update();
+
 CREATE TABLE consolidation_applied (
   namespace_id    uuid NOT NULL,
   tenant_id       text NOT NULL,
@@ -690,7 +785,8 @@ CREATE TABLE consolidation_applied (
   version         integer,
   applied_at      timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, op_key),
-  FOREIGN KEY (namespace_id, batch_key) REFERENCES consolidation_batches (namespace_id, batch_key)
+  FOREIGN KEY (namespace_id, batch_key) REFERENCES consolidation_batches (namespace_id, batch_key),
+  FOREIGN KEY (namespace_id, batch_key) REFERENCES consolidation_proposals (namespace_id, batch_key)   -- RESTRICT: a proposal with an applied op can never be discarded (N43)
 );
 
 CREATE INDEX consolidation_applied_batch_idx ON consolidation_applied (namespace_id, batch_key, op_index);
@@ -1040,8 +1136,8 @@ GRANT SELECT ON shard_meta TO engram_app, engram_relay, engram_move, engram_admi
 GRANT SELECT, INSERT, UPDATE, DELETE ON
   documents, document_versions, document_version_chunks, chunks, facts, fact_links,
   entities, entity_aliases, entity_mentions,
-  observations, observation_versions, observation_sources,
-  consolidation_batches, consolidation_applied, batch_jobs,
+  observations, observation_versions, observation_sources, observation_inputs,
+  consolidation_batches, consolidation_proposals, consolidation_applied, batch_jobs,
   pages, page_versions, page_sources,
   operations, idempotency_keys, token_usage_events, token_usage, quota_counters,
   blob_tombstones, export_snapshots, namespace_stats
@@ -1063,8 +1159,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   namespace_ownership, move_applied, namespace_stats,
   ingest_ledger, documents, document_versions, document_version_chunks, chunks, facts, fact_links,
   entities, entity_aliases, entity_mentions,
-  observations, observation_versions, observation_sources,
-  consolidation_batches, consolidation_applied, batch_jobs,
+  observations, observation_versions, observation_sources, observation_inputs,
+  consolidation_batches, consolidation_proposals, consolidation_applied, batch_jobs,
   pages, page_versions, page_sources,
   operations, idempotency_keys, token_usage_events, token_usage, quota_counters,
   blob_tombstones, export_snapshots, deletion_log, outbox_skipped

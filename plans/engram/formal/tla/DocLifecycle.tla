@@ -23,6 +23,8 @@
 (*       version cannot resurrect content).                                *)
 (*   FinalizeChecksNewer : FinalizeVersion(u) retires nothing and marks u  *)
 (*       superseded when a newer version has already been started.         *)
+(*   (ND-11) REPLACE-retired facts keep their observation_sources rows until  *)
+(*       purge; the design run of this spec is what exposed the gap.         *)
 (*   ApplyCheck : what the consolidation apply transaction re-verifies     *)
 (*       with FOR SHARE: "batch" = every fact the LLM saw is still live    *)
 (*       (else the proposal is discarded); "cited" = only cited facts are  *)
@@ -173,11 +175,20 @@ Delete(d) ==
   /\ UNCHANGED <<vcontent, vpending, index, ncons>>
 
 \* Asynchronous physical purge of a retired fact (after the grace period).
+\* A fact retired by REPLACE keeps its observation_sources rows while it can
+\* still be un-retired; the purge removes them and the source-count trigger
+\* retires observations left with none (ND-11).  A fact retired by Delete
+\* lost its source rows in the delete cascade, so this is a no-op for it.
 Purge(f) ==
   /\ fstate[f] = "retired"
   /\ fstate' = [fstate EXCEPT ![f] = "absent"]
   /\ links' = {l \in links : f \notin l}
-  /\ UNCHANGED <<vstate, vcontent, vpending, deleted, obs, index, dirty, ncons>>
+  /\ obs' = [o \in Obs |->
+              IF obs[o].st \in {"live", "stale"} /\ f \in obs[o].src
+                THEN IF obs[o].src \ {f} = {} THEN [obs[o] EXCEPT !.st = "retired", !.src = {}]
+                                              ELSE [obs[o] EXCEPT !.src = @ \ {f}]
+                ELSE obs[o]]
+  /\ UNCHANGED <<vstate, vcontent, vpending, deleted, index, dirty, ncons>>
 
 -----------------------------------------------------------------------------
 (* Consolidation: read batch, LLM call (no transaction), apply transaction *)
@@ -251,8 +262,14 @@ NoDeletedContentRecalled ==
   /\ (RecallFacts \cup GraphArm) \cap deleted = {}
   /\ \A o \in RecallObs : obs[o].deriv \cap deleted = {}
 
+\* A live observation cites at least one source and every source row still
+\* exists (live, or retired by REPLACE and inside its grace period -- the
+\* observation is then stale_write and still visible, D16).  Sources of
+\* acknowledged deletes are excluded by NoObservationCitesDeletedAfterAck.
 ObservationHasSources ==
-  \A o \in Obs : obs[o].st = "live" => obs[o].src /= {} /\ obs[o].src \subseteq Live
+  \A o \in Obs : obs[o].st = "live" =>
+    /\ obs[o].src /= {}
+    /\ \A f \in obs[o].src : fstate[f] /= "absent"
 
 OneActiveVersion ==
   \A d \in Docs : Cardinality({v \in Versions : vstate[d][v] = "active"}) <= 1

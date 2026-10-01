@@ -36,7 +36,7 @@ deliverable and run in CI.
 | `AsOf.tla` | D9 `as_of`: `mentioned_at`, observation versions, `effective_at`, recall(T) | `NoLeak`, `EffectiveCoversCited`, action property `OlderVersionStable` | 3 facts, 2 observations, times 1..3, 2 versions each | `AsOf.cfg` (symmetry) | **PASS** 1,687,878 / 332,776, depth 8, 1 min 22 s (run concurrently with another check) |
 | `AsOf.tla` | `effective_at` from cited sources only (D9 as first written) | `NoLeak` | same | `AsOf_CitedOnly.cfg` | **FAIL as intended**, depth 4, 1 s (7.2.4) |
 | `DocLifecycle.tla` | D8/D11/D12/D7: replace/delete vs per-chunk commits, consolidation read/apply, purge, transactional and async index | `NoOrphanLinks`, `NoObservationCitesDeletedAfterAck`, `NoDeletedContentRecalled`, `ObservationHasSources`, `OneActiveVersion`, `VersionsConsistent`, liveness `IndexConverges` | 2 documents, 3 hashes, 2 versions, 3 observations, 3 consolidations | `DocLifecycle.cfg` (async index, symmetry); `DocLifecycle_Tx.cfg` (transactional index); `DocLifecycle_Live.cfg` (2 hashes, 1 observation, no symmetry) | PENDING_DOC_ASYNC / PENDING_DOC_TX / PENDING_DOC_LIVE |
-| `DocLifecycle.tla` | five single-knob simplifications (7.2.1) | the invariant each one breaks | 2 documents, 2 hashes, 2 observations | `DocLifecycle_NoCommitCheck/_NoFinalizeCheck/_CitedOnly/_NoApplyCheck/_UnfilteredIndex.cfg` | **all FAIL as intended**, depths 5/7/8/6/6, ≤ 3 s each |
+| `DocLifecycle.tla` | five single-knob simplifications (7.2.1) | the invariant each one breaks | 2 documents, 2 hashes, 2 observations | `DocLifecycle_NoCommitCheck/_NoFinalizeCheck/_CitedOnly/_NoApplyCheck/_UnfilteredIndex.cfg` | **all FAIL as intended**, depths 5/7/9/6/5, ≤ 3 s each (re-run after ND-11) |
 | `ShardMove.tla` | D5 + N2 move: plan, barrier copy, catch-up, freeze, drain, four-step cutover, rollback, mover crash/restart, stale caches, pinned workflows, concurrent retain/consolidate/delete writes | `SingleWritableOwner`, `WritesOnlyAtOwner`, `NoLossNoDup`, `NoDupAnywhere`, `ReadsFresh`, liveness `MoveTerminates` | 2 shards, 2 namespaces (1 movable), 2 API clients, 1 workflow, 3 writes, epochs ≤ 3, 2 move attempts, 1 crash | `ShardMove.cfg` (symmetry on clients/writes); `ShardMove_Live.cfg` (1 namespace, 1 client, 2 writes, epochs ≤ 2) | PENDING_MOVE_SAFETY / PENDING_MOVE_LIVE |
 | `ShardMove.tla` | copy snapshot without barrier (D5 step 2 as first written) | `NoLossNoDup` | 1 namespace, 2 writes | `ShardMove_NoBarrier.cfg` | **FAIL as intended**, depth 12, 1 s (7.2.5) |
 | `ShardMove.tla` | catalog switched before source `moved_out` (D5 step 6 order) | `ReadsFresh` | same | `ShardMove_D5Order.cfg` | **FAIL as intended**, depth 8, 1,523 distinct states, 3 s (7.2.5) |
@@ -85,8 +85,11 @@ facts (the batch); `ConsolidateApply(o)` is the apply transaction, which re-veri
 acknowledged-deleted content. `NoObservationCitesDeletedAfterAck`: `src ∩ deleted = ∅` for
 every observation. `NoDeletedContentRecalled`: neither the fact arm, the graph arm (one hop
 over `links`, both endpoints live) nor any live observation whose `deriv` intersects
-`deleted` is returned; recall over the async index is `index ∩ Live`. `ObservationHasSources`
-(D12's trigger). `OneActiveVersion` and `VersionsConsistent` (an active version's chunks are
+`deleted` is returned; recall over the async index is `index ∩ Live`. `ObservationHasSources`:
+a live observation cites at least one source and every source row still exists — live, or
+retired by a replace and inside its purge grace (the observation is then `stale_write` and
+still visible, D16); acknowledged deletes are covered by the previous invariant.
+`OneActiveVersion` and `VersionsConsistent` (an active version's chunks are
 live; every live fact belongs to a non-deleted version; once no version of a document is
 ingesting, its live facts are exactly the active version's chunks). **Liveness**
 `IndexConverges ≡ ◇□(Index = Live)` under weak fairness of `Relay`; every other action is
@@ -144,7 +147,7 @@ NoDeletedContentRecalled ==
    the next retain. **Rule:** `FinalizeVersion(u)` first reads `documents.current_version`
    and the set of started versions `FOR UPDATE`; if a newer version exists it only marks `u`
    superseded; the retire set is computed by the newest version only (ND-2).
-3. `ApplyCheck = "cited"` (depth 8): consolidation reads a batch spanning d1 and d2; d1 is
+3. `ApplyCheck = "cited"` (depth 9): consolidation reads a batch spanning d1 and d2; d1 is
    deleted and acked; the apply transaction drops the deleted sources but keeps the text,
    which was written with d1's facts in the prompt. `NoDeletedContentRecalled` fails on the
    observation. `ApplyCheck = "none"` (depth 6) fails one step earlier on
@@ -156,11 +159,29 @@ NoDeletedContentRecalled ==
    reconsolidated (ND-3). This is the one place the model changed the register's behaviour:
    D8 as written keeps a stale observation visible, which contradicts D16's "nothing from the
    document is returned after the ack".
-4. `FilterIndexByStore = FALSE` (depth 6): `CommitChunk`, `Relay` (index has f), `Delete`
+4. `FilterIndexByStore = FALSE` (depth 5): `CommitChunk`, `Relay` (index has f), `Delete`
    acked — the store retired f, the index has not caught up, recall returns f. **Rule:**
    results from an `Async` index are joined with `facts.retired_at IS NULL AND
    invalidated_at IS NULL` before ranking (ND-9); the transactional MVP index does not need
    it but the `index.Index` contract requires it so the external-engine adapter cannot forget.
+
+**What the design run found (no knob flipped).** The first run of `DocLifecycle.cfg` and
+`DocLifecycle_Tx.cfg` failed `ObservationHasSources` at depth 8 with a trace that contains no
+delete at all: d1 v1 commits h1; v2 starts and commits h2; consolidation reads and cites
+(d1, h1); `FinalizeVersion(d1, v2)` retires h1. A live observation now cites a retired fact.
+The register has no rule for this: D8 cascades `observation_sources` only on `Delete`, and
+D12's trigger fires only when source rows are removed, which a replace-retire never does.
+Two readings were possible — hide the observation (as for delete) or keep it — and D16
+decides it: observations are allowed to lag *writes* by the consolidation debounce, and a
+replace is a write, whereas a delete must be invisible at the ack. **Rule (ND-11):** a fact
+retired by replace keeps its `observation_sources` rows during the purge grace (an un-retire
+restores them for free), the observation is marked `stale_write` and stays visible until the
+next consolidation round rewrites it from the new version's facts; `PurgeWorkflow` deletes
+the source rows and the existing trigger retires observations left with none. The invariant
+was restated to "every source row exists" (the model's `Purge` now cascades), and the delete
+path keeps the strict `src ∩ deleted = ∅`. The reported numbers for the design configurations
+are from the re-run after this change; the first run's failing trace is kept in the results
+log.
 
 A note on the async-index abstraction: `Relay(f)` sets the index entry for `f` to the store's
 current state instead of replaying `f`'s events one by one. That is sound for the safety
@@ -624,4 +645,5 @@ extraction function.
 | ND-7 | Catch-up stops waiting for `lag < 100` after 10 rounds and freezes anyway; drain then runs longer but the move always reaches `frozen`. | D5 step 3 | unbounded catch-up (liveness fails under sustained writes). |
 | ND-8 | Consolidation proposals are persisted write-once in `consolidation_batches(batch_key, ops, created_observation_ids)` before any op is applied; the apply activity reads the stored proposal; `op_key = sha256(batch_key ‖ op_index)` over the stored list; each op's effect and its `consolidation_applied` row are one transaction. Failed LLM calls store nothing (bisect/retry). | D12 row 1 | keys over the live LLM output (TLC counterexample in 7.2.2). |
 | ND-9 | Every `index.Index` implementation's query results are joined with `facts.retired_at IS NULL AND invalidated_at IS NULL` (and the `as_of` predicate) before ranking; `Transactional` implementations may skip the join by contract only if the test suite proves it is redundant. | D7 | trusting the index. |
+| ND-11 | Replace-retire keeps `observation_sources` (and `page_sources`) rows during the purge grace and marks the citing observation `stale_write` (visible); `PurgeWorkflow` deletes the rows and the D12 trigger retires observations left with no source. Proof counts and `GetMemory` expansions count only sources with `retired_at IS NULL`. | D8 row 3, D12 (gap found by the `DocLifecycle` design run) | hiding observations on replace (would make every document update blank its observations for a consolidation cycle). |
 | ND-10 | Formal artefacts are part of the definition of done: a PR that changes a modelled protocol changes the spec and the mapped test in the same PR (`formal/MANIFEST.md`, label escape hatch). | — | nightly-only checking. |

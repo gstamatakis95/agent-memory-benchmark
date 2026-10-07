@@ -1,0 +1,267 @@
+// memory/v1/operation.proto
+//
+// Long-running operations. Every asynchronous unit of work (a document
+// retain, a document/namespace delete, a page refresh, a snapshot, a
+// consolidation round) is an Operation backed by exactly one Temporal
+// workflow (id `ns/{namespace_id}/op/{operation_id}` on task queue
+// `shard-{shard_id}`, decision D11). OperationService is the read barrier of
+// the consistency model (decision D16): after WaitOperation returns SUCCEEDED
+// for a retain, Recall on the same namespace observes every fact of that
+// document version.
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+import "memory/v1/errors.proto";
+
+option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+
+// OperationService reads, waits on and cancels asynchronous operations.
+service OperationService {
+  // GetOperation returns the current state of one operation. Together with
+  // WaitOperation it is exempt from the "namespace DELETING → FAILED_PRECONDITION"
+  // rule of the interceptor, so DELETE_NAMESPACE / DELETE_TENANT operations
+  // can be polled (decision N70).
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListOperations lists operations of a namespace, newest first.
+  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // CancelOperation requests cancellation. Cancellation is cooperative: the
+  // workflow stops at the next activity boundary; chunks already committed
+  // stay visible (retain) or stay deleted (purge). Terminal operations fail
+  // with FAILED_PRECONDITION + PreconditionFailed{OPERATION_TERMINAL}.
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+  // WaitOperation blocks until the operation is terminal or `timeout`
+  // elapses, whichever is first, and returns the operation either way (check
+  // `state`). Unary long-poll rather than a stream: it is a barrier, not a
+  // feed — one round trip, no long-lived stream pinned to one API replica
+  // behind Envoy, trivially usable from Connect/JSON and curl. The effective
+  // wait is min(timeout, call deadline − 500 ms, 60 s).
+  // Mechanism (decision N70): the API parks the call on Temporal's
+  // workflow-result long-poll (GetWorkflow(...).Get with the remaining
+  // timeout), capped per API process; beyond the cap, or when the workflow
+  // is gone (purged namespace), it falls back to a jittered database poll of
+  // the operations row. Exempt from the DELETING rejection like GetOperation.
+  rpc WaitOperation(WaitOperationRequest) returns (WaitOperationResponse);
+}
+
+// OperationKind names the workflow behind an operation.
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED = 0;
+  // MemoryService.Retain: one document version.
+  OPERATION_KIND_RETAIN_DOCUMENT = 1;
+  // DocumentService.DeleteDocument: asynchronous blob/row purge after the
+  // synchronous cascade.
+  OPERATION_KIND_DELETE_DOCUMENT = 2;
+  // NamespaceService.DeleteNamespace: per-shard purge.
+  OPERATION_KIND_DELETE_NAMESPACE = 3;
+  // Background consolidation round (never client-created; listed for
+  // observability of consolidation_lag).
+  OPERATION_KIND_CONSOLIDATE = 4;
+  // PageService.RefreshPage.
+  OPERATION_KIND_REFRESH_PAGE = 5;
+  // ExportService.CreateSnapshot.
+  OPERATION_KIND_CREATE_SNAPSHOT = 6;
+  // Admin-initiated namespace move (visible to the tenant as a kind only;
+  // shard ids are in the admin API).
+  OPERATION_KIND_MOVE_NAMESPACE = 7;
+}
+
+// OperationState is the lifecycle of an operation. Terminal states are
+// SUCCEEDED, FAILED and CANCELLED.
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  // Accepted and durable (ledger + operation row committed); the workflow has
+  // not started an activity yet.
+  OPERATION_STATE_PENDING = 1;
+  // At least one activity has run; `progress` is meaningful.
+  OPERATION_STATE_RUNNING = 2;
+  // Paused by a volume quota (`llm_tokens_per_day`, `max_facts`) until the
+  // window resets; `deferred` says why and until when. Resumes by itself.
+  OPERATION_STATE_DEFERRED = 3;
+  // Completed; for a retain, the document version is active.
+  OPERATION_STATE_SUCCEEDED = 4;
+  // Stopped with `error`; partial effects are described per kind in the plan.
+  OPERATION_STATE_FAILED = 5;
+  // Stopped by CancelOperation or by a namespace delete.
+  OPERATION_STATE_CANCELLED = 6;
+}
+
+// Operation is the public view of an asynchronous unit of work.
+message Operation {
+  // UUID: UUIDv7 when minted by the server; any RFC 4122 version is accepted
+  // on submit, and per-document ids of a multi-document Retain are UUIDv5
+  // (decision N72 relaxed the earlier "UUIDv7 only" validation).
+  string id = 1;
+  OperationKind kind = 2;
+  OperationState state = 3;
+  NamespaceRef namespace = 4;
+  // Id of the resource the operation acts on: document_id, page_id, snapshot
+  // version as string, or empty for namespace-scoped kinds.
+  string target_id = 5;
+  OperationProgress progress = 6;
+  // Set only when state == FAILED.
+  OperationError error = 7;
+  // Set only when state == DEFERRED.
+  DeferredInfo deferred = 8;
+  // Set only when state == SUCCEEDED.
+  OperationResult result = 9;
+  Timestamps timestamps = 10;
+  // When the operation became terminal.
+  google.protobuf.Timestamp finished_at = 11;
+  // request_id of the submitting call, for correlation.
+  string request_id = 12;
+  // Hint: estimated time until observations and pages of this namespace
+  // reflect the facts written by this operation (consolidation debounce +
+  // current backlog). Absent when the kind produces no facts. Not a bound.
+  google.protobuf.Duration consolidation_lag = 13;
+
+  reserved 100 to 199;
+}
+
+// OperationProgress counts work units. For RETAIN_DOCUMENT the unit is a
+// chunk; for DELETE_* it is a purge batch; for CREATE_SNAPSHOT it is a file;
+// for REFRESH_PAGE and CONSOLIDATE it is a batch of LLM calls.
+message OperationProgress {
+  int32 units_total = 1;
+  int32 units_done = 2;
+  int32 units_failed = 3;
+  // Current phase label, e.g. "chunk", "extract", "embed", "commit",
+  // "finalize", "purge-blobs".
+  string phase = 4;
+  // Retain only: chunks skipped by the content-hash delta (unchanged).
+  int32 units_skipped = 5;
+}
+
+// OperationError mirrors google.rpc.Status for a failed operation.
+message OperationError {
+  // google.rpc.Code numeric value (e.g. 8 = RESOURCE_EXHAUSTED).
+  int32 code = 1;
+  string message = 2;
+  // Typed details, same set as memory/v1/errors.proto.
+  repeated google.protobuf.Any details = 3;
+  // True when resubmitting the same request with a new operation_id is
+  // expected to succeed (gateway outage, transient shard error).
+  bool retryable = 4;
+}
+
+// DeferredInfo explains a DEFERRED operation.
+message DeferredInfo {
+  // Quota key that deferred the operation ("llm_tokens_per_day", "max_facts").
+  string quota = 1;
+  // Earliest time the workflow will resume.
+  google.protobuf.Timestamp resume_at = 2;
+  // Which level of the hierarchy is exhausted.
+  QuotaScope scope = 3;
+}
+
+// OperationResult is the kind-specific outcome of a SUCCEEDED operation.
+// Only the fields for the operation's kind are set.
+message OperationResult {
+  // RETAIN_DOCUMENT: the document version that became active.
+  int64 document_version = 1;
+  // RETAIN_DOCUMENT: facts written by this version (new chunks only).
+  int32 facts_written = 2;
+  // RETAIN_DOCUMENT: chunks reused unchanged through the content-hash delta.
+  int32 chunks_reused = 3;
+  // DELETE_DOCUMENT / DELETE_NAMESPACE: rows physically purged.
+  int64 rows_purged = 4;
+  // DELETE_DOCUMENT / DELETE_NAMESPACE: blobs deleted.
+  int64 blobs_purged = 5;
+  // REFRESH_PAGE: new page version.
+  int64 page_version = 6;
+  // CREATE_SNAPSHOT: snapshot version.
+  int64 snapshot_version = 7;
+  // CONSOLIDATE: observation operations applied.
+  int32 observation_ops_applied = 8;
+}
+
+// GetOperationRequest fetches one operation.
+message GetOperationRequest {
+  NamespaceRef namespace = 1;
+  string operation_id = 2;
+  // Optional projection; empty = all fields.
+  google.protobuf.FieldMask read_mask = 3;
+
+  reserved 100 to 199;
+}
+
+// GetOperationResponse wraps the operation.
+message GetOperationResponse {
+  Operation operation = 1;
+
+  reserved 100 to 199;
+}
+
+// ListOperationsRequest lists operations, newest first.
+message ListOperationsRequest {
+  NamespaceRef namespace = 1;
+  PagingRequest paging = 2;
+  // Filter by kind; empty = all kinds.
+  repeated OperationKind kinds = 3;
+  // Filter by state; empty = all states.
+  repeated OperationState states = 4;
+  // Filter by target (document_id, page_id).
+  string target_id = 5;
+  // Only operations created at or after this time.
+  google.protobuf.Timestamp created_after = 6;
+  google.protobuf.FieldMask read_mask = 7;
+
+  reserved 100 to 199;
+}
+
+// ListOperationsResponse is a page of operations.
+message ListOperationsResponse {
+  repeated Operation operations = 1;
+  PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// CancelOperationRequest requests cooperative cancellation.
+message CancelOperationRequest {
+  NamespaceRef namespace = 1;
+  string operation_id = 2;
+  RequestMeta meta = 3;
+  // Free-text reason recorded on the operation.
+  string reason = 4;
+
+  reserved 100 to 199;
+}
+
+// CancelOperationResponse returns the operation after the cancel request was
+// recorded (state may still be RUNNING until the workflow observes it).
+message CancelOperationResponse {
+  Operation operation = 1;
+
+  reserved 100 to 199;
+}
+
+// WaitOperationRequest blocks until terminal or timeout.
+message WaitOperationRequest {
+  NamespaceRef namespace = 1;
+  string operation_id = 2;
+  // Maximum server-side wait; 0 = 30 s; clamped to 60 s and to the call
+  // deadline minus 500 ms. The response is always the current state.
+  google.protobuf.Duration timeout = 3;
+
+  reserved 100 to 199;
+}
+
+// WaitOperationResponse returns the operation; `timed_out` tells the two
+// return paths apart.
+message WaitOperationResponse {
+  Operation operation = 1;
+  // True when the wait ended by timeout and the operation is not terminal.
+  bool timed_out = 2;
+
+  reserved 100 to 199;
+}

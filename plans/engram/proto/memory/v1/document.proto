@@ -1,0 +1,209 @@
+// memory/v1/document.proto
+//
+// DocumentService: read and delete documents (the client-addressed unit of
+// retain and delete). Documents are created only through
+// MemoryService.Retain; this service never writes content.
+//
+// DeleteDocument is UNARY and returns an Operation because the delete has two
+// halves (decision D8): everything Recall/Reflect/GetMemory/Export can see is
+// removed SYNCHRONOUSLY inside one shard transaction (facts retired, links
+// and mentions deleted, observation sources and inputs removed, observations
+// derived from the deleted content hidden as stale_delete until
+// reconsolidated, pages marked stale) and the call returns only after that
+// commits; the
+// blob deletion and the physical row purge run ASYNCHRONOUSLY in a Temporal
+// PurgeWorkflow that the returned Operation tracks. A client that needs
+// "storage reclaimed" waits on the Operation; a client that needs "no longer
+// returned" needs nothing beyond the ack.
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+import "memory/v1/operation.proto";
+
+option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+
+// DocumentService reads and deletes documents. Scope memory.read for
+// Get/List, memory.write for Delete.
+service DocumentService {
+  // GetDocument returns document metadata and, optionally, its version list.
+  rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListDocuments pages through documents of a namespace, most recently
+  // updated first.
+  rpc ListDocuments(ListDocumentsRequest) returns (ListDocumentsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // DeleteDocument removes a document and everything derived from it. The
+  // synchronous cascade is committed before the call returns; the returned
+  // Operation (kind DELETE_DOCUMENT) tracks blob and physical purge. Deleting
+  // an unknown document returns NOT_FOUND; deleting a document whose purge
+  // is already running returns the existing operation (idempotent).
+  rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
+  // GetDocumentVersion returns one version's metadata (chunk/fact counts,
+  // status, the operation that produced it).
+  rpc GetDocumentVersion(GetDocumentVersionRequest) returns (GetDocumentVersionResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+// DocumentState is the lifecycle of a document.
+enum DocumentState {
+  DOCUMENT_STATE_UNSPECIFIED = 0;
+  // Has at least one active version.
+  DOCUMENT_STATE_ACTIVE = 1;
+  // First version still ingesting; nothing visible yet.
+  DOCUMENT_STATE_INGESTING = 2;
+  // Synchronous cascade done; purge in progress. Not returned by List unless
+  // `include_deleting`.
+  DOCUMENT_STATE_DELETING = 3;
+}
+
+// DocumentVersionStatus is the lifecycle of one version.
+enum DocumentVersionStatus {
+  DOCUMENT_VERSION_STATUS_UNSPECIFIED = 0;
+  DOCUMENT_VERSION_STATUS_INGESTING = 1;
+  DOCUMENT_VERSION_STATUS_ACTIVE = 2;
+  // Replaced by a newer version; its unchanged chunks live on in the newer
+  // version, its removed chunks are retired.
+  DOCUMENT_VERSION_STATUS_SUPERSEDED = 3;
+  DOCUMENT_VERSION_STATUS_DELETED = 4;
+}
+
+// Document is the public view of a document.
+message Document {
+  NamespaceRef namespace = 1;
+  string document_id = 2;
+  // Highest version number; 0 while the first version is ingesting.
+  int64 current_version = 3;
+  DocumentState state = 4;
+  // Content hash of the current version (hex SHA-256 over the concatenated
+  // item content).
+  string content_hash = 5;
+  // Live (non-retired) chunk and fact counts.
+  int32 chunk_count = 6;
+  int32 fact_count = 7;
+  // Union of item tags of the current version.
+  repeated string tags = 8;
+  // Metadata of the first item of the current version.
+  google.protobuf.Struct metadata = 9;
+  // LLM document summary (≤ 200 chars) used in chunk headers.
+  string summary = 10;
+  Timestamps timestamps = 11;
+  // Operation that produced the current version.
+  string last_operation_id = 12;
+  // Versions, newest first; only when GetDocumentRequest.include_versions.
+  repeated DocumentVersion versions = 13;
+  // Free-text context of the current version.
+  string context = 14;
+
+  reserved 100 to 199;
+}
+
+// DocumentVersion describes one retain of a document.
+message DocumentVersion {
+  int64 version = 1;
+  string content_hash = 2;
+  DocumentVersionStatus status = 3;
+  string operation_id = 4;
+  UpdateMode update_mode = 5;
+  int32 chunk_count = 6;
+  // Chunks reused unchanged from the previous version (delta retain).
+  int32 chunks_reused = 7;
+  int32 fact_count = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp activated_at = 10;
+}
+
+// GetDocumentRequest fetches one document.
+message GetDocumentRequest {
+  NamespaceRef namespace = 1;
+  string document_id = 2;
+  google.protobuf.FieldMask read_mask = 3;
+  // Also return `versions`.
+  bool include_versions = 4;
+
+  reserved 100 to 199;
+}
+
+// GetDocumentResponse wraps the document.
+message GetDocumentResponse {
+  Document document = 1;
+
+  reserved 100 to 199;
+}
+
+// ListDocumentsRequest lists documents, most recently updated first.
+message ListDocumentsRequest {
+  NamespaceRef namespace = 1;
+  PagingRequest paging = 2;
+  // Tag filter over the document's tag union.
+  TagFilter tag_filter = 3;
+  // Prefix match on document_id (e.g. "session-2026-09-").
+  string document_id_prefix = 4;
+  // Only documents updated at or after this time.
+  google.protobuf.Timestamp updated_after = 5;
+  // Also return documents in state DELETING.
+  bool include_deleting = 6;
+  google.protobuf.FieldMask read_mask = 7;
+  repeated MetadataFilter metadata_filters = 8;
+
+  reserved 100 to 199;
+}
+
+// ListDocumentsResponse is a page of documents.
+message ListDocumentsResponse {
+  repeated Document documents = 1;
+  PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// DeleteDocumentRequest removes a document.
+message DeleteDocumentRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  string document_id = 3;
+  // Optional client-chosen operation id (UUIDv7).
+  string operation_id = 4;
+  // When > 0, the delete only proceeds if current_version equals this value
+  // (FAILED_PRECONDITION + PreconditionFailed{ETAG_MISMATCH} otherwise).
+  int64 expected_version = 5;
+
+  reserved 100 to 199;
+}
+
+// DeleteDocumentResponse acknowledges the synchronous cascade and returns the
+// purge operation.
+message DeleteDocumentResponse {
+  Operation operation = 1;
+  // Facts retired by the synchronous cascade.
+  int32 facts_retired = 2;
+  // Observations hidden (stale_delete) and pages marked stale by the cascade.
+  int32 observations_marked_stale = 3;
+  int32 pages_marked_stale = 4;
+
+  reserved 100 to 199;
+}
+
+// GetDocumentVersionRequest fetches one version.
+message GetDocumentVersionRequest {
+  NamespaceRef namespace = 1;
+  string document_id = 2;
+  // 0 = current version.
+  int64 version = 3;
+
+  reserved 100 to 199;
+}
+
+// GetDocumentVersionResponse wraps the version.
+message GetDocumentVersionResponse {
+  DocumentVersion document_version = 1;
+
+  reserved 100 to 199;
+}

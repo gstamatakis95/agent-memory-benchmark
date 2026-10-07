@@ -1,0 +1,196 @@
+// memory/v1/export.proto
+//
+// ExportService (phase 3): per-namespace snapshots to blob storage under the
+// namespace's shard prefix (`{shard}/{tenant}/{ns}/export/v{n}/…`, decision
+// D12), served back to thin clients that sync them next to an agent for
+// grep-style local search.
+//
+// Versions are dense integers per namespace. Snapshot v{n} always contains a
+// full set of files; when v{n-1} still exists and its outbox range has not
+// been pruned, it also contains `delta-v{n-1}-v{n}.jsonl.zst`, derived from
+// the outbox, so a client at v{n-1} downloads only the delta. A client
+// further behind applies consecutive deltas or falls back to the full files.
+//
+// StreamSnapshot is SERVER-STREAMING: parts of ≤ 1 MiB, resumable by
+// (path, offset). Unary "download a file" was rejected because gRPC messages
+// should stay ≤ 4 MiB and files reach gigabytes.
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+import "memory/v1/operation.proto";
+
+option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+
+// ExportService creates and serves snapshots. CreateSnapshot needs
+// memory.write (it consumes worker capacity and storage); the reads need
+// memory.read.
+service ExportService {
+  // CreateSnapshot starts a snapshot (kind CREATE_SNAPSHOT) at the current
+  // outbox position and returns the Operation. At most one snapshot per
+  // namespace runs at a time (ABORTED + OperationConflict otherwise).
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  // GetSnapshotManifest returns the manifest of one version (0 = latest).
+  rpc GetSnapshotManifest(GetSnapshotManifestRequest) returns (GetSnapshotManifestResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListSnapshots lists manifests, newest first.
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // StreamSnapshot streams one file of a snapshot in parts of ≤ 1 MiB from a
+  // byte offset. The last part carries the file's SHA-256. A version marked
+  // `expired` (it contained a document deleted since, decision N59) is
+  // refused with FAILED_PRECONDITION + PreconditionFailed{SNAPSHOT_EXPIRED}:
+  // the client re-syncs from a new full snapshot.
+  rpc StreamSnapshot(StreamSnapshotRequest) returns (stream StreamSnapshotResponse);
+}
+
+// SnapshotFileKind classifies a file in a snapshot.
+enum SnapshotFileKind {
+  SNAPSHOT_FILE_KIND_UNSPECIFIED = 0;
+  // manifest.json (also returned inline as SnapshotManifest).
+  SNAPSHOT_FILE_KIND_MANIFEST = 1;
+  // facts.jsonl.zst: one Memory (kind FACT) per line, invalidated excluded.
+  SNAPSHOT_FILE_KIND_FACTS = 2;
+  // observations.jsonl.zst: latest version of each live observation.
+  SNAPSHOT_FILE_KIND_OBSERVATIONS = 3;
+  // chunks.jsonl.zst: live chunks with header and provenance.
+  SNAPSHOT_FILE_KIND_CHUNKS = 4;
+  // pages/<name>.md: current version of each page.
+  SNAPSHOT_FILE_KIND_PAGE = 5;
+  // delta-v{n-1}-v{n}.jsonl.zst: ordered upsert/delete records since the
+  // previous version.
+  SNAPSHOT_FILE_KIND_DELTA = 6;
+}
+
+// SnapshotFile describes one file of a snapshot.
+message SnapshotFile {
+  // Path relative to the snapshot root, e.g. "facts.jsonl.zst",
+  // "pages/q3-plan.md".
+  string path = 1;
+  SnapshotFileKind kind = 2;
+  int64 size_bytes = 3;
+  // Hex SHA-256 of the file bytes as streamed (compressed where applicable).
+  string sha256 = 4;
+  // "zstd" or "" (identity).
+  string content_encoding = 5;
+  // Records in the file (lines for JSONL).
+  int64 record_count = 6;
+}
+
+// SnapshotManifest describes one snapshot version.
+message SnapshotManifest {
+  NamespaceRef namespace = 1;
+  int64 version = 2;
+  // Version the delta file is relative to; 0 when no delta is included.
+  int64 base_version = 3;
+  // True when a DELTA file is present.
+  bool delta_available = 4;
+  // Consistent point of the snapshot: every fact with mentioned_at ≤ this
+  // and committed before the outbox position is included.
+  google.protobuf.Timestamp as_of = 5;
+  repeated SnapshotFile files = 6;
+  int64 total_bytes = 7;
+  string operation_id = 8;
+  google.protobuf.Timestamp created_at = 9;
+  // Schema version of the JSONL record format ("1").
+  string format_version = 10;
+  // Counts for quick sanity checks.
+  int64 fact_count = 11;
+  int64 observation_count = 12;
+  int64 chunk_count = 13;
+  int32 page_count = 14;
+  // True when a document contained in this snapshot was deleted after it was
+  // taken (decision N59): the delete cascade marks every such snapshot
+  // expired so an acknowledged delete cannot be served through an old
+  // export. Expired versions stay listed (so a client learns why its chain is
+  // broken) but StreamSnapshot refuses them; the next CreateSnapshot must be
+  // a full one.
+  bool expired = 15;
+  google.protobuf.Timestamp expired_at = 16;
+
+  reserved 100 to 199;
+}
+
+// CreateSnapshotRequest starts a snapshot.
+message CreateSnapshotRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  string operation_id = 3;
+  // Include chunks.jsonl.zst (largest file; default false).
+  bool include_chunks = 4;
+  // Include pages/*.md (default true when unset).
+  optional bool include_pages = 5;
+
+  reserved 100 to 199;
+}
+
+// CreateSnapshotResponse returns the snapshot operation; the version is in
+// OperationResult.snapshot_version once SUCCEEDED.
+message CreateSnapshotResponse {
+  Operation operation = 1;
+
+  reserved 100 to 199;
+}
+
+// GetSnapshotManifestRequest fetches a manifest.
+message GetSnapshotManifestRequest {
+  NamespaceRef namespace = 1;
+  // 0 = latest completed version.
+  int64 version = 2;
+
+  reserved 100 to 199;
+}
+
+// GetSnapshotManifestResponse wraps the manifest.
+message GetSnapshotManifestResponse {
+  SnapshotManifest manifest = 1;
+
+  reserved 100 to 199;
+}
+
+// ListSnapshotsRequest lists manifests, newest first.
+message ListSnapshotsRequest {
+  NamespaceRef namespace = 1;
+  PagingRequest paging = 2;
+
+  reserved 100 to 199;
+}
+
+// ListSnapshotsResponse is a page of manifests.
+message ListSnapshotsResponse {
+  repeated SnapshotManifest manifests = 1;
+  PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// StreamSnapshotRequest selects one file and a resume offset.
+message StreamSnapshotRequest {
+  NamespaceRef namespace = 1;
+  int64 version = 2;
+  // File path from the manifest.
+  string path = 3;
+  // Byte offset to resume from (0 = start). Must be < size_bytes.
+  int64 offset = 4;
+
+  reserved 100 to 199;
+}
+
+// StreamSnapshotResponse is one part of the file.
+message StreamSnapshotResponse {
+  string path = 1;
+  // Offset of `data` within the file.
+  int64 offset = 2;
+  // ≤ 1 MiB (1,048,576 bytes).
+  bytes data = 3;
+  // True on the last part.
+  bool last = 4;
+  // Hex SHA-256 of the whole file; set only when `last`.
+  string sha256 = 5;
+
+  reserved 100 to 199;
+}

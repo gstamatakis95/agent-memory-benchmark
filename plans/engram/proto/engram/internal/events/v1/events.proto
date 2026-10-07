@@ -1,0 +1,236 @@
+// engram/internal/events/v1/events.proto
+//
+// The outbox/Kafka event envelope (decision D6). One Event is written to the
+// per-shard `outbox` table in the same transaction as the state change it
+// describes; the relay hands it to the `index`, optional `kafka` and
+// temporary `move:<ns>` consumers in `seq` order.
+//
+// Events are THIN: they carry ids, hashes and the small scalar changes
+// (retired_at, invalidated_at, stale flags), never embeddings or long text.
+// Consumers that need full rows (the move replayer, an external index) read
+// them from the shard by id at the same epoch; rows are immutable except for
+// the flags the events themselves carry. This keeps the outbox at a few
+// hundred bytes per event and makes replay idempotent by (namespace_id, seq).
+//
+// Versioning: `schema_version` in the envelope; consumers must skip unknown
+// payload variants (proto3 keeps unknown oneof members as unknown fields)
+// and count them in `events_unknown_payload_total`.
+syntax = "proto3";
+
+package engram.internal.events.v1;
+
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+
+option go_package = "example.com/engram/gen/go/engram/internal/events/v1;eventsv1";
+
+// Event is the envelope.
+message Event {
+  // Per-shard outbox sequence (bigint sequence; gaps possible, see D6).
+  int64 seq = 1;
+  string namespace_id = 2;
+  string tenant_id = 3;
+  // Ownership epoch under which the change was committed.
+  int64 epoch = 4;
+  google.protobuf.Timestamp occurred_at = 5;
+  // Envelope schema version (1).
+  uint32 schema_version = 6;
+  // UUIDv7, unique per event; the Kafka message key is namespace_id, this is
+  // the dedupe key for external consumers.
+  string event_id = 7;
+  // Operation that caused the change, if any.
+  string operation_id = 8;
+  // Shard that produced the event (for cross-shard consumers such as Kafka).
+  int32 shard_id = 9;
+
+  oneof payload {
+    DocumentVersionStarted document_version_started = 20;
+    ChunkCommitted chunk_committed = 21;
+    ChunksRetired chunks_retired = 22;
+    DocumentVersionActivated document_version_activated = 23;
+    DocumentDeleted document_deleted = 24;
+    FactInvalidated fact_invalidated = 25;
+    FactRestored fact_restored = 26;
+    ObservationUpserted observation_upserted = 27;
+    ObservationRetired observation_retired = 28;
+    ObservationsMarkedStale observations_marked_stale = 29;
+    EntityUpserted entity_upserted = 30;
+    EntitiesMerged entities_merged = 31;
+    PageVersionCreated page_version_created = 32;
+    PageDeleted page_deleted = 33;
+    PagesMarkedStale pages_marked_stale = 34;
+    SnapshotCreated snapshot_created = 35;
+    RowsPurged rows_purged = 36;
+    TokenUsageRecorded token_usage_recorded = 37;
+    NamespacePurged namespace_purged = 38;
+    RestoreMarker restore_marker = 39;
+  }
+}
+
+// DocumentVersionStarted: a new document version row exists (INGESTING).
+message DocumentVersionStarted {
+  string document_id = 1;
+  int64 version = 2;
+  string content_hash = 3;
+  memory.v1.UpdateMode update_mode = 4;
+  int32 chunks_planned = 5;
+}
+
+// ChunkCommitted: CommitChunk committed a chunk with its facts, mentions and
+// links. The replayer copies rows by these ids.
+message ChunkCommitted {
+  string document_id = 1;
+  int64 version = 2;
+  string chunk_id = 3;
+  string content_hash = 4;
+  repeated string fact_ids = 5;
+  repeated string entity_ids = 6;
+  int32 links_written = 7;
+  google.protobuf.Timestamp mentioned_at = 8;
+}
+
+// ChunksRetired: chunks (and their facts) got retired_at set.
+message ChunksRetired {
+  string document_id = 1;
+  // Version whose finalisation retired them (or 0 for a delete cascade).
+  int64 version = 2;
+  repeated string chunk_ids = 3;
+  repeated string fact_ids = 4;
+  google.protobuf.Timestamp retired_at = 5;
+}
+
+// DocumentVersionActivated: FinalizeVersion made the version ACTIVE and the
+// previous one SUPERSEDED.
+message DocumentVersionActivated {
+  string document_id = 1;
+  int64 version = 2;
+  int64 superseded_version = 3;
+  int32 fact_count = 4;
+  int32 chunk_count = 5;
+}
+
+// DocumentDeleted: the synchronous delete cascade committed (decision D8).
+message DocumentDeleted {
+  string document_id = 1;
+  repeated string fact_ids = 2;
+  repeated string chunk_ids = 3;
+  // Observations that lost ≥ 1 source or prompt input (marked stale_delete,
+  // hidden until reconsolidated — N41) and those retired because they lost
+  // every source.
+  repeated string observations_marked_stale = 4;
+  repeated string observations_retired = 5;
+  repeated string pages_marked_stale = 6;
+  google.protobuf.Timestamp deleted_at = 7;
+}
+
+// FactInvalidated: soft curation.
+message FactInvalidated {
+  string fact_id = 1;
+  google.protobuf.Timestamp invalidated_at = 2;
+  string reason = 3;
+}
+
+// FactRestored: soft curation undone.
+message FactRestored {
+  string fact_id = 1;
+}
+
+// ObservationUpserted: a consolidation CREATE or UPDATE wrote a new
+// observation version.
+message ObservationUpserted {
+  string observation_id = 1;
+  int64 version = 2;
+  repeated string source_fact_ids = 3;
+  google.protobuf.Timestamp effective_at = 4;
+  string op_key = 5;
+  bool created = 6;
+}
+
+// ObservationRetired: a consolidation DELETE, or the zero-sources trigger.
+message ObservationRetired {
+  string observation_id = 1;
+  string op_key = 2;
+  bool zero_sources = 3;
+}
+
+// ObservationsMarkedStale: evidence changed under these observations
+// (stale_write from a replace-retire or restore: still visible; stale_delete
+// from a delete, purge or invalidate: hidden until reconsolidated).
+message ObservationsMarkedStale {
+  repeated string observation_ids = 1;
+  string cause_fact_id = 2;
+}
+
+// EntityUpserted: entity created or canonical name changed.
+message EntityUpserted {
+  string entity_id = 1;
+  string canonical_name = 2;
+  string type = 3;
+  bool created = 4;
+}
+
+// EntitiesMerged: resolution merged duplicates into `survivor_id`.
+message EntitiesMerged {
+  string survivor_id = 1;
+  repeated string merged_ids = 2;
+}
+
+// PageVersionCreated: a refresh wrote a page version.
+message PageVersionCreated {
+  string page_id = 1;
+  int64 version = 2;
+  string markdown_blob_key = 3;
+  google.protobuf.Timestamp effective_at = 4;
+}
+
+// PageDeleted: the page definition and versions were removed.
+message PageDeleted {
+  string page_id = 1;
+}
+
+// PagesMarkedStale: evidence changed under these pages.
+message PagesMarkedStale {
+  repeated string page_ids = 1;
+  bool stale_write = 2;
+  bool stale_delete = 3;
+}
+
+// SnapshotCreated: an export finished.
+message SnapshotCreated {
+  int64 version = 1;
+  string manifest_blob_key = 2;
+  int64 base_version = 3;
+}
+
+// RowsPurged: a purge batch physically deleted rows (index consumers drop
+// the ids; the move replayer deletes them on target).
+message RowsPurged {
+  string table = 1;
+  repeated string ids = 2;
+  string document_id = 3;
+}
+
+// TokenUsageRecorded: metering row written (moves with the namespace).
+message TokenUsageRecorded {
+  string day = 1;
+  string op = 2;
+  string model = 3;
+  int64 prompt_tokens = 4;
+  int64 completion_tokens = 5;
+  int64 cost_micros = 6;
+}
+
+// NamespacePurged: the namespace's last rows on this shard are gone.
+message NamespacePurged {
+  int64 rows_purged = 1;
+  int64 blobs_purged = 2;
+}
+
+// RestoreMarker: the shard was restored from backup to `restored_to` and the
+// epoch of every namespace it hosts was bumped (decision N23); consumers
+// (external index, Kafka) reconcile from this point.
+message RestoreMarker {
+  int32 shard_id = 1;
+  google.protobuf.Timestamp restored_to = 2;
+  bool epoch_bump = 3;
+}

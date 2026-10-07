@@ -1,0 +1,270 @@
+# Engram — Decision Register (binding for every section of the plan)
+
+This register fixes the cross-cutting decisions that every section of the implementation
+plan must agree with. Sections may add detail; they may not contradict a row here without
+changing the row. Each decision names the alternative that was rejected.
+
+Project name: **Engram** (an engram is a physical memory trace). Go module `example.com/engram`,
+Go 1.25. Reference system: Hindsight (github.com/vectorize-io/hindsight, MIT). This document is
+a standalone design and is unrelated to the benchmark code that shares this repository.
+
+## D1. Identifiers and naming
+
+| Thing | Decision | Rejected |
+|---|---|---|
+| `tenant_id` | Opaque string `[a-z0-9-]{1,64}`, minted by the control plane. | UUID (harder to read in logs/metrics). |
+| `namespace_id` | Server-assigned UUIDv7 string, globally unique. Namespaces also carry a tenant-unique `name`. Clients address `tenant_id` + `namespace_id`, never a shard. | Client-chosen ids (collisions across tenants complicate the catalog). |
+| `shard_id` | `int32`, dense, assigned by the catalog. Metrics label `shard="7"`. | String names (no ordering, harder to bin-pack). |
+| `epoch` | `int64` per namespace, starts at 1, incremented at every shard-move cutover and at every restore-from-backup. | Lease timestamps (clock-dependent). |
+| `document_id` | Client-chosen string ≤ 256 bytes, unique per namespace; the upsert key. | Server ids (clients need deterministic replace). |
+| `memory_id` (a fact), `chunk_id`, `entity_id`, `observation_id`, `page_id` | UUIDv7 strings (time-ordered, index-friendly). | bigserial (not portable across shards during moves). |
+| `operation_id` | UUIDv7; client MAY supply it (idempotent async submit). Also the Temporal workflow id suffix. | Server-only ids (retries create duplicates). |
+| `request_id` | Client-supplied idempotency key for unary writes, scoped to (tenant, namespace, method), kept 24 h in the shard's `idempotency_keys` table; catalog-level writes (namespace/tenant/admin) keep theirs in the catalog DB. Reuse with a different request hash → `ALREADY_EXISTS` + `OperationConflict`. | None. |
+| Binaries | `engram-api` (gRPC + Connect on one port), `engram-worker` (Temporal worker + outbox relay + move executor), `engram-mcp` (MCP adapter), `engramctl` (ops CLI). | One binary with modes (violates "API and worker are separate images"). |
+| Proto packages | Public: `memory.v1` (MemoryService, DocumentService, NamespaceService, OperationService, ExportService, PageService). Admin: `memory.admin.v1` (ShardService, MoveService, TenantService). Internal (not served): `engram.internal.workflow.v1` (Temporal payloads), `engram.internal.events.v1` (outbox/Kafka events). | Single package (breaks independent versioning). |
+
+## D2. What a shard is
+
+| Decision | Rationale | Rejected |
+|---|---|---|
+| A shard is **one dedicated PostgreSQL 16 instance** (own container, own volume, own WAL, own backups), image `paradedb/paradedb:latest-pg16` (bundles pgvector ≥ 0.8, pg_search, pg_trgm), with a **pgbouncer** sidecar in transaction-pooling mode. | Physical isolation of IOPS, buffer cache, WAL, vacuum, backup/restore and migration blast radius. "No query spans shards" is enforced by construction: a connection belongs to exactly one shard. | Schema-per-shard in one cluster (shared buffer pool and WAL, one hot tenant degrades all, backups are not independent). Partition-set-per-shard (same problems, plus cross-partition planner risk). |
+| Namespaces of **different tenants MAY share a shard** (default pool). A tenant with `isolation=dedicated` gets shards flagged `dedicated_tenant_id`. | 10,000 tenants cannot each own an instance; bin-packing is the only economic option. | One shard per tenant. |
+| Isolation **within** a shard: (1) `namespace_id` is the **leading column of every primary key and every B-tree/GIN/GiST index** of every namespace-scoped table (HNSW and BM25 are single-column access methods: there, isolation comes from hash-partition pruning, the in-scan `namespace_id` filter and RLS; the only shard-wide indexes are the outbox PK on `seq` and the scheduler partial indexes on `operations`, listed as explicit exceptions in §3.4); (2) **Row-Level Security** on every namespace-scoped table, policy `namespace_id = current_setting('engram.namespace_id')::uuid`, application role `engram_app` is `NOBYPASSRLS`; the store sets `SET LOCAL engram.namespace_id`, `engram.tenant_id`, `engram.epoch` at the start of every transaction; (3) every **write** transaction first takes `pg_advisory_xact_lock_shared(hashtextextended(namespace_id::text, 0))` and then reads `SELECT state, epoch FROM namespace_ownership WHERE namespace_id=$1` (no row lock; the row is the fence *value*, the advisory lock is the fence *lock*), aborting with `FAILED_PRECONDITION` + `WrongShardOrEpoch` if `state <> 'active'` or `epoch <> $2`; the copy barrier, freeze, restore and export take the exclusive advisory lock, which queues fairly behind and ahead of shared holders (a `FOR SHARE` row lock would let a stream of compatible lockers starve the barrier and churn multixacts, review F-5); **reads** take no lock and accept `state IN ('active','frozen')` without checking the epoch; (4) big tables are **hash-partitioned by `namespace_id` into 16 partitions** per shard (`facts`, `fact_links`, `chunks`, `entity_mentions`) so each HNSW/BM25 index is smaller and partition-pruned by the namespace predicate. | RLS makes a forgotten `WHERE namespace_id=` a bug that returns zero rows instead of leaking; the ownership `FOR SHARE` row is the fencing token for shard moves. | Per-namespace tables/partitions (DDL per namespace, thousands of relations per shard). Trusting application predicates only. |
+| `namespace_ownership(namespace_id, tenant_id, epoch, state, freeze_reason)` exists on **every shard** and mirrors the catalog for the namespaces that shard hosts. States: `incoming`, `active`, `frozen`, `moved_out`; `freeze_reason ∈ {move, delete, restore}` says why a namespace is frozen. Only `move` and `restore` surface to clients as `NamespaceFrozen`; a `delete` freeze surfaces as `PreconditionFailed{NAMESPACE_DELETING}`. | The shard, not the catalog cache, is the source of truth for "may I write here now". | Catalog-only fencing (a stale cache would allow writes to the wrong shard). |
+
+## D3. Sizing (assumptions marked A-n)
+
+| Quantity | Value |
+|---|---|
+| Shard soft cap / hard cap | 10 M live facts / 20 M live facts; ~150 namespaces; 300 GB volume |
+| Shard instance | 8 vCPU, 64 GB RAM, NVMe ≥ 10 k IOPS (A-1) |
+| Vectors | `halfvec(768)` in-row (pgvector ≥ 0.7): 1.5 KB/fact; HNSW `m=16, ef_construction=128`, `hnsw.ef_search=100`, `hnsw.iterative_scan=relaxed_order`, `hnsw.max_scan_tuples=20000` |
+| Footprint at 10 M facts | facts heap ≈ 12 GB; vectors ≈ 15 GB; HNSW ≈ 18 GB; BM25 ≈ 4 GB; `fact_links` (≈ 30/fact → 300 M rows of three UUIDs: heap ≈ 30 GB + PK ≈ 21 GB + reverse index ≈ 20 GB) ≈ 71 GB (≈ 35 GB at 15 links/fact); chunks (1 M × 3 KB + vectors + HNSW) ≈ 7 GB; entities/mentions ≈ 5 GB; observations incl. versions, vectors, HNSW and BM25 ≈ 8 GB; ingest ledger ≈ 6 GB; `observation_inputs` (N41, quoted sources capped at 5 per candidate observation, N47) ≈ 10 GB; **≈ 168 GB total (≈ 133 GB at 15 links/fact), ≈ 40 GB hot working set**; inside the 300 GB volume and the 64 GB RAM budget. Detailed per-table sizing in §3.7. |
+| Fleet for 1 B facts | 100 shards at soft cap (50 at hard cap) |
+| **Cell** = one API + worker stack | serves **≤ 32 shards** (bounded by per-instance pool 32 × 16 = 512 conns through pgbouncer, and 32 Temporal task queues × 2 pollers per worker). 1 B facts = 4 cells. MVP = 1 cell. A request that resolves to a shard in another cell is **forwarded** by `engram-api` over gRPC to that cell's Envoy (same metadata, same deadline), phase 3. |
+| Recall target | 50 QPS/shard, p95 < 300 ms at mid budget. Budget: authz+catalog 2 ms, query embedding 25 ms, 5 arms in parallel ≤ 60 ms p95, RRF 1 ms, cross-encoder on 150 pairs ≤ 120 ms p95, boosts+packing 3 ms, streaming overhead 5 ms → ≈ 215 ms p95 (A-2: gateway rerank latency) |
+| Retain throughput | per worker: `min(32 / L_extract, R_extract_rpm / 60)` chunks/s with `L_extract` ≈ 3–6 s → 5–10 chunks/s/worker unconstrained; a 600 RPM gateway cap yields 10 chunks/s cell-wide. Backfills go through the gateway **batch** API (no RPM cap, ~50 % cheaper). |
+
+## D4. Catalog (control plane)
+
+| Decision | Rationale | Rejected |
+|---|---|---|
+| Storage: a small dedicated PostgreSQL `engram_catalog` (streaming replica for HA). Tables: `tenants`, `shards`, `namespaces`, `namespace_moves`, `catalog_events`. | Same operational skill set; transactional epoch bumps. | etcd/Consul (another system; no transactions with tenant config). |
+| Cache: in-process `catalog.Resolver`, LRU 100 k entries, TTL 60 s, negative cache 5 s, invalidated by Postgres `LISTEN catalog_changes` (payload `{namespace_id, shard_id, epoch, state}`). | Sub-millisecond resolve on the hot path; near-instant invalidation on moves. | Redis (extra system; the shard-side fence already makes staleness safe). |
+| Catalog unavailable: serve cached entries for **existing namespaces indefinitely** (a gauge reports staleness; only `deleting` state and quota freshness degrade), expire negative entries after 10 min, and return `UNAVAILABLE` with `RetryInfo{2 s}` only on a miss; catalog replica promotion is automated (review F-21: the shard-side fence already makes staleness safe, so expiring entries only converted a catalog outage into a fleet outage). Workers never call the catalog on the hot path (only the move executor's Plan/Freeze/Cutover activities do; every other catalog write a workflow needs, such as marking a namespace deleted or releasing a source shard after a move, goes through an admin RPC on `engram-api` or through `engramctl`): workflow inputs carry `(namespace_id, tenant_id, shard_id, epoch)` and the shard's ownership row verifies them. | Correctness never depends on cache freshness (D2 row 4). | Fail-closed on any staleness (needless outage). |
+
+## D5. Move protocol (per-namespace epoch fencing)
+
+States in `namespace_moves.state`: `planned → copying → catching_up → frozen → cutover → cleaning → done`, or `→ rolled_back` from any state before `cutover`.
+
+1. **plan**: choose target; insert `namespace_ownership(ns, tenant, epoch e+1, 'incoming')` on target; catalog `namespaces.state='moving'` (writes still allowed at source, epoch e).
+2. **copy**: the mover takes a **copy barrier**: `SELECT … FOR UPDATE` on the source ownership row (it waits for every in-flight writer, which holds `FOR SHARE`, to commit or abort), opens the `REPEATABLE READ` snapshot while holding it, releases the lock, and records `p0 = max(outbox.seq)` inside that snapshot. Because the outbox `INSERT` is the last statement of every write transaction (D6), every `seq ≤ p0` is already committed or aborted, so no later-committing lower `seq` can be missed (TLC `ShardMove_NoBarrier` shows the loss without the barrier). It then streams every namespace-scoped table (namespace-ordered `COPY`) into target; blobs are copied prefix→prefix (`{src}/{tenant}/{ns}/` → `{dst}/{tenant}/{ns}/`).
+3. **catch-up**: replay source `outbox` rows for the namespace with `seq > p0` onto target (each event idempotent by `(namespace_id, seq)` and applied by key; target keeps `move_applied_seq`). Loop until lag < 100 events or < 5 s; give up and roll back after 10 rounds.
+4. **freeze**: catalog `state='frozen'`; source ownership `state='frozen'` (same epoch e). New source writes fail with `FAILED_PRECONDITION/NamespaceFrozen`; the API retries them with backoff for up to 30 s and otherwise surfaces `NamespaceFrozen{retry_after}` to the client. The drain wait is 15 s by default and 60 s at most; a freeze watchdog rolls the move back after 120 s. Reads continue at source.
+5. **drain**: replay remaining outbox rows until `move_applied_seq = max(seq)`; verify row counts (and checksums up to 1 M facts, a 1 % sample above) between the static copies; terminate in-flight Temporal workflows for the namespace on the source task queue (all are restartable from durable per-chunk state) and record their **workflow ids** (operations carry an `operation_id`; the `consolidate` singleton and `page/{page_id}` workflows are restarted by workflow id).
+6. **cutover**, in this order across the three databases (TLC `ShardMove_D5Order` shows a stale client reading at the frozen source if the catalog switches first): (a) persist the cutover decision in `namespace_moves`; (b) target ownership `state='active', epoch=e+1`; (c) source ownership `state='moved_out'`; (d) catalog `namespaces.shard_id = target, epoch = e+1, state='active'` + `NOTIFY catalog_changes`; (e) restart the recorded workflows on the target task queue with the same workflow ids (hence the same `operation_id`s). The source is `frozen`, never `active`, during (b)–(c), so there is still at most one writable owner.
+7. **cleanup**: after a 24 h grace, `engramctl` deletes the namespace's rows on source (admin role) and the old blob prefix.
+
+Safety argument: a write is accepted only inside a transaction that holds `FOR SHARE` on an ownership row with `state='active'` and the caller's epoch; source is set `frozen` **before** target is set `active`, so at no instant do two shards hold `active` for one namespace. Duplicates are impossible because the target applies outbox rows keyed by `(namespace_id, seq)`; loss is impossible because freeze precedes drain and drain precedes cutover.
+
+## D6. Outbox and Kafka
+
+| Decision | Rationale | Rejected |
+|---|---|---|
+| Per-shard `outbox(seq bigint, namespace_id, epoch, event_type, payload bytea /*proto*/, created_at)` written in the **same transaction** as every state change. Payload type `engram.internal.events.v1.Event`. | Transactional outbox, never dual writes. It is also the change log a shard move replays. | Logical replication/CDC (Debezium) — another system, and per-namespace filtering is awkward. |
+| Relay: one active relay per shard in `engram-worker`, elected with `pg_try_advisory_lock`, reads in `seq` order in batches of 500 using the shard-level `engram_relay` role, which bypasses RLS for `SELECT` on `outbox`/`outbox_cursors` only (it must read every namespace in `seq` order; it never reads any other table). Consumers keep cursors in `outbox_cursors(consumer, last_seq)`. Consumers: `index` (no-op for the built-in Postgres index, the external-engine adapter otherwise), `kafka` (optional), `move:<ns>` (temporary, during a move). Rows below every cursor and older than 7 days are deleted daily in batches of 10 k. | | |
+| Sequence gaps: `seq` comes from a sequence, so a later `seq` can commit before an earlier one. The relay keeps a **gap watchlist**: a skipped `seq` is re-checked for `2 × statement_timeout` (60 s; `statement_timeout = idle_in_transaction_session_timeout = 30 s` on writers), then declared aborted. Invariant A-F1: the outbox `INSERT` is the **last statement** of every write transaction, so a drawn `seq` is committed or aborted within one timeout of being drawn. The relay delivers a strict prefix: no cursor passes an open gap. | Bounded and model-checked (TLA+ `Outbox.tla`: a 1× horizon fails, no watchlist loses events). | Serializing writers on a table lock (kills throughput); xmin-watermark tricks (wraparound-unsafe). |
+| **Kafka is optional and off by default.** When on: topic per shard `engram.events.shard-{id}`, key = `namespace_id`, value = the same `Event` proto, schema published to the buf registry (BSR) and referenced by header `schema=engram.internal.events.v1.Event`. Only justification: external consumers (analytics/CDC, an external search engine) that need replay and fan-out. | Temporal already provides durable orchestration and Postgres provides a per-shard ordered log. | Kafka as the ingest queue (would put a second durable store in the write path). |
+
+## D7. Search index
+
+| Decision | Rationale | Rejected |
+|---|---|---|
+| MVP index = Postgres indexes on the shard: HNSW (`halfvec_cosine_ops`) on `facts.embedding`, `chunks.embedding` and `observation_versions.embedding`; **BM25 via pg_search** (`USING bm25`) on `facts.text`, `chunks.text` and `observation_versions.text` (observations are recalled through the semantic and lexical arms, D10); pg_trgm GIN on `entities.canonical_name`. The `index.Index` interface is `Transactional` here (written in the same tx as facts) and `Async` for an external engine fed by the outbox `index` consumer. | One system, transactional, rebuildable (`REINDEX`). | tsvector + `ts_rank_cd` (not BM25; kept as a fallback implementation when pg_search is unavailable, documented as lower quality). External engine in MVP (extra system). |
+
+## D8. Document versions, delta retain, delete
+
+| Decision |
+|---|
+| `documents(namespace_id, document_id, current_version, state, …)`, `document_versions(namespace_id, document_id, version, content_hash, status: ingesting/active/superseded/deleted, operation_id)`. |
+| Chunk identity within a document is its **content hash**: unique `(namespace_id, document_id, content_hash)`. Chunk text (≤ 4,000 characters and ≤ 16 KiB of UTF-8; the column `CHECK` is on bytes) is stored in Postgres; the raw item body goes to the append-only `ingest_ledger` row plus a blob. |
+| Retain (`REPLACE`) of version v: chunk → for each hash: live chunk exists → keep everything (no LLM, no embedding); retired-but-not-purged → un-retire; new → extraction cache lookup → LLM → insert. Chunks not in the new set get `retired_at = now()`, and so do their facts (denormalized `facts.retired_at`, set in the same statement group). `APPEND` only adds chunks. |
+| Delete(document) is **synchronous in Postgres** for everything recall can see: facts `retired_at`, `fact_links` rows deleted, `entity_mentions` deleted, `observation_sources` rows deleted, observations left with 0 sources retired, observations that lost ≥ 1 source marked `stale=true` (reconsolidate), `page_sources` rows deleted and pages marked `stale_delete=true`. Blob deletion and physical row purge are asynchronous (Temporal `PurgeDocument` / `PurgeNamespace`, grace 1 h for retire, 0 for explicit delete), but the ack is returned only after the synchronous part commits. |
+| Recall filters `retired_at IS NULL` everywhere; nothing else is needed for visibility. |
+| Soft curation: `Invalidate(memory_id)` sets `facts.invalidated_at` (recall excludes; observations keep the source but are marked stale); `Restore` clears it. Distinct from `retired_at`. |
+| Namespace delete = catalog state `deleting` (reads/writes rejected) → per-shard purge workflow → catalog row `deleted`. Tenant delete = all namespaces. |
+
+## D9. `as_of` semantics
+
+| Decision |
+|---|
+| Every fact stores `mentioned_at` **= the item's `timestamp`, set by the server, never by the extractor or by a per-item override** (it is the time the system learned the content and the only `as_of` key), `said_at` (the model's judgement of when the source said it, used for display and ranking only) and `occurred_start`/`occurred_end` (when it *happened*). Chunks store the same `mentioned_at`. A model-chosen or backdated `as_of` key would make "leak-free" depend on an LLM (review F-2). |
+| Observations are **versioned**: `observation_versions(observation_id, version, text, effective_at, …)` with `effective_at(v) = max(max(mentioned_at) over every fact shown to the consolidation prompt that produced v (its **inputs**, not only the facts it cites), max(effective_at) over the candidate observations shown, effective_at(v−1))`. TLC `AsOf_CitedOnly` shows the leak when only cited sources count: a version written with a newer fact in view but citing older ones would surface before that fact. The clamp makes `effective_at` monotone across versions: a later version that cites only older facts was still written with knowledge of the previous text, so it must not surface at an earlier `as_of`. Recall with `as_of = T` returns, for each observation, the latest version with `effective_at ≤ T` (none if the first version is later than T). Pages use the same rule (`page_versions.effective_at`). |
+| Recall with `as_of = T` filters facts and chunks by `mentioned_at ≤ T` **inside every arm** (semantic, lexical, graph expansion, temporal, chunks), not after fusion, so budgets are not consumed by invisible rows. |
+
+## D10. Recall pipeline (no LLM calls)
+
+| Stage | Decision |
+|---|---|
+| Arms (parallel, per-arm candidate caps low/mid/high = 50/150/400) | semantic (HNSW over facts), lexical (BM25 over facts), graph (bounded expansion from the top-20 seeds of semantic ∪ lexical over `fact_links`; node budget 100/300/1000; temporal links ≤ 5 hops × 10 neighbours; entity/causal/semantic links ≤ 2 hops), temporal (facts whose occurrence window overlaps the query window, ordered by distance to `query_timestamp`), chunks (BM25 ∪ HNSW over chunks). |
+| Fusion | RRF with k = 60 over all arms; observations participate through semantic + lexical arms over `observation_versions`. |
+| Rerank | cross-encoder through the gateway (`models.rerank`, default `bge-reranker-v2-m3`) on the top 50/150/300 fused candidates. If the remaining deadline < 150 ms, rerank is skipped and results are marked `stage=FUSED`. |
+| Boosts | multiplicative, bounded: recency ≤ +10 %, temporal proximity ≤ +10 %, observation proof count ≤ +5 %; combined factor clamped to [0.75, 1.25]. |
+| Tag filter (5 modes, Hindsight-compatible) | `tag_match` ∈ {ANY, ANY_STRICT, ALL, ALL_STRICT, EXACT}; let Q = query tags, I = item tags. ANY: I = ∅ ∨ I ∩ Q ≠ ∅ (untagged items pass); ANY_STRICT: I ∩ Q ≠ ∅; ALL: I = ∅ ∨ Q ⊆ I; ALL_STRICT: Q ⊆ I ∧ I ≠ ∅; EXACT: I = Q. An unset filter matches everything. Tags are filters applied inside every arm, never security. |
+| Packing | greedy in rank order into `max_tokens` (default 4 k / 8 k / 16 k by budget); an item that does not fit is **skipped, not truncated**, and counted in `skipped_count`; packing never stops early. Token counting: `cl100k_base` via tiktoken-go. |
+| Streaming | `Recall` is server-streaming: one result per message, flushed in groups of 10 after the last stage that fits the deadline, then a trailing `RecallStats` message with per-stage timings. A deadline hit mid-stream leaves the delivered results valid and omits the stats. |
+
+## D11. Retain pipeline (Temporal)
+
+| Decision |
+|---|
+| Workflow `RetainDocument`, id `ns/{namespace_id}/op/{operation_id}`, task queue `shard-{shard_id}`. Activities: `Chunk` (pure Go), `SummarizeDocument` (1 LLM call per document version, cached by document hash), `ExtractChunk` (1 LLM structured call per chunk, cached), `EmbedChunk` (facts + chunk), `ResolveEntities`, `BuildLinks`, `CommitChunk` (single transaction per chunk: facts, links, mentions, outbox), `FinalizeVersion` (retire missing chunks, mark version active). Per-chunk fan-out ≤ 32. Every activity is idempotent by `(namespace_id, document_id, version, content_hash)`; the epoch is a fence checked at commit time, never part of an identity or idempotency key (a restarted workflow after a move must recognise chunks committed at the previous epoch). |
+| Extraction cache: blob key `{shard}/{tenant}/{ns}/xcache/{sha256(chunk_hash ‖ prompt_version ‖ model ‖ schema_version)}.json`. Per-namespace on purpose: a shared cache would let one tenant probe another's content via timing. |
+| Chunking: heading-anchored, content-defined boundaries, target 3,000 chars, min 500, max 4,000, no overlap; each chunk gets a header `[doc summary ≤ 200 chars] > [heading path]` prepended for embedding and extraction (not stored in `text`, stored in `header`). |
+| Consolidation trigger: `SignalWithStart` of the per-namespace `Consolidate` workflow (id `ns/{namespace_id}/consolidate`), debounced 30 s. |
+
+## D12. Consolidation, Reflect, Pages, Export (phase 2–3)
+
+| Decision |
+|---|
+| Consolidation: 8 facts per LLM call, ≤ 100 facts per round, candidate observations = top-10 by semantic similarity per batch; ops `create/update/delete` with cited `source_fact_ids`; bisect on failure 8 → 4 → 2 → 1; idempotency `batch_key = sha256(sorted fact ids ‖ prompt_version ‖ model)` and `op_key = sha256(batch_key ‖ op_index)` recorded in `consolidation_applied`. DB trigger retires any observation whose `observation_sources` count reaches 0 (observations never outlive sources). |
+| Reflect: forced searches (observations, then facts), then ≤ 10 free iterations, ≤ 100 k context tokens, ≤ 300 s wall, per-tool deadline 10 s; tools `search_memories`, `search_observations`, `get_page`, `expand_fact`; citations are filtered against the set of ids actually returned by tools in the session; optional JSON-schema output validated server-side. Per-namespace `mission`, `directives`, `disposition{skepticism, literalism, empathy ∈ 1..5}`. |
+| Pages: `pages(namespace_id, page_id, name, source_query, tag_filter, refresh_policy, current_version, stale_write, stale_delete)`, `page_versions(page_id, version, markdown_blob_key, effective_at)`, `page_sources(page_id, fact_id|observation_id)`. Refresh = LLM delta-edit with previous markdown + added/removed evidence. |
+| Export: `{shard}/{tenant}/{ns}/export/v{n}/{manifest.json, facts.jsonl.zst, observations.jsonl.zst, chunks.jsonl.zst, pages/*.md}` plus `delta-v{n-1}-v{n}.jsonl.zst` computed by diffing consecutive snapshots by (id, version) — the outbox range is only an optimisation when it is still retained (D6 keeps 7 days), so deltas are always producible; `ExportService.StreamSnapshot` streams 1 MiB parts. |
+| Config inheritance: system (file) ⊂ tenant (catalog JSONB) ⊂ namespace (catalog JSONB); keys `models.{extract,consolidate,reflect,embed,rerank}`, `chunk.target_chars`, `recall.default_budget`, `quota.*`. Resolved and cached with the catalog entry. |
+
+## D13. Auth, quotas, observability
+
+| Decision |
+|---|
+| JWT (EdDSA/RS256, JWKS cached 5 min) claims: `tenant_id`, `ns` (list of namespace ids or `["*"]`), `scopes ⊆ {memory.read, memory.write, memory.admin, tenant.admin}`. One `authz.Interceptor` (unary + stream) verifies the token, resolves the namespace via the catalog, checks `namespace.tenant_id == token.tenant_id` and allowlist membership, and puts `RequestScope{tenant, namespace, shard, epoch, scopes}` in the context. MCP and Connect adapters forward the same JWT to the core, so the interceptor is the only enforcement point. Tags are filters, never security. |
+| Quotas per tenant and per namespace: `recalls_per_min`, `retains_per_min` (enforced in the interceptor, token bucket in the API, `RESOURCE_EXHAUSTED` + `memory.v1.QuotaExceeded` detail plus a runtime `google.rpc.RetryInfo`), `llm_tokens_per_day` and `max_facts` (tenant-level counters are rolled up in the catalog table `tenant_usage_daily`, fed by the API off the hot path, because no query may span shards; workflows enforce the namespace's share, which the catalog computes from the tenant limit and places in the workflow's config snapshot; exhaustion **defers** the operation — state `DEFERRED`, resumes at window reset — rather than failing it). |
+| Observability: OpenTelemetry traces with one span per stage; Prometheus metrics labelled `shard` (always) and `tenant` (metering counters only; never `namespace` as a label); per-namespace `token_usage(day, op, model, prompt_tokens, completion_tokens, cost_micros)` lives in the shard DB so it moves with the namespace. |
+
+## D14. Go package layout (fixed)
+
+```
+cmd/engram-api  cmd/engram-worker  cmd/engram-mcp  cmd/engramctl
+proto/memory/v1  proto/memory/admin/v1  proto/engram/internal/workflow/v1  proto/engram/internal/events/v1
+gen/go/...                      (buf generate: protoc-gen-go, protoc-gen-go-grpc, protoc-gen-connect-go)
+internal/authz      internal/catalog     internal/router      internal/gateway   internal/blob
+internal/store      internal/index       internal/chunk       internal/extract   internal/entity
+internal/link       internal/recall      internal/consolidate internal/reflect   internal/pages
+internal/workflows  internal/outbox      internal/move        internal/export    internal/quota
+internal/config     internal/telemetry   internal/api         internal/ledger    internal/errs
+adapters/mcp        adapters/connect
+formal/tla/*.tla    formal/lean/Engram/*.lean
+```
+
+## D15. Model defaults (through the gateway)
+
+| Operation | Default | Notes |
+|---|---|---|
+| Embedding | `nomic-embed-text-v1.5`, 768-d, prefixes `search_document: ` / `search_query: `, L2-normalised | Matryoshka truncation to 512-d is a config knob, off by default. |
+| Rerank | `bge-reranker-v2-m3` | Gateway rerank endpoint; batch of ≤ 300 pairs per call. |
+| Extract / Summarize / Consolidate | `models.extract`, `models.consolidate` — a fast structured-output model class | Per-namespace override. Prompt versions `extract/v1`, `summarize/v1`, `consolidate/v1`, `dedup_adjudicate/v1`; the benchmark judge is `judge/v1`. |
+| Reflect / Page refresh | `models.reflect` — a stronger model class | Prompt versions `reflect/v1`, `reflect_structured/v1`, `page/v1` (delta edit), `page_full/v1` (rebuild fallback). |
+
+## D16. Consistency model (stated once, referenced everywhere)
+
+- **Retain** acks after the ingest-ledger row and the operation row are durable; nothing is visible yet. Facts become visible **per chunk** as each `CommitChunk` transaction commits; the operation reaches `SUCCEEDED` when the version is active. `OperationService.WaitOperation` is the read barrier: after it returns `SUCCEEDED`, a `Recall` on the same namespace observes every fact of that version (reads go to the shard primary; there are no read replicas on the recall path).
+- **Observations and pages** lag facts by the consolidation debounce plus processing time; no bound is promised, but `Operation` exposes `consolidation_lag`.
+- **Delete** acks after the synchronous cascade commits; from then on nothing from the document is returned by Recall, Reflect, GetMemory or Export. Blob and physical purge complete asynchronously and are observable via the delete operation.
+- **Cross-namespace and cross-shard**: no ordering or visibility relationship whatsoever.
+
+## D17. Phasing and effort (used by the roadmap)
+
+Phase 0 foundations ≈ 9 engineer-weeks (includes a 3-week Phase 0' that resolves review findings F-1…F-8 as register changes and measures rerank latency, pg_search pushdown and filtered-HNSW recall on the real images); Phase 1 MVP ≈ 45 (moves behind an admin flag); Phase 2 (consolidation, reflect, backfill) ≈ 20; Phase 3 (pages, export, multi-cell, per-tenant config) ≈ 24; formal methods and evaluation harness ≈ 14. Total ≈ 112 engineer-weeks; the committed scope for 3 engineers in 6 months is Phases 0–2 (≈ 74 ew), Phase 3 is a separate track. The earlier 74-ew total was a lower bound with an impossible serial chain (review F-16).
+
+## D18. Decisions added during drafting (binding once listed here)
+
+| Id | Decision | Where it came from |
+|---|---|---|
+| N1 | Leaf package `internal/errs` holds typed errors and their gRPC/Connect/Temporal mapping; `internal/api` must not be imported by services, store or workflows. | §2 |
+| N2 | The move workflow `move/{namespace_id}/{epoch}` runs on the **target** shard's task queue `shard-{target}`; the executing worker opens a second, move-scoped pool to the source using the `engram_move` role. This is the only code path that holds two shard handles, and it is fenced by the move row. | §2, §5 |
+| N3 | A per-shard Temporal schedule `shard/{id}/op-sweeper` (every 60 s) starts workflows for `PENDING` operations older than 2 min that have no workflow. The API still returns `UNAVAILABLE` if `StartWorkflow` fails after the ledger commit; the ack is not weakened. | §2 |
+| N4 | The outbox relay reads with the `engram_relay` role (RLS bypass for `SELECT` on `outbox` only; `outbox_cursors` has no namespace column). Events carry every field a consumer needs (`DocumentDeleted` carries the deletion-log fields), so the relay never reads another table. | §2, §3 |
+| N5 | A namespace of another tenant returns `NOT_FOUND` (no existence oracle); a same-tenant namespace outside the token's allowlist, or a missing scope, returns `PERMISSION_DENIED`; a namespace in state `deleting` returns `FAILED_PRECONDITION`. | §2, §4 |
+| N6 | `chunks.content_hash = sha256(text)` excludes the contextual header; the header hash is stored separately and compared at `FinalizeVersion` to decide re-embedding without re-extraction. | §2, §5 |
+| N7 | Raw bodies larger than 64 KiB are written to blob `{shard}/{tenant}/{ns}/ledger/{sha256}` before the ledger transaction; the ledger row stores the hash and the key. Smaller bodies are stored inline in the ledger row. | §2, §3 |
+| N8 | Streams fix `RequestScope` when opened; a JWT expiring mid-stream does not abort the stream (Reflect may run 300 s). | §2 |
+| N9 | Retain groups items by `document_id` and creates one Operation per document; `RetainResponse` returns the aligned list. A caller-supplied `operation_id` is used verbatim for a single document and as the UUIDv5 namespace for several. | §4 |
+| N10 | The public `Namespace` message hides both `shard_id` and `epoch`; the epoch appears only in the `WrongShardOrEpoch` error detail and in `memory.admin.v1`. | §4 |
+| N11 | Deadlines are mandatory: a missing deadline is `INVALID_ARGUMENT`; per-method caps (Recall 10 s, Retain 30 s, Reflect 330 s, WaitOperation 65 s, StreamSnapshot 600 s, others 30 s) are enforced, not silently clamped. | §4 |
+| N12 | Outbox events are thin (ids, versions and flags, never text or vectors); consumers read rows by id at the recorded epoch. | §4 |
+| N13 | Embeddings travel inside Temporal payloads as little-endian float32 bytes and spill to a staging blob above 512 KiB. | §4 |
+| N14 | `PageService` and `ExportService` are registered from day one and answer `UNIMPLEMENTED` until phase 3, so the contract and the adapters never change shape. | §4 |
+| N15 | The outbox relay holds its election lock (`pg_try_advisory_lock`) on a dedicated direct Postgres connection (`shards[].direct`), never through pgbouncer: session-level locks do not survive transaction pooling. `LISTEN` is only ever used against the catalog, which has no pgbouncer. | §8, §9 |
+| N16 | Fault-injection knobs compile only under build tags `faultinject` / `testauth`; a lint step fails the build if a release binary exports them. | §8 |
+| N17 | Forwarded cross-cell requests carry `engram-forward-hops`; at most one hop, never re-forwarded. | §8 |
+| N18 | Benchmark pins: judge `gpt-oss-120b` through the gateway, temperature 0, prompt `judge/v1`; `bench.lock` records gateway-reported model versions; one namespace per LongMemEval question and per LoCoMo conversation under tenant `bench`. Hindsight is measured in two configurations (its defaults and a model-matched one); parity is judged against the matched one. | §8 |
+| N19 | Every store query is registered in `store.Queries` so the RLS canary is exhaustive; `engramlint sql` additionally requires an explicit `namespace_id` predicate in every query. | §8 |
+| N20 | `token_usage.price_version` is recorded and cost is computed at write time, never re-priced. | §8 |
+| N21 | Every shard keeps a `deletion_log(kind, subject_id, namespace_id, deleted_at)` (kinds: `document`, `namespace`, `tenant`, `memory` for Invalidate) written in the delete transaction and replicated to the catalog by a `deletion-log` outbox consumer; a restore replays the deletes recorded after the backup point before the shard is re-enabled. | §9 |
+| N22 | `shard_meta(schema_version, engram_min_version, engram_max_version)` on every shard; api/worker mark an out-of-range shard `unavailable` instead of refusing to start; moves refuse on a schema-version mismatch; `migrate --shard` refuses during a non-terminal move. | §9 |
+| N23 | Backups: pgBackRest per shard under `_backups/shard-{id}/`, AES-256 repository cipher, `archive_timeout = 60` (RPO ≤ 60 s), four weekly full sets (28 days) which is also the tenant-facing deletion SLA; blobs are not backed up (content-addressed and re-derivable or tombstoned). Restore fences the shard, bumps every hosted namespace's epoch, restarts in-flight operations and resets outbox cursors. | §9 |
+| N24 | Envoy retries only a fixed allowlist of read methods and only on transport-level failures; writes and long streams have `num_retries: 0`. Secrets are file-mounted, re-read every 60 s and on `SIGHUP`. | §9 |
+| N25 | Token metering is exactly-once through `token_usage_events(usage_key)`; the resolved config travels in the workflow input as `config_snapshot`. | §5 |
+| N26 | `chunks.extraction_key = sha256(content_hash ‖ prompt_version ‖ model ‖ schema_version)`; a prompt or model bump is a new key, re-extracted through the ordinary retain path, with the old facts retired at `FinalizeVersion`; nothing is rewritten in place. | §5, §6 |
+| N27 | Per-document serialisation: versions are assigned under the `documents` row lock; `FinalizeVersion` and the delete cascade share `pg_advisory_xact_lock(namespace_id, document_id)`; the higher version wins and `CommitChunk` stops with `superseded` when `documents.current_version > v`. | §5 |
+| N28 | Per-shard maintenance schedules (`consolidate-sweep`, `page-cron`, `purge-sweep`, `outbox-trim`) run under the admin role with one read per tick; the move's catch-up consumer is pull-based with its own cursor, not a relay sink; the relay's lock lives on a direct connection. | §5 |
+| N29 | Observation and page `effective_at` are monotone across versions (D9 clamp); stale observations are reconsolidated in update/delete-only batches. | §5 |
+| N30 | Export: a single `WriteFiles` activity per snapshot, the manifest written last as the commit point; the thin client syncs by sorted merge of (id, version). | §5 |
+| N31 | `RetainBackfill` pre-warms the extraction cache through the gateway batch API (`batch_jobs` table) and then runs ordinary `RetainDocument` children. | §5 |
+| N32 | Both databases use schema `public`; helper functions are prefixed `engram_*` (shard) and `catalog_*` (catalog). Tags are normalised at write time: ≤ 32 per row, each matching `^[a-z0-9][a-z0-9._:/-]{0,63}$`, stored sorted and deduplicated so array operators behave as set operators; `engram_tag_match(mode, q, i)` is the SQL twin of the Lean decision procedure. | §3 |
+| N33 | `observation_versions.superseded_at` and `page_versions.superseded_at` precompute the D9 rule (= `effective_at` of the next version), so an `as_of` query is a plain range filter inside the HNSW/BM25 scans. | §3 |
+| N34 | `fact_links` stores undirected edges once (`src < dst`), causal edges directed; who/what/when/where/why live in one `w5 jsonb` column. | §3 |
+| N35 | Operation states are exactly the proto's: `PENDING, RUNNING, DEFERRED, SUCCEEDED, FAILED, CANCELLED`; a partially failed retain is `SUCCEEDED` with `progress.units_failed > 0`. | §2, §3, §4 |
+| N36 | Catalog writes that a workflow needs after a move or a delete go through two admin RPCs: `MoveService.CleanupMove` (releases the source copy after the grace period) and `ShardService.ReleaseNamespace` (marks a namespace purged on a shard); a cell-wide `control` task queue hosts `TenantDelete`. | §5, §4 |
+| N37 | `pages.stale_seq` is a compare-and-clear counter: a refresh clears staleness only if no newer stale mark arrived while it ran. | §5, §3 |
+| N38 | `operations.kind` strings on the shard map one-to-one to the proto `OperationKind` (`retain` ↔ `RETAIN`, `purge` ↔ `DELETE_DOCUMENT`, …); the API performs the mapping, never the SQL. | §3 |
+| N39 | Observation scope is a namespace config key `consolidate.observation_scope` (default `combined`), not a per-item field; per-item scoping is an open question (§11). | §5 |
+
+## D19. Corrections from model checking (binding; they amend D5, D6, D8, D9, D12 above)
+
+| Id | Correction | Exposed by |
+|---|---|---|
+| N40 | `CommitChunk` takes `FOR SHARE` on the `document_versions` row and requires `status = 'ingesting'`; `FinalizeVersion(v)` marks v `superseded` without retiring anything if a newer version has already started. Without this a late commit resurrects deleted or superseded content, and an older version finalising late retires the newer version's chunks. | `DocLifecycle_NoCommitCheck`, `_NoFinalizeCheck` |
+| N41 | `observation_inputs(observation_id, version, fact_id)` records the facts the consolidation prompt **rendered** for that version: the batch facts plus the quoted sources of the shown candidates (≤ 5 per candidate, N47), not every source of every candidate (review F-9). The apply transaction re-verifies all inputs `FOR SHARE` (live, not retired, not invalidated) and discards the proposal otherwise. Deletion-derived hiding is **per version and permanent**: the delete cascade sets `observation_versions.derived_from_deleted = true` on every version whose inputs named a victim; such a version is never served again at any `as_of`, and reconsolidation never clears the flag, it only writes a new version. `observations.stale_delete` remains the "needs rewrite" signal and hides the observation's *current* version until the rewrite lands; versions written without the victim stay servable at their `as_of` range. `stale_write` stays visible. (Review F-1: observation-level un-hiding would resurrect a deleted-derived older version under `as_of`.) | `DocLifecycle_CitedOnly`, `_NoApplyCheck`, review F-1/F-9 |
+| N42 | A `REPLACE`-retired fact keeps its `observation_sources`/`observation_inputs` rows during the retire grace; the observation is marked `stale_write` and stays visible; the purge cascades exactly like an explicit delete. | DocLifecycle design run |
+| N43 | Consolidation proposals are persisted write-once under `batch_key` **before** apply; `op_key` is computed over the stored list; effect and key are written in one transaction. The only permitted mutation is a single `DELETE` of a proposal none of whose ops has been applied (the discard path of N41, enforced by a `RESTRICT` foreign key from `consolidation_applied`). Idempotency keys are otherwise decorative. | `Consolidation_VolatileProposal`, `_NonAtomicKey` |
+| N44 | The async index mode joins search hits with `retired_at IS NULL AND invalidated_at IS NULL` at read time; a hit the store no longer considers live is dropped even if the index has not caught up. | `DocLifecycle_UnfilteredIndex` |
+| N45 | Move copy barrier (D5 step 2) and cutover order (D5 step 6) as amended above; catch-up gives up after 10 rounds. | `ShardMove_NoBarrier`, `_D5Order` |
+| N46 | Every TLA+ spec has a liveness configuration that runs in CI (seconds); the full-bound safety configurations run nightly with a 30-minute cap. A spec change must change the matching Go model-based test (a manifest check enforces the pairing). | §7 |
+| N47 | The consolidation prompt shows at most 5 quoted sources per candidate observation, which bounds `observation_inputs` to ≈ 10 GB per shard at 10 M facts (uncapped it would be ≈ 34 GB). | §3, §6 |
+| N48 | `Invalidate(memory_id)` marks every observation that used the fact as `stale_delete` (hidden until reconsolidated), by the same argument as N41; `Restore` marks them `stale_write` (visible). | §5 |
+| N49 | A retain whose version is superseded by a newer one before it finalises ends `SUCCEEDED` with `superseded_by = <version>` in the operation result; no new operation state is introduced (N35). | §5 |
+
+## D20. Corrections from the adversarial review (binding; `REVIEW.md` has the findings, this table has the decisions)
+
+| Id | Decision | Amends | Finding |
+|---|---|---|---|
+| N50 | Move catch-up and drain replay by **anti-join**: `SELECT … FROM outbox o WHERE namespace_id=$1 AND seq > p0 AND NOT EXISTS (SELECT 1 FROM move_applied m WHERE m.namespace_id=o.namespace_id AND m.seq=o.seq)`, never `seq > applied`; after freeze no writer holds a seq, so one final anti-join pass is complete. `engram_move` stays namespace-confined. | D5 steps 3, 5 | F-3 |
+| N51 | The move target is loaded with `COPY … FROM STDIN BINARY` under a dedicated `engram_move_load` role that is `BYPASSRLS` with `INSERT` only on namespace tables; every batch runs in a transaction that re-checks the target ownership row (`state='incoming'`, matching epoch) explicitly. `COPY FROM` is refused on RLS tables, so the RLS fence cannot be used on the load side. | N2 | F-4 |
+| N52 | Cutover sub-steps (b), (c), (d) are three activities with sub-second retry; a read that hits `WrongShardOrEpoch{namespace_state = MOVED_OUT}` re-resolves in a bounded loop (≤ 5 s) exactly like `NamespaceFrozen`; `FAILED_PRECONDITION` during a move counts against the availability SLI. | D5 step 6 | F-20 |
+| N53 | Reranking: default model `bge-reranker-base` (v2-m3 is a per-namespace upgrade); `rerank_top` = 0 / 50 / 150 for LOW / MID / HIGH until the gateway's sustained pairs/s per cell is measured (assumption A-R1: ≥ 80 k pairs/s per cell, i.e. 1,600 recall/s × 50); the rerank-skip rate is an SLO breach, not a degradation. | D3, D10, D15 | F-6 |
+| N54 | The recall latency budget is a critical-path sum: authz 2 → embed 25 → lexical ‖ semantic 60 → graph 30 (seeded from the lexical arm immediately, from the semantic arm as a second wave) → fuse 1 → rerank 90 (50 pairs) → boosts+pack 3 → stream 5 = **216 ms p95 at MID**; M1.2 measures the rerank-skip rate (< 1 % at target QPS) explicitly. | D3 | F-7 |
+| N55 | Semantic arm plan by namespace size: namespaces below 20 k live facts use an exact scan over `(namespace_id)` + `live` (≈ 30 MB of `halfvec`, 5–15 ms); namespaces above it get a partial HNSW index `WHERE namespace_id = …` created when the `large` flag flips; the shared partition index is the fallback. `hnsw.ef_search ≥` the arm cap (400 at HIGH). Heap fetches per recall × QPS are part of the IOPS sizing. | D3, D7 | F-8 |
+| N56 | `APPEND` chains: the base of an append is the highest existing version, assigned at `LoadItem` under the `documents` row lock, even while that version is still ingesting; two concurrent appends therefore produce `base ‖ A` and `base ‖ A ‖ B`, never a lost append. | D8 | F-10 |
+| N57 | Observation update order: insert the new `observation_sources`/`observation_inputs` rows first, then delete the stale ones, so the zero-sources trigger never fires inside an update. | N41, D12 | F-11 |
+| N58 | `FinalizeVersion` retires every live fact of the document whose `extraction_key` differs from its chunk's current `extraction_key`, so a prompt or model bump never leaves two live fact sets on a kept chunk. | N26 | F-12 |
+| N59 | Delete reaches every copy: the cascade marks every export snapshot that contains the document `expired` (`StreamSnapshot` refuses it and the client re-syncs from a new full snapshot); every Temporal activity result larger than 4 KiB travels by blob key (extraction, embeddings, links; `CommitChunkInput` is keys-only) and `RetainDocument` continues-as-new every 100 chunks or 20 MB of history; consolidation blobs are retained only for the purge grace; a Temporal `DataConverter` payload codec (AES-GCM, per-shard key) encrypts whatever still travels inline. | D16, N13, D12 | F-13, F-18, F-25 |
+| N60 | The document summary in the chunk header is recomputed only on `REPLACE` or when the document has grown by more than 25 % since the last summary; the header is embedded into the chunk vector only, never into fact vectors; `header_hash` covers the heading path and the current summary id. | D11, N6 | F-14 |
+| N61 | The synchronous delete cascade covers only what visibility needs: `retired_at` on facts and chunks, `observation_sources`/`observation_inputs` removal with the triggers, `derived_from_deleted` flags, page flags, `deletion_log` and the outbox row. `fact_links` and `entity_mentions` are deleted by `PurgeDocument`; the graph arm joins `facts` and filters `live` on both endpoints, so `NoOrphanLinks` is restated as "no traversal through a non-live fact". The cascade SLO is stated per 1 k facts. | D8 | F-19, F-38 |
+| N62 | Prometheus metrics never carry a `tenant` label; per-tenant metering is served from `token_usage` (exactly-once, N25) by `engramctl report` and an optional OpenTelemetry delta-temporality export. | D13 | F-22 |
+| N63 | Every connection to a shard, including the relay's and the mover's direct ones, goes through a per-shard virtual endpoint that failover flips atomically; a promotion bumps the epoch of every namespace on the shard unless the old primary was verifiably stopped (`pg_ctl stop -m immediate` and volume detached). | D2, N15, §9 | F-24 |
+| N64 | The ownership state machine (states × roles × statements, including `freeze_reason`, restore and the read fence) is written once in §3.3.1 and every transition is executed against the real DDL by a T3 test before any move code exists. The catalog `namespace_state` gains `restoring`. | D2, D5 | F-23 |
+| N65 | JWT claims gain `ns_group` (namespaces carry a tenant-defined group); the explicit `ns` list is for small cases, `["*"]` for all. | D13 | F-29 |
+| N66 | Config keys: add `prompts.*` (prompt version pins), `retain.mission`, `consolidate.{mission, observation_scope, max_observations_per_scope}`, `reflect.keep_transcripts`; the allow-list and the proto comment are generated from one Go table. | D12 | F-26 |
+| N67 | RRF is computed in exact rational arithmetic (`math/big.Rat`, ≤ 2,000 candidates × 5 arms) so permutation invariance holds as stated; `Scores.lexical` and `Scores.semantic` are reported as per-query normalised values in [0, 1], never raw BM25 scores (which are partition-relative and a weak cross-tenant channel). | D10 | F-31, F-28 |
+| N68 | The temporal arm probes two-sided around `query_timestamp` on the btree `(namespace_id, occurred_start)` (nearest N before and after, N = arm cap) instead of sorting every overlapping fact. | D10 | F-32 |
+| N69 | `namespace_stats` counters are derived (periodic `count(*) WHERE live`), `operations.progress` is written once per wave by the workflow, and entity upserts are applied in `canonical_norm` order in one statement, so no chunk commit serialises on a hot row or deadlocks on `entities`. | D11 | F-36, F-41 |
+| N70 | `WaitOperation` is implemented on Temporal's workflow-result long-poll with a per-process cap and a jittered database fallback; `OperationService.Get/Wait` are exempt from the `deleting` rejection so `DELETE_NAMESPACE`/`DELETE_TENANT` operations can be awaited. | N11 | F-39, F-27 |
+| N71 | One Temporal cluster per fleet (task queues are already per shard); the cross-cell `Forwarder` proxies streaming methods as a gRPC `ClientStream`; the external Envoy listener strips `engram-forward-*` headers; gRPC reflection serves `memory.v1` only. | D3, N17 | F-35, F-42 |
+| N72 | Idempotency hashes are SHA-256 over normalised protojson (sorted keys, unknown fields dropped); derived operation ids may be any UUID (validation relaxed from "UUIDv7"); the per-shard op-sweeper also completes or deletes `creating` namespaces older than 2 min. | D1, N9, N3 | F-43, F-44, F-45 |
+| N73 | Reflect gains `search_pages` (full-text + semantic over `page_versions`, `PageService.SearchPages`) and keeps a map/reduce fallback at the context cap; §1.9 "improved" rows are downgraded to "changed, to be measured" until the §8.6 ablations exist. | D12 | F-33 |
+| N74 | Facts-per-chunk is one assumption (A-F = 10) measured in Phase 0'; every count and cost in §3.7, §6.8, §8.6 and §10 is derived from it in one table; time-to-fill and spend-to-fill for 1 B facts are stated next to D3 (≈ 29 days at 4 cells and ≈ $160 k at list prices); `RetainBackfill` moves to Phase 2. | D3, N31 | F-17, F-34 |
+| N75 | `engram-api` drains for ≥ 340 s on shutdown; the Envoy read route's `grpc_timeout_header_max` is 65 s (or `WaitOperation` moves to the no-retry route); nothing clamps a deadline the API would reject. | N11, N24 | F-30 |
+| N76 | pg_search behaviour on hash-partitioned tables (Top-K pushdown, `text[]` literal tokenisation, composite `key_field`) is an M0.2 exit criterion on the real ParadeDB image; `TsvectorIndex` stays the fallback with its own p95. | D7 | F-37 |
+| N77 | §7.1 and the executive summary state exactly which TLC configurations completed; the CI gate is the set of design configurations that complete in minutes (bounds shrunk until they do), the nightly job runs the larger ones with a 30-minute cap and reports INCOMPLETE as such; `AsOf.tla` gains the previous version's inputs and a delete action, `DocLifecycle.tla` a `cited ⊂ inputs` apply variant, `ShardMove.tla` multi-snapshot copy and `Holding`-independent replay (open work items in §7.6). | N46 | F-15 |
+| N78 | Realisation details from the data-model pass: `move_applied` exists on both shards (target authoritative via `ON CONFLICT` in the apply transaction, source a lagging copy written after the target commit) so the N50 anti-join is one source-side statement; the copy barrier's exclusive advisory lock is session-level on the mover's direct connection and is released after the `REPEATABLE READ` snapshot's first statement; the delete cascade retires facts before it deletes `observation_sources`/`observation_inputs` rows (the evidence triggers depend on that order); partial HNSW indexes for large namespaces are created by owner-run DDL (`engramctl index`, role `engram_migrate`). | N50, N51, N55, N61 | §3 |

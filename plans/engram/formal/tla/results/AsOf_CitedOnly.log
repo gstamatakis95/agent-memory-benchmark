@@ -1,0 +1,37 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 51 and seed 5399525551446859489 with 4 workers on 4 cores with 5461MB heap and 64MB offheap memory [pid: 3142] (Linux 6.18.44-fc-v50 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/AsOf.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module AsOf
+Starting... (2026-10-01 06:20:24)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-01 06:20:25.
+Error: Invariant NoLeak is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ versions = (o1 :> <<>> @@ o2 :> <<>>)
+/\ mentioned = (f1 :> 0 @@ f2 :> 0 @@ f3 :> 0)
+
+State 2: <InsertFact line 60, col 3 to line 62, col 23 of module AsOf>
+/\ versions = (o1 :> <<>> @@ o2 :> <<>>)
+/\ mentioned = (f1 :> 1 @@ f2 :> 0 @@ f3 :> 0)
+
+State 3: <InsertFact line 60, col 3 to line 62, col 23 of module AsOf>
+/\ versions = (o1 :> <<>> @@ o2 :> <<>>)
+/\ mentioned = (f1 :> 1 @@ f2 :> 2 @@ f3 :> 0)
+
+State 4: <Consolidate line 68, col 3 to line 77, col 24 of module AsOf>
+/\ versions = (o1 :> <<[cited |-> {f1}, deriv |-> {f1, f2}, eff |-> 1]>> @@ o2 :> <<>>)
+/\ mentioned = (f1 :> 1 @@ f2 :> 2 @@ f3 :> 0)
+
+103 states generated, 32 distinct states found, 22 states left on queue.
+The depth of the complete state graph search is 5.
+The average outdegree of the complete state graph is 4 (minimum is 2, the maximum 6 and the 95th percentile is 6).
+Finished in 01s at (2026-10-01 06:20:25)

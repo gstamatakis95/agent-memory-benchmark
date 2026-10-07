@@ -1,0 +1,303 @@
+// memory/v1/page.proto
+//
+// PageService (phase 3): mental models / knowledge pages — living markdown
+// documents defined by a source query and a tag filter, refreshed after
+// consolidation or on a schedule by an LLM delta-edit (decision D12).
+// Staleness is tracked separately for writes (new evidence arrived) and
+// deletes (cited evidence was removed), because a delete-stale page may be
+// citing content that must not be shown, while a write-stale page is merely
+// incomplete.
+//
+// Pages are versioned like observations: GetPage with as_of returns the
+// latest version with effective_at ≤ T (decision D9).
+//
+// Before phase 3 the service is registered and every method returns
+// UNIMPLEMENTED.
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+import "memory/v1/operation.proto";
+
+option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+
+// PageService manages knowledge pages. Create/Update/Delete/Refresh require
+// memory.write; Get/List require memory.read.
+service PageService {
+  // CreatePage defines a page and, unless `defer_refresh`, starts its first
+  // refresh. `name` is unique per namespace (ALREADY_EXISTS otherwise).
+  rpc CreatePage(CreatePageRequest) returns (CreatePageResponse);
+  // GetPage returns a page and (optionally) its markdown at a version or as
+  // of a time.
+  rpc GetPage(GetPageRequest) returns (GetPageResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListPages lists pages, by name.
+  rpc ListPages(ListPagesRequest) returns (ListPagesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // SearchPages ranks pages by relevance of their current (or as_of) version
+  // to `query`: BM25 ∪ HNSW over page_versions fused with RRF, no LLM. It is
+  // the Reflect agent's `search_pages` tool and the equivalent of Hindsight's
+  // `search_mental_models` (decision N73). Unary, page tokens. Scope
+  // memory.read.
+  rpc SearchPages(SearchPagesRequest) returns (SearchPagesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // UpdatePage patches the definition (source_query, tag_filter,
+  // refresh_policy, display fields). Changing the query or filter marks the
+  // page stale_write.
+  rpc UpdatePage(UpdatePageRequest) returns (UpdatePageResponse);
+  // DeletePage removes the definition and all versions synchronously (pages
+  // are small; no purge operation).
+  rpc DeletePage(DeletePageRequest) returns (DeletePageResponse);
+  // RefreshPage starts a refresh (kind REFRESH_PAGE) and returns the
+  // Operation; a running refresh is returned instead of a new one.
+  rpc RefreshPage(RefreshPageRequest) returns (RefreshPageResponse);
+}
+
+// RefreshTrigger says when a page refreshes automatically.
+enum RefreshTrigger {
+  // AFTER_CONSOLIDATION.
+  REFRESH_TRIGGER_UNSPECIFIED = 0;
+  // After each consolidation round that touched cited evidence (debounced).
+  REFRESH_TRIGGER_AFTER_CONSOLIDATION = 1;
+  // Every `interval`.
+  REFRESH_TRIGGER_SCHEDULED = 2;
+  // Only through RefreshPage.
+  REFRESH_TRIGGER_MANUAL = 3;
+}
+
+// RefreshPolicy controls automatic refreshes.
+message RefreshPolicy {
+  RefreshTrigger trigger = 1;
+  // For SCHEDULED: 1 h .. 30 d.
+  google.protobuf.Duration interval = 2;
+  // For AFTER_CONSOLIDATION: minimum spacing between refreshes (default 1 h).
+  google.protobuf.Duration debounce = 3;
+}
+
+// PageContent is one version's markdown.
+message PageContent {
+  int64 version = 1;
+  // Markdown, ≤ 256 KiB.
+  string markdown = 2;
+  // The as_of visibility key (decision D9): max(mentioned_at / effective_at)
+  // over every evidence item shown to the refresh prompt that wrote this
+  // version (not only the cited ones), clamped >= the previous version.
+  google.protobuf.Timestamp effective_at = 3;
+  // Facts + observations cited.
+  int32 source_count = 4;
+  google.protobuf.Timestamp created_at = 5;
+  // Operation that produced the version.
+  string operation_id = 6;
+}
+
+// Page is the definition plus staleness state.
+message Page {
+  // UUIDv7.
+  string page_id = 1;
+  NamespaceRef namespace = 2;
+  // Unique per namespace, `[a-z0-9][a-z0-9._-]{0,127}`; also the export file
+  // name.
+  string name = 3;
+  string display_name = 4;
+  // Natural-language query that selects the evidence (run through Recall at
+  // HIGH budget on refresh).
+  string source_query = 5;
+  TagFilter tag_filter = 6;
+  RefreshPolicy refresh_policy = 7;
+  // 0 until the first refresh succeeds.
+  int64 current_version = 8;
+  // New evidence matching source_query arrived since current_version.
+  bool stale_write = 9;
+  // Evidence cited by current_version was deleted or invalidated since.
+  bool stale_delete = 10;
+  google.protobuf.Timestamp stale_since = 11;
+  google.protobuf.Timestamp last_refreshed_at = 12;
+  string last_refresh_operation_id = 13;
+  Timestamps timestamps = 14;
+  string etag = 15;
+  // Populated when requested (GetPage.include_content).
+  PageContent content = 16;
+  // Optional author guidance for the page-refresh prompt, ≤ 4 KiB.
+  string instructions = 17;
+
+  reserved 100 to 199;
+}
+
+// CreatePageRequest defines a page.
+message CreatePageRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  // name, display_name, source_query, tag_filter, refresh_policy and
+  // instructions are read.
+  Page page = 3;
+  // Do not start the first refresh now.
+  bool defer_refresh = 4;
+  string operation_id = 5;
+
+  reserved 100 to 199;
+}
+
+// CreatePageResponse returns the page and, if started, the refresh
+// operation.
+message CreatePageResponse {
+  Page page = 1;
+  Operation refresh_operation = 2;
+
+  reserved 100 to 199;
+}
+
+// GetPageRequest fetches a page by id or name.
+message GetPageRequest {
+  NamespaceRef namespace = 1;
+  oneof selector {
+    string page_id = 2;
+    string name = 3;
+  }
+  // Return `content`.
+  bool include_content = 4;
+  // Content version to return; 0 = current (or the as_of rule below).
+  int64 version = 5;
+  // When set, `content` is the latest version with effective_at ≤ as_of;
+  // NOT_FOUND {PAGE version} if none. Ignored when `version` > 0.
+  google.protobuf.Timestamp as_of = 6;
+  google.protobuf.FieldMask read_mask = 7;
+
+  reserved 100 to 199;
+}
+
+// GetPageResponse wraps the page.
+message GetPageResponse {
+  Page page = 1;
+
+  reserved 100 to 199;
+}
+
+// ListPagesRequest lists pages by name.
+message ListPagesRequest {
+  NamespaceRef namespace = 1;
+  PagingRequest paging = 2;
+  // Only pages with stale_write or stale_delete set.
+  bool stale_only = 3;
+  string name_prefix = 4;
+  google.protobuf.FieldMask read_mask = 5;
+
+  reserved 100 to 199;
+}
+
+// ListPagesResponse is a page of pages.
+message ListPagesResponse {
+  repeated Page pages = 1;
+  PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// SearchPagesRequest ranks pages by relevance to a query.
+message SearchPagesRequest {
+  NamespaceRef namespace = 1;
+  PagingRequest paging = 2;
+  // Natural-language query, 1-8 KiB; embedded once with the `search_query: `
+  // prefix and tokenised for BM25.
+  string query = 3;
+  // Restricts to pages whose own tag_filter.tags satisfy the mode (pages are
+  // matched by their definition tags). Unset = every page.
+  TagFilter tag_filter = 4;
+  // Rank each page by the latest version with effective_at ≤ as_of and hide
+  // pages with no such version (decision D9). Unset = current versions.
+  google.protobuf.Timestamp as_of = 5;
+  // Candidate caps per arm (LOW/MID/HIGH = 50/150/400); UNSPECIFIED = MID.
+  Budget budget = 6;
+  // Return `content` (markdown of the matched version) on every hit.
+  bool include_content = 7;
+  google.protobuf.FieldMask read_mask = 8;
+
+  reserved 100 to 199;
+}
+
+// PageHit is one ranked page.
+message PageHit {
+  // 1-based rank within the whole result (stable across pages of results).
+  int32 rank = 1;
+  // The page; `content` is the matched version when include_content is set.
+  Page page = 2;
+  // Version that matched (the current one, or the as_of selection).
+  int64 version = 3;
+  // RRF score of the hit (exact rational arithmetic, rounded; decision N67).
+  float score = 4;
+  // Best-matching passage of the matched version, ≤ 512 bytes.
+  string snippet = 5;
+}
+
+// SearchPagesResponse is a page of ranked hits.
+message SearchPagesResponse {
+  repeated PageHit hits = 1;
+  PagingResponse paging = 2;
+  // The cut-off actually applied (echo of as_of).
+  google.protobuf.Timestamp as_of_applied = 3;
+
+  reserved 100 to 199;
+}
+
+// UpdatePageRequest patches the definition.
+message UpdatePageRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  Page patch = 3;
+  // Allowed paths: display_name, source_query, tag_filter, refresh_policy,
+  // refresh_policy.*, instructions.
+  google.protobuf.FieldMask update_mask = 4;
+  string etag = 5;
+
+  reserved 100 to 199;
+}
+
+// UpdatePageResponse returns the updated page.
+message UpdatePageResponse {
+  Page page = 1;
+
+  reserved 100 to 199;
+}
+
+// DeletePageRequest deletes a page synchronously.
+message DeletePageRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  string page_id = 3;
+
+  reserved 100 to 199;
+}
+
+// DeletePageResponse acknowledges the delete.
+message DeletePageResponse {
+  // Versions removed.
+  int32 versions_deleted = 1;
+
+  reserved 100 to 199;
+}
+
+// RefreshPageRequest starts a refresh.
+message RefreshPageRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  string page_id = 3;
+  string operation_id = 4;
+  // Refresh even when the page is not stale (full rewrite instead of a
+  // delta edit).
+  bool force = 5;
+
+  reserved 100 to 199;
+}
+
+// RefreshPageResponse returns the refresh operation.
+message RefreshPageResponse {
+  Operation operation = 1;
+
+  reserved 100 to 199;
+}

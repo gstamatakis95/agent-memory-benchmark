@@ -1,0 +1,216 @@
+// memory/v1/namespace.proto
+//
+// NamespaceService: the tenant-facing control surface for namespaces.
+//
+// What is hidden and why: a Namespace never exposes its `shard_id` or its
+// ownership `epoch`. Clients address (tenant_id, namespace_id) only
+// (decision D1); a shard id in the public resource would invite clients to
+// cache it and reason about placement, and the epoch changes on every move
+// and restore without any client-visible meaning. Both are visible to
+// operators through memory.admin.v1 (ShardService.ResolveNamespace,
+// MoveService) and the ops CLI. The public `state` is exposed so a client can
+// understand why a write is being retried (MOVING/FROZEN) or rejected
+// (DELETING).
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+import "memory/v1/errors.proto";
+import "memory/v1/operation.proto";
+
+option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+
+// NamespaceService creates, reads, updates and deletes namespaces. Create,
+// Update and Delete require scope memory.admin (namespace administration
+// inside a tenant); Get/List require memory.read. A JWT whose `ns` allowlist
+// is not `["*"]` cannot create namespaces.
+service NamespaceService {
+  // CreateNamespace assigns a UUIDv7 id and a shard (catalog bin-packing,
+  // honouring tenant isolation) and returns the namespace in state
+  // PROVISIONING or ACTIVE. `name` must be unique within the tenant
+  // (ALREADY_EXISTS otherwise). Idempotent by RequestMeta.request_id.
+  rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse);
+  // GetNamespace returns one namespace with optional stats.
+  rpc GetNamespace(GetNamespaceRequest) returns (GetNamespaceResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListNamespaces lists the caller's tenant's namespaces (restricted to the
+  // JWT allowlist unless it is `["*"]`).
+  rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // UpdateNamespace applies a field-mask patch to mutable fields
+  // (display_name, mission, directives, disposition, config_overrides).
+  // Optimistic concurrency through `etag`.
+  rpc UpdateNamespace(UpdateNamespaceRequest) returns (UpdateNamespaceResponse);
+  // DeleteNamespace moves the namespace to DELETING (reads and writes are
+  // rejected from then on) and returns the purge Operation (kind
+  // DELETE_NAMESPACE). Running operations of the namespace are cancelled.
+  rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
+}
+
+// Disposition tunes the reflect agent's persona per namespace (decision
+// D12). Each value is 1..5; 0 means "inherit" (system default 3).
+message Disposition {
+  // 1 = accepts claims at face value … 5 = demands multiple sources.
+  int32 skepticism = 1;
+  // 1 = interprets questions liberally … 5 = answers exactly what was asked.
+  int32 literalism = 2;
+  // 1 = neutral tone … 5 = strongly considers the user's feelings/goals.
+  int32 empathy = 3;
+}
+
+// NamespaceStats are approximate counters maintained on the shard.
+message NamespaceStats {
+  int64 fact_count = 1;
+  int64 observation_count = 2;
+  int64 document_count = 3;
+  int64 chunk_count = 4;
+  int64 page_count = 5;
+  int64 entity_count = 6;
+  // Approximate storage used on the shard (heap + indexes + blobs).
+  int64 storage_bytes = 7;
+  google.protobuf.Timestamp last_retain_at = 8;
+  google.protobuf.Timestamp last_consolidation_at = 9;
+  // Current estimated lag between fact writes and observation updates.
+  google.protobuf.Duration consolidation_lag = 10;
+  // Facts written but not yet consolidated.
+  int64 unconsolidated_facts = 11;
+}
+
+// Namespace is the public resource. Output-only fields: namespace_id,
+// tenant_id, state, stats, timestamps, etag.
+message Namespace {
+  // Server-assigned UUIDv7.
+  string namespace_id = 1;
+  string tenant_id = 2;
+  // Tenant-unique handle, `[a-z0-9][a-z0-9._-]{0,127}`; immutable.
+  string name = 3;
+  // Human-readable label, ≤ 256 bytes.
+  string display_name = 4;
+  // What the agent using this namespace is for; injected into Reflect
+  // prompts. ≤ 4 KiB.
+  string mission = 5;
+  // Standing instructions for Reflect, each ≤ 1 KiB, ≤ 32 entries.
+  repeated string directives = 6;
+  Disposition disposition = 7;
+  // Config overrides layered over tenant and system config (decision D12):
+  // keys `models.{extract,consolidate,reflect,embed,rerank}`,
+  // `chunk.target_chars`, `recall.default_budget`, `quota.*`. Unknown keys
+  // are rejected with INVALID_ARGUMENT.
+  google.protobuf.Struct config_overrides = 8;
+  // Catalog state (see errors.proto NamespaceState).
+  NamespaceState state = 9;
+  Timestamps timestamps = 10;
+  // Populated when GetNamespaceRequest.include_stats.
+  NamespaceStats stats = 11;
+  // Opaque version for optimistic concurrency in UpdateNamespace.
+  string etag = 12;
+
+  reserved 100 to 199;
+}
+
+// CreateNamespaceRequest creates a namespace in the caller's tenant.
+message CreateNamespaceRequest {
+  // Must equal the JWT tenant_id claim.
+  string tenant_id = 1;
+  RequestMeta meta = 2;
+  // Only name, display_name, mission, directives, disposition and
+  // config_overrides are read; other fields must be unset.
+  Namespace namespace = 3;
+
+  reserved 100 to 199;
+}
+
+// CreateNamespaceResponse returns the created namespace.
+message CreateNamespaceResponse {
+  Namespace namespace = 1;
+
+  reserved 100 to 199;
+}
+
+// GetNamespaceRequest fetches one namespace.
+message GetNamespaceRequest {
+  NamespaceRef namespace = 1;
+  google.protobuf.FieldMask read_mask = 2;
+  // Populate `stats` (one extra query on the shard).
+  bool include_stats = 3;
+
+  reserved 100 to 199;
+}
+
+// GetNamespaceResponse wraps the namespace.
+message GetNamespaceResponse {
+  Namespace namespace = 1;
+
+  reserved 100 to 199;
+}
+
+// ListNamespacesRequest lists a tenant's namespaces, by name.
+message ListNamespacesRequest {
+  string tenant_id = 1;
+  PagingRequest paging = 2;
+  // Filter by state; empty = all except DELETED.
+  repeated NamespaceState states = 3;
+  // Prefix match on `name`.
+  string name_prefix = 4;
+  google.protobuf.FieldMask read_mask = 5;
+
+  reserved 100 to 199;
+}
+
+// ListNamespacesResponse is a page of namespaces.
+message ListNamespacesResponse {
+  repeated Namespace namespaces = 1;
+  PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// UpdateNamespaceRequest patches mutable fields.
+message UpdateNamespaceRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  // Carries the new values for the paths in update_mask.
+  Namespace patch = 3;
+  // Required, non-empty. Allowed paths: display_name, mission, directives,
+  // disposition, disposition.*, config_overrides. Any other path fails with
+  // INVALID_ARGUMENT (OUTPUT_ONLY / UNKNOWN_FIELD_MASK_PATH).
+  google.protobuf.FieldMask update_mask = 4;
+  // When set, the update only applies if it equals the current etag
+  // (FAILED_PRECONDITION + PreconditionFailed{ETAG_MISMATCH} otherwise).
+  string etag = 5;
+
+  reserved 100 to 199;
+}
+
+// UpdateNamespaceResponse returns the updated namespace.
+message UpdateNamespaceResponse {
+  Namespace namespace = 1;
+
+  reserved 100 to 199;
+}
+
+// DeleteNamespaceRequest deletes a namespace and all its data.
+message DeleteNamespaceRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  string operation_id = 3;
+  // Must equal the namespace `name`; a typed confirmation that guards
+  // against deleting the wrong id.
+  string confirm_name = 4;
+
+  reserved 100 to 199;
+}
+
+// DeleteNamespaceResponse returns the purge operation.
+message DeleteNamespaceResponse {
+  Operation operation = 1;
+
+  reserved 100 to 199;
+}

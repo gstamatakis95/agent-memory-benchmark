@@ -59,15 +59,15 @@ the `ALTER ROLE … SET` statements and the Compose limits are generated from it
 | Setting | Value | Why |
 |---|---|---|
 | `shared_buffers` / `effective_cache_size` / container limit | 32 GB / 96 GB / 112 GB | hot set ≈ 65 GB at 10 M facts (§3.7, N114) |
-| `synchronous_commit` | `local` (database default and `ALTER ROLE` for `engram_app`, `engram_worker`, `engram_move`, `engram_admin`) | no synchronous standby exists; a commit cannot hang (N122) |
+| `synchronous_commit` | `local` (database default and `ALTER ROLE` for `engram_app`, `engram_relay`, `engram_move`, `engram_admin`) | no synchronous standby exists; a commit cannot hang (N122) |
 | `maintenance_work_mem`, `max_parallel_maintenance_workers` | 2 GB, 4 | per-namespace index builds (§9.2) |
 | `max_connections`, `work_mem`, `max_wal_size`, `checkpoint_timeout` | 100, 64 MB, 8 GB, 15 min | |
 | `wal_level`, `archive_mode`, `archive_timeout`, `archive_command` | `replica`, on, 60 s, `pgbackrest --stanza=${STANZA} archive-push %p` | RPO ≤ 60 s for retains |
 | `autovacuum_max_workers`, `autovacuum_freeze_max_age`, `vacuum_freeze_min_age` (content partitions) | 6, 10⁹, 10⁷ | XID arithmetic below (P-11) |
-| `plan_cache_mode` (`engram_app`, `engram_worker`) | `force_custom_plan` | per-namespace partial index predicates need custom plans (N112) |
+| `plan_cache_mode` (`engram_app`) | `force_custom_plan` | per-namespace partial index predicates need custom plans (N112) |
 | `random_page_cost`, `effective_io_concurrency`, `max_parallel_workers_per_gather` | 1.1, 200, 4 | NVMe |
 | `idle_in_transaction_session_timeout`, `statement_timeout` (`engram_app`) | 30 s, 5 s read / 30 s write | A-F1 |
-| `lock_timeout` | 2 s (`engram_app`, `engram_worker`); 10 s (`engram_move`, `engram_admin`), with the freeze and Materialize activities setting `SET LOCAL lock_timeout = '35s'` for their single attempt | N82, N120, N124 |
+| `lock_timeout` | 2 s (`engram_app`: API and worker); 10 s (`engram_move`, `engram_admin`), with the freeze and Materialize activities setting `SET LOCAL lock_timeout = '35s'` for their single attempt | N82, N120, N124 |
 | `shared_preload_libraries`, `log_min_duration_statement`, `log_lock_waits` | `pg_search,pg_stat_statements`, 500 ms, on | |
 
 **Capacity budgets (N114).** These are the numbers the alerts of §9.4 and the M0.5/M0.6 exits
@@ -362,6 +362,7 @@ report` and the optional OTel delta export. Cardinality is bounded by `#shards �
 | `engram_expunge_oldest_pending_seconds` | gauge | shard, phase (`materialize`, `purge`, `index`) | age of the oldest marker not yet through the phase (SLA: 900 s, 86 400 s, 172 800 s) |
 | `engram_expunge_rows_purged_total`, `engram_expunge_phase_seconds` | counter, histogram | shard, table/phase | purge throughput; phase duration |
 | `engram_degraded_namespaces` | gauge | shard | namespaces currently in degraded mode (N119) |
+| `engram_observations_hidden_total` | counter | shard, cause (`document`, `invalidation`) | observation chains that `Expunge.Materialize` hid (`MaterializeResult.observations_hidden`, one per `derived_hidden` row of kind `observation`); the blast radius of deletes and invalidations, read against the rebuild rate (R27) |
 | `engram_intent_put_seconds`, `engram_intent_failures_total`, `engram_intent_replayed_total` | histogram, counter | shard (kind) | intent `put` latency (≈ 10 to 50 ms), failed puts (deletes refused), intents applied by a restore replay |
 | `engram_delete_ack_seconds` | histogram | shard, kind | `intent.put` + marker transaction |
 | `engram_hnsw_indexes`, `engram_hnsw_build_seconds`, `engram_hnsw_dead_fraction` | gauge, histogram, gauge | shard, table | per-namespace partial indexes (≤ 450 per shard), build time, dead fraction of the worst touched index |
@@ -448,7 +449,7 @@ phase, oldest pending age, marker-set sizes, degraded namespaces, purge rate); *
 `engramctl shard add --id 3 --cell 1 --host shard-host-2 --capacity-facts 10000000 --volume /mnt/nvme/shard-3 [--dedicated-tenant acme]`:
 
 1. **Provision.** Render the `shard-3-postgres`/`pgbouncer`/`exporter` blocks on the chosen shard host (at most four shards per host, 128 GB each), create the volume, generate secrets and a prefix-scoped blob credential for `3/*`, generate the pgBackRest config, create the DNS names of §9.1, `docker compose up -d`; the catalog row is inserted `provisioning` (invisible to placement).
-2. **Schema.** `engramctl migrate --shard 3` on the direct connection: extensions (`vector`, `pg_search`, `pg_trgm`, `pg_stat_statements`), roles (`engram_app` `NOBYPASSRLS`, `engram_relay`, `engram_move` namespace-confined and without `BYPASSRLS`, `engram_migrate` the table owner, `engram_expunge` the only role allowed `DELETE` on content tables, `engram_admin`) with the role GUCs of §9.1, tables, 16 hash partitions per big table, RLS policies, B-tree/BM25/trgm indexes (per-namespace vector indexes are created later by the sweeper), `shard_meta`; then `--check-rls` and `engramctl config lint`.
+2. **Schema.** `engramctl migrate --shard 3` on the direct connection: extensions (`vector`, `pg_search`, `pg_trgm`, `pg_stat_statements`), roles (`engram_app` `NOBYPASSRLS`, `engram_relay`, `engram_move` namespace-confined and without `BYPASSRLS`, `engram_migrate` the table owner, `engram_admin` the only role allowed `DELETE` on content tables: `engramctl` and the Expunge purge; there is no worker or expunge role, the worker connects as `engram_app`) with the role GUCs of §9.1, tables, 16 hash partitions per big table, RLS policies, B-tree/BM25/trgm indexes (per-namespace vector indexes are created later by the sweeper), `shard_meta`; then `--check-rls` and `engramctl config lint`.
 3. **Backups.** `pgbackrest stanza-create`, first full backup, `verify`, and a restore drill into a scratch container (`engramctl backup drill --shard 3 --with-deletes`) before step 5.
 4. **Config.** Append the `shards[]` block, rolling-restart api and worker one replica at a time; `engramctl shard check 3` writes a canary namespace (`_canary/3`), retains, waits, recalls, deletes (exercising the intent `put`), waits for the expunge to finish.
 5. **Register.** Catalog `UPDATE shards SET state='active', soft_cap_facts=…, max_namespaces=150, dedicated_tenant_id=…, blob_prefix='3'`; from here `CreateNamespace` may place namespaces on shard 3.

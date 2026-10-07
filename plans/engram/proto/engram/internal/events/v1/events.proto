@@ -52,7 +52,8 @@
 //     the new field instead of decoding a 36-byte ASCII UUID as a 36-byte id;
 //   * the N81 payloads (oneof 40-47) and `RowsPurged` (36) are removed;
 //   * `ChunksRetired` (22) is replaced by `ChunksTombstoned` (49);
-//   * `DocumentDeleted` lost every id list (an O(1) marker, N115).
+//   * `DocumentDeleted` lost every id list (an O(1) marker, N115) and gained
+//     `up_to_version` (N133c).
 // Removed field numbers are always reserved.
 syntax = "proto3";
 
@@ -190,11 +191,16 @@ enum ExpungeState {
 
 // DocumentDeleted: the O(1) soft-delete marker (decision N115), emitted again
 // when the expunge materializes and when it purges. No id list: consumers
-// delete by the indexed `(namespace_id, document_id)` query.
+// delete by the indexed `(namespace_id, document_id)` query restricted to
+// `document_version <= up_to_version`, because the same document_id may have
+// been retained again since (decision N133c).
 message DocumentDeleted {
   string document_id = 1;
   google.protobuf.Timestamp deleted_at = 7;
   ExpungeState state = 16;
+  // The tombstone covers every version of the document up to and including
+  // this one; versions above it are live content and must be kept.
+  int64 up_to_version = 17;
 
   // Removed in the D22 redesign (decisions N115, N117, N128): the id lists
   // and counts of the synchronous cascade.

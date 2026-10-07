@@ -62,8 +62,10 @@ sets that grow (operation kinds, event names, reasons) are `text` with a `CHECK`
 6. **Deletion is a marker; physical work is the expunge (N115, N119).** `DeleteDocument` is one
    `document_tombstones` row, `documents.state = 'deleting'`, one `deletion_log` row and one
    outbox event, committed in milliseconds at any size after the intent object is durable
-   (N122). `Invalidate` inserts a `fact_hidden` row and `Restore` deletes it. Every read path
-   applies the visibility predicate of 3.8 at ack; a throttled per-namespace `Expunge` workflow
+   (N122). The tombstone covers `(document_id, up_to_version)` (N133c): it hides the versions the
+   document had at the delete, so the same `document_id` can be retained again at once, starting at
+   `up_to_version + 1`. `Invalidate` inserts a `fact_hidden` row and `Restore` deletes it. Every read
+   path applies the visibility predicate of 3.8 at ack; a throttled per-namespace `Expunge` workflow
    materialises derived hiding, then purges rows in batches, then rebuilds touched indexes. Deletes
    are rare; recall SLOs may degrade for a namespace while markers are `pending` (3.8).
 7. **Derived versions carry evidence segments, not lineage (N117).** `root_version` is immutable
@@ -105,6 +107,13 @@ roles connect). Tables: `cells`, `tenants`, `shards`, `namespaces`, `namespace_m
 `LISTEN/NOTIFY` trigger. There is no catalog delete log: delete intents are blob objects (N122).
 Roles: `catalog_migrate` (owner), `catalog_app` (engram-api), `catalog_admin` (engramctl,
 MoveService, ShardService).
+
+**Catalog operations are derived, never stored (N127, N133d).** There is no catalog `operations`
+table. `DELETE_NAMESPACE` is answered from `namespaces.state` (`deleting` → `RUNNING`, `deleted` →
+`SUCCEEDED`) and `DELETE_TENANT` from the `tenants` row: `delete_operation_id` and
+`delete_requested_at` are written in the statement that sets `state = 'deleting'`, `deleted_at`
+with `state = 'deleted'`, and the view `tenant_delete_operations` maps them to
+`(operation_id, state, create_time, finish_time)` for `TenantService.GetTenantOperation`.
 
 ```sql
 CREATE TABLE shards (
@@ -393,6 +402,7 @@ blob `ledger/{sha256}` written before the row (N7). Ledger rows are never purged
 CREATE TABLE documents (            -- MUTABLE, fillfactor 70
   namespace_id uuid NOT NULL, tenant_id text NOT NULL, document_id text NOT NULL,
   current_version integer NOT NULL DEFAULT 0, state document_state NOT NULL DEFAULT 'active',   -- active|deleting|deleted
+  life_start integer NOT NULL DEFAULT 1,                                       -- first version of the current life (N133c); a revive sets it
   item_timestamp timestamptz, context text NOT NULL DEFAULT '',
   tags text[] NOT NULL DEFAULT '{}' CHECK (engram_tags_valid(tags)),        -- the ONLY place tags live (N113)
   metadata jsonb NOT NULL DEFAULT '{}', document_hash bytea, summary_blob_key text, summary_hash bytea,
@@ -421,11 +431,19 @@ document (partial unique index). `document_version_chunks(…, content_hash, chu
 insert-only: it carries membership **and the chunk's position in that version**, because a chunk
 row (immutable) cannot carry an ordinal that changes across versions.
 
-**Delete versus retain.** `documents.state = 'deleting'` is set in the same transaction as the
-tombstone; `Retain` of a `deleting` document is refused until the Expunge finishes (the document
-row is deleted at the end of the purge, so the id is reusable; tombstones in state `purged` are
-not part of any visibility set, which is what lets a re-created document be visible while its
-24 h tombstone still exists).
+**Delete versus retain (N133c).** `documents.state = 'deleting'` is set in the same transaction as
+the tombstone, which records `up_to_version = max(document_versions.version)` (read under the
+document lock, in-flight versions included). A `Retain` of a `deleting` document is **not
+refused**: the ack transaction *revives* the row (`state = 'active'`, `deleted_at = NULL`,
+`current_version = 0`) and assigns the version `greatest(max(document_versions.version),
+max(document_tombstones.up_to_version)) + 1`, which becomes `life_start`. The `greatest` term keeps
+the numbering above the tombstone after the Expunge has purged the covered `document_versions`
+rows. Every row inserted from then on carries `document_version >= life_start > up_to_version`, so
+the predicate leaves it visible while the covered rows are hidden and then purged. Chunk identity is
+`(document_id, content_hash, life_start)`: the same text retained again after a delete is a new
+chunk row, never the covered one. An `APPEND` after a delete starts from an empty base (its base
+chain stops at `life_start`). The Expunge deletes the `documents` row only while it is still
+`deleting`; tombstones in state `purged` are not part of any visibility set.
 
 **The per-document advisory lock is what `CommitChunk` relies on** (N40, N83): shared try-lock,
 plain reads of the version row and `documents.current_version`, proceed only on `status =
@@ -436,19 +454,21 @@ keeps only the `documents` row lock.
 #### 3.3.4 Chunks, facts and vectors (partitioned)
 
 ```sql
-CREATE TABLE chunks (               -- INSERT-ONLY; identity = content hash within the document
+CREATE TABLE chunks (               -- INSERT-ONLY; identity = content hash within the document's current life
   namespace_id uuid NOT NULL, tenant_id text NOT NULL, chunk_id uuid NOT NULL, document_id text NOT NULL,
+  document_version integer NOT NULL, life_start integer NOT NULL,               -- inserting version (N133c); documents.life_start at insert
   content_hash bytea NOT NULL, header_hash bytea NOT NULL,                      -- header excluded from the identity (N6)
   heading_path text NOT NULL DEFAULT '', header text NOT NULL DEFAULT '',
   text text NOT NULL CHECK (octet_length(text) BETWEEN 1 AND 16384),            -- <= 4,000 chars (D8)
   mentioned_at timestamptz NOT NULL,                                            -- N86: max(timestamp of every item the chunk covers)
   created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (namespace_id, chunk_id), UNIQUE (namespace_id, document_id, content_hash)
+  PRIMARY KEY (namespace_id, chunk_id), UNIQUE (namespace_id, document_id, content_hash, life_start)
 ) PARTITION BY HASH (namespace_id);
 
 CREATE TABLE facts (                -- INSERT-ONLY
   namespace_id uuid NOT NULL, tenant_id text NOT NULL, memory_id uuid NOT NULL,
-  document_id text NOT NULL, chunk_id uuid NOT NULL, ordinal smallint NOT NULL,
+  document_id text NOT NULL, document_version integer NOT NULL,                 -- the version whose CommitChunk inserted the fact (N133c)
+  chunk_id uuid NOT NULL, ordinal smallint NOT NULL,
   content_hash bytea NOT NULL,                                                  -- sha256(normalised text); the curation_log key
   extraction_key bytea NOT NULL,                                                -- N87 key; a re-extraction inserts facts under a new key
   text text NOT NULL, fact_type fact_type NOT NULL, w5 jsonb NOT NULL DEFAULT '{}',
@@ -462,12 +482,12 @@ CREATE TABLE facts (                -- INSERT-ONLY
 
 CREATE TABLE fact_vectors (         -- INSERT-ONLY, N111
   namespace_id uuid NOT NULL, tenant_id text NOT NULL, memory_id uuid NOT NULL, embedding_model text NOT NULL,
-  document_id text NOT NULL, chunk_id uuid NOT NULL, mentioned_at timestamptz NOT NULL,    -- immutable copies: the arm filters INSIDE the scan
+  document_id text NOT NULL, document_version integer NOT NULL, chunk_id uuid NOT NULL, mentioned_at timestamptz NOT NULL,    -- immutable copies: the arm filters INSIDE the scan
   embedding halfvec(768) STORAGE MAIN NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, memory_id, embedding_model),
   FOREIGN KEY (namespace_id, memory_id) REFERENCES facts ON DELETE CASCADE
 ) PARTITION BY HASH (namespace_id);
--- chunk_vectors(…, chunk_id, embedding_model, embedding_effective_at, document_id, mentioned_at, embedding) and
+-- chunk_vectors(…, chunk_id, embedding_model, embedding_effective_at, document_id, document_version, mentioned_at, embedding) and
 -- observation_version_vectors(…, ov_id, embedding_model, observation_id, version, effective_at, embedding) likewise
 ```
 
@@ -477,7 +497,7 @@ Decisions:
 |---|---|---|---|
 | vectors | side tables keyed `(content id, embedding_model)`; `ReembedChunk` and a model change insert rows; a model change is the `ReembedNamespace` workflow (insert, index, flip `namespace_models`, expunge the old), never a config flip | the vectored row never changes; versioned re-embed (A-7) | embedding on the content row |
 | `chunk_vectors` key | `(chunk_id, embedding_model, embedding_effective_at)` — one extra column beyond N111's key | a summary refresh re-embeds a chunk without re-extracting (N110a); under `as_of = T` the arm admits rows with `embedding_effective_at <= T` and `mentioned_at <= T` and takes the best admitted row per chunk (N85) | replacing the row (not insert-only) |
-| immutable copies on vector rows | `document_id`, `chunk_id`, `mentioned_at` / `effective_at` | visibility and `as_of` become in-scan filters, so an iterative HNSW scan refills past hidden rows without a join per candidate | a join to the content table per candidate |
+| immutable copies on vector rows | `document_id`, `document_version`, `chunk_id`, `mentioned_at` / `effective_at` | visibility and `as_of` become in-scan filters, so an iterative HNSW scan refills past hidden rows without a join per candidate | a join to the content table per candidate |
 | `extraction_key` on facts only | the chunk row has no key; `FinalizeVersion` inserts `fact_hidden(cause = 'reextract')` for facts of a kept chunk whose key differs from the current one (N58) | a chunk row cannot change; the unique key includes `extraction_key` so the re-extracted twin can coexist | key on `chunks`, updated in place |
 | `w5` | one `jsonb` object | payload for prompts and display, never filtered | five columns |
 | `fact_type` | enum column, not in the BM25 index | a rare filter, applied after the Top-K | a generated `fact_type_code` (no generated columns, P-10) |
@@ -524,7 +544,7 @@ at 2,000 and above the partial HNSW serves, with `hnsw.ef_search` = the arm cap 
 HIGH). Observed on the applied schema as `engram_app` under RLS, one namespace with 20,003 vectors: the stats
 plan said `create`, the generated statement built `fv_c189d1d65214_2db1c3` on `fact_vectors_p02`
 (valid), and the semantic arm with `ef_search = 150`, `iterative_scan = relaxed_order` and all three
-marker arrays planned `Index Scan using fv_… Order By: (embedding <=> …)` under the RLS one-time
+marker sets planned `Index Scan using fv_… Order By: (embedding <=> …)` under the RLS one-time
 filter, returned 150 rows and removed 2 by the visibility filter inside the scan. At 2,103 vectors
 and default costs the planner still preferred the exact scan, which is the crossover behaving as
 designed; the partial index becomes the natural choice well above the 2,000 threshold.
@@ -539,8 +559,8 @@ cascade from `facts`. The graph arm joins both endpoints and applies the visibil
 each (3.8), so a link to a hidden fact is inert from the ack of the marker.
 
 `entities` is mutable (`mention_count`, `last_seen_at`, `merged_into`; the expunge recomputes
-`canonical_name` from the remaining mentions); `entity_aliases` gains `document_id` (N118) so the
-expunge deletes the victim's aliases; `entity_mentions` (partitioned, insert-only) carries the
+`canonical_name` from the remaining mentions); `entity_aliases` gains `document_id` and `document_version`
+(N118, N133c) so the expunge deletes the victim's aliases and no others; `entity_mentions` (partitioned, insert-only) carries the
 fact's `mentioned_at`. **Under `as_of`, an `EntityRef` carries only `mention`:** `canonical_name`
 and alias merges are suppressed and graph entity hops use `entity_mentions.mentioned_at <= T`.
 Fuzzy resolution goes through `engram_entity_fuzzy(ns, norm)`, a `SECURITY DEFINER` function that
@@ -568,8 +588,8 @@ CREATE TABLE observation_version_meta (  -- INSERT-ONLY, write-once (N33)
 );
 CREATE TABLE observation_inputs (    -- INSERT-ONLY: every fact SHOWN to the stage-2 writer of version v (N41, N121)
   namespace_id uuid NOT NULL, tenant_id text NOT NULL, observation_id uuid NOT NULL, version integer NOT NULL,
-  fact_id uuid NOT NULL, document_id text NOT NULL,                              -- document_id denormalised (N117)
-  PRIMARY KEY (namespace_id, observation_id, version, fact_id)                  -- + indexes (namespace_id, document_id) and (namespace_id, fact_id)
+  fact_id uuid NOT NULL, document_id text NOT NULL, document_version integer NOT NULL,   -- the fact's, denormalised (N117, N133c)
+  PRIMARY KEY (namespace_id, observation_id, version, fact_id)                  -- + indexes (namespace_id, document_id, document_version) and (namespace_id, fact_id)
 );
 CREATE TABLE derived_hidden (        -- the materialisation of the read predicate, written by Expunge.Materialize (N119)
   namespace_id uuid NOT NULL, tenant_id text NOT NULL, kind text NOT NULL CHECK (kind IN ('observation', 'page')), id uuid NOT NULL,
@@ -580,13 +600,15 @@ CREATE TABLE derived_hidden (        -- the materialisation of the read predicat
 
 `page_versions` (insert-only, `root_version`), `page_version_meta` (write-once `superseded_at`) and
 `page_version_inputs(page_id, version, kind ∈ {fact, observation}, source_id, source_version,
-document_id)` follow the same shape; the input rows of a page are polymorphic, so they carry no FK
-and the expunge deletes them by `(namespace_id, document_id)` and by page.
+document_id, document_version)` follow the same shape; the input rows of a page are polymorphic, so
+they carry no FK and the expunge deletes them by `(namespace_id, document_id, document_version <=
+up_to_version)` and by page.
 
 **Evidence segments (N117).** The derivation set of `(O, v)` is `observation_inputs(O, w)` for
 `root_version(v) ≤ w ≤ v`: everything its writer could have seen (the batch facts attached to `O`
 and the text of the previous version, itself written from the segment's earlier inputs). `(O, v)`
-is **visible** iff no input in its segment names a tombstoned document or a hidden fact **and** no
+is **visible** iff no input in its segment names a document version covered by a tombstone
+(`document_version <= up_to_version`) or a hidden fact **and** no
 `derived_hidden` row covers it (`root_version` equal, `version >= from_version`). The old rule
 "current version hidden while `stale_delete`" is gone: a current version whose inputs are intact
 stays visible while the observation awaits a rewrite, and one with a victim in its segment is
@@ -622,11 +644,13 @@ just below the smallest unconsolidated fact **whether visible or marker-hidden**
 #### 3.3.7 Markers, Expunge state, operations, metering, exports
 
 ```sql
-CREATE TABLE document_tombstones (   -- Delete(document): ONE row; Expunge progress lives in expunge_state
-  namespace_id uuid NOT NULL, tenant_id text NOT NULL, document_id text NOT NULL, deleted_at timestamptz NOT NULL,
+CREATE TABLE document_tombstones (   -- Delete(document): ONE row covering (document_id, up_to_version); Expunge progress lives in expunge_state
+  namespace_id uuid NOT NULL, tenant_id text NOT NULL, document_id text NOT NULL,
+  up_to_version integer NOT NULL CHECK (up_to_version >= 1),                    -- hides document_version <= up_to_version (N133c)
+  deleted_at timestamptz NOT NULL,
   operation_id uuid, intent_key text,                                            -- N122: the intent object put BEFORE this row
   expunge_state text NOT NULL DEFAULT 'pending' CHECK (expunge_state IN ('pending', 'materialized', 'purged')),
-  materialized_at timestamptz, purged_at timestamptz, ..., PRIMARY KEY (namespace_id, document_id)
+  materialized_at timestamptz, purged_at timestamptz, ..., PRIMARY KEY (namespace_id, document_id, up_to_version)
 );
 CREATE TABLE chunk_tombstones (namespace_id uuid, tenant_id text, chunk_id uuid, retired_at timestamptz NOT NULL DEFAULT now(),
   reason text NOT NULL CHECK (reason IN ('replace', 'reextract')), PRIMARY KEY (namespace_id, chunk_id));         -- FK cascade from chunks
@@ -634,7 +658,7 @@ CREATE TABLE fact_hidden (namespace_id uuid, tenant_id text, memory_id uuid, hid
   cause text NOT NULL DEFAULT 'invalidate' CHECK (cause IN ('invalidate', 'reextract')), reason text NOT NULL DEFAULT '',
   intent_key text, PRIMARY KEY (namespace_id, memory_id));                                                        -- FK cascade from facts
 CREATE TABLE curation_log (namespace_id uuid, tenant_id text, memory_id uuid, content_hash bytea NOT NULL, document_id text NOT NULL,
-  action text NOT NULL CHECK (action IN ('invalidate', 'restore')), at timestamptz NOT NULL DEFAULT now(), reason text NOT NULL DEFAULT '',
+  document_version integer NOT NULL, action text NOT NULL CHECK (action IN ('invalidate', 'restore')), at timestamptz NOT NULL DEFAULT now(), reason text NOT NULL DEFAULT '',
   PRIMARY KEY (namespace_id, memory_id, at));                       -- INSERT-ONLY; no FK: it outlives the purge of the old fact
 CREATE TABLE expunge_progress (namespace_id uuid, tenant_id text, unit text, table_name text,        -- unit: a document_id, '*chunks' or '*namespace'
   phase text NOT NULL CHECK (phase IN ('materialize', 'purge', 'hygiene', 'finish')), last_key text,
@@ -642,14 +666,15 @@ CREATE TABLE expunge_progress (namespace_id uuid, tenant_id text, unit text, tab
 ```
 
 - `DeleteDocument` = (intent object in blob storage) → `engram_try_ns_fence`, exclusive document lock, `documents.state = 'deleting'`,
-  one `document_tombstones` row, one `deletion_log` row, one outbox event, commit. Nothing else is touched.
+  one `document_tombstones` row (`up_to_version` = the highest version assigned so far), one `deletion_log` row, one outbox event,
+  commit. Nothing else is touched.
 - `Invalidate(f)` = intent → `INSERT fact_hidden` + `curation_log` + `deletion_log` + outbox; `Restore(f)` = intent →
   `DELETE fact_hidden WHERE cause = 'invalidate'`, `DELETE derived_hidden WHERE cause = ('invalidation', f)`, `curation_log` row.
   **Restore is exact because nothing else encodes the invalidation** (verified: the visible set of facts, observation versions
   and page versions before `Invalidate` equals the set after `Restore`, with the materialised rows in between).
 - `FinalizeVersion(REPLACE)` inserts `chunk_tombstones(reason = 'replace')` for chunks not in the new membership (one statement);
   an un-retire on a flap is `DELETE FROM chunk_tombstones`. The curation of a re-extracted twin is re-applied at `CommitChunk`
-  from `curation_log` by `(document_id, content_hash)`, last action wins (A-16).
+  from `curation_log` by `(document_id, content_hash)` among rows with `document_version >= documents.life_start`, last action wins (A-16).
 - **Expunge (N119)**, one workflow per namespace, every activity fenced `active` at the epoch and skipped while a move is open:
   (1) **Materialize** under the exclusive derivation lock: insert `derived_hidden`, mark observations/pages `stale_delete`, set
   `expunge_state = 'materialized'`; (2) **Purge** in batches of 1,000 with 50 ms pauses — facts (the FK cascade takes vectors, links,
@@ -724,9 +749,9 @@ where `shard_id` is a routing column (`namespaces.shard_id`, `shards.shard_id`,
 | `observations`, `pages` | `(ns, observation_id)`, `(ns, page_id)` | PK | yes (FK) | PK; stale; tags GIN / name | mutable state |
 | `observation_versions` (16), `page_versions` | `(ns, observation_id, version)`, `(ns, page_id, version)` | PK, partition key (versions) | yes | PK; `(ns, ov_id)` unique; effective | `ov_id` exists only because the BM25 `key_field` must be one column |
 | `observation_version_meta`, `page_version_meta` | like their versions | PK | yes | PK | write-once `superseded_at` |
-| `observation_inputs`, `page_version_inputs` | `(ns, obs, version, fact_id)`; `(ns, page, version, kind, source_id, source_version)` | PK | yes | PK; `(ns, document_id)`; `(ns, fact_id)` / `(ns, kind, source_id)` | `document_id` denormalised for the read predicate and the expunge |
+| `observation_inputs`, `page_version_inputs` | `(ns, obs, version, fact_id)`; `(ns, page, version, kind, source_id, source_version)` | PK | yes | PK; `(ns, document_id, document_version)`; `(ns, fact_id)` / `(ns, kind, source_id)` | `document_id` and `document_version` denormalised for the read predicate and the expunge |
 | `observation_sources`, `observation_version_sources`, `page_sources` | `(ns, …)` | PK | yes | PK, memory/source | working set / frozen evidence |
-| `document_tombstones`, `chunk_tombstones`, `fact_hidden`, `curation_log` | `(ns, document_id)`, `(ns, chunk_id)`, `(ns, memory_id)`, `(ns, memory_id, at)` | PK | yes | PK; open tombstones partial | the markers (N115) |
+| `document_tombstones`, `chunk_tombstones`, `fact_hidden`, `curation_log` | `(ns, document_id, up_to_version)`, `(ns, chunk_id)`, `(ns, memory_id)`, `(ns, memory_id, at)` | PK | yes | PK; open tombstones partial | the markers (N115, N133c) |
 | `derived_hidden`, `expunge_progress` | `(ns, kind, id, root_version, cause_kind, cause_id)`; `(ns, unit, table_name)` | PK | yes | PK; cause | Expunge stage state (N119) |
 | `consolidation_batches`, `consolidation_proposals`, `consolidation_applied`, `fact_consolidation`, `consolidation_state`, `batch_jobs` | `(ns, batch_key)` … | PK | yes | PK; round; batch | |
 | `operations` | `namespace_id, operation_id` | PK | yes (FK) | PK, created, active | `operations_sweeper_idx (created_at)` and `operations_deferred_idx (deferred_until)` are shard-wide partial indexes for admin schedulers |
@@ -756,7 +781,7 @@ table below is generated from `events.proto` (`make gen-docs`).
 | `ChunkCommitted` | `CommitChunk` (re-emitted by `ReembedChunk`) | `document_id, version, chunk_id, content_hash, fact_ids[], entity_ids[], links_written, mentioned_at` |
 | `ChunksRetired` | `FinalizeVersion` | `document_id, version, page, page_count, chunk_ids[], retired_at` (chunk tombstones, paged) |
 | `DocumentVersionActivated` | `FinalizeVersion` | `document_id, version, superseded_version, fact_count, chunk_count` |
-| `DocumentDeleted` | the delete marker transaction; again by the Expunge | `document_id, deleted_at, phase` (`MARKED` \| `PURGED`) — **O(1)**, no id list; index consumers delete by the indexed `(namespace_id, document_id)` query |
+| `DocumentDeleted` | the delete marker transaction; again by the Expunge | `document_id, up_to_version, deleted_at, phase` (`MARKED` \| `PURGED`) — **O(1)**, no id list; index consumers delete by the indexed `(namespace_id, document_id)` query restricted to `document_version <= up_to_version` |
 | `FactInvalidated`, `FactRestored` | Invalidate/Restore | `fact_id, hidden_at, reason` / `fact_id` |
 | `ObservationUpserted`, `ObservationRetired` | consolidation apply | `observation_id, version, root_version, source_fact_ids[], effective_at, op_key` / `observation_id, op_key` |
 | `EntityUpserted`, `EntitiesMerged` | `CommitChunk`, resolver | `entity_id, canonical_name, type, created` / `survivor_id, merged_ids[]` |
@@ -914,14 +939,15 @@ installable outside the ParadeDB image.
 
 **The visibility predicate (N116), identical in every arm.** The recall layer loads the marker sets once
 per request, in three indexed selects (alert when a set exceeds 16 k entries; above that an arm switches to
-the `NOT EXISTS` anti-join form), and passes them as array parameters:
+the `NOT EXISTS` anti-join form), and passes them as parameters:
 
 ```sql
-SELECT engram_doc_tomb($1)            AS doc_tomb,     -- document_tombstones with expunge_state <> 'purged'
+SELECT engram_doc_tomb($1)            AS doc_tomb,     -- jsonb {document_id: up_to_version} over document_tombstones with expunge_state <> 'purged'
        engram_doc_tomb($1, true)      AS doc_pending,  -- only 'pending': the observation_inputs lookup is skipped for materialised ones
        engram_chunk_tomb($1)          AS chunk_tomb,   -- chunk_tombstones
        engram_fact_hidden_ids($1)     AS fact_hidden;  -- fact_hidden
--- facts and chunks:  visible(f) = f.document_id <> ALL($doc_tomb) AND f.chunk_id <> ALL($chunk_tomb) AND f.memory_id <> ALL($fact_hidden)
+-- facts and chunks:  visible(f) = NOT engram_doc_hidden($doc_tomb, f.document_id, f.document_version)   -- document_version <= up_to_version
+--                                   AND f.chunk_id <> ALL($chunk_tomb) AND f.memory_id <> ALL($fact_hidden)
 --                    and, for as_of = T:  f.mentioned_at <= T   (immutable row; never said_at)
 ```
 
@@ -957,7 +983,8 @@ SELECT memory_id, document_id, chunk_id, mentioned_at, embedding <=> $2::halfvec
   FROM fact_vectors
  WHERE namespace_id = $1 AND embedding_model = $m
    AND mentioned_at <= $3                                  -- as_of, omitted when unset
-   AND document_id <> ALL ($doc_tomb) AND chunk_id <> ALL ($chunk_tomb) AND memory_id <> ALL ($fact_hidden)
+   AND NOT engram_doc_hidden($doc_tomb, document_id, document_version)   -- document_version <= up_to_version (N133c)
+   AND chunk_id <> ALL ($chunk_tomb) AND memory_id <> ALL ($fact_hidden)
    AND document_id = ANY ($allowed_docs)                   -- tag filter, when set
  ORDER BY embedding <=> $2::halfvec(768)
  LIMIT 150;
@@ -970,7 +997,7 @@ reads the namespace through `fact_vectors_model_idx` and sorts (≤ 2,000 rows, 
 the namespace's partial HNSW serves (`fv_<md5(ns)[0:12]>_<md5(model)[0:6]>` on its single partition).
 Verified as `engram_app` under RLS with 20,003 vectors in the namespace: the RLS qual appears as a one-time filter
 `current_setting('engram.namespace_id')::uuid = '…'`, only partition `fact_vectors_p02` is scanned, and the plan is
-`Index Scan using fv_c189d1d65214_2db1c3 … Order By: (embedding <=> …)` with the three marker arrays and `mentioned_at` as
+`Index Scan using fv_c189d1d65214_2db1c3 … Order By: (embedding <=> …)` with the three marker sets and `mentioned_at` as
 filters inside the scan (150 rows returned, 2 removed); a namespace without an index plans the btree path plus a sort. The
 same three plans apply to `chunk_vectors` and `observation_version_vectors`.
 
@@ -980,12 +1007,12 @@ so the Top-K is over-fetched and the visibility is applied to it:
 
 ```sql
 SELECT c.* FROM (
-  SELECT memory_id, document_id, chunk_id, mentioned_at, fact_type, pdb.score(memory_id) AS score
+  SELECT memory_id, document_id, document_version, chunk_id, mentioned_at, fact_type, pdb.score(memory_id) AS score
     FROM facts
    WHERE namespace_id = $1 AND text ||| $2 AND mentioned_at <= $3
    ORDER BY pdb.score(memory_id) DESC, memory_id ASC          -- deterministic tiebreak
    LIMIT $over) c                                              -- $over = 150 when all marker sets are empty, else 300, doubled while short (≤ 3 rounds)
- WHERE c.document_id <> ALL ($doc_tomb) AND c.chunk_id <> ALL ($chunk_tomb) AND c.memory_id <> ALL ($fact_hidden)
+ WHERE NOT engram_doc_hidden($doc_tomb, c.document_id, c.document_version) AND c.chunk_id <> ALL ($chunk_tomb) AND c.memory_id <> ALL ($fact_hidden)
    AND c.document_id = ANY ($allowed_docs) AND c.fact_type = ANY ($4::fact_type[])
  ORDER BY c.score DESC, c.memory_id ASC
  LIMIT 150;
@@ -1013,10 +1040,10 @@ SELECT c.ov_id, c.observation_id, c.version, c.distance
   LEFT JOIN observation_version_meta s ON s.namespace_id = $1 AND s.observation_id = c.observation_id AND s.version = c.version
  WHERE (s.superseded_at IS NULL OR s.superseded_at > $3)             -- D9: latest version with effective_at <= T; unset as_of: the current version
    AND (cardinality(o.tags) = 0 OR o.tags && $q)                       -- scope tags, mode-specific
-   AND NOT EXISTS (SELECT 1 FROM observation_inputs i                  -- (a) the SEGMENT root_version(v) <= w <= v names a pending victim or a hidden fact
+   AND NOT EXISTS (SELECT 1 FROM observation_inputs i                  -- (a) the SEGMENT root_version(v) <= w <= v names a pending victim version or a hidden fact
                     WHERE i.namespace_id = $1 AND i.observation_id = c.observation_id
                       AND i.version BETWEEN ov.root_version AND ov.version
-                      AND (i.document_id = ANY ($doc_pending) OR i.fact_id = ANY ($fact_hidden)))
+                      AND (engram_doc_hidden($doc_pending, i.document_id, i.document_version) OR i.fact_id = ANY ($fact_hidden)))
    AND NOT EXISTS (SELECT 1 FROM derived_hidden h                      -- (b) already materialised: a PK-prefix lookup
                     WHERE h.namespace_id = $1 AND h.kind = 'observation' AND h.id = c.observation_id
                       AND h.root_version = ov.root_version AND ov.version >= h.from_version)
@@ -1029,7 +1056,7 @@ use the same two lookups with depth two (`engram_page_version_hidden`: a fact in
 tombstoned or hidden, or an observation-version input of the segment is hidden, or `derived_hidden` covers
 it); `GetPage`, `SearchPages`, Reflect's `get_page`/`search_pages`, the MCP tools and the export apply it, and
 a hidden current page returns `PAGE_HIDDEN` until the refresh lands. **Chunk arm:** `chunk_vectors` with
-`embedding_effective_at <= $3 AND mentioned_at <= $3 AND document_id <> ALL ($doc_tomb)` and the chunk
+`embedding_effective_at <= $3 AND mentioned_at <= $3 AND NOT engram_doc_hidden($doc_tomb, document_id, document_version)` and the chunk
 tombstones, best admitted row per `chunk_id`. **Evidence of any version** is that version's own rows:
 
 ```sql
@@ -1037,7 +1064,8 @@ SELECT s.memory_id, s.quote, f.text
   FROM observation_version_sources s
   JOIN facts f ON f.namespace_id = s.namespace_id AND f.memory_id = s.memory_id
  WHERE s.namespace_id = $1 AND s.observation_id = $o AND s.version = $v
-   AND f.mentioned_at <= $3 AND f.document_id <> ALL ($doc_tomb) AND f.chunk_id <> ALL ($chunk_tomb) AND f.memory_id <> ALL ($fact_hidden);
+   AND f.mentioned_at <= $3 AND NOT engram_doc_hidden($doc_tomb, f.document_id, f.document_version)
+   AND f.chunk_id <> ALL ($chunk_tomb) AND f.memory_id <> ALL ($fact_hidden);
 -- proof_count = the number of rows served
 ```
 
@@ -1053,12 +1081,12 @@ sets filter the branches (the over-fetch rule of the lexical arm applies):
 ```sql
 (SELECT memory_id, occurred_start, occurred_end FROM facts
   WHERE namespace_id = $1 AND occurred_start IS NOT NULL AND occurred_start <= $6 AND occurred_start >= $4
-    AND mentioned_at <= $3 AND document_id <> ALL ($doc_tomb) AND chunk_id <> ALL ($chunk_tomb) AND memory_id <> ALL ($fact_hidden)
+    AND mentioned_at <= $3 AND NOT engram_doc_hidden($doc_tomb, document_id, document_version) AND chunk_id <> ALL ($chunk_tomb) AND memory_id <> ALL ($fact_hidden)
   ORDER BY occurred_start DESC LIMIT 150)
 UNION ALL
 (SELECT memory_id, occurred_start, occurred_end FROM facts
   WHERE namespace_id = $1 AND occurred_start IS NOT NULL AND occurred_start > $6 AND occurred_start <= $5
-    AND mentioned_at <= $3 AND document_id <> ALL ($doc_tomb) AND chunk_id <> ALL ($chunk_tomb) AND memory_id <> ALL ($fact_hidden)
+    AND mentioned_at <= $3 AND NOT engram_doc_hidden($doc_tomb, document_id, document_version) AND chunk_id <> ALL ($chunk_tomb) AND memory_id <> ALL ($fact_hidden)
   ORDER BY occurred_start ASC LIMIT 150)
 ORDER BY abs(extract(epoch FROM (occurred_start - $6))) LIMIT 150;
 ```
@@ -1085,7 +1113,7 @@ WITH RECURSIVE hops AS (
                    AND (l.link_type <> 'causal' OR l.src_memory_id = ANY (h.frontier))) e          -- causal: forward only
           JOIN facts f ON f.namespace_id = $1 AND f.memory_id = e.nb
          WHERE NOT (e.nb = ANY (h.visited)) AND f.mentioned_at <= $3
-           AND f.document_id <> ALL ($doc_tomb) AND f.chunk_id <> ALL ($chunk_tomb) AND f.memory_id <> ALL ($fact_hidden)
+           AND NOT engram_doc_hidden($doc_tomb, f.document_id, f.document_version) AND f.chunk_id <> ALL ($chunk_tomb) AND f.memory_id <> ALL ($fact_hidden)
          GROUP BY e.nb ORDER BY max(e.weight) DESC
          LIMIT GREATEST(0, $budget - cardinality(h.visited))) s) nf
    WHERE h.hop < $hops AND cardinality(h.visited) < $budget AND nf.frontier IS NOT NULL
@@ -1111,7 +1139,8 @@ object; `$t/$e/$op` tenant, epoch, operation; `$ik` the intent object name):
 -- DeleteDocument
 SELECT pg_advisory_xact_lock(k.k1, k.k2) FROM engram_doc_lock_keys($1, $2) AS k;     -- exclusive document lock: waits for in-flight CommitChunks
 UPDATE documents SET state = 'deleting', deleted_at = now() WHERE namespace_id = $1 AND document_id = $2 AND state = 'active' RETURNING created_at;   -- 0 rows -> NOT_FOUND
-INSERT INTO document_tombstones (namespace_id, tenant_id, document_id, deleted_at, operation_id, intent_key) VALUES ($1, $t, $2, now(), $op, $ik);
+INSERT INTO document_tombstones (namespace_id, tenant_id, document_id, up_to_version, deleted_at, operation_id, intent_key)
+SELECT $1, $t, $2, max(v.version), now(), $op, $ik FROM document_versions v WHERE v.namespace_id = $1 AND v.document_id = $2;   -- up_to_version: every version assigned so far, in-flight ones included (N133c)
 UPDATE export_snapshots SET state = 'expired', expired_reason = 'document_delete', expires_at = now()
  WHERE namespace_id = $1 AND state IN ('building', 'ready') AND created_at >= $c;                   -- N126: building and ready alike
 INSERT INTO deletion_log (namespace_id, tenant_id, intent_key, kind, subject_id, epoch, operation_id) VALUES ($1, $t, $ik, 'document', $2, $e, $op);
@@ -1132,19 +1161,20 @@ could contain it is `expired`.
 
 ```sql
 SELECT engram_try_doc_lock_shared($1, $2);        -- false -> retryable DocumentBusy (100 ms)
-SELECT state, current_version FROM documents WHERE namespace_id = $1 AND document_id = $2;   -- plain read; state <> 'active' -> aborted
+SELECT state, current_version, life_start FROM documents WHERE namespace_id = $1 AND document_id = $2;   -- plain read; state <> 'active' -> aborted
 SELECT status FROM document_versions WHERE namespace_id = $1 AND document_id = $2 AND version = $v;   -- anything but 'ingesting' -> stop
-INSERT INTO chunks (namespace_id, tenant_id, chunk_id, document_id, content_hash, header_hash, heading_path, header, text, mentioned_at)
-VALUES (…) ON CONFLICT (namespace_id, document_id, content_hash) DO NOTHING RETURNING chunk_id, (created_at = now()) AS inserted;
+SELECT 1 FROM document_tombstones WHERE namespace_id = $1 AND document_id = $2 AND up_to_version >= $v;   -- a tombstone covers v (the document was deleted and re-used meanwhile) -> aborted
+INSERT INTO chunks (namespace_id, tenant_id, chunk_id, document_id, document_version, life_start, content_hash, header_hash, heading_path, header, text, mentioned_at)
+VALUES (…, $v, $life_start, …) ON CONFLICT (namespace_id, document_id, content_hash, life_start) DO NOTHING RETURNING chunk_id, (created_at = now()) AS inserted;   -- N133c: a covered chunk is never the conflict
 DELETE FROM chunk_tombstones WHERE namespace_id = $1 AND chunk_id = $chunk;                  -- un-retire a flap; no row rewritten
-INSERT INTO chunk_vectors (…, embedding_effective_at, …) VALUES (…) ON CONFLICT DO NOTHING;
-INSERT INTO facts (…, mentioned_at, said_at, …) VALUES (…)                                       -- mentioned_at from the chunk (N86), never the extractor
+INSERT INTO chunk_vectors (…, embedding_effective_at, document_version, …) VALUES (…) ON CONFLICT DO NOTHING;
+INSERT INTO facts (…, document_version, mentioned_at, said_at, …) VALUES (…, $v, …)           -- document_version = v; mentioned_at from the chunk (N86), never the extractor
 ON CONFLICT (namespace_id, chunk_id, extraction_key, content_hash) DO NOTHING;
-INSERT INTO fact_vectors (…) SELECT … ON CONFLICT DO NOTHING;
-INSERT INTO fact_hidden (…, cause) SELECT f.namespace_id, …, 'invalidate' FROM facts f JOIN curation_log c ON …   -- A-16: the LAST action per (document_id, content_hash) is re-applied
+INSERT INTO fact_vectors (…, document_version, …) SELECT … ON CONFLICT DO NOTHING;
+INSERT INTO fact_hidden (…, cause) SELECT f.namespace_id, …, 'invalidate' FROM facts f JOIN curation_log c ON …   -- A-16: the LAST action per (document_id, content_hash) of this life (c.document_version >= $life_start) is re-applied
   WHERE c.action = 'invalidate' AND f.memory_id = ANY ($new_fact_ids) ON CONFLICT DO NOTHING;
 INSERT INTO entities (…) SELECT … FROM unnest(…) ORDER BY norm ON CONFLICT (namespace_id, canonical_norm) WHERE merged_into IS NULL DO UPDATE SET mention_count = entities.mention_count + EXCLUDED.mention_count, last_seen_at = now();
-INSERT INTO entity_aliases (…, document_id) … ON CONFLICT DO NOTHING;   INSERT INTO entity_mentions (…, mentioned_at) … ON CONFLICT DO NOTHING;
+INSERT INTO entity_aliases (…, document_id, document_version) … ON CONFLICT DO NOTHING;   INSERT INTO entity_mentions (…, mentioned_at) … ON CONFLICT DO NOTHING;
 INSERT INTO fact_links (…) VALUES (…) ON CONFLICT DO NOTHING;           -- rows pre-sorted by (src, dst, type): no deadlocks
 INSERT INTO document_version_chunks (…, ordinal) VALUES (…) ON CONFLICT DO NOTHING;
 INSERT INTO token_usage_events (…) ON CONFLICT (namespace_id, usage_key) DO NOTHING;   INSERT INTO token_usage (…) ON CONFLICT (…) DO UPDATE SET …;
@@ -1163,7 +1193,7 @@ statement per effect, both markers:
 SELECT pg_advisory_xact_lock(k.k1, k.k2) FROM engram_doc_lock_keys($1, $2) AS k;            -- exclusive, lock_timeout 35 s single attempt
 INSERT INTO chunk_tombstones (namespace_id, tenant_id, chunk_id, reason)
 SELECT c.namespace_id, c.tenant_id, c.chunk_id, 'replace' FROM chunks c
- WHERE c.namespace_id = $1 AND c.document_id = $2
+ WHERE c.namespace_id = $1 AND c.document_id = $2 AND c.life_start = $life_start       -- the current life only: covered chunks have a tombstone already (N133c)
    AND c.chunk_id NOT IN (SELECT chunk_id FROM document_version_chunks WHERE namespace_id = $1 AND document_id = $2 AND version = $3)   -- document-scoped (N107)
 ON CONFLICT DO NOTHING RETURNING chunk_id;                                                    -- -> ChunksRetired (paged)
 INSERT INTO fact_hidden (namespace_id, tenant_id, memory_id, cause, reason)                   -- N58: old-key facts on a kept chunk
@@ -1191,31 +1221,32 @@ INSERT INTO derived_hidden (namespace_id, tenant_id, kind, id, root_version, fro
 SELECT i.namespace_id, i.tenant_id, 'observation', i.observation_id, ov.root_version, min(i.version), 'document', i.document_id
   FROM observation_inputs i
   JOIN observation_versions ov ON ov.namespace_id = i.namespace_id AND ov.observation_id = i.observation_id AND ov.version = i.version
- WHERE i.namespace_id = $1 AND i.document_id = $victim
+ WHERE i.namespace_id = $1 AND i.document_id = $victim AND i.document_version <= $up_to           -- only the covered versions (N133c)
  GROUP BY i.namespace_id, i.tenant_id, i.observation_id, ov.root_version, i.document_id
 ON CONFLICT DO NOTHING;                                              -- invalidation causes: the same with i.fact_id = $f and cause ('invalidation', $f)
 -- pages: fact inputs by document_id, observation inputs through the rows just written
 INSERT INTO derived_hidden (…, kind, id, root_version, from_version, …)
 SELECT … 'page', pv.page_id, pv.root_version, min(pi.version), 'document', $victim
   FROM page_version_inputs pi JOIN page_versions pv ON … AND pv.version = pi.version
- WHERE pi.namespace_id = $1 AND (pi.document_id = $victim OR (pi.kind = 'observation' AND EXISTS (
+ WHERE pi.namespace_id = $1 AND ((pi.document_id = $victim AND pi.document_version <= $up_to) OR (pi.kind = 'observation' AND EXISTS (
          SELECT 1 FROM derived_hidden h JOIN observation_versions ov ON ov.namespace_id = h.namespace_id AND ov.observation_id = h.id
           WHERE h.kind = 'observation' AND h.id = pi.source_id AND h.cause_id = $victim AND ov.version = pi.source_version
             AND ov.root_version = h.root_version AND pi.source_version >= h.from_version)))
  GROUP BY …;
 UPDATE observations SET stale_delete = true, stale_since = coalesce(stale_since, now()) WHERE (namespace_id, observation_id) IN (…);   -- nudge Consolidate (root rebuilds) and PageRefresh
-UPDATE document_tombstones SET expunge_state = 'materialized', materialized_at = now() WHERE namespace_id = $1 AND document_id = $victim;
+UPDATE document_tombstones SET expunge_state = 'materialized', materialized_at = now() WHERE namespace_id = $1 AND document_id = $victim AND up_to_version = $up_to;
 ```
 
 The purge then deletes in primary-key batches, recording `expunge_progress.last_key`:
 
 ```sql
 DELETE FROM facts WHERE namespace_id = $1 AND memory_id IN
-  (SELECT memory_id FROM facts WHERE namespace_id = $1 AND document_id = $victim AND memory_id > $last ORDER BY memory_id LIMIT 1000);
+  (SELECT memory_id FROM facts WHERE namespace_id = $1 AND document_id = $victim AND document_version <= $up_to AND memory_id > $last ORDER BY memory_id LIMIT 1000);
 -- FK cascades: fact_vectors, fact_links, entity_mentions, observation_inputs, observation_sources, observation_version_sources, fact_consolidation, fact_hidden
--- then chunks (cascade: chunk_vectors, chunk_tombstones, document_version_chunks), page_version_inputs / entity_aliases / curation_log
--- WHERE document_id = $victim, recompute entities.canonical_name from the remaining mentions, ledger rows of an explicit delete,
--- document_versions, the documents row; blob_tombstones for xcache/, ver/, ledger/, proposal blobs
+-- then chunks WHERE document_version <= $up_to (cascade: chunk_vectors, chunk_tombstones, document_version_chunks), page_version_inputs /
+-- entity_aliases / curation_log WHERE document_id = $victim AND document_version <= $up_to, recompute entities.canonical_name from the
+-- remaining mentions, ledger rows of the covered versions of an explicit delete, document_versions WHERE version <= $up_to, the documents
+-- row only while it is still 'deleting' (a revived document keeps it, N133c); blob_tombstones for xcache/, ver/, ledger/, proposal blobs
 ```
 
 **Move queries** (N124). *Bulk copy,* per range of ≤ 100 k rows ordered by primary key, `READ COMMITTED`, no snapshot or
@@ -1306,7 +1337,7 @@ namespace (visible-fact count via the marker anti-join, counts of chunks, docume
   readable in `RETURNING` on a partitioned table. `ReembedChunk` inserts a `chunk_vectors` row and nothing else.
 - Every read path (recall arms, GetMemory, ListMemories, Reflect and MCP tools, GetPage/SearchPages, the
   export) applies the 3.8 visibility predicate; `PAGE_HIDDEN` is the page error; recall passes the four marker
-  arrays (`doc_tomb`, `doc_pending`, `chunk_tomb`, `fact_hidden`) to every arm and to the async-index join.
+  sets (`doc_tomb` and `doc_pending` as jsonb `{document_id: up_to_version}`, `chunk_tomb`, `fact_hidden`) to every arm and to the async-index join.
 - The fence is the try-lock over `engram_ns_fence_key`; the derivation lock is `engram_ns_derivation_key`; the
   document lock is `engram_doc_lock_keys`; exclusive takers make one 35 s attempt (3.3). Marker transactions
   take no lock beyond the shared fence.
@@ -1341,3 +1372,4 @@ namespace (visible-fact count via the marker anti-join, counts of chunks, docume
 | P-5, P-19, P-16, H-20 | N131, N116 | `engram_entity_fuzzy` (`SECURITY DEFINER`); cleanup `DELETE` carries `namespace_id`; `pick_shard` derives the count; scheduler writes through `WithNamespaceTx(write)` |
 | A-5, A-6 | N127 | `operations.kind` adds `delete_tenant`, `expunge`, `reembed`; `superseded_by`, `cancel_reason` |
 | A-7 | N111 | `namespace_models`, catalog `embedding_model`, `ReembedNamespace` |
+| round-3 realisation | N133 c, d | `document_tombstones.up_to_version` (in the key), `document_version` on chunks, facts, vector rows, evidence inputs, aliases and `curation_log`, `documents.life_start`, `chunks` identity per life, `engram_doc_hidden`; catalog `tenants.delete_operation_id`, `delete_requested_at` and the view `tenant_delete_operations` |

@@ -39,8 +39,8 @@ epoch=$2`.
   attempt with `lock_timeout = 35 s`**, longer than any legal 30 s writer, instead of a 5 s retry
   storm (D22); they queue fairly behind the writers in flight when they asked, and writers that
   arrive later are refused by their try-lock, so a continuous stream of writers cannot starve
-  them. Role defaults: `lock_timeout = 2 s` for `engram_app` and `engram_worker`, 10 s for
-  `engram_move` and `engram_admin`.
+  them. Role defaults: `lock_timeout = 2 s` for `engram_app` (the API and the worker connect as
+  the same role), 10 s for `engram_move` and `engram_admin`.
 - **Marker transactions take no derivation lock** (N82, N120): a delete, an invalidate and a
   tombstone are correct without one because visibility is evaluated at read time. A document delete
   takes the exclusive per-document lock (it flips `documents.state` and must not interleave with
@@ -195,16 +195,23 @@ The steps below run once per document, all documents of a request inside one sha
       update_mode, request_id, operation_id)` (§3.3.3).
    3. `INSERT documents(namespace_id, document_id, current_version = 0, state = 'active') ON
       CONFLICT (namespace_id, document_id) DO UPDATE SET updated_at = now() RETURNING
-      current_version, state` (the `DO UPDATE` takes the row lock), then `v = coalesce(max(version),
-      0) + 1` over `document_versions`. This assigns the **version** under the document's row
-      lock, so versions are dense and monotone per document (D8). `state <> 'active'`
-      (`deleting`) or a row in `document_tombstones` → `ABORTED` +
-      `OperationConflict{DOCUMENT_PURGING, existing_operation_id = the DELETE_DOCUMENT
-      operation}`: the document id is reusable only after the expunge has finished and the
-      tombstone is dropped (N115); a client that wants to re-use the content immediately uses a new
-      `document_id`. For `APPEND` the base is **not** recorded here: `LoadItem` assigns it under
-      the same row lock (N56). The ack keeps **only the `documents` row lock** (`FOR UPDATE`) and
-      takes no advisory lock (N83).
+      current_version, state, life_start` (the `DO UPDATE` takes the row lock), then `v =
+      greatest(max(document_versions.version), max(document_tombstones.up_to_version)) + 1`
+      (`coalesce` 0). This assigns the **version** under the document's row lock, so versions are
+      dense and monotone per document (D8) and never at or below a tombstone's `up_to_version`
+      even after the Expunge purged the covered version rows. **A `deleting` document is revived,
+      not refused (N133c):** in the same statement sequence `UPDATE documents SET state =
+      'active', deleted_at = NULL, current_version = 0, life_start = v WHERE state = 'deleting'`
+      (a brand-new row, or one whose delete was already purged while its tombstone still exists,
+      also gets `life_start = v`).
+      The tombstone keeps hiding versions `<= up_to_version`; the new version starts at
+      `up_to_version + 1`, so its facts are visible at `CommitChunk` while the old ones stay hidden
+      until the Expunge purges them. No conflict is raised and the client never
+      waits for an expunge. For `APPEND` the base is **not** recorded here: `LoadItem` assigns it
+      under the same row lock (N56) and never reaches below `life_start`, so a revived document
+      appends to nothing it deleted (an `APPEND` that is the first version of a life, `v =
+      life_start`, is stored as `replace`: there is nothing to append to). The ack keeps **only the `documents` row lock** (`FOR UPDATE`)
+      and takes no advisory lock (N83).
    4. `INSERT document_versions(namespace_id, document_id, version = v, content_hash, status =
       'ingesting', operation_id, ledger_id)`.
    5. `INSERT operations(namespace_id, operation_id, kind = RETAIN_DOCUMENT, state = PENDING,
@@ -243,8 +250,8 @@ manifest_key, counters}` is workflow-local.
 1. **`LoadItem`** (short write tx + blob get/put): the ledger row (and raw blob) and the current
    active version's chunk hash set. For `APPEND` it **assigns the base (N56)**: `SELECT … FROM
    documents … FOR UPDATE`, then `UPDATE document_versions SET append_base_version = (SELECT
-   max(version) … WHERE version < v) WHERE version = v AND append_base_version IS NULL` — the
-   highest existing version, *even one still ingesting* (two appends A and B 1 s apart therefore
+   max(version) … WHERE version < v AND version >= life_start) WHERE version = v AND
+   append_base_version IS NULL` — the highest existing version of the current life, *even one still ingesting* (two appends A and B 1 s apart therefore
    chunk `body(c) ‖ A` and `body(c) ‖ A ‖ B` and the newer finalise drops nothing of A's). **It
    reads one object (N104):** each version has `body_key`/`body_hash`, the full reconstructed body
    as a content-addressed blob `{shard}/{tenant}/{ns}/ver/{sha256}`; `LoadItem` puts the new
@@ -271,7 +278,9 @@ manifest_key, counters}` is workflow-local.
    **not fatal**: the summary falls back to the first heading or the first 200 chars
    (`summary_fallback = true`).
 4. **`PlanChunks`** (read tx, one query): for every manifest hash, `SELECT chunk_id, content_hash
-   FROM chunks WHERE namespace_id AND document_id AND content_hash = ANY($1)`, the chunk's row in
+   FROM chunks WHERE namespace_id AND document_id AND life_start = $life_start AND content_hash =
+   ANY($1)` (chunks of a deleted life are never candidates, so the same text after a delete is
+   `absent` and gets a new row, N133c), the chunk's row in
    `chunk_tombstones`, the `extraction_key` of its visible facts, and `document_version_chunks`
    membership for version `v`. Each chunk is classified `member` (already committed for `v`: the
    restart path), `live` (unchanged: membership row only), `tombstoned` (un-retire by deleting the
@@ -320,7 +329,8 @@ manifest_key, counters}` is workflow-local.
       1. fence prelude at the caller's epoch.
       2. `SELECT engram_try_doc_lock_shared(namespace_id, document_id)`; refused → retryable
          `DocumentBusy` (100 ms). Then plain reads: `documents.state` (`deleting` →
-         `aborted{document_deleted}`), the document tombstone row (present → `aborted`), and
+         `aborted{document_deleted}`), `documents.life_start`, the document tombstones (one with
+         `up_to_version >= v` → `aborted`: `v` was deleted, even if the document was revived since), and
          `document_versions.status` for `v` (N40: `status <> 'ingesting'` → `superseded`/`aborted`;
          the workflow skips straight to step 7). `FinalizeVersion` and the delete marker
          transaction take the *exclusive* form of the same key under `lock_timeout = 5 s`, so a
@@ -328,9 +338,9 @@ manifest_key, counters}` is workflow-local.
          deleted document.
       3. `SELECT 1 FROM document_version_chunks WHERE (namespace_id, document_id, v, h)` → exists →
          `COMMIT`, return `already` (the exactly-once guard).
-      4. `INSERT chunks(chunk_id uuidv7, …, content_hash = h, header_hash, text, header,
-         heading_path, mentioned_at) ON CONFLICT (namespace_id, document_id, content_hash) DO
-         NOTHING`, then the chunk vector `INSERT chunk_vectors(…, embedding_model,
+      4. `INSERT chunks(chunk_id uuidv7, …, document_version = v, life_start, content_hash = h,
+         header_hash, text, header, heading_path, mentioned_at) ON CONFLICT (namespace_id,
+         document_id, content_hash, life_start) DO NOTHING`, then the chunk vector `INSERT chunk_vectors(…, embedding_model,
          embedding_effective_at) ON CONFLICT DO NOTHING` (N85: `embedding_effective_at` = the
          `mentioned_at` of the newest item the summary in the embedded header covers), and
             `INSERT document_version_chunks` with the chunk's `ordinal` in this version (chunk positions
@@ -339,15 +349,15 @@ manifest_key, counters}` is workflow-local.
          content row exists.**
       5. If the chunk has no visible facts under the current `extraction_key`: `INSERT facts(…,
          mentioned_at, said_at, occurred_*, prompt_version, extraction_key, document_id,
-         chunk_id)` and `INSERT fact_vectors(…, embedding_model)` (the vector rows carry immutable copies of `document_id`,
-         `chunk_id` and `mentioned_at`, so the visibility and `as_of` predicates run inside the index
+         document_version = v, chunk_id)` and `INSERT fact_vectors(…, embedding_model)` (the vector rows carry immutable copies of `document_id`,
+         `document_version`, `chunk_id` and `mentioned_at`, so the visibility and `as_of` predicates run inside the index
          scan; `facts` is unique on `(namespace_id, chunk_id, extraction_key, content_hash)`, the
          idempotency of this step); entities in one sorted upsert;
-         `entity_aliases` (with the producing `document_id`, N118), `entity_mentions` (with the fact's
+         `entity_aliases` (with the producing `document_id` and `document_version`, N118, N133c), `entity_mentions` (with the fact's
          `mentioned_at`, N118); `fact_links ON CONFLICT DO NOTHING` in key order (undirected
          edges once with `src < dst`, N34). **Curation sticks (N115):** for each new fact whose
-         `(document_id, content_hash)` matches the last action of a `curation_log` row, insert the
-         same `fact_hidden` marker.
+         `(document_id, content_hash)` matches the last action of a `curation_log` row of this life
+         (`document_version >= life_start`), insert the same `fact_hidden` marker.
       6. `token_usage_events` / `token_usage` (PD-1). No counter, progress or `chunks_done` update.
       7. `INSERT outbox(ChunkCommitted)` (paged at 256 ids). `COMMIT`. **The facts of this chunk
          are visible to Recall from this instant (D16).**
@@ -355,14 +365,16 @@ manifest_key, counters}` is workflow-local.
 7. **`FinalizeVersion`** (fenced write tx) — the per-document serialisation point:
    1. fence prelude; then the exclusive per-document advisory lock under `lock_timeout = 5 s` (it
       waits for every in-flight `CommitChunk` of the document).
-   2. `SELECT current_version AS c, state FROM documents … FOR UPDATE`. `state <> 'active'` → mark
-      the version `deleted`, the operation `CANCELLED{CANCEL_REASON_DOCUMENT_DELETED}`, return. A
+   2. `SELECT current_version AS c, state FROM documents … FOR UPDATE`. `state <> 'active'` or a
+      tombstone with `up_to_version >= v` → mark the version `deleted`, the operation
+      `CANCELLED{CANCEL_REASON_DOCUMENT_DELETED}`, return. A
       replay (version already terminal) returns the recorded result.
    3. **Newer-version check (N40):** if `max(version) > v`, mark `v` `superseded`, tombstone
       **nothing**, leave `current_version`, and end the operation `SUCCEEDED` with
       `document_version = v` and `superseded_by = max` (N49, N127).
    4. **`v` is the newest:** supersede older `ingesting` rows, then **insert**
-      `chunk_tombstones(reason = 'replace')` for the document's chunks not in `v`'s membership
+      `chunk_tombstones(reason = 'replace')` for the chunks of the document's current life
+      (`life_start`) not in `v`'s membership
       (document-scoped subquery, N107: `content_hash NOT IN (SELECT content_hash FROM
       document_version_chunks WHERE namespace_id = $1 AND document_id = $2 AND version = $3)`) and
       `fact_hidden(reason = 'reextract')` for visible facts of kept chunks whose `extraction_key`
@@ -411,7 +423,7 @@ extraction cache already makes the concurrent waste zero LLM calls).
 |---|---|---|---|---|---|---|
 | API validate + quota | handler | — | client retry | authz interceptor resolves shard+epoch | none | — |
 | Raw blob put (> 64 KiB) | handler | `ledger/{sha256(content)}` (N7) | client retry | — | none | — |
-| Ledger + version + operation | handler | `(namespace_id, method, request_id)`; `(namespace_id, operation_id)` | client retry with same `request_id` | shared try-lock, `active` @ epoch; `documents` row `FOR UPDATE` only (N83); tombstone check | write tx | `DocumentVersionStarted` |
+| Ledger + version + operation | handler | `(namespace_id, method, request_id)`; `(namespace_id, operation_id)` | client retry with same `request_id` | shared try-lock, `active` @ epoch; `documents` row `FOR UPDATE` only (N83); revive of a `deleting` document, version above `up_to_version` (N133c) | write tx | `DocumentVersionStarted` |
 | Start workflow | handler | workflow id `ns/{ns}/op/{op}` (`USE_EXISTING`) | client retry; op-sweeper N3 | — | none | — |
 | `LoadItem` | activity | `(ns, doc, v)`; `append_base_version IS NULL` and `body_key IS NULL` predicates (N56, N104) | `P-db` | shared try-lock, `active` @ epoch; `documents` row `FOR UPDATE` for the base | short write tx + blob get/put | — |
 | `Chunk` | activity | `(ns, doc, v)` → same manifest bytes (N59, N86) | `P-pure` | none | none | — |
@@ -489,9 +501,9 @@ sequenceDiagram
 | Two `APPEND`s A and B submitted 1 s apart | `LoadItem(v₂)` assigns `append_base_version = v₁` under the `documents` row lock (N56), so `v₂` chunks `body(c) ‖ A ‖ B`; its finalise tombstones only the re-cut tail chunk of `v₁` | no lost append |
 | Prompt or model bump re-extracts a kept chunk | `stale_extraction`: new facts are inserted under the new `extraction_key`; `FinalizeVersion` inserts `fact_hidden(reextract)` for the old ones (N58) | one visible fact set per chunk |
 | Worker crashes with a 20 MB history | The run continued-as-new at the last wave boundary with `RetainResume` | never near Temporal's 50 MB / 51 k-event limits |
-| Late `CommitChunk` of a superseded or deleted version | The plain reads under the shared document lock return `superseded`/`deleted`/tombstone → `superseded`/`aborted`, no insert | no resurrection after the ack |
+| Late `CommitChunk` of a superseded or deleted version | The plain reads under the shared document lock return `superseded`/`deleted`/a tombstone with `up_to_version >= v` → `superseded`/`aborted`, no insert, also when the document was revived since | no resurrection after the ack |
 | Document deleted mid-retain | The marker transaction takes the exclusive document lock (waiting for in-flight commits), flips `documents.state`, inserts the tombstone and cancels the retain operations (`CANCEL_REASON_DOCUMENT_DELETED`); a `CommitChunk` racing it fails the try-lock (`DocumentBusy`) or sees the tombstone → `aborted`. Rows a racing commit inserted before the marker are hidden by it like the rest | nothing from the document is visible after the delete ack |
-| Retain into a document id that is still `DELETING` | `ABORTED` + `OperationConflict{DOCUMENT_PURGING}` naming the delete operation | the client waits for the expunge or uses a new id |
+| Retain into a deleted document id while its expunge is pending | The ack revives the `documents` row and assigns `v = greatest(max version, max up_to_version) + 1`; the tombstone keeps hiding versions `<= up_to_version`; the same text gets new chunk rows (identity includes `life_start`) | the new content is visible at once, the old content stays hidden until purged (N133c) |
 | `CommitChunk` meets a cache or staging blob purged by a concurrent expunge | `InputBlobMissing` (N100): the chunk sub-pipeline re-runs `ExtractChunk` and `EmbedChunk` (≤ 2 re-runs), then `chunk_failed`; the expunge deletes `xcache` blobs only when no visible chunk references the hash **and** the blob is older than `xcache_grace = 24 h` | no permanent failure from a purge race |
 | `FinalizeVersion` queued behind a stream of `CommitChunk`s | `CommitChunk` try-locks fail while the exclusive request is queued → `DocumentBusy`, backoff 100 ms; the exclusive request is granted within 5 s | no starvation (`TestDocLock_NoStarvation`) |
 | A freeze, delete freeze or restore is queued on the namespace | Writers' shared try-lock is refused → `NamespaceFrozen{200 ms}` at once; no pooled connection waits (N82) | recall p95 on a second namespace of the shard does not move (`TestFence_PoolNotExhausted`) |
@@ -706,7 +718,7 @@ with no facts never starts one.
 rewrite": `stale_write` — evidence changed (a `REPLACE` tombstoned a source, a restore brought one
 back); `stale_delete` — the expunge materialized a delete or an invalidation touching a segment.
 Neither hides anything. What is hidden is decided by the read predicate (N117): a version `(O, v)`
-is invisible iff an input in its segment `root_version(v) ≤ w ≤ v` names a tombstoned document or
+is invisible iff an input in its segment `root_version(v) ≤ w ≤ v` names a document version covered by a tombstone or
 a hidden fact, or a `derived_hidden` row covers it; the latest *visible* version is what Recall
 serves, and none if every version is hidden until the rebuild lands. Hiding is **permanent for
 document causes** at every `as_of`, because an older version written with the victim in view must
@@ -714,8 +726,9 @@ never resurface; a rebuild writes a new root version and clears nothing. A stale
 model the observation's *remaining visible* sources and quotes only; hidden observations are
 selected first and may fill a round (up to 100 facts' worth of rebuilds), rate-limited by
 `consolidate.max_rebuilds_per_round`. An observation whose last visible source disappears is
-retired by the rebuild (`RETIRE`). `engram_observations_hidden_total{shard}` tracks the hidden set
-against an SLO.
+retired by the rebuild (`RETIRE`). `engram_observations_hidden_total{shard}` (§9) counts the
+observation chains Materialize hid (`MaterializeResult.observations_hidden`), so the blast radius of
+deletes and invalidations is visible against the rebuild rate.
 
 **Caps.** ≤ 100 facts per round → ≤ 13 routing batches + ≤ 4 rebuild batches; stage 2 adds one call
 per touched observation, ≈ 3.5 calls per chunk overall (D3); ≤ 4 groups in parallel;
@@ -963,10 +976,14 @@ read predicate every time (N116, N117), so there is nothing to go stale or to ra
    3. `UPDATE documents SET state = 'deleting', deleted_at = now() WHERE namespace_id AND
       document_id AND state = 'active' RETURNING current_version` — zero rows because it is already
       `deleting` → return the existing delete operation (idempotent); no row → `NOT_FOUND`.
-   4. `UPDATE document_versions SET status = 'deleted' WHERE namespace_id AND document_id`
-      (including an `ingesting` version, whose workflow is cancelled below).
-   5. `INSERT document_tombstones(namespace_id, tenant_id, document_id, deleted_at, operation_id,
-      intent_key, expunge_state = 'pending')` — **the marker**.
+   4. `UPDATE document_versions SET status = 'deleted' WHERE namespace_id AND document_id AND
+      status <> 'deleted'` (including an `ingesting` version, whose workflow is cancelled below;
+      versions of an earlier, already deleted life are `deleted` and stay so).
+   5. `INSERT document_tombstones(namespace_id, tenant_id, document_id, up_to_version, deleted_at,
+      operation_id, intent_key, expunge_state = 'pending')` with `up_to_version =
+      max(document_versions.version)` of the document — **the marker**. It covers every version the
+      document has now, in-flight ones included; the document id may be retained again at once and
+      its new versions start above `up_to_version` (N133c).
    6. `UPDATE export_snapshots SET state = 'expired', expired_at = now() WHERE namespace_id AND
       state IN ('building', 'ready') AND created_at >= (SELECT min(created_at) FROM
       document_versions WHERE namespace_id AND document_id)` (N126; `building` is expired too, and
@@ -977,7 +994,7 @@ read predicate every time (N116, N117), so there is nothing to go stale or to ra
       state IN (PENDING, RUNNING, DEFERRED)`; `INSERT deletion_log(kind = 'document', subject_id =
       document_id, operation_id)` (idempotency key = the intent object name, N21); `INSERT
       idempotency_keys`.
-   8. outbox `DocumentDeleted{document_id, deleted_at, state = PENDING}` — one O(1) event, the
+   8. outbox `DocumentDeleted{document_id, up_to_version, deleted_at, state = PENDING}` — one O(1) event, the
       last statement (A-F1). `COMMIT`. Milliseconds at any document size.
 4. **Ack path**: `SignalWithStart("ns/{ns}/expunge", ExpungeInput{target = MARKERS, operation_id})`;
    `CancelWorkflow` for the cancelled retain operations; return `Operation{RUNNING}` with
@@ -989,10 +1006,12 @@ read predicate every time (N116, N117), so there is nothing to go stale or to ra
 marker sets **once per request** with three indexed selects (`engram_doc_tomb`,
 `engram_chunk_tomb`, `engram_fact_hidden_ids`): `doc_tomb` (`document_tombstones` rows in `pending` or
 `materialized`), `doc_pending` (only `pending`: the per-candidate `observation_inputs` lookup is
-skipped for materialized ones), `chunk_tomb` and `fact_hidden`, and passes them as array parameters (`<> ALL($n)`) to every arm and to the
-async-index join; sizes are bounded by expunge lag and alerted above 16 k entries, above which an
-arm falls back to an SQL anti-join. `visible(f) ≡ f.document_id ∉ DocTomb ∧ f.chunk_id ∉ ChunkTomb
-∧ f.memory_id ∉ FactHidden`. Derived versions add the evidence-segment check of N117 (§5.4.2).
+skipped for materialized ones), `chunk_tomb` and `fact_hidden`, and passes them as parameters to every arm and to the
+async-index join (`doc_tomb` and `doc_pending` as a jsonb map `{document_id: up_to_version}`, tested by
+`engram_doc_hidden`; `chunk_tomb` and `fact_hidden` as arrays, `<> ALL($n)`); sizes are bounded by expunge lag and alerted above 16 k entries, above which an
+arm falls back to an SQL anti-join. `visible(f) ≡ f.document_version > up_to(f.document_id, DocTomb) ∧
+f.chunk_id ∉ ChunkTomb ∧ f.memory_id ∉ FactHidden` (`up_to` = 0 for a document with no open tombstone,
+so only versions `<= up_to_version` are hidden and a re-used `document_id` stays visible above it). Derived versions add the evidence-segment check of N117 (§5.4.2).
 `GetMemory`, `ListMemories`, Reflect's tools, the MCP tools, `GetPage`/`SearchPages` and the export
 apply the same predicate, whose SQL form is `engram_visible_facts`, `engram_visible_chunks`, `engram_visible_observation_versions` and `engram_visible_page_versions` (with `engram_obs_version_hidden` and `engram_page_version_hidden` for a single version; §3.4). `as_of` stays `mentioned_at ≤ T`
 on the immutable row.
@@ -1007,7 +1026,12 @@ workflow sleeps 1 min); like every shard-wide scheduler the `expunge` sweeper ac
 ownership (N97). Input `ExpungeInput{scope, operation_id, target, document_ids, batch_size = 1000,
 batch_pause = 50 ms, xcache_grace = 24 h}`. Idempotent by construction: every statement is a
 predicate delete that re-runs to zero rows, and progress is recorded in `expunge_progress`
-(`unit`, `table_name`, `last_key`) so a restarted run resumes at the last batch.
+(`unit`, `table_name`, `last_key`) so a restarted run resumes at the last batch. The worker
+connects as `engram_app` like the API; the activities that `DELETE` content, `INSERT
+derived_hidden` or `UPDATE document_tombstones` (Materialize, Purge, Finish) run as
+`engram_admin`, the only role with those verbs (§3.3.1): there is no separate worker or expunge
+role. **A run is per tombstone `(document_id, up_to_version)`:** every predicate below carries
+`document_version <= up_to_version`, so a document id that was retained again keeps its new rows.
 
 1. **Materialize** (`derivation tx`; exclusive derivation lock, `lock_timeout = 35 s`, one attempt,
    N120). For each pending marker: find every observation version and page version whose evidence
@@ -1026,13 +1050,14 @@ predicate delete that re-runs to zero rows, and progress is recorded in `expunge
    must never resurface at any `as_of`.
 2. **Purge** (`write tx`, batches of 1,000 with 50 ms pauses, heartbeat, `ContinueAsNew` every 200
    batches), only **after every registered index and Kafka consumer cursor has passed the delete's
-   `seq`** (`engram_consumers_passed`) (`ids_elided` victims are deleted by the indexed `(namespace_id, document_id)` query).
+   `seq`** (`engram_consumers_passed`) (`ids_elided` victims are deleted by the indexed `(namespace_id, document_id)` query restricted to `document_version <= up_to_version`).
    Rows in FK order: `fact_links` and `entity_mentions` (cascade from `facts`), the evidence rows
    naming the victim's facts (`observation_version_sources`, `observation_inputs`,
    `observation_sources`, `page_version_inputs`, `page_sources`), `fact_vectors`, `facts`,
    `chunk_vectors`, `chunks` (their `chunk_tombstones` and `fact_hidden` rows go with them),
-   `document_version_chunks`, `document_versions`, the victim's `entity_aliases` and
-   `curation_log` rows, then the explicit-delete `ingest_ledger` rows under the admin role (the
+   `document_version_chunks`, `document_versions` (`version <= up_to_version`), the victim's
+   `entity_aliases` and `curation_log` rows, then the explicit-delete `ingest_ledger` rows of the
+   covered versions under the admin role (the
    only role the append-only trigger admits for `DELETE`; right-to-erasure outranks append-only
    purity, and `deletion_log` is the audit trail), then blobs: the raw `ledger/` body when no other
    ledger row references the hash, `ver/` bodies, manifests, `consolidate/` proposals, and
@@ -1047,7 +1072,8 @@ predicate delete that re-runs to zero rows, and progress is recorded in `expunge
    `DROP INDEX` with no graph repair (§5.4.3).
 4. **Finish**: `expunge_state = 'purged'`, outbox `DocumentDeleted{PURGED}`, operation
    `SUCCEEDED{rows_purged, blobs_purged}`; the tombstone row is deleted 24 h later by the sweeper
-   (the document id becomes reusable then).
+   (the `documents` row is deleted at the end of the purge only while it is still `deleting`; a document
+   retained again since keeps it, and the document id was reusable from the delete ack).
 
 **Other targets.** `CHUNK_TOMBSTONES` purges chunks tombstoned by `replace`/`reextract` after a 1 h
 grace (the un-retire window for documents that flap): their facts and vectors go, the tombstone
@@ -1106,11 +1132,15 @@ are being purged: `GetOperation` derives `DELETE_NAMESPACE` state from `namespac
 `TenantService.DeleteTenant`: put one tenant intent object; catalog `tenants.state = 'deleting'`
 (every request for the tenant now fails `PreconditionFailed{TENANT_DELETING}`); run
 `freeze_delete` for every namespace of the tenant (so the delete is effective for all of them at
-the ack); insert the `DELETE_TENANT` operation row in the catalog database and return it with one
-`DELETE_NAMESPACE` operation per namespace (N127). Workflow `TenantDelete`, id
+the ack); in the same catalog transaction as `state = 'deleting'` write `tenants.delete_operation_id`
+and `delete_requested_at`, and return the `DELETE_TENANT` operation with one `DELETE_NAMESPACE`
+operation per namespace (N127). **There is no operation row** (N133d): `GetTenantOperation` derives
+the state from the `tenants` row (view `tenant_delete_operations`: `deleting` → `RUNNING`, `deleted`
+→ `SUCCEEDED`, `deleted_at` the finish time), as `GetOperation` derives `DELETE_NAMESPACE` from
+`namespaces.state` (§5.4.3). Workflow `TenantDelete`, id
 `tenant/{tenant_id}/delete`, on the cell's `control` task queue (a queue for the few workflows that
 are not shard-scoped, PD-10), runs the namespace expunge for each namespace as child workflows on
-their own shard queues, ≤ 8 in parallel, then `tenants.state = 'deleted'`. Rejected: a loop inside
+their own shard queues, ≤ 8 in parallel, then `tenants.state = 'deleted'` with `deleted_at`. Rejected: a loop inside
 the API handler (not durable across API restarts).
 
 #### 5.4.5 Soft invalidate / restore
@@ -1119,7 +1149,7 @@ the API handler (not durable across API restarts).
 transaction (no derivation lock): fence prelude; `INSERT fact_hidden(memory_id, cause =
 'invalidate', reason, intent_key)` — a conflict is `ALREADY_INVALIDATED` (idempotent success), a
 non-fact id `MEMORY_NOT_A_FACT`, an unknown id `NOT_FOUND`; `INSERT curation_log(memory_id,
-content_hash, document_id, action = 'invalidate')`; `UPDATE observations SET stale_write = true
+content_hash, document_id, document_version, action = 'invalidate')`; `UPDATE observations SET stale_write = true
 WHERE observation_id IN (SELECT observation_id FROM observation_inputs WHERE fact_id = $1)` and
 `UPDATE pages SET stale_delete = true, stale_seq = stale_seq + 1` for pages whose
 `page_version_inputs` name the fact (narrow mutable rows); outbox `FactInvalidated`,
@@ -1148,7 +1178,7 @@ v1/v2/v3 interleaving; invalidate-twice.
 | Event | Written at ack | Readers (read-time predicate) | Done later by the expunge |
 |---|---|---|---|
 | Replace retires a chunk (`FinalizeVersion`) | `chunk_tombstones(replace)`; `fact_hidden(reextract)` for stale-key facts | facts and chunks hidden; observations and pages derived from them **stay visible**, marked `stale_write` (a replace is a write) | after 1 h grace: purge chunk rows (`CHUNK_TOMBSTONES`); rebuilds follow like any other |
-| Explicit document delete | `documents.state = 'deleting'`, `document_tombstones`, intent object, expired snapshots, cancelled retains | facts, chunks, links to them, entity aliases, every observation and page version whose segment names the document: all hidden | materialize (≤ 15 min), purge (≤ 24 h), index rebuild (≤ 48 h) |
+| Explicit document delete | `documents.state = 'deleting'`, `document_tombstones(document_id, up_to_version)`, intent object, expired snapshots, cancelled retains | facts, chunks, links to them, entity aliases of the covered versions, every observation and page version whose segment names a covered version: all hidden; versions of a re-used id above `up_to_version` stay visible | materialize (≤ 15 min), purge (≤ 24 h), index rebuild (≤ 48 h) |
 | Invalidate | `fact_hidden`, `curation_log`, intent object, stale marks | the fact and every version whose segment names it hidden | materialize `derived_hidden(invalidation)`; no purge |
 | Restore | marker and `derived_hidden(invalidation)` rows deleted | exact inverse | — |
 | Namespace delete | intent object, `freeze_delete`, catalog `deleting` | all reads and writes rejected | `DROP INDEX`, batched purge, blobs, shred key |
@@ -1215,7 +1245,7 @@ sequenceDiagram
 | `CommitChunk` racing the marker | The marker waits for the in-flight commit (shared holder); a commit that starts later fails its try-lock (`DocumentBusy`) or, after the marker commits, sees the tombstone → `aborted`; rows a commit inserted before the marker are hidden by it | no post-ack visibility, even for late inserts |
 | `ApplyBatch` concurrent with the delete | Either the apply re-verification sees the marker and discards the proposal, or the apply commits first holding the shared derivation lock, Materialize waits for it and records the new version in `derived_hidden`; in the meantime the read predicate hides it | invariant holds under concurrency (`Derivation.tla`) |
 | Expunge worker dies mid-batch | Transaction rolls back; retry repeats the predicate delete from `expunge_progress` | exactly-once effect |
-| Purge starts before an async index consumer caught up | The purge waits for every registered cursor to pass the delete's `seq`; an `ids_elided` victim is deleted from the external index by `(namespace_id, document_id)` | the index never returns a row the shard no longer has, and the read join drops non-visible hits anyway |
+| Purge starts before an async index consumer caught up | The purge waits for every registered cursor to pass the delete's `seq`; an `ids_elided` victim is deleted from the external index by `(namespace_id, document_id)` and `document_version <= up_to_version` | the index never returns a row the shard no longer has, and the read join drops non-visible hits anyway |
 | Blob store down during `PurgeBlobs` | `P-blob` retries; rows are already gone; operation stays `RUNNING` at `phase = purge` | eventual |
 | Namespace delete while a move is copying | Rejected at the API (`NAMESPACE_BUSY`); the operator aborts the move first | no interleaving |
 | A move starts while an expunge is pending | `StartMove` sets `move_epoch`; every expunge activity returns `paused`; the markers are copied or reconciled with the namespace and the expunge resumes on the target (§5.5) | the move sees only the rows inserted after its copy began (N124) |
@@ -1223,7 +1253,7 @@ sequenceDiagram
 | Primary fails right after a delete ack | The intent object exists; the promoted or restored shard comes up `frozen/restore` and replays every intent newer than `restore_point − 10 min` before reads reopen (§5.5.5) | RPO 0 for acknowledged deletes (N122) |
 | Invalidate, then the observation is rebuilt, then Restore | The rebuild wrote a new root version without the fact; Restore deleted the marker and the `derived_hidden(invalidation)` rows; the older hidden versions are visible again at their `as_of` | curation is reversible and exact |
 | `StreamSnapshot(version = n − 1)` after the ack | The version is `expired` → `PreconditionFailed{SNAPSHOT_EXPIRED}`; the client applies the next delta (with delete records) or takes a full snapshot | no acknowledged delete served through an old export |
-| Retain into the deleted document id | `ABORTED` + `OperationConflict{DOCUMENT_PURGING}` until the tombstone is dropped | no new rows under a tombstoned id |
+| Retain into the deleted document id | Allowed at once (see the retain row above); a second delete of the re-used id inserts a second tombstone with a higher `up_to_version` (it is part of the key) | no new row is ever covered by an older tombstone |
 
 **Kafka: not used.** The marker is one Postgres transaction; the expunge is one Temporal workflow;
 the outbox already tells every consumer what was deleted.

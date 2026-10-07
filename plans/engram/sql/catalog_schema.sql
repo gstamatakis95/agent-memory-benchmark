@@ -65,6 +65,11 @@ CREATE TABLE cells (
 
 -- -----------------------------------------------------------------------------
 -- tenants. config: the tenant layer of system < tenant < namespace inheritance (D12).
+-- DELETE_TENANT (N127, N133d) has no operation row: the catalog derives the operation from this
+-- row, as DELETE_NAMESPACE is derived from namespaces.state. delete_operation_id and
+-- delete_requested_at are written in the same statement that sets state = 'deleting' (the
+-- DeleteTenant ack); deleted_at is written by the last step of the TenantDelete workflow together
+-- with state = 'deleted'. See the view tenant_delete_operations.
 -- -----------------------------------------------------------------------------
 CREATE TABLE tenants (
   tenant_id     text PRIMARY KEY CHECK (tenant_id ~ '^[a-z0-9-]{1,64}$'),
@@ -74,9 +79,25 @@ CREATE TABLE tenants (
   config        jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(config) = 'object'),
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now(),
-  deleted_at    timestamptz,
-  CHECK ((state = 'deleted') = (deleted_at IS NOT NULL))
+  delete_operation_id  uuid,                        -- the DELETE_TENANT operation id (UUIDv7 minted by engram-api at the ack)
+  delete_requested_at  timestamptz,                 -- the ack time = the operation's create_time
+  deleted_at    timestamptz,                        -- the operation's finish_time
+  CHECK ((state = 'deleted') = (deleted_at IS NOT NULL)),
+  CHECK ((state IN ('deleting', 'deleted')) = (delete_operation_id IS NOT NULL)),
+  CHECK ((state IN ('deleting', 'deleted')) = (delete_requested_at IS NOT NULL))
 );
+
+-- DELETE_TENANT operations, derived (N133d): 'deleting' -> RUNNING, 'deleted' -> SUCCEEDED. No other
+-- state is derivable: TenantDelete is retried until it completes, so a stuck delete stays RUNNING.
+-- TenantService.GetTenantOperation reads this view (admin, tenant-scoped).
+CREATE VIEW tenant_delete_operations AS
+SELECT t.tenant_id,
+       t.delete_operation_id AS operation_id,
+       CASE t.state WHEN 'deleting' THEN 'RUNNING' ELSE 'SUCCEEDED' END AS state,
+       t.delete_requested_at AS create_time,
+       t.deleted_at AS finish_time
+  FROM tenants t
+ WHERE t.state IN ('deleting', 'deleted');
 
 CREATE TRIGGER tenants_touch BEFORE UPDATE ON tenants
   FOR EACH ROW EXECUTE FUNCTION catalog_touch_updated_at();

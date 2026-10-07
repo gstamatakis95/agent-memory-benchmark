@@ -491,9 +491,9 @@ sequenceDiagram
    the document is expired (N126); the `DELETE_DOCUMENT` operation, `deletion_log` and one
    `DocumentDeleted` outbox event (an O(1) event with no id list) as the last statement. Milliseconds
    at any document size. `Invalidate` is one `fact_hidden` row and `Restore` deletes it.
-3. **Visibility is a read-time predicate** (N116, N117): `visible(f) ≡ f.document_id ∉ DocTomb ∧
+3. **Visibility is a read-time predicate** (N116, N117): `visible(f) ≡ ¬hidden(DocTomb, f.document_id, f.document_version) ∧
    f.chunk_id ∉ ChunkTomb ∧ f.memory_id ∉ FactHidden`, over the three marker sets loaded once per
-   request; an observation or page version is visible iff no input in its evidence segment
+   request (`DocTomb` maps each tombstoned document to its `up_to_version`, N133); an observation or page version is visible iff no input in its evidence segment
    (`inputs(O, w)` for `root_version(v) ≤ w ≤ v`) names a tombstoned document or hidden fact and no
    `derived_hidden` row covers it. Depth is fixed at two (fact → observation → page), so this is two
    `EXISTS`, not a walk. Nothing is computed at delete time: no lineage, no recorded set, no

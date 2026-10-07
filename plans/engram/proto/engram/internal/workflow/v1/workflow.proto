@@ -820,6 +820,10 @@ message PurgeBatchInput {
   // Lowest outbox cursor among the registered index/Kafka consumers; the
   // purge refuses to start while it is below the delete's `seq`.
   int64 min_consumer_cursor = 6;
+  // MARKERS only: the tombstone's up_to_version. Every delete carries
+  // `document_version <= up_to_version`, so rows of a document id that was
+  // retained again are never purged (decision N133c).
+  int64 up_to_version = 7;
 }
 
 // PurgeBatchResult reports one batch.

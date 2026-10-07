@@ -233,7 +233,7 @@ at most one Engram detail plus, when a retry hint exists, `RetryInfo`.
 | `WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state}` | `FAILED_PRECONDITION` | The shard's `namespace_ownership` row disagrees with the resolved (shard, epoch): stale catalog cache, move cut over between resolve and execute, restore bumped the epoch (D2 row 3). The API invalidates its catalog entry, re-resolves and retries the whole call **once** for writes; a call that sees `namespace_state = MOVED_OUT` (the window between cutover sub-steps (c) and (d), §5.5) re-resolves in a **bounded loop of ≤ 5 s**, exactly like `NamespaceFrozen`, because the catalog still names the source until (d) and a single retry would fail identically (N52, N125). It is surfaced only when that also fails and counts against the availability SLI. The routing hint of the permanent `moved_out` row (`target_shard_id`, `next_epoch`, N93) travels as the **internal** `engram.internal.errors.v1.MovedOutHint`, consumed by the router and dropped by the interceptor; no shard id is part of a public message (N128, A-12). | Retry with backoff (a fresh resolve happens server-side). Never persist epochs. |
 | `NamespaceFrozen{namespace_id, retry_after, reason}` (+ `RetryInfo`) | `FAILED_PRECONDITION` | Writes during the freeze window of a move, a restore or a delete (D5), or while an exclusive taker is queued on the namespace fence and the writer's `try`-lock was refused (`reason` unspecified, `retry_after` = 200 ms; the fence never waits, N82; the internal `FenceBusy` detail is mapped to this). Reads continue only for a move freeze; a delete or restore freeze rejects them (N122). The API already retried with backoff for up to 30 s. | Retry after `retry_after`. |
 | `NamespaceNotReady{namespace_id, retry_after}` (+ `RetryInfo`) | `UNAVAILABLE` | The target shard of a move is `ready` but not yet `active` (cutover sub-steps (c) to (b″), well under a second, N125). The API retries inside its bounded loop first. | Retry after `retry_after`. |
-| `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: the document is `DELETING` (its tombstone exists until the expunge finished, `DOCUMENT_PURGING`, N115), namespace cutover in progress, page already refreshing, snapshot already running. | `WaitOperation(existing_operation_id)` then resubmit. |
+| `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: namespace cutover in progress, page already refreshing, snapshot already running. | `WaitOperation(existing_operation_id)` then resubmit. |
 | `OperationConflict{reason: IDEMPOTENCY_KEY_REUSED}` | `ALREADY_EXISTS` | `request_id`/`operation_id` reused with a different request hash; namespace/page `name` already taken. | Use a fresh id; the stored one is bound to a different request. |
 | `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation, etag mismatch, `Invalidate` on a non-fact or already-invalidated id, namespace `DELETING`, snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
 | — | `UNAUTHENTICATED` | Missing/invalid/expired JWT. | Refresh the token. |
@@ -1434,8 +1434,9 @@ half is the throttled per-namespace `Expunge` workflow** (N119) that the returne
 `DELETE_DOCUMENT`) tracks: materialize (≤ 15 min), purge rows and blobs (≤ 24 h), index rebuilt
 (≤ 48 h); Recall SLOs may degrade while a marker is pending. `expected_version` gives
 compare-and-delete. Deleting a document that is already `DELETING` returns the existing operation
-(idempotent), deleting an unknown one is `NOT_FOUND`, and a Retain into a `DELETING` document is
-`ABORTED` + `OperationConflict{DOCUMENT_PURGING}` until the tombstone is dropped. Full file under
+(idempotent), deleting an unknown one is `NOT_FOUND`, and a Retain into a deleted `document_id` is accepted at
+once: it starts at `up_to_version + 1`, so the new content is visible while the deleted versions stay
+hidden and are expunged (N133). Full file under
 `plans/engram/proto/memory/v1/document.proto`.
 
 #### `memory/v1/namespace.proto`
@@ -2084,8 +2085,8 @@ grpcurl -H "authorization: Bearer $JWT" -max-time 10 \
 
 From `deletedAt` on, Recall, Reflect, GetMemory, ListMemories, GetPage, SearchPages and
 StreamSnapshot return nothing derived from the document; `WaitOperation` on the returned id
-completes when the rows and blobs are physically gone (≤ 24 h), and a Retain into the same
-`documentId` before then is `ABORTED` + `OperationConflict{DOCUMENT_PURGING}`.
+completes when the rows and blobs are physically gone (≤ 24 h). A Retain into the same
+`documentId` is accepted at once and starts a new version above the tombstone (N133).
 
 ### Round-3 changes
 

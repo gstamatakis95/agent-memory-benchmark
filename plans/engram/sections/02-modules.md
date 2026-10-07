@@ -61,7 +61,7 @@ Four ideas carry the design; everything else is a detail of one of them.
 2. The planner is a `pipeline.Pipeline[*recall.State]`; its steps run in order and each records a
    `StageTiming`:
 3. `Embed` — `gateway.Embedder.Embed("search_query: " + text)` (LRU hit skips it).
-4. `Visibility` — `tx.Visible().Sets(ctx)` loads `doc_tomb`, `chunk_tomb`, `fact_hidden` once
+4. `Visibility` — `tx.Visible().Sets(ctx)` loads `doc_tomb` (document → `up_to_version`), `chunk_tomb`, `fact_hidden` once
    (three indexed selects) and resolves the tag filter into an allowed-document set (N116).
 5. `Arms` — runs the configured `[]recall.Arm` (Strategy): lexical and temporal immediately, semantic
    and chunks when the embedding arrives, graph in two seeded waves; each arm calls
@@ -209,7 +209,7 @@ type Deleter interface {
 }
 
 // OperationWaiter implements WaitOperation: park on Temporal's workflow-result long-poll (≤ MaxOpenWaits per
-// process), else poll the operations row every 1 s ± 250 ms; DELETE_NAMESPACE is served from the catalog (N70).
+// process), else poll the operations row every 1 s ± 250 ms; DELETE_NAMESPACE and DELETE_TENANT are served from the catalog, derived from `namespaces.state` / the `tenants` row (N70, N133d).
 type OperationWaiter interface {
 	Wait(ctx context.Context, sc authz.RequestScope, op id.OperationID, timeout time.Duration) (*memoryv1.Operation, bool /*timedOut*/, error)
 }
@@ -292,7 +292,7 @@ type Registry interface { // shards and tenants (admin surface, §9)
 	SetShardState(ctx context.Context, s id.ShardID, to ShardState) error
 	ListShards(ctx context.Context, cell string) ([]Shard, error)
 	GetTenant(ctx context.Context, t id.TenantID) (*TenantEntry, error)
-	TenantOperation(ctx context.Context, t id.TenantID, op id.OperationID) (*memoryv1.Operation, error) // DELETE_TENANT lives here (N127)
+	TenantOperation(ctx context.Context, t id.TenantID, op id.OperationID) (*memoryv1.Operation, error) // DELETE_TENANT lives here, derived from tenants.state / deleted_at (N127, N133d)
 }
 type Resolver interface {
 	Resolve(ctx context.Context, ns id.NamespaceID) (*Entry, error)      // never blocks on the catalog with a fresh entry
@@ -495,7 +495,7 @@ type GraphReader interface {
 
 ```go
 type Markers interface {
-	TombstoneDocument(ctx context.Context, t DocumentTombstone) error                  // document_tombstones 'pending'; intent_key recorded
+	TombstoneDocument(ctx context.Context, t DocumentTombstone) error                  // document_tombstones 'pending' covering (document, t.UpToVersion = highest version assigned, N133c); intent_key recorded
 	TombstoneChunks(ctx context.Context, reason ChunkReason, cs []id.ChunkID) error    // 'replace' | 'reextract'
 	Hide(ctx context.Context, f id.FactID, cause HideCause, reason, intentKey string) (changed bool, err error) // fact_hidden: 'invalidate' | 'reextract'
 	Unhide(ctx context.Context, f id.FactID) (changed bool, err error)                 // refuses a 'reextract' marker
@@ -503,7 +503,7 @@ type Markers interface {
 }
 // Every marker method also inserts the shard-local deletion_log row keyed by the intent name (N122), in the same transaction.
 type MarkerReader interface {
-	Sets(ctx context.Context) (MarkerSets, error)  // doc_tomb, doc_pending, chunk_tomb, fact_hidden: three indexed selects (N116)
+	Sets(ctx context.Context) (MarkerSets, error)  // doc_tomb and doc_pending ({document → up_to_version}, N133c), chunk_tomb, fact_hidden: three indexed selects (N116)
 	Curation(ctx context.Context, doc id.DocumentID, hash [32]byte) (CurationState, error) // last action for a twin, re-applied at CommitChunk
 }
 type Derived interface {
@@ -547,7 +547,7 @@ for `FinalizeVersion` and the delete marker transaction), the derivation lock is
 exclusive fence on `AdminTx.Ownership().FenceExclusive` (`Freeze`, delete freeze, restore: one 35 s
 attempt). Key spaces are disjoint (N113): namespace fence, derivation lock, document lock.
 
-Roles: `engram_app` and `engram_worker` run `lock_timeout = 2 s`, `engram_move` and `engram_admin`
+Roles: `engram_app` (API and worker alike; there is no worker role) runs `lock_timeout = 2 s`, `engram_move` and `engram_admin`
 10 s, all with `synchronous_commit = local`. *Test seam:* testcontainers Postgres with the real
 migrations — RLS (a query without `SET LOCAL` returns nothing), the append-only ledger,
 `TestContent_InsertOnly` (N113: a test-only trigger raises on any `UPDATE` of a content row),
@@ -568,7 +568,7 @@ type Filter struct {
 	AsOf *time.Time              // mentioned_at ≤ AsOf inside the predicate; chunk arm also embedding_effective_at ≤ AsOf (N85)
 	FactTypes []memoryv1.FactType
 	AllowedDocs []id.DocumentID  // the tag filter, resolved once (N116)
-	Markers store.MarkerSets     // doc_tomb / chunk_tomb / fact_hidden: applied to EVERY hit, also an external engine's (N44, N116)
+	Markers store.MarkerSets     // doc_tomb (document → up_to_version) / chunk_tomb / fact_hidden: applied to EVERY hit, also an external engine's (N44, N116)
 }
 type Hit struct { ID uuid.UUID; Kind Kind; Score float64 /* arm-local; normalised per query by the planner (N67) */; MentionedAt time.Time }
 
@@ -1284,7 +1284,7 @@ func TemporalType(err error) string               // ApplicationError type: "Wro
 | `WrongShardOrEpoch` | `FAILED_PRECONDITION` | writes: once, after a re-resolve; `MOVED_OUT`: follow the internal hint, reads then a bounded loop ≤ 5 s (N52, N98); never for a workflow | store ownership check, move fence |
 | `NamespaceFrozen` | `FAILED_PRECONDITION` | bounded (≤ 30 s in the API; `P-frozen` in workflows) | store ownership check (`frozen/*`), the refused fence try-lock (`FenceBusy`, 200 ms) |
 | `NamespaceNotReady` | `UNAVAILABLE` | yes, inside the API's 5 s re-resolve loop (N125) | store ownership check on a `ready` shard |
-| `OperationConflict` | `ABORTED` (concurrent conflict) / `ALREADY_EXISTS` (`IDEMPOTENCY_KEY_REUSED`) | `ABORTED`: wait for `existing_operation_id`, resubmit | api idempotency; `DOCUMENT_PURGING` (tombstone not yet dropped, N115), `NAMESPACE_BUSY`, `PAGE_REFRESHING` |
+| `OperationConflict` | `ABORTED` (concurrent conflict) / `ALREADY_EXISTS` (`IDEMPOTENCY_KEY_REUSED`) | `ABORTED`: wait for `existing_operation_id`, resubmit | api idempotency; `NAMESPACE_BUSY`, `PAGE_REFRESHING` (a retain into a deleted document id is not a conflict, N133c) |
 | `PreconditionFailed` | `FAILED_PRECONDITION` | no | catalog CAS, move cutover, etag and version checks, snapshot expiry, `PAGE_HIDDEN`, `ALREADY_INVALIDATED` (types in §4) |
 | `Unavailable` | `UNAVAILABLE` | yes | catalog miss when down, gateway 429/5xx, Temporal start failure, shard down, `ShardNotLocal` |
 | `PermanentLLM` | `INTERNAL` | no | gateway 4xx, wrong embedding dims, schema-invalid output after one repair prompt |
@@ -1316,7 +1316,7 @@ type).
 | Expunge | one per namespace; purge in 1,000-row batches with a 50 ms pause behind the consumer-cursor check; SLAs materialize ≤ 15 min, purge ≤ 24 h, index ≤ 48 h; `ExpungeMaterializeSlow` pages at 900 s | `expunge.Expunger`, `engram_expunge_oldest_pending_seconds` | N119 |
 | Reflect | ≤ 10 iterations, ≤ 100 k context tokens, ≤ 300 s, tool deadline 10 s, ≤ 4 concurrent reflects per namespace; one `Reserve` per iteration | `reflect.Caps`, api semaphore | D12, N130 |
 | Move | dirty copy in key ranges of ≤ 100,000 rows, 4 parallel streams, the writer path stays live; freeze watchdog `max(120 s, 60 s + 1 s per 10 k facts)`, ≤ 15 min; ≤ 4 moves per cell, one per namespace; cutover (b″) and (d) retried indefinitely | `move.StartOptions` | N124, N125 |
-| Fence acquisition | writers never wait (`pg_try_advisory_xact_lock_shared`, refusal → `NamespaceFrozen{200 ms}`); exclusive takers make one attempt with `lock_timeout` 35 s; role defaults 2 s (`engram_app`, `engram_worker`), 10 s (`engram_move`, `engram_admin`) | `store.Store.InNamespace`, role defaults | N82: no pooled connection waits behind a queued freeze |
+| Fence acquisition | writers never wait (`pg_try_advisory_xact_lock_shared`, refusal → `NamespaceFrozen{200 ms}`); exclusive takers make one attempt with `lock_timeout` 35 s; role defaults 2 s (`engram_app`), 10 s (`engram_move`, `engram_admin`) | `store.Store.InNamespace`, role defaults | N82: no pooled connection waits behind a queued freeze |
 | Derivation lock | shared by every writer of derived versions; exclusive for `Materialize` and `Restore`, one 35 s attempt | `store.Derived` | N120 |
 | Per-document lock | `CommitChunk` shared try-lock (`DocumentBusy`, 100 ms); `FinalizeVersion` and the delete marker exclusive | `store.DocumentWriter.Lock` | N83 |
 | Outbox event size | ≤ 256 ids and ≤ 16 KiB per event; elided above 4,096 ids | `outbox.Writer`, `outbox.Group` | N80; the CHECK is a backstop |

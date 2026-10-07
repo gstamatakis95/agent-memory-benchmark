@@ -225,8 +225,8 @@ message NamespaceNotReady {
 message OperationConflict {
   // Operation id or request id the caller supplied.
   string operation_id = 1;
-  // The operation that owns the conflicting state (e.g. the purge running on
-  // the document you are retaining into).
+  // The operation that owns the conflicting state (e.g. the move or delete of
+  // the namespace you are writing to, or the refresh of the page).
   string existing_operation_id = 2;
   OperationConflictReason reason = 3;
 }
@@ -237,14 +237,16 @@ enum OperationConflictReason {
   // The same request_id/operation_id was reused with a different request
   // hash within the retention window (ALREADY_EXISTS).
   OPERATION_CONFLICT_REASON_IDEMPOTENCY_KEY_REUSED = 1;
-  // The document is DELETING: its tombstone exists until the expunge has
-  // finished and the tombstone has been dropped (ABORTED; decision N115).
-  // `existing_operation_id` is the DELETE_DOCUMENT operation to wait on.
-  OPERATION_CONFLICT_REASON_DOCUMENT_PURGING = 2;
   // The namespace has a delete or move cutover in progress (ABORTED).
   OPERATION_CONFLICT_REASON_NAMESPACE_BUSY = 3;
   // A refresh of the same page is already running (ABORTED).
   OPERATION_CONFLICT_REASON_PAGE_REFRESHING = 4;
+
+  // DOCUMENT_PURGING (2) is removed (decision N133c): a deleted document_id
+  // can be retained again at once and its new versions start above the
+  // tombstone's up_to_version, so a retain never waits for an expunge.
+  reserved 2;
+  reserved "OPERATION_CONFLICT_REASON_DOCUMENT_PURGING";
 }
 
 // PreconditionFailed → FAILED_PRECONDITION. The request was well-formed but

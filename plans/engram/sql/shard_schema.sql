@@ -15,6 +15,9 @@
 -- column, fillfactor 100; the only DML after the insert is a DELETE by the expunge (engram_admin).
 -- Visibility is a READ-TIME predicate over small marker tables (document_tombstones,
 -- chunk_tombstones, fact_hidden, derived_hidden; N115-N117), never a flag stamped at delete time.
+-- A document tombstone covers (document_id, up_to_version) (N133c): every row that carries a
+-- document_id also carries the document_version that inserted it, and the predicate hides only
+-- document_version <= up_to_version, so a deleted document_id can be re-used at once.
 -- Mutable state lives in narrow tables (fillfactor 50-70, HOT): documents, observations, pages,
 -- the *_version_meta rows, markers, namespace_stats, vector_indexes.
 --
@@ -628,7 +631,8 @@ CREATE TRIGGER vector_indexes_touch BEFORE UPDATE ON vector_indexes
 -- application. Events are thin (N12, N80): ids, versions and flags; never text or vectors; a
 -- delete is ONE O(1) marker event (DocumentDeleted); ids are 16-byte `bytes`, an event carries at
 -- most 256 ids, larger sets are paged, above 4,096 ids the event carries counts only
--- (ids_elided; consumers delete by the indexed (namespace_id, document_id) query, N119). Moves do
+-- (ids_elided; consumers delete by the indexed (namespace_id, document_id, document_version <=
+-- up_to_version) query, N119, N133c). Moves do
 -- not read the outbox (N124). The CHECK is the backstop, not the mechanism.
 CREATE SEQUENCE outbox_seq AS bigint CACHE 1;
 
@@ -726,14 +730,21 @@ CREATE INDEX ingest_ledger_received_idx ON ingest_ledger (namespace_id, received
 CREATE TRIGGER ingest_ledger_append_only BEFORE UPDATE OR DELETE ON ingest_ledger
   FOR EACH ROW EXECUTE FUNCTION engram_forbid_ledger_mutation();
 
--- documents (D8): MUTABLE (state, current_version, tags, metadata, context; tags are item-level
--- and live HERE only, N113). state 'deleting' is set in the same transaction as the tombstone
--- (N115); Retain of a 'deleting' document is refused until the Expunge removed the row.
+-- documents (D8): MUTABLE (state, current_version, life_start, tags, metadata, context; tags are
+-- item-level and live HERE only, N113). state 'deleting' is set in the same transaction as the
+-- tombstone (N115). A Retain of a 'deleting' document REVIVES it (N133c) in the ack transaction:
+-- state 'active', deleted_at NULL, current_version 0 (nothing finalised yet) and life_start = the
+-- new version, which is greatest(max(document_versions.version), max(document_tombstones.up_to_version))
+-- + 1, so a version number never falls at or below a tombstone's up_to_version. life_start is the
+-- first version of the document's current life (1 for a new document): chunk identity is
+-- (document_id, content_hash, life_start), so a revived document never re-uses a chunk row that a
+-- tombstone covers. The Expunge deletes this row only while it is still 'deleting'.
 CREATE TABLE documents (
   namespace_id      uuid NOT NULL,
   tenant_id         text NOT NULL,
   document_id       text NOT NULL CHECK (octet_length(document_id) BETWEEN 1 AND 256),
   current_version   integer NOT NULL DEFAULT 0 CHECK (current_version >= 0),
+  life_start        integer NOT NULL DEFAULT 1 CHECK (life_start >= 1),
   state             document_state NOT NULL DEFAULT 'active',
   item_timestamp    timestamptz,
   context           text NOT NULL DEFAULT '',
@@ -806,11 +817,17 @@ CREATE INDEX document_versions_op_idx ON document_versions (namespace_id, operat
 -- of UTF-8 (D8). Position in a version lives in document_version_chunks.ordinal; the vector in
 -- chunk_vectors; retirement in chunk_tombstones. The extraction key is NOT here: a prompt or model
 -- bump re-extracts a kept chunk and the new facts carry the new key (N58).
+-- document_version is the version whose CommitChunk inserted the row (the version a document
+-- tombstone's up_to_version is compared with, N133c). life_start is documents.life_start at insert:
+-- identity within a document is (content hash, life), so the same text in a revived document is a
+-- NEW row and the covered one is purged by the Expunge without touching the new content.
 CREATE TABLE chunks (
   namespace_id     uuid NOT NULL,
   tenant_id        text NOT NULL,
   chunk_id         uuid NOT NULL,
   document_id      text NOT NULL,
+  document_version integer NOT NULL CHECK (document_version >= 1),
+  life_start       integer NOT NULL CHECK (life_start >= 1),
   content_hash     bytea NOT NULL CHECK (octet_length(content_hash) = 32),   -- sha256(text)
   header_hash      bytea NOT NULL CHECK (octet_length(header_hash) = 32),    -- sha256(header) (N6)
   heading_path     text NOT NULL DEFAULT '' CHECK (octet_length(heading_path) <= 1024),
@@ -819,8 +836,9 @@ CREATE TABLE chunks (
   mentioned_at     timestamptz NOT NULL,                                     -- N86: max(timestamp of every item whose bytes the chunk covers); facts inherit it
   created_at       timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, chunk_id),
-  UNIQUE (namespace_id, document_id, content_hash),
-  FOREIGN KEY (namespace_id, document_id) REFERENCES documents (namespace_id, document_id)
+  UNIQUE (namespace_id, document_id, content_hash, life_start),
+  FOREIGN KEY (namespace_id, document_id) REFERENCES documents (namespace_id, document_id),
+  CHECK (life_start <= document_version)
 ) PARTITION BY HASH (namespace_id);
 
 -- membership and position of chunks in document versions (REPLACE tombstones chunks not in the new set)
@@ -848,6 +866,7 @@ CREATE TABLE facts (
   tenant_id            text NOT NULL,
   memory_id            uuid NOT NULL,
   document_id          text NOT NULL,
+  document_version     integer NOT NULL CHECK (document_version >= 1),       -- version whose CommitChunk inserted the fact (N133c)
   chunk_id             uuid NOT NULL,
   ordinal              smallint NOT NULL CHECK (ordinal >= 0),               -- position in the chunk's extraction
   content_hash         bytea NOT NULL CHECK (octet_length(content_hash) = 32),   -- sha256(normalised text); the curation_log key (N115)
@@ -876,14 +895,15 @@ CREATE TABLE facts (
 -- (namespace_models); ReembedChunk and a model change INSERT rows, ReembedNamespace flips the
 -- current model and the expunge removes the old rows. The columns after the key are immutable
 -- COPIES of attributes of the content row, so every visibility and as_of predicate can run INSIDE
--- the (iterative) index scan without a join: document_id and chunk_id for the marker sets (N116),
--- mentioned_at / effective_at for as_of. STORAGE MAIN keeps the vector inline so the exact scan is a heap scan.
+-- the (iterative) index scan without a join: document_id, document_version and chunk_id for the marker
+-- sets (N116, N133c), mentioned_at / effective_at for as_of. STORAGE MAIN keeps the vector inline so the exact scan is a heap scan.
 CREATE TABLE fact_vectors (
   namespace_id     uuid NOT NULL,
   tenant_id        text NOT NULL,
   memory_id        uuid NOT NULL,
   embedding_model  text NOT NULL,
   document_id      text NOT NULL,
+  document_version integer NOT NULL CHECK (document_version >= 1),
   chunk_id         uuid NOT NULL,
   mentioned_at     timestamptz NOT NULL,
   embedding        halfvec(768) STORAGE MAIN NOT NULL,
@@ -904,6 +924,7 @@ CREATE TABLE chunk_vectors (
   embedding_model        text NOT NULL,
   embedding_effective_at timestamptz NOT NULL,
   document_id            text NOT NULL,
+  document_version       integer NOT NULL CHECK (document_version >= 1),
   mentioned_at           timestamptz NOT NULL,
   embedding              halfvec(768) STORAGE MAIN NOT NULL,
   created_at             timestamptz NOT NULL DEFAULT now(),
@@ -973,13 +994,15 @@ CREATE TABLE entity_aliases (
   alias_norm    text NOT NULL CHECK (octet_length(alias_norm) BETWEEN 1 AND 256),
   source        text NOT NULL CHECK (source IN ('extracted', 'hint', 'merge')),
   document_id   text,                              -- N118: the document whose item produced the alias; the expunge deletes the victim's aliases
+  document_version integer CHECK (document_version >= 1),   -- N133c: the expunge deletes only document_version <= up_to_version
   created_at    timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, alias_norm),
-  FOREIGN KEY (namespace_id, entity_id) REFERENCES entities (namespace_id, entity_id) ON DELETE CASCADE
+  FOREIGN KEY (namespace_id, entity_id) REFERENCES entities (namespace_id, entity_id) ON DELETE CASCADE,
+  CHECK ((document_id IS NULL) = (document_version IS NULL))
 );
 
 CREATE INDEX entity_aliases_entity_idx ON entity_aliases (namespace_id, entity_id);
-CREATE INDEX entity_aliases_document_idx ON entity_aliases (namespace_id, document_id) WHERE document_id IS NOT NULL;
+CREATE INDEX entity_aliases_document_idx ON entity_aliases (namespace_id, document_id, document_version) WHERE document_id IS NOT NULL;
 
 -- entity_mentions (hash-partitioned), INSERT-ONLY. mentioned_at is the fact's, copied (N118).
 CREATE TABLE entity_mentions (
@@ -1098,8 +1121,9 @@ CREATE INDEX observation_sources_memory_idx ON observation_sources (namespace_id
 
 -- observation_inputs (N41, N117), INSERT-ONLY: every fact the stage-2 writer was SHOWN when it
 -- wrote version v (the batch facts attached to O; at most 5 quoted older sources; all of them O's
--- own sources, N121). document_id is denormalised so the read predicate and the expunge reach a
--- victim document without joining facts. The FK cascade lets the purge of a fact remove the row.
+-- own sources, N121). document_id and document_version are denormalised (immutable copies of the
+-- fact's) so the read predicate and the expunge reach a victim document version without joining
+-- facts. The FK cascade lets the purge of a fact remove the row.
 CREATE TABLE observation_inputs (
   namespace_id    uuid NOT NULL,
   tenant_id       text NOT NULL,
@@ -1107,6 +1131,7 @@ CREATE TABLE observation_inputs (
   version         integer NOT NULL CHECK (version >= 1),
   fact_id         uuid NOT NULL,                       -- = facts.memory_id
   document_id     text NOT NULL,                       -- = facts.document_id (immutable copy)
+  document_version integer NOT NULL CHECK (document_version >= 1),   -- = facts.document_version (immutable copy, N133c)
   created_at      timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, observation_id, version, fact_id),
   FOREIGN KEY (namespace_id, observation_id, version)
@@ -1114,7 +1139,7 @@ CREATE TABLE observation_inputs (
   FOREIGN KEY (namespace_id, fact_id) REFERENCES facts (namespace_id, memory_id) ON DELETE CASCADE
 ) WITH (fillfactor = 100);
 
-CREATE INDEX observation_inputs_document_idx ON observation_inputs (namespace_id, document_id);
+CREATE INDEX observation_inputs_document_idx ON observation_inputs (namespace_id, document_id, document_version);
 CREATE INDEX observation_inputs_fact_idx     ON observation_inputs (namespace_id, fact_id);
 
 -- observation_version_sources (N85), INSERT-ONLY: the cited evidence of EACH version, copied from
@@ -1312,9 +1337,9 @@ CREATE TABLE page_version_meta (
 -- page_version_inputs (N117), INSERT-ONLY: what the page writer was shown for each version. The
 -- derivation depth is fixed at two (fact -> observation -> page), so a page version is hidden by two
 -- EXISTS (a fact input of its segment is tombstoned/hidden, or an observation-version input of its
--- segment is hidden). source_version is 0 for facts. document_id is the fact's (NULL for
--- observation inputs); no FK because the source is polymorphic, so the expunge deletes by
--- (namespace_id, document_id) and by page.
+-- segment is hidden). source_version is 0 for facts. document_id and document_version are the
+-- fact's (NULL for observation inputs); no FK because the source is polymorphic, so the expunge
+-- deletes by (namespace_id, document_id, document_version <= up_to_version) and by page.
 CREATE TABLE page_version_inputs (
   namespace_id    uuid NOT NULL,
   tenant_id       text NOT NULL,
@@ -1324,14 +1349,16 @@ CREATE TABLE page_version_inputs (
   source_id       uuid NOT NULL,                      -- memory_id | observation_id
   source_version  integer NOT NULL DEFAULT 0 CHECK (source_version >= 0),
   document_id     text,
+  document_version integer CHECK (document_version >= 1),
   created_at      timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, page_id, version, kind, source_id, source_version),
   FOREIGN KEY (namespace_id, page_id, version) REFERENCES page_versions (namespace_id, page_id, version) ON DELETE CASCADE,
   CHECK ((kind = 'fact') = (document_id IS NOT NULL)),
+  CHECK ((kind = 'fact') = (document_version IS NOT NULL)),
   CHECK ((kind = 'fact') = (source_version = 0))
 ) WITH (fillfactor = 100);
 
-CREATE INDEX page_version_inputs_document_idx ON page_version_inputs (namespace_id, document_id) WHERE document_id IS NOT NULL;
+CREATE INDEX page_version_inputs_document_idx ON page_version_inputs (namespace_id, document_id, document_version) WHERE document_id IS NOT NULL;
 CREATE INDEX page_version_inputs_source_idx   ON page_version_inputs (namespace_id, kind, source_id);
 
 -- page_sources: MUTABLE working set of the current page's sources (rewritten by PageRefresh)
@@ -1353,7 +1380,13 @@ CREATE INDEX page_sources_source_idx ON page_sources (namespace_id, source_id);
 -- invalidation. Tiny, namespace-keyed, loaded into the recall request three selects at a time (N116).
 -- -----------------------------------------------------------------------------
 
--- document_tombstones: one row per deleted document. expunge_state is the Expunge's progress
+-- document_tombstones: one row per delete of a document, covering (document_id, up_to_version)
+-- (N133c): it hides exactly the rows with document_version <= up_to_version, i.e. every version
+-- the document had when it was deleted (up_to_version = max(document_versions.version) read under
+-- the document lock, in-flight versions included). The same document_id can be retained again at
+-- once: the new versions start at up_to_version + 1 and stay visible while the covered rows are
+-- hidden and then purged. up_to_version is part of the key because a re-used id can be deleted
+-- again while the first tombstone still exists. expunge_state is the Expunge's progress
 -- (pending -> materialized -> purged, N119); the row is deleted 24 h after 'purged'. Recall
 -- passes the rows in 'pending' and 'materialized' (purged ones have no rows left to hide).
 -- intent_key names the blob-storage intent object written BEFORE this row (N122).
@@ -1361,6 +1394,7 @@ CREATE TABLE document_tombstones (
   namespace_id   uuid NOT NULL,
   tenant_id      text NOT NULL,
   document_id    text NOT NULL CHECK (octet_length(document_id) BETWEEN 1 AND 256),
+  up_to_version  integer NOT NULL CHECK (up_to_version >= 1),
   deleted_at     timestamptz NOT NULL,
   operation_id   uuid,
   intent_key     text,
@@ -1368,7 +1402,7 @@ CREATE TABLE document_tombstones (
   materialized_at timestamptz,
   purged_at      timestamptz,
   created_at     timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (namespace_id, document_id),
+  PRIMARY KEY (namespace_id, document_id, up_to_version),
   FOREIGN KEY (namespace_id, tenant_id) REFERENCES namespace_ownership (namespace_id, tenant_id),
   CHECK ((expunge_state <> 'pending') = (materialized_at IS NOT NULL)),
   CHECK ((expunge_state = 'purged') = (purged_at IS NOT NULL))
@@ -1410,21 +1444,23 @@ CREATE TABLE fact_hidden (
 
 -- curation_log (A-16), INSERT-ONLY: every Invalidate / Restore with the fact's content_hash and
 -- document. CommitChunk re-applies the LAST action per (document_id, content_hash) to the new facts
--- of a re-extracted twin, so curation sticks. No FK: it must outlive the purge of the old fact; the
--- expunge deletes the rows of a deleted document explicitly.
+-- of a re-extracted twin (of the document's current life: document_version >= documents.life_start),
+-- so curation sticks. No FK: it must outlive the purge of the old fact; the expunge deletes the
+-- rows of a deleted document explicitly (document_version <= up_to_version, N133c).
 CREATE TABLE curation_log (
   namespace_id  uuid NOT NULL,
   tenant_id     text NOT NULL,
   memory_id     uuid NOT NULL,
   content_hash  bytea NOT NULL CHECK (octet_length(content_hash) = 32),
   document_id   text NOT NULL,
+  document_version integer NOT NULL CHECK (document_version >= 1),   -- the fact's
   action        text NOT NULL CHECK (action IN ('invalidate', 'restore')),
   at            timestamptz NOT NULL DEFAULT now(),
   reason        text NOT NULL DEFAULT '' CHECK (octet_length(reason) <= 1024),
   PRIMARY KEY (namespace_id, memory_id, at)
 ) WITH (fillfactor = 100);
 
-CREATE INDEX curation_log_twin_idx ON curation_log (namespace_id, document_id, content_hash, at DESC);
+CREATE INDEX curation_log_twin_idx ON curation_log (namespace_id, document_id, content_hash, at DESC);   -- the twin lookup filters document_version >= life_start
 
 -- -----------------------------------------------------------------------------
 -- Expunge stage tables (N119)
@@ -1445,7 +1481,7 @@ CREATE TABLE derived_hidden (
   root_version  integer NOT NULL CHECK (root_version >= 1),
   from_version  integer NOT NULL,
   cause_kind    text NOT NULL CHECK (cause_kind IN ('document', 'invalidation')),
-  cause_id      text NOT NULL,                       -- document_id | memory_id::text
+  cause_id      text NOT NULL,                       -- document_id | memory_id::text (a document cause covers the tombstone's document_version <= up_to_version inputs only, N133c)
   created_at    timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, kind, id, root_version, cause_kind, cause_id),
   FOREIGN KEY (namespace_id, tenant_id) REFERENCES namespace_ownership (namespace_id, tenant_id),
@@ -1641,16 +1677,31 @@ CREATE TABLE export_snapshots (
 
 -- ---- Marker sets (N116) -----------------------------------------------------
 -- The recall layer loads the three sets ONCE per request (three indexed selects) and passes them to
--- every arm as array parameters: f.document_id <> ALL($doc_tomb), f.chunk_id <> ALL($chunk_tomb),
--- f.memory_id <> ALL($fact_hidden). These functions are the same selects, for tests, engramctl and
--- the SQL fallback; the recall layer alerts when a set exceeds 16 k entries, above which an arm
--- switches to the anti-join form (NOT EXISTS over the marker table).
-CREATE FUNCTION engram_doc_tomb(p_ns uuid, p_pending_only boolean DEFAULT false) RETURNS text[]
+-- every arm as parameters: engram_doc_hidden($doc_tomb, f.document_id, f.document_version),
+-- f.chunk_id <> ALL($chunk_tomb), f.memory_id <> ALL($fact_hidden). These functions are the same
+-- selects, for tests, engramctl and the SQL fallback; the recall layer alerts when a set exceeds
+-- 16 k entries, above which an arm switches to the anti-join form (NOT EXISTS over the marker table).
+--
+-- DocTomb (N133c) is a jsonb object {document_id: up_to_version}: per document the GREATEST
+-- up_to_version over its open tombstones (a document can be deleted, re-used and deleted again while
+-- the first marker still exists). A row is hidden by it iff document_version <= that number, so the
+-- versions of a re-used document_id above it stay visible. Purged tombstones are left out: their
+-- rows are gone.
+CREATE FUNCTION engram_doc_tomb(p_ns uuid, p_pending_only boolean DEFAULT false) RETURNS jsonb
 LANGUAGE sql STABLE AS $$
-  SELECT coalesce(array_agg(t.document_id), '{}'::text[])
-    FROM document_tombstones t
-   WHERE t.namespace_id = p_ns AND t.expunge_state <> 'purged'
-     AND (NOT p_pending_only OR t.expunge_state = 'pending');
+  SELECT coalesce(jsonb_object_agg(x.document_id, x.up_to), '{}'::jsonb)
+    FROM (SELECT t.document_id, max(t.up_to_version) AS up_to
+            FROM document_tombstones t
+           WHERE t.namespace_id = p_ns AND t.expunge_state <> 'purged'
+             AND (NOT p_pending_only OR t.expunge_state = 'pending')
+           GROUP BY t.document_id) x;
+$$;
+
+-- The document half of the visibility predicate: is version p_ver of document p_doc covered by a
+-- tombstone in the set p_tomb? Single-expression SQL, so the planner inlines it.
+CREATE FUNCTION engram_doc_hidden(p_tomb jsonb, p_doc text, p_ver integer) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT p_ver <= coalesce((p_tomb ->> p_doc)::integer, 0);
 $$;
 
 CREATE FUNCTION engram_chunk_tomb(p_ns uuid) RETURNS uuid[]
@@ -1664,15 +1715,17 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 -- ---- The visibility predicate (N116, N117): the one SQL every arm applies ----------------------
--- Facts and chunks: visible(f) = f.document_id NOT IN DocTomb AND f.chunk_id NOT IN ChunkTomb AND
--- f.memory_id NOT IN FactHidden, plus as_of = mentioned_at <= T on the immutable row.
+-- Facts and chunks: visible(f) = (f.document_id, f.document_version) NOT COVERED BY DocTomb AND
+-- f.chunk_id NOT IN ChunkTomb AND f.memory_id NOT IN FactHidden, plus as_of = mentioned_at <= T on the
+-- immutable row. "Covered" is document_version <= up_to_version (N133c).
 CREATE FUNCTION engram_visible_facts(p_ns uuid, p_as_of timestamptz DEFAULT 'infinity') RETURNS TABLE (memory_id uuid)
 LANGUAGE sql STABLE AS $$
   WITH m AS (SELECT engram_doc_tomb(p_ns) AS d, engram_chunk_tomb(p_ns) AS c, engram_fact_hidden_ids(p_ns) AS h)
   SELECT f.memory_id
     FROM facts f, m
    WHERE f.namespace_id = p_ns AND f.mentioned_at <= p_as_of
-     AND f.document_id <> ALL (m.d) AND f.chunk_id <> ALL (m.c) AND f.memory_id <> ALL (m.h);
+     AND NOT engram_doc_hidden(m.d, f.document_id, f.document_version)
+     AND f.chunk_id <> ALL (m.c) AND f.memory_id <> ALL (m.h);
 $$;
 
 CREATE FUNCTION engram_visible_chunks(p_ns uuid, p_as_of timestamptz DEFAULT 'infinity') RETURNS TABLE (chunk_id uuid)
@@ -1681,17 +1734,17 @@ LANGUAGE sql STABLE AS $$
   SELECT k.chunk_id
     FROM chunks k, m
    WHERE k.namespace_id = p_ns AND k.mentioned_at <= p_as_of
-     AND k.document_id <> ALL (m.d) AND k.chunk_id <> ALL (m.c);
+     AND NOT engram_doc_hidden(m.d, k.document_id, k.document_version) AND k.chunk_id <> ALL (m.c);
 $$;
 
 -- Observation version (O, v) is HIDDEN iff (a) an input of its SEGMENT (root_version(v) <= w <= v)
--- names a tombstoned document or a hidden fact, or (b) a derived_hidden row covers it. p_doc_pending
--- carries only the tombstones still 'pending': once Materialize has finished a marker, (b) answers
--- for it and the observation_inputs lookup is skipped for that marker (N119). fact_hidden is always
--- looked up (a small set). Nothing here walks: a version that commits after the marker and names
+-- names a document version covered by a tombstone or a hidden fact, or (b) a derived_hidden row
+-- covers it. p_doc_pending carries only the tombstones still 'pending' (jsonb, as engram_doc_tomb):
+-- once Materialize has finished a marker, (b) answers for it and the observation_inputs lookup is
+-- skipped for that marker (N119). fact_hidden is always looked up (a small set). Nothing here walks: a version that commits after the marker and names
 -- the victim is hidden because inputs are read at query time.
 CREATE FUNCTION engram_obs_version_hidden(p_ns uuid, p_obs uuid, p_ver integer,
-                                          p_doc_pending text[], p_fact_hidden uuid[]) RETURNS boolean
+                                          p_doc_pending jsonb, p_fact_hidden uuid[]) RETURNS boolean
 LANGUAGE sql STABLE AS $$
   SELECT EXISTS (
     SELECT 1
@@ -1700,7 +1753,7 @@ LANGUAGE sql STABLE AS $$
        AND (EXISTS (SELECT 1 FROM observation_inputs i
                      WHERE i.namespace_id = p_ns AND i.observation_id = p_obs
                        AND i.version BETWEEN v.root_version AND v.version
-                       AND (i.document_id = ANY (p_doc_pending) OR i.fact_id = ANY (p_fact_hidden)))
+                       AND (engram_doc_hidden(p_doc_pending, i.document_id, i.document_version) OR i.fact_id = ANY (p_fact_hidden)))
          OR EXISTS (SELECT 1 FROM derived_hidden h
                      WHERE h.namespace_id = p_ns AND h.kind = 'observation' AND h.id = p_obs
                        AND h.root_version = v.root_version AND v.version >= h.from_version)));
@@ -1710,7 +1763,7 @@ $$;
 -- observations): hidden iff a fact input of its segment is tombstoned/hidden, OR an observation-version
 -- input of its segment is hidden by the observation rule, OR a derived_hidden row covers it.
 CREATE FUNCTION engram_page_version_hidden(p_ns uuid, p_page uuid, p_ver integer,
-                                           p_doc_pending text[], p_fact_hidden uuid[]) RETURNS boolean
+                                           p_doc_pending jsonb, p_fact_hidden uuid[]) RETURNS boolean
 LANGUAGE sql STABLE AS $$
   SELECT EXISTS (
     SELECT 1
@@ -1720,7 +1773,7 @@ LANGUAGE sql STABLE AS $$
                      WHERE i.namespace_id = p_ns AND i.page_id = p_page
                        AND i.version BETWEEN pv.root_version AND pv.version
                        AND i.kind = 'fact'
-                       AND (i.document_id = ANY (p_doc_pending) OR i.source_id = ANY (p_fact_hidden)))
+                       AND (engram_doc_hidden(p_doc_pending, i.document_id, i.document_version) OR i.source_id = ANY (p_fact_hidden)))
          OR EXISTS (SELECT 1 FROM page_version_inputs i
                      WHERE i.namespace_id = p_ns AND i.page_id = p_page
                        AND i.version BETWEEN pv.root_version AND pv.version
@@ -1799,7 +1852,8 @@ LANGUAGE sql STABLE AS $$
   SELECT f.memory_id
     FROM facts f, m
    WHERE f.namespace_id = p_ns AND f.memory_id > m.wm
-     AND f.document_id <> ALL (m.d) AND f.chunk_id <> ALL (m.c) AND f.memory_id <> ALL (m.h)
+     AND NOT engram_doc_hidden(m.d, f.document_id, f.document_version)
+     AND f.chunk_id <> ALL (m.c) AND f.memory_id <> ALL (m.h)
      AND NOT EXISTS (SELECT 1 FROM fact_consolidation c
                       WHERE c.namespace_id = f.namespace_id AND c.memory_id = f.memory_id AND c.note = 'done')
      AND NOT EXISTS (SELECT 1 FROM fact_consolidation l
@@ -2103,7 +2157,7 @@ END $$;
 -- =============================================================================
 
 -- chunks
-CREATE INDEX chunks_doc_idx       ON chunks (namespace_id, document_id);
+CREATE INDEX chunks_doc_idx       ON chunks (namespace_id, document_id, document_version);
 CREATE INDEX chunks_mentioned_idx ON chunks (namespace_id, mentioned_at);
 -- pg_search:begin
 CREATE INDEX chunks_bm25 ON chunks
@@ -2112,7 +2166,7 @@ CREATE INDEX chunks_bm25 ON chunks
 -- pg_search:end
 
 -- facts
-CREATE INDEX facts_doc_idx          ON facts (namespace_id, document_id);
+CREATE INDEX facts_doc_idx          ON facts (namespace_id, document_id, document_version);
 CREATE INDEX facts_mentioned_idx    ON facts (namespace_id, mentioned_at DESC);
 CREATE INDEX facts_occurred_idx     ON facts (namespace_id, occurred_start)   -- temporal arm: two-sided probe around query_timestamp (N68)
   WHERE occurred_start IS NOT NULL;

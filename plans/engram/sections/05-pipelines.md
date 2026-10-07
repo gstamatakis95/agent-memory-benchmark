@@ -24,8 +24,8 @@ query, §5.4–5.5). Every top-level input carries `schema_version` (2 for this 
 
 **Fencing, not identity.** The epoch appears in every workflow input and in every fence check,
 and in no idempotency key (D11): a restarted execution must recognise work committed under the
-previous epoch. Every *write* activity opens `store.Store.InNamespace(ctx, scope, fn)` with
-`scope.Mode = Write` (§2.2.7; the `WithNamespaceTx(write)` of N97 and N131), which executes the **fence prelude**: `SET LOCAL engram.namespace_id / tenant_id /
+previous epoch. Every *write* activity opens `store.Store.InNamespace(ctx, scope, fn)` (§2.2.7; the write-mode
+unit of work of N97 and N131; reads use `ReadNamespace`), which executes the **fence prelude**: `SET LOCAL engram.namespace_id / tenant_id /
 epoch`, then `SELECT engram_try_ns_fence(namespace_id)` (the shared
 `pg_try_advisory_xact_lock_shared` on the one-argument key `hashtextextended(ns, 0)`, N113), then a
 plain `SELECT state, epoch FROM namespace_ownership WHERE namespace_id=$1` (no row lock; the row
@@ -58,7 +58,7 @@ epoch=$2`.
   statement when it emits several events (invariant A-F1, D6): a drawn `seq` is committed or
   aborted within one timeout of being drawn, which the relay's 60 s gap watchlist (§5.6) assumes;
   `engramlint sql` fails a builder whose outbox append is followed by another statement, and every
-  scheduler write to `operations` or the outbox goes through the same write-mode `InNamespace` (N131).
+  scheduler write to `operations` or the outbox goes through the same `InNamespace` (N131).
   Every role runs `synchronous_commit = local`; no synchronous standby exists (N122).
 - Outcomes: `active` at the caller's epoch → proceed; `frozen` or a refused try-lock →
   `errs.NamespaceFrozen` (retryable); `ready` → `errs.NamespaceNotReady` (retryable);
@@ -101,7 +101,10 @@ mover's source cleanup goes through the `engram_migrate`-owned `SECURITY DEFINER
 parallel commits of a document do not serialise on the operation row (N69). Operation
 transitions emit no outbox event (a move does not replay the outbox any more, N124).
 `namespace_stats` counters are **derived** (periodic `count(*)` of the visible rows by the **stats
-sweeper**, which also creates and drops the per-namespace partial HNSW indexes, N112), never written
+sweeper**, which also decides the per-namespace partial HNSW indexes with
+`engram_vector_index_plan` — create at 2,000 vectors of the namespace's current model, drop below
+1,000, exact scan in between — and runs the statements of `engram_hnsw_ddl` through `engramctl
+index`, N112), never written
 on the commit path. State transitions are monotone: `PENDING → RUNNING ⇄ DEFERRED →
 SUCCEEDED|FAILED|CANCELLED`; an `UPDATE … WHERE state NOT IN (terminal)` guard makes a late
 activity from a terminated workflow harmless.
@@ -227,7 +230,9 @@ The steps below run once per document, all documents of a request inside one sha
 catalog entry at submit time and carried in the workflow input (PD-2, adopted as N25; in
 `RetainDocumentInput` it is the `models` + `chunk_target_chars` fields). Workers must not call the
 catalog (D4), and a configuration change applies deterministically to operations submitted after
-it. `models.embed` is fixed at namespace creation (N111) and is not part of the mutable snapshot.
+it. `models.embed` and the dimension are fixed at namespace creation (N111; `namespaces.embedding_model`
+and `embedding_dims` in the catalog, `namespace_models` on the shard) and are not part of the mutable
+snapshot.
 
 #### 5.1.2 Workflow `RetainDocument`
 
@@ -293,8 +298,7 @@ manifest_key, counters}` is workflow-local.
       `PermanentLLMError` or validation failure after one repair attempt → a `chunk_failed{reason}`
       *result*; the workflow records it in `operations.error` and continues; the operation ends
       `SUCCEEDED` with `progress.units_failed > 0` (N35).
-   b. **`EmbedChunk`** (blob + gateway; **unary embedder, one text per call, concurrency bounded at
-      the gateway**): `search_document: {fact.text}` for each fact (**no header**, N60) and
+   b. **`EmbedChunk`** (blob + gateway; `EmbedBatch` ≤ 64 texts per call): `search_document: {fact.text}` for each fact (**no header**, N60) and
       `search_document: {header}\n{chunk text}` for the chunk, L2-normalised, `halfvec(768)`.
       Per-namespace embedding cache `{prefix}/ecache/{sha256(prefixed text ‖ model ‖ dims)}.f16`.
       Vectors go to the staging blob `{prefix}/staging/{sha256(K)}.f32`; the result carries the key
@@ -329,12 +333,16 @@ manifest_key, counters}` is workflow-local.
          NOTHING`, then the chunk vector `INSERT chunk_vectors(…, embedding_model,
          embedding_effective_at) ON CONFLICT DO NOTHING` (N85: `embedding_effective_at` = the
          `mentioned_at` of the newest item the summary in the embedded header covers), and
-         `INSERT document_version_chunks` with the chunk's `ordinal` in this version. A
+            `INSERT document_version_chunks` with the chunk's `ordinal` in this version (chunk positions
+         live there, not on the chunk row). A
          `tombstoned` chunk is un-retired by `DELETE FROM chunk_tombstones`. **No `UPDATE` of a
          content row exists.**
       5. If the chunk has no visible facts under the current `extraction_key`: `INSERT facts(…,
          mentioned_at, said_at, occurred_*, prompt_version, extraction_key, document_id,
-         chunk_id)` and `INSERT fact_vectors(…, embedding_model)`; entities in one sorted upsert;
+         chunk_id)` and `INSERT fact_vectors(…, embedding_model)` (the vector rows carry immutable copies of `document_id`,
+         `chunk_id` and `mentioned_at`, so the visibility and `as_of` predicates run inside the index
+         scan; `facts` is unique on `(namespace_id, chunk_id, extraction_key, content_hash)`, the
+         idempotency of this step); entities in one sorted upsert;
          `entity_aliases` (with the producing `document_id`, N118), `entity_mentions` (with the fact's
          `mentioned_at`, N118); `fact_links ON CONFLICT DO NOTHING` in key order (undirected
          edges once with `src < dst`, N34). **Curation sticks (N115):** for each new fact whose
@@ -446,7 +454,7 @@ sequenceDiagram
       W->>G: quota.Reserve then extract/v1, mentioned_at forced to the chunk value (D9, N86)
       W->>B: put xcache entry (= result blob)
     end
-    W->>G: Embed one text per call, bounded concurrency, facts without header, chunk with header (N60)
+    W->>G: EmbedBatch up to 64 texts, facts without header, chunk with header (N60)
     W->>B: put staging/sha256(K).f32 (result by key, N59)
     W->>DB: ResolveEntities and BuildLinks - read tx
     W->>DB: CommitChunk one tx, inserts only: chunk, facts, vector side tables, links, mentions, curation re-applied (N111, N115)
@@ -496,8 +504,7 @@ sequenceDiagram
 3.5` once the extract, summary and the two consolidation stages (routing and writing) are counted
 (N121, D3). With `L_extract ≈ 3–6 s` the first term is 5–10 chunks/s per worker;
 a 600 RPM cap yields **≈ 2.9 chunks/s per cell** regardless of worker count, so filling 1 B facts
-online takes **≈ 100 days at 4 cells**. Embedding (one text per call, concurrency bounded at the
-gateway) and Postgres (`CommitChunk` ≈ 15 ms) are not the bottleneck.
+online takes **≈ 100 days at 4 cells**. Embedding (≤ 64 texts per call, ≈ 100 ms) and Postgres (`CommitChunk` ≈ 15 ms) are not the bottleneck.
 
 **`RetainBackfill`** (workflow `ns/{ns}/backfill/{backfill_id}` on `shard-{id}`, started by
 `engramctl backfill`; a **launch prerequisite in the committed scope**, N130) moves extraction off
@@ -562,8 +569,9 @@ with no facts never starts one.
 
 #### 5.2.2 One round
 
-1. **`SelectRound`** (read tx): ≤ 100 pending facts — **visible** facts above the watermark with no
-   `done` stamp in `fact_consolidation` (N95), ordered by `memory_id` (UUIDv7, so id order is
+1. **`SelectRound`** (read tx; `engram_pending_facts` and `engram_consolidation_watermark`): ≤ 100
+   pending facts — **visible** facts above the watermark with no `done` stamp in
+   `fact_consolidation` (N95), ordered by `memory_id` (UUIDv7, so id order is
    creation order), plus up to 10 retry facts whose latest stamp is `failed` and older than 7 days
    — and ≤ 25 stale observations (`stale_write OR stale_delete`, not retired, `stale_delete`
    first) with their remaining visible sources. Rebuilds are limited to
@@ -768,7 +776,7 @@ stateDiagram-v2
 | Worker dies between `StoreProposal` and `ApplyBatch` | `StoreProposal`'s `ON CONFLICT DO NOTHING` returns zero rows; the retried attempt's writes are discarded and `ApplyBatch` applies the stored list (N43) | the keys name a list that cannot change |
 | A fact is deleted or invalidated between `SelectRound` and `ApplyBatch` | The marker is already committed, so step 3.6.4's visibility predicate finds it invisible → the proposal is discarded and the batch re-queued without it. If the marker commits *after* the apply, the version is hidden by the read predicate and Materialize (which waited for the shared derivation lock the apply held) records it in `derived_hidden` | no observation is ever served that was written with a victim in view (`Derivation.tla` `NoDeletedDerivationServed`, `MaterializeComplete`) |
 | A candidate observation shown in stage 1 is hidden between `FindCandidates` and `ApplyBatch` | Stage 1 output is decisions only and no candidate text enters a stored version: an `attach` to a now-hidden target is skipped, and stage 2 only ever shows the target's own visible sources | no lineage exists to taint (N117) |
-| `update` of an observation whose source set is larger than the ≤ 5 quotes shown | Only sources the writer was shown and dropped are deleted; unshown sources stay | `proof_count` does not erode |
+| `update` of an observation whose source set is larger than the ≤ 10 quotes shown to `consolidate_write/v1` | Only sources the writer was shown and dropped are deleted; unshown sources stay | `proof_count` does not erode |
 | Model returns ids not shown | The decision or write is rejected in validation; if every one is rejected the batch bisects; a persistent single-fact failure is stamped `failed` | bounded LLM spend |
 | Namespace frozen during `ApplyBatch` | `P-frozen` retries until the mover terminates the singleton and restarts it by workflow id on the target; the restarted execution re-selects the same pending facts (`fact_consolidation`, `consolidation_state` and `consolidation_applied` rows are reconciled with the namespace, N124) | no double application |
 | Scope at capacity | Retry with the capacity note; second overflow stamps `note = 'capacity'` | facts stay recallable |
@@ -821,21 +829,25 @@ sleeping until `last_refreshed_at + debounce`; manual, delete and invalidate ref
    `tag_filter`, `as_of = now()`, `prefer_observations = true`, budget `mid`, `max_tokens = 2 ×
    page budget`; every arm applies the visibility predicate. Diff against `page_sources`: **added**
    = retrieved ids not in sources; **changed** = cited observations whose `current_version`
-   advanced; **removed** = cited ids that are now invisible. Cited-but-not-retrieved visible
-   sources are *kept* ("absence is not contradiction"). Nothing changed and no flag set →
+   advanced; **retired** = cited ids that consolidation retired because they were refuted or merged
+   away (never a deleted or invalidated item: invisible evidence is not rendered). Cited-but-not-retrieved
+   visible sources are *kept* ("absence is not contradiction") and rendered as a count only. If any
+   input in the current version's evidence segment is tombstoned or hidden, the current version is
+   hidden and the refresh takes the full-rebuild path (step 5). Nothing changed and no flag set →
    `NoChange`, no LLM call, no version.
-3. **`DeltaEdit`** (gateway, `page/v1`, `models.reflect`, temperature 0.2; `quota.Reserve` first):
-   input = the previous markdown parsed into blocks with stable ids `b{sha256(normalised
-   text)[:8]}`, the three evidence sets and the `source_query`; output = `{operations:
+3. **`DeltaEdit`** (gateway, `page/v1`, `models.reflect`, temperature 0.2; `quota.Reserve` first;
+   runs **only on a visible page**): input = the previous markdown parsed into blocks with stable
+   ids `b{sha256(normalised text)[:8]}`, `added[]`, `changed[]` `{id, old_text, new_text}`,
+   `retired[]` `{id, text}`, the `kept_sources` count and the `source_query`; output = `{operations:
    [replace_section | append_block | remove_block | rename_section]}` with `cites[]` per added or
    replaced block (§6.6). **Validation:** every `section`/`block_id` exists; ≤ 40 ops; rendered
    length ≤ 2 × (previous + added evidence) tokens; every `cite` ∈ added ∪ changed ∪ kept
-   sources; a `remove_block` names a block that cites a removed/changed source. Failure → one
+   sources; a `remove_block` names a block that cites a retired/changed source. Failure → one
    retry with the errors appended; second failure → step 5.
 4. **`ApplyDeltaOps`** (pure): apply ops, render markdown, compute `page_sources' = (sources −
-   removed) ∪ cites`. Unchanged blocks stay byte-identical.
-5. **`FullRebuild`** fallback (gateway, `page_full/v1`): synthesis from all visible evidence (kept ∪
-   added ∪ changed), no previous text shown; used when delta validation failed twice, when there is
+   retired) ∪ cites`. Unchanged blocks stay byte-identical.
+5. **`FullRebuild`** (gateway, `page_full/v1`, the **root rebuild**): synthesis from all visible
+   evidence (visible observation versions preferred, then facts), no previous text shown; used when delta validation failed twice, when there is
    no baseline, when `source_query` changed, and **whenever the base version is hidden** (a delta
    from a hidden version would carry the victim's content). A full rebuild starts a new root
    segment (`root_version = version`).
@@ -843,14 +855,15 @@ sleeping until `last_refreshed_at + debounce`; manual, delete and invalidate ref
    put `{prefix}/pages/{page_id}/v{n+1}.md` (idempotent key); `INSERT page_versions(page_id,
    version = n + 1, root_version, markdown_blob_key, effective_at, evidence_hash) ON CONFLICT DO
    NOTHING` (zero rows → a previous attempt committed: read it and return); `INSERT
-   page_version_inputs` for **every evidence item shown to the prompt** (added ∪ changed ∪ kept:
-   kind `fact` or `observation`, `source_id`, `source_version`, `document_id`) — the segment's
-   input set; the previous version's write-once `page_version_meta.superseded_at`; replace
+   page_version_inputs` for **every id rendered to the prompt** (`added`, `changed` new side and
+   `retired` for `page/v1`; the evidence list for `page_full/v1`; kind `fact` or `observation`,
+   `source_id`, `source_version`, `document_id`) — the segment's input set; `root_version` is
+   inherited from the previous version for a delta and equals `version` for a full rebuild; the previous version's write-once `page_version_meta.superseded_at`; replace
    `page_sources`; `UPDATE pages SET current_version = n + 1, stale_write = false, stale_delete =
    false WHERE stale_seq = $captured`; `token_usage_events`; `operations` (manual) →
    `SUCCEEDED{page_version}`; outbox `PageVersionCreated{page_id, version, root_version}`.
    `effective_at = max(effective_at of every observation version and mentioned_at of every fact
-   shown to the prompt, effective_at(n))` — monotone (D9).
+   rendered to the prompt, effective_at(n))` — monotone (D9).
 7. `ContinueAsNew` with `{pending_nudge}`.
 
 #### 5.3.3 Step table
@@ -973,14 +986,15 @@ read predicate every time (N116, N117), so there is nothing to go stale or to ra
    `pending` tombstone, and the alert below fires at 15 min.
 
 **What every reader does while the tombstone exists (N116).** The recall layer loads the three
-marker sets **once per request** with three indexed selects — `DocTomb` (`document_tombstones`
-rows in `pending` or `materialized`), `ChunkTomb` (`chunk_tombstones`) and `FactHidden`
-(`fact_hidden`) — and passes them as array parameters (`<> ALL($n)`) to every arm and to the
+marker sets **once per request** with three indexed selects (`engram_doc_tomb`,
+`engram_chunk_tomb`, `engram_fact_hidden_ids`): `doc_tomb` (`document_tombstones` rows in `pending` or
+`materialized`), `doc_pending` (only `pending`: the per-candidate `observation_inputs` lookup is
+skipped for materialized ones), `chunk_tomb` and `fact_hidden`, and passes them as array parameters (`<> ALL($n)`) to every arm and to the
 async-index join; sizes are bounded by expunge lag and alerted above 16 k entries, above which an
 arm falls back to an SQL anti-join. `visible(f) ≡ f.document_id ∉ DocTomb ∧ f.chunk_id ∉ ChunkTomb
 ∧ f.memory_id ∉ FactHidden`. Derived versions add the evidence-segment check of N117 (§5.4.2).
 `GetMemory`, `ListMemories`, Reflect's tools, the MCP tools, `GetPage`/`SearchPages` and the export
-apply the same predicate (`engram_visible_facts` and friends, §3). `as_of` stays `mentioned_at ≤ T`
+apply the same predicate, whose SQL form is `engram_visible_facts`, `engram_visible_chunks`, `engram_visible_observation_versions` and `engram_visible_page_versions` (with `engram_obs_version_hidden` and `engram_page_version_hidden` for a single version; §3.4). `as_of` stays `mentioned_at ≤ T`
 on the immutable row.
 
 #### 5.4.2 `Expunge` workflow
@@ -997,7 +1011,7 @@ predicate delete that re-runs to zero rows, and progress is recorded in `expunge
 
 1. **Materialize** (`derivation tx`; exclusive derivation lock, `lock_timeout = 35 s`, one attempt,
    N120). For each pending marker: find every observation version and page version whose evidence
-   segment names a victim and `INSERT derived_hidden(namespace_id, kind ∈ {observation, page}, id,
+   segment names a victim (the test of `engram_obs_version_hidden` and `engram_page_version_hidden`) and `INSERT derived_hidden(namespace_id, kind ∈ {observation, page}, id,
    root_version, from_version, cause_kind ∈ {document, invalidation}, cause_id)` with
    `from_version = min(version)` of the segment's inputs that name the victim. Mark the affected
    `observations` and `pages` `stale_delete` (a rewrite is needed), nudge root rebuilds
@@ -1012,7 +1026,7 @@ predicate delete that re-runs to zero rows, and progress is recorded in `expunge
    must never resurface at any `as_of`.
 2. **Purge** (`write tx`, batches of 1,000 with 50 ms pauses, heartbeat, `ContinueAsNew` every 200
    batches), only **after every registered index and Kafka consumer cursor has passed the delete's
-   `seq`** (`ids_elided` victims are deleted by the indexed `(namespace_id, document_id)` query).
+   `seq`** (`engram_consumers_passed`) (`ids_elided` victims are deleted by the indexed `(namespace_id, document_id)` query).
    Rows in FK order: `fact_links` and `entity_mentions` (cascade from `facts`), the evidence rows
    naming the victim's facts (`observation_version_sources`, `observation_inputs`,
    `observation_sources`, `page_version_inputs`, `page_sources`), `fact_vectors`, `facts`,
@@ -1064,7 +1078,7 @@ time: no stale snapshot, no depth bound and no recorded set to drift.
 3. **`freeze_delete`** on the shard: `UPDATE namespace_ownership SET state = 'frozen', freeze_reason
    = 'delete' WHERE namespace_id AND state = 'active'` (role `engram_app`; no outgoing edge except
    deletion, N101): every fenced writer is blocked, and the read fence rejects `frozen/delete`;
-4. **catalog tx**: `namespaces.state = 'deleting'`, `delete_operation_id`, `NOTIFY catalog_changes`
+4. **catalog tx**: `namespaces.state = 'deleting'`, `NOTIFY catalog_changes`
    (the resolver now answers `FAILED_PRECONDITION` + `NAMESPACE_DELETING` except for
    `OperationService.GetOperation`/`WaitOperation`, N70);
 5. ack with `Operation{RUNNING}`; `ExecuteWorkflow(Expunge{target = NAMESPACE}, id = "ns/{ns}/op/{op}",
@@ -1080,7 +1094,7 @@ tables, `batch_jobs`, `token_usage*`, `quota_counters`, `namespace_stats`, `idem
 `operations`, `ingest_ledger`, markers, `derived_hidden`, `expunge_progress`, `export_snapshots`;
 `outbox` rows stay until the trimmer); **`PurgeBlobs`** (paginated listing of
 `{shard}/{tenant}/{ns}/`, 1,000 keys per page, repeat until empty); **shred the namespace data
-key** (N99); **`RemoveOwnership`** (`DELETE FROM namespace_ownership`, the one deletion edge);
+key** (N99); **`RemoveOwnership`** (`purge_deleted`: `DELETE FROM namespace_ownership`, the one deletion edge of a `frozen/delete` row);
 **`MarkDeleted`** through the admin RPC `ShardService.ReleaseNamespace` (workers never write the
 catalog directly, D4): `namespaces.state = 'deleted'`, row kept as a tombstone, `NOTIFY`. The
 operation is answered from the **catalog** meanwhile, because the shard rows that would hold it
@@ -1250,14 +1264,17 @@ every shard's credentials).
    catalog, D4): catalog `INSERT namespace_moves(move_id, namespace_id, tenant_id, source_shard_id,
    target_shard_id, from_epoch = e, to_epoch = e + 1, state = 'planned', created_by)` — refused by
    the partial unique index on active moves (`MovePrecondition`, non-retryable);
-   `namespaces.state = 'moving'`; `NOTIFY`. Target: `INSERT namespace_ownership(…, epoch = e + 1,
-   state = 'incoming', move_id)`; a namespace that once lived on the target has a permanent
-   `moved_out` row there (N93), advanced by `moved_out → incoming` (a strictly greater epoch and no
-   data rows of the namespace present). Source: `start_move` sets `move_id` and `move_epoch = e +
+   `namespaces.state = 'moving'`; `NOTIFY`. Target: the `plan_target` edge inserts
+   `namespace_ownership(…, epoch = e + 1, state = 'incoming', move_id)`; a namespace that once
+   lived on the target has a permanent `moved_out` row there (N93), advanced by the `return_move`
+   edge `moved_out → incoming` (a strictly greater epoch and no data rows of the namespace
+   present). Source: `start_move` sets `move_id` and `move_epoch = e +
    1`, which **pauses the expunge and every shard-wide scheduler for the namespace** (they join
    `namespace_ownership` and act only on `active` rows without `move_epoch`). Plan records in
    `namespace_moves` the source's `pg_control_system().system_identifier` and
-   `pg_control_checkpoint().timeline_id` and **T_copy = now() on the source**; every later activity
+   `pg_control_checkpoint().timeline_id` (`source_system_id`, `source_timeline_id`) and **`t_copy` =
+   `now()` on the source**; the cutover steps stamp `frozen_at`, `ready_at`, `moved_out_at` and
+   `activated_at`; every later activity
    on the source re-reads them on its session and fails `MoveFenced` on mismatch (N123). It also
    fixes the freeze watchdog, `max(120 s, 60 s + 1 s per 10,000 live facts)`, capped at 15 min, and
    refuses unless the per-table column-list hashes of source and target match (step 2). Catalog
@@ -1285,7 +1302,8 @@ every shard's credentials).
    `facts` ranges copy in up to 4 parallel streams. The target has **no partial HNSW for the
    namespace** during the copy (its vector tables carry only the B-tree and BM25 maintenance), so
    the rate is bounded by those inserts; after the copy the mover builds the namespace's partial
-   indexes with `CREATE INDEX CONCURRENTLY` through `engramctl index` and runs **`VerifyFK`**
+   indexes with `CREATE INDEX CONCURRENTLY` through `engramctl index` (the statements of
+   `engram_hnsw_ddl`, chosen by `engram_vector_index_plan`) and runs **`VerifyFK`**
    (`engram_verify_fk(ns)`, an anti-join count of orphans per foreign key, must be 0) outside the
    freeze. **Blobs:** every key referenced by a copied row (`ingest_ledger.body_blob_key`,
    `document_versions.body_key`, `page_versions.markdown_blob_key`, export manifests and parts) is
@@ -1345,8 +1363,8 @@ every shard's credentials).
      point of no return.
    - (b′) `ReadyTarget`: target `incoming → ready` (edge `ready_target`, `engram_move`). **Nothing
      routes to `ready`**: writers and readers get the retryable `NamespaceNotReady`.
-   - (c) `CutoverSource`: source `frozen/move → moved_out` with `target_shard_id` and
-     `target_epoch = e + 1` — **the point of no return**. The mover re-checks the source timeline
+      - (c) `CutoverSource`: source `frozen/move → moved_out` (edge `cutover_c`) with
+     `target_shard_id` and `target_epoch = e + 1` — **the point of no return**. The mover re-checks the source timeline
      against the catalog here (N123).
    - (b″) `ActivateTarget`: target `ready → active` (edge `activate_target`, clears `move_id`),
      sub-second and retried indefinitely.
@@ -1383,7 +1401,7 @@ every shard's credentials).
 9. **`Rollback`** (any failure before cutover sub-step (c): a mismatch in `Reconcile`, the
    watchdog, a missing blob, a timeline mismatch, a relay drain that did not finish, or
    `engramctl move abort`): **before Freeze** → `abort_move` on the source, delete the target rows
-   and ownership row; **after Freeze** → `thaw_move` (`frozen/move → active`) first, then the same;
+   and ownership row (`rollback_target`); **after Freeze** → `thaw_move` (`frozen/move → active`) first, then the same;
    **after (b′)** → `unready_target` (`ready → incoming`) first, then the same. Restart any workflows
    recorded in step 5 on the **source** queue with epoch `e`. After a rollback onto a shard that
    had a `moved_out` row, `return_abort` (`incoming → moved_out`, restoring the hint from
@@ -1408,7 +1426,7 @@ every shard's credentials).
 | `CutoverCatalog` (d) | activity | catalog `epoch = e AND state = 'frozen'`; success if already `e + 1` for this move | `P-cutover`, retried indefinitely | — | catalog tx + `NOTIFY` | catalog event |
 | `Restart` | activity | workflow ids, `TERMINATE_IF_RUNNING`; `AlreadyStarted` ok only on `shard-{target}` and memo epoch `e + 1`; reconcile loop (N97) | `P-temporal` | — | none | — |
 | `Cleanup` | timer + activity (admin RPC) | predicate deletes via `engram_cleanup_namespace`; ownership row kept as `moved_out` (N93) | `P-db` / `P-blob` | source `moved_out` (`SECURITY DEFINER` function) | admin txs in batches | — |
-| `Rollback` | activity | state predicates (`abort_move`, `thaw_move`, `unready_target`, `return_abort`) | `P-catalog` / `P-db` | only before (c) | catalog tx; source tx; target txs | catalog event `MoveRolledBack` |
+| `Rollback` | activity | state predicates (`abort_move`, `thaw_move`, `unready_target`, `rollback_target`, `return_abort`) | `P-catalog` / `P-db` | only before (c) | catalog tx; source tx; target txs | catalog event `MoveRolledBack` |
 
 #### 5.5.3 Sequence
 
@@ -1492,7 +1510,7 @@ failover runs this sequence, in order:
    the target side and the restored row is thawed. Only then does the shard continue.
 2. **Epoch.** For every namespace the catalog lists on `S`, a catalog transaction sets `epoch = e +
    1, state = 'restoring'` (N64) + `NOTIFY` **first**; the shard's `namespace_ownership` is then
-   rewritten to the catalog value and brought up `frozen/restore` (rule `greater`; the
+   rewritten to the catalog value and brought up `frozen/restore` (edges `freeze_restore`, then `restore_done` with rule `greater`; `epoch_bump` for a failover without restore; the
    `move_epoch > epoch` CHECK is moot because the move was already aborted). Every execution that
    started before the restore carries epoch `e` and fails its next fence.
 3. **Timeline.** Promotion writes the new `(system_identifier, timeline_id)` into
@@ -1556,7 +1574,7 @@ resumes it with its deadlines intact and failover never loses a late commit (§3
 
 | Sink | Transactional index (MVP) | Async external index | Kafka (optional) |
 |---|---|---|---|
-| Action | no-op: the HNSW/BM25 rows were written in the producing transaction; the cursor advances immediately | for each event, read the named rows by id at the recorded epoch (`InNamespace` in read mode; an `ids_elided` event is read by `document_id`, N80) and bulk-upsert into `engram-shard-{id}` keyed by `memory_id` with `version = seq` (idempotent; a lower version never overwrites a higher one); a `DocumentDeleted` event deletes by the indexed `(namespace_id, document_id)` query; **every hit is joined against the read-time visibility predicate (N116), so the index never returns a hidden row even before it has caught up** | produce the `Event` proto unchanged to `engram.events.shard-{id}`, key `namespace_id`, headers `schema`, `seq`, `epoch`; idempotent producer, `acks = all`; downstream consumers dedup by `(namespace_id, seq)` and fetch content through the API |
+| Action | no-op: the HNSW/BM25 rows were written in the producing transaction; the cursor advances immediately | for each event, read the named rows by id at the recorded epoch (`ReadNamespace`; an `ids_elided` event is read by `document_id`, N80) and bulk-upsert into `engram-shard-{id}` keyed by `memory_id` with `version = seq` (idempotent; a lower version never overwrites a higher one); a `DocumentDeleted` event deletes by the indexed `(namespace_id, document_id)` query; **every hit is joined against the read-time visibility predicate (N116), so the index never returns a hidden row even before it has caught up** | produce the `Event` proto unchanged to `engram.events.shard-{id}`, key `namespace_id`, headers `schema`, `seq`, `epoch`; idempotent producer, `acks = all`; downstream consumers dedup by `(namespace_id, seq)` and fetch content through the API |
 | Cursor commit | after each batch | after the engine acknowledges the bulk request | after the broker acknowledges the batch |
 | Failure | — | engine down: the `index` cursor stalls, others continue; alert at 15 min lag | broker down: `kafka` cursor stalls; outbox rows accumulate (trimmer respects the cursor); alert at 5 days (2 days before the 7-day trim) |
 
@@ -1725,4 +1743,4 @@ retryable under the named policies. `NamespaceFrozen` is retryable only under `P
 | H-10, H-11, A-14 | N126 | `building` snapshots, expiry in the marker transaction, always-emitted delta with `deleted_ids`, no `open_gaps` (§5.7). |
 | A-4, A-8 | N130 | `quota.Reserve` before every gateway call class; `calls_per_chunk ≈ 3.5`; `RetainBackfill` committed (§5.0, §5.1.6). |
 | A-9 | N128 | One `RefreshPolicy`; no `on_delete`, `cron` or `Retain{priority}` (§5.3, §5.1.6). |
-| H-20, P-5 | N131 | Scheduler writes go through the write-mode `InNamespace`; trigram lookup through a `SECURITY DEFINER` function (§5.0, §5.1.2). |
+| H-20, P-5 | N131 | Scheduler writes go through `InNamespace`; trigram lookup through a `SECURITY DEFINER` function (§5.0, §5.1.2). |

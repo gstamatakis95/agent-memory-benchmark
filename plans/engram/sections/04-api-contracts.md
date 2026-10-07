@@ -430,9 +430,10 @@ enum UpdateMode {
   UPDATE_MODE_UNSPECIFIED = 0;
   // The items are the whole new content of the document. Chunks whose content
   // hash is unchanged are kept (no LLM, no embedding); chunks missing from
-  // the new set are retired together with their facts.
+  // the new set are hidden together with their facts by chunk tombstones
+  // (decision N115) and purged later by the expunge.
   UPDATE_MODE_REPLACE = 1;
-  // The items are appended to the document; nothing is retired. Chunk hashes
+  // The items are appended to the document; nothing is hidden. Chunk hashes
   // that already exist are skipped.
   UPDATE_MODE_APPEND = 2;
 }
@@ -492,8 +493,10 @@ enum TagMatchMode {
 }
 
 // TagFilter restricts results to items whose tag set satisfies `mode`
-// against `tags`. Applied inside every recall arm (before ranking), never
-// after fusion, so budgets are not spent on filtered-out rows. Tags are
+// against `tags`. Tags are item-level and live on the document; the filter is
+// resolved once into an allowed-document set that every recall arm applies
+// (before ranking), never after fusion, so budgets are not spent on
+// filtered-out rows (decision N116). Tags are
 // filters, never security (decision D13): a caller with access to a
 // namespace can read every tag in it.
 message TagFilter {
@@ -605,7 +608,9 @@ message Timestamps {
   google.protobuf.Timestamp updated_at = 2;
 }
 
-// EntityRef is a resolved entity attached to a memory.
+// EntityRef is a resolved entity attached to a memory. Under
+// RecallRequest.as_of only `mention` is set (decision N118): entity ids,
+// canonical names, types and alias merges may postdate the cut-off.
 message EntityRef {
   // UUIDv7 of the entity, unique per namespace.
   string entity_id = 1;
@@ -1528,9 +1533,10 @@ namespace or tenant delete. Retain activities are unchanged in shape; what chang
 write: `FinalizeVersion` inserts `chunk_tombstones` and `fact_hidden(reextract)` rows instead of
 updating facts, `CommitChunk` inserts vectors into the side tables keyed by model (N111) and
 re-applies `curation_log` (N115). **Consolidation is two-stage (N121):** `RouteBatchInput/Result`
-(stage 1: `RoutingDecision{ATTACH, CREATE, MERGE, DROP_SOURCE}`, nothing textual persisted),
-`WriteObservationInput/Result` (stage 2: one call per touched observation, `ObservationWrite` with
-the shown `input_fact_ids`), `StoreProposalInput` (write-once, N43) and `ApplyBatchInput/Result`
+(stage 1, `consolidate_route/v1`: `RoutingDecision{ATTACH, CREATE, SKIP, MERGE, DROP_SOURCE}`,
+nothing textual persisted), `WriteObservationInput/Result` (stage 2, `consolidate_write/v1`: one call
+per touched observation, `ObservationWrite` with the shown `input_fact_ids`; modes create, update,
+rebuild), `StoreProposalInput` (write-once, N43) and `ApplyBatchInput/Result`
 (derivation lock, re-verification is the visibility predicate over the batch's fact ids; the
 lineage messages are gone). **Expunge (N119):** `ExpungeInput`, `MaterializeInput/Result`,
 `PurgeBatchInput/Result`, `ExpungeResult`. Also `TenantDeleteInput`, `RetainBackfillInput`,

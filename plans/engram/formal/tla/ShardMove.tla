@@ -118,14 +118,14 @@ Plan ==
 
 \* Dirty range copy: any non-empty part of what Src has and Tgt lacks (READ COMMITTED ranges).
 CopyRange ==
-  /\ mp = "copying"
+  /\ mp = "copying" /\ own[Src].st \in {"active", "frozen"} /\ own[Tgt].st = "incoming"
   /\ \E X \in SUBSET (store[Src] \ store[Tgt]) :
        /\ X # {} /\ store' = [store EXCEPT ![Tgt] = @ \cup X]
   /\ UNCHANGED <<cat, mp, own, fin, mut, bak, used, ca, committed, lost, wr, cc, now, Tc, mtl, tl, nRestore, nBak,
                  frozenSet, frozenMut, actSet, actMut, zcut>>
 
 CopyMut ==
-  /\ mp = "copying" /\ mut' = [mut EXCEPT ![Tgt] = mut[Src]]
+  /\ mp = "copying" /\ own[Src].st \in {"active", "frozen"} /\ own[Tgt].st = "incoming" /\ mut' = [mut EXCEPT ![Tgt] = mut[Src]]
   /\ UNCHANGED <<cat, mp, own, fin, store, bak, used, ca, committed, lost, wr, cc, now, Tc, mtl, tl, nRestore, nBak,
                  frozenSet, frozenMut, actSet, actMut, zcut>>
 
@@ -141,7 +141,7 @@ Freeze ==
 
 \* Under freeze: re-copy immutable rows created since Tc - Margin, merge the mutable cell in full.
 Reconcile ==
-  /\ mp = "frozen"
+  /\ mp = "frozen" /\ own[Src].st = "frozen" /\ own[Tgt].st = "incoming"   \* every mover step is fenced on both rows
   /\ store' = [store EXCEPT ![Tgt] = @ \cup {r \in store[Src] : ca[r] + Margin >= Tc}]
   /\ mut' = [mut EXCEPT ![Tgt] = mut[Src]]
   /\ mp' = "reconciled"
@@ -149,7 +149,7 @@ Reconcile ==
                  frozenSet, frozenMut, actSet, actMut, zcut>>
 
 MakeReady ==
-  /\ mp = "reconciled" /\ Verified
+  /\ mp = "reconciled" /\ own[Src].st = "frozen" /\ own[Tgt].st = "incoming" /\ Verified
   /\ IF UseReady
        THEN /\ own' = [own EXCEPT ![Tgt].st = "ready"] /\ mp' = "ready"
             /\ UNCHANGED <<actSet, actMut>>
@@ -183,7 +183,7 @@ CatFlip ==
 
 \* Rollback at any step before (c): thaw the source, drop the target, undo a premature flip.
 Rollback ==
-  /\ mp \in PreC
+  /\ mp \in PreC /\ Holders(Tgt) = {}
   /\ mp' = "rolled_back"
   /\ own' = [own EXCEPT ![Src] = IF @.st = "frozen" THEN Row("active", @.ep) ELSE @,
                         ![Tgt] = Row("none", 0)]

@@ -30,7 +30,7 @@
 (*   MatInvalid = TRUE Materialize also covers invalidated facts           *)
 (*   EffAllShown = FALSE effective_at counts only cited facts, not shown   *)
 (***************************************************************************)
-EXTENDS Naturals, Sequences, FiniteSets
+EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS Docs, Facts, DocOf, Mentioned,   \* facts are 1..4; tuples <<doc,..>> and <<time,..>>
           Obs, Pages, MaxVerO, MaxVerP,    \* max versions per observation / page
@@ -210,6 +210,8 @@ Next == (\E w \in Writers : Route(w)) \/ WriterStep \/ Expunge
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(WriterStep) /\ WF_vars(MatStart) /\ WF_vars(MatWrite)
         /\ WF_vars(\E d \in Docs : Purge(d))
+
+Symm == Permutations(Obs)
 
 -----------------------------------------------------------------------------
 (* Invariants *)

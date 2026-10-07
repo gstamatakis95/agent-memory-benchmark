@@ -191,8 +191,9 @@ open for every streaming call.
    `scope.shard` if the shard is in this cell; otherwise (phase 3) the call is forwarded over
    gRPC to the owning cell's Envoy with identical metadata and remaining deadline, and the
    response is proxied verbatim.
-9. **Transaction fencing.** Every store access runs through `store.Store.InNamespace` (§2.2.7):
-   `BEGIN` → `SET LOCAL engram.namespace_id/tenant_id/epoch` → for writes the **fence prelude**
+9. **Transaction fencing.** Every store access runs through `store.Store.InNamespace` (writes) or
+   `ReadNamespace` (reads) (§2.2.7): `BEGIN` → `SET LOCAL engram.namespace_id/tenant_id/epoch` → for
+   writes the **fence prelude**
    `SELECT engram_try_ns_fence(namespace_id)` (a `pg_try_advisory_xact_lock_shared` on the
    namespace key) followed by a plain `SELECT state, epoch FROM namespace_ownership WHERE
    namespace_id=$1` (no row lock — the row is the fence *value*, the advisory lock the fence
@@ -265,7 +266,7 @@ sequenceDiagram
 `MemoryService.Retain` is unary (D16: the ack promises durability of the raw input, not
 visibility). The API does three things in one shard transaction and one Temporal call:
 
-1. `store.Store.InNamespace` in write mode: insert `idempotency_keys(request_id)` (24 h, D1) — a
+1. `store.Store.InNamespace` (the write unit of work): insert `idempotency_keys(request_id)` (24 h, D1) — a
    duplicate returns the stored `operation_id` immediately; append the `ingest_ledger` row
    (raw item body ≤ 64 KiB inline, larger bodies referenced by blob key
    `{shard}/{tenant}/{ns}/ledger/{sha256}` (N7); the blob `Put` happens *before* the transaction and
@@ -325,7 +326,7 @@ sequenceDiagram
       W->>G: ExtractChunk (structured JSON, prompt extract/v1, mentioned_at = item timestamp, D9)
       W->>B: Put xcache entry (= the result blob)
     end
-    W->>G: EmbedChunk (facts without header, chunk with header, one text per call, bounded concurrency, search_document: prefix) → staging blob
+    W->>G: EmbedChunk (facts without header, chunk with header, batch ≤ 64 texts, search_document: prefix) → staging blob
     W->>DB: ResolveEntities (pg_trgm + alias table, read tx)
     W->>DB: BuildLinks (temporal ≤ 20/fact, semantic kNN k=10 ≥ 0.75, entity, causal)
     W->>DB: CommitChunk: one tx, inserts only — fence prelude (shared try-lock + ownership check @ epoch), shared per-document try-lock (N83) and plain read of version row status ingesting (N40), chunk, facts, vectors in the side tables (N111), sorted entity upserts, links, mentions, outbox last (InputBlobMissing → rerun extract + embed ≤ 2×, N100)
@@ -342,7 +343,7 @@ stages, N121), `L_extract` the gateway structured-call latency (≈ 3–6 s, A-3
 per-model cap. A 600 RPM cap yields ≈ 2.9 chunks/s per cell regardless of worker count, so filling
 1 B facts online takes ≈ 100 days at 4 cells; `RetainBackfill` bypasses the cap through the
 gateway batch API (~50 % cheaper) and is a **launch prerequisite** in the committed scope (§5.1.6).
-Embedding is not the bottleneck (one text per call to the unary embedder, bounded concurrency).
+Embedding is not the bottleneck (batches of ≤ 64 texts, ≈ 100 ms).
 
 Rejected: acking only after the first chunk commits (would make the ack latency LLM-bound and
 tie the client's deadline to the gateway); acking before the ledger row is durable (the raw
@@ -484,7 +485,7 @@ sequenceDiagram
    synchronous standby, so commits cannot hang (N122). Acknowledged deletes and invalidations have
    RPO 0 because restore and failover replay the intents; a delete whose client saw a transport
    error may still take effect.
-2. **Marker transaction** (`InNamespace`, write mode): fence prelude; the exclusive per-document
+2. **Marker transaction** (`InNamespace`): fence prelude; the exclusive per-document
    advisory lock (N83); `documents.state = 'deleting'`; `document_versions.status = 'deleted'`;
    **`INSERT document_tombstones`**; every `building` or `ready` export snapshot that can contain
    the document is expired (N126); the `DELETE_DOCUMENT` operation, `deletion_log` and one
@@ -508,7 +509,7 @@ sequenceDiagram
 `Recall`, `Reflect`, `GetMemory`, `ListMemories`, `GetPage`, `SearchPages` or **any** export —
 snapshots that contained it, or were being built, are `expired`, so `StreamSnapshot` refuses them
 and `engram-sync` applies the next delta's delete records (N126). An external (`Async`) index
-that has not caught up cannot leak either: every `index.Index` joins its hits with the same
+that has not caught up cannot leak either: every `index.Searcher` joins its hits with the same
 predicate at read time (N44). What it does *not* guarantee: physical row purge, blob deletion,
 index-engine convergence and reconsolidation of the affected observations, which complete
 asynchronously and are observable through the delete operation (`WaitOperation`). Temporal

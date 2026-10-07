@@ -542,6 +542,9 @@ enum RoutingKind {
   ROUTING_KIND_MERGE = 3;
   // Remove `fact_ids` as sources of `observation_id`.
   ROUTING_KIND_DROP_SOURCE = 4;
+  // The fact is trivial, already covered by a candidate's quoted sources or
+  // purely transient: it is stamped `done` without an observation.
+  ROUTING_KIND_SKIP = 5;
 }
 
 // RoutingDecision is one stage-1 outcome. Nothing textual is persisted from
@@ -553,6 +556,8 @@ message RoutingDecision {
   string observation_id = 3;
   // MERGE only: the observation folded into the survivor.
   string merged_observation_id = 4;
+  // CREATE only: facts of one new facet share a number (1-8).
+  int32 new_group = 5;
 }
 
 // RouteBatchResult is the stage-1 outcome of one batch.
@@ -566,7 +571,9 @@ message RouteBatchResult {
   repeated string failed_fact_ids = 5;
 }
 
-// ObservationWriteKind is the stage-2 write type.
+// ObservationWriteKind is the stage-2 write type; CREATE, UPDATE and
+// ROOT_REBUILD are the `consolidate_write/v1` modes create, update and rebuild,
+// RETIRE is its `retire` action.
 enum ObservationWriteKind {
   OBSERVATION_WRITE_KIND_UNSPECIFIED = 0;
   OBSERVATION_WRITE_KIND_CREATE = 1;

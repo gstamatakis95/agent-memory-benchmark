@@ -2190,3 +2190,81 @@ N98, N101 (edge table regenerated from R4), N103 (fold again), N109, N110(b)(c).
 Kept unchanged: D1, D4, D6 (outbox and relay; the move no longer reads it), D7 (BM25), D11, D13,
 D14, N40, N43, N56, N58 (via `fact_hidden`), N59, N60, N83, N85 (evidence per version), N86, N87,
 N99, N100, N104 (with H-16), N106.
+
+## Disposition
+
+Every finding of this round maps to a register row (`00-decision-register.md`; D22 holds N111 to N132, superseded rows keep their ids). Product guidance applied throughout: deletes are rare, a delete is an O(1) soft marker honoured by every read path at ack, and physical work is an asynchronous throttled expunge.
+
+| Finding | Disposition | Register id | Note |
+|---|---|---|---|
+| H-1 | Accepted, redesigned | N117, N41 | Stale-snapshot closure is gone: visibility is a read-time predicate over evidence segments. Lineage fixpoint under a lock rejected (keeps the blast radius). |
+| H-2 | Accepted, mechanism removed | N117, N79 (withdrawn) | No walk, so no depth bound to fail open. |
+| H-3 | Accepted, mechanism removed | N115, N84 (withdrawn) | Invalidate is one `fact_hidden` insert; no counter or CHECK. |
+| H-4 | Accepted | N122, N92 (withdrawn) | `remote_apply` deleted; intents in blob storage, `synchronous_commit = local`. |
+| H-5 | Accepted | N125, N101 | Rollback defined at every step before (c) with `unready_target`. |
+| H-6 | Accepted | N125 | `ready` state; nothing routes to the target before (c). |
+| H-7 | Accepted, redesigned | N124, N81 (withdrawn) | Reconcile by set difference replaces replay; set semantics applied uniformly. |
+| H-8 | Accepted | N124 | Blob existence check; cutover refused while a key is missing. |
+| H-9 | Accepted | N122 | `freeze_delete` runs on the shard before the ack; read fence rejects `frozen/delete`. |
+| H-10 | Accepted | N126 | `building` snapshots expire; `RecordSnapshot` re-checks tombstones. |
+| H-11 | Accepted, mechanism removed | N126 | Outbox-based export cut deleted. |
+| H-12 | Accepted | N117, N116 | Page versions get segments and inputs; `PAGE_HIDDEN`. |
+| H-13 | Accepted | N123 | Restore and failover arbitrate open moves against `namespace_moves`; `reconcile_out`. |
+| H-14 | Accepted | N123, N63 | Timeline and system identifier registered in the catalog before the endpoint flips. |
+| H-15 | Accepted | N95 | Append-only stamps keyed by `stamped_at`. |
+| H-16 | Accepted | N104 | Nullable `body_key`/`body_hash`, `append_base_version`. |
+| H-17 | Accepted | N119 | Index consumer deletes by query; purge waits for consumer cursors. |
+| H-18 | Accepted | N82, N120 | Single 35 s attempt for exclusive takers. |
+| H-19 | Accepted | N113 | Separate lock key spaces. |
+| H-20 | Accepted | N97, N131 | Sweeper writes go through `WithNamespaceTx(write)`; lint checks the prelude. |
+| H-21 | Accepted, mechanism removed | N124 | Moves never touch `outbox_cursors`. |
+| H-22 | Accepted | N93, N125 | `return_abort` edge keeps the permanent fence value. |
+| H-23 | Accepted | N95 | Watermark stays below the smallest unconsolidated fact, visible or marker-hidden. |
+| H-24 | Accepted | N121 | Only visible sources rendered; batch re-queued at most 3 times. |
+| H-25 | Accepted | N124 | Relay drain before cutover, bounded 60 s. |
+| P-1 | Accepted, redesigned | N111, N112, N113 | Immutable content rows and vector side tables; option (b) (flags on the vectored row) rejected. |
+| P-2 | Accepted, mechanism removed | N117 | No depth bound exists. |
+| P-3 | Accepted | N112, N117, N121 | Per-namespace index, segments, two-stage consolidation shrink the blast radius. |
+| P-4 | Accepted | N112 | `DROP INDEX` plus batched delete; no HNSW graph repair on namespace delete. |
+| P-5 | Accepted | N116, N131 | Tags resolved outside RLS; `SECURITY DEFINER` trigram wrapper; `EXPLAIN` as `engram_app`. |
+| P-6 | Accepted | N112, N114 | Per-namespace HNSW, exact scan below 2,000, IOPS table. |
+| P-7 | Rejected as proposed (sync standby kept out) | N122 | Intent log instead of a synchronous standby (doubles footprint, still blocks). |
+| P-8 | Accepted | N124, N91, N89 | Column lists generated and hashed; no HNSW on the target until after the copy. |
+| P-9 | Accepted | N71 | Temporal per cell, 512 history shards, dedicated HA Postgres, M0 load test. |
+| P-10 | Accepted | N113, N78 | No generated columns; CIC per partition procedure. |
+| P-11 | Accepted | N114 | Batched cursor advances, freeze age settings, XID alert. |
+| P-12 | Accepted | N82, N120, N124 | Single 35 s attempt; markers lockless. |
+| P-13 | Accepted | N131, N23 | pgBackRest in the image, `repo-block=y`, archive command. |
+| P-14 | Accepted | N131 | `postgres_exporter` and alerts. |
+| P-15 | Accepted | N131 | One generated table for `postgres -c` and role GUCs. |
+| P-16 | Accepted | N131 | `namespaces_count` derived in `pick_shard`. |
+| P-17 | Accepted | N114 | 4 shards per 512 GB host, 8 hosts per cell. |
+| P-18 | Accepted | N122 | `memory_restore` logged; last state per subject; admin replay path. |
+| P-19 | Accepted | N131 | Outer `DELETE` carries `namespace_id`. |
+| P-20 | Moot | N79 (withdrawn) | The lineage walk no longer exists. |
+| A-1 | Accepted | N116, N117 | Pages carry segments and honour markers at ack. |
+| A-2 | Accepted | N125, N93 | Rollback after (b′) via `unready_target`. |
+| A-3 | Accepted, option (b) | N114, D3 | 128 GB RAM; options (a) TOAST and (c) 6 M-fact cap rejected. |
+| A-4 | Accepted | N130, D3, N74 | Throughput formula with `calls_per_chunk`; fill about 100 days; backfill committed. |
+| A-5 | Accepted | N127 | `superseded_by`, `cancel_reason`, `DELETE_TENANT`; `MOVE_NAMESPACE` leaves the public enum. |
+| A-6 | Accepted | N127 | Session-scoped MCP request ids; deterministic minted document ids. |
+| A-7 | Accepted | N111 | Embedding model fixed at creation; change is `ReembedNamespace`. |
+| A-8 | Accepted | N130, D13 | `quota.Reserve` before every gateway call class; trailing-usage shares. |
+| A-9 | Accepted | N128 | Proto `RefreshPolicy` wins; `priority` sentence deleted. |
+| A-10 | Accepted, done in this rewrite | N103, D3, D5, D10, D15, D17 | Fold performed in place; `gen-docs` lints D-rows against N-rows. |
+| A-11 | Accepted | N128 | Pre-1.0 exception, new field numbers, schema_version 2, baseline tag. |
+| A-12 | Accepted | N128 | Internal error details move to `engram.internal.errors.v1`. |
+| A-13 | Accepted | N128 | Comments fixed, key table generated at M0.8. |
+| A-14 | Accepted | N126 | Always-emitted delta with `deleted_ids`; sync client refuses expired copy. |
+| A-15 | Accepted | N118 | `mention` only under `as_of`; expunge recomputes names. |
+| A-16 | Accepted | N115 | `curation_log` re-applied at `CommitChunk`. |
+| A-17 | Accepted | N129 | Rerank depth ablation gates M1.2. |
+| A-18 | Partly accepted | N129 | `GetEffectiveConfig` and typed `Directive` added; the rest become non-goal rows. |
+| A-19 | Accepted | N130 | One cumulative method for typical and worst case. |
+| A-20 | Partly accepted | N129 | Honest rationale and bookmarkable claim removed; unary alias rejected (second contract matrix). |
+| A-21 | Accepted | N80 | Elision rule restated; delete SLO is the marker transaction. |
+| A-22 | Accepted | N114 | One connection and CPU budget per shard; pool figure fixed at 16. |
+| A-23 | Accepted | N105, D17 | MVP exit week 24; M0.8 re-scoped. |
+| A-24 | Accepted | N96, N128 | Lake skeleton, `score_mono`, refinement mapping, workflow protos. |
+| A-25 | Accepted | N129 | Adapter validates tokens and serves resource metadata. |
+| A-26 | Accepted | N129 | Rank 1 always emitted whole. |

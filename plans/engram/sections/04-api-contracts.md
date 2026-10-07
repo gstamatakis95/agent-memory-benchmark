@@ -63,7 +63,7 @@ and the Temporal history all see the same bytes. Rejected: `x-engram-namespace` 
 Every call must carry a deadline. A call without one is rejected with `INVALID_ARGUMENT` and a
 `ValidationError{violations:[{field:"grpc-timeout", reason:"MISSING_DEADLINE"}]}` before any work
 is done. Rationale: (1) Recall's rerank stage decides on the *remaining* deadline (skip rerank if
-< 150 ms, D10) and cannot do that without one; (2) an unbounded call is an unbounded shard
+< 106 ms = rerank p95 + pack + stream + 8 ms, N106; the SLO assumes a client deadline ≥ 300 ms) and cannot do that without one; (2) an unbounded call is an unbounded shard
 connection through pgbouncer, and the per-instance pool is only 32 (D3); (3) Envoy route timeouts
 would otherwise silently become the deadline, with a different error code. Rejected alternative:
 a server-side default deadline — it hides misconfigured clients until the day the default is
@@ -166,8 +166,8 @@ at most one Engram detail plus, when a retry hint exists, `RetryInfo`.
 | `ValidationError{violations[]}` | `INVALID_ARGUMENT` | Malformed request: missing/too-long field, bad enum value, inconsistent `TagFilter`, unknown mask path, **missing or over-cap deadline**, bad page token. | Fix the request. Never retry unchanged. |
 | `NotFound{kind, id, namespace}` | `NOT_FOUND` | Unknown memory/document/operation/page/snapshot id; namespace unknown **or belonging to another tenant**; page version absent at `as_of`. | Do not retry; the id is wrong or the resource is gone. |
 | `QuotaExceeded{quota, limit, current, retry_after, scope}` (+ `RetryInfo`) | `RESOURCE_EXHAUSTED` | Admission-time rate quotas `recalls_per_min`, `retains_per_min`, `max_request_bytes`, `max_namespaces` (D13). *Not* raised for `llm_tokens_per_day`/`max_facts`: those defer the operation (`DEFERRED`) instead. | Sleep `retry_after`, retry identical request. |
-| `WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state}` | `FAILED_PRECONDITION` | The shard's `namespace_ownership` row disagrees with the resolved (shard, epoch): stale catalog cache, move cut over between resolve and execute, restore bumped the epoch (D2 row 3). The API invalidates its catalog entry, re-resolves and retries the whole call **once** for writes; a **read** that sees `namespace_state = MOVED_OUT` (the window between cutover sub-steps (c) and (d), §5.5) re-resolves in a **bounded loop of ≤ 5 s**, exactly like `NamespaceFrozen`, because the catalog still names the source until (d) and a single retry would fail identically (N52, review F-20). Surfaced only when that also fails; counted against the availability SLI. | Retry with backoff (a fresh resolve happens server-side). Never persist epochs. |
-| `NamespaceFrozen{namespace_id, retry_after, reason}` (+ `RetryInfo`) | `FAILED_PRECONDITION` | Writes during the freeze window of a move or a restore (D5 step 4). The API already retried with backoff for up to 30 s. | Retry after `retry_after`. Reads are unaffected. |
+| `WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state, target_shard_id, next_epoch}` | `FAILED_PRECONDITION` | The shard's `namespace_ownership` row disagrees with the resolved (shard, epoch): stale catalog cache, move cut over between resolve and execute, restore bumped the epoch (D2 row 3). The API invalidates its catalog entry, re-resolves and retries the whole call **once** for writes; a **read** that sees `namespace_state = MOVED_OUT` (the window between cutover sub-steps (c) and (d), §5.5) re-resolves in a **bounded loop of ≤ 5 s**, exactly like `NamespaceFrozen`, because the catalog still names the source until (d) and a single retry would fail identically (N52, review F-20). Surfaced only when that also fails; counted against the availability SLI. With `namespace_state = MOVED_OUT` the detail also carries `target_shard_id` and `next_epoch` read from the `moved_out` ownership row (N98): the API routes the call to the target using only that hint, so cutover does not depend on the catalog; both fields are **API-internal** and stripped before the error leaves the API (shard ids are never public). | Retry with backoff (a fresh resolve happens server-side). Never persist epochs. |
+| `NamespaceFrozen{namespace_id, retry_after, reason}` (+ `RetryInfo`) | `FAILED_PRECONDITION` | Writes during the freeze window of a move, a restore or a delete (D5 step 4), or while an exclusive taker is queued on the namespace fence and the writer's `try`-lock was refused (`reason = FENCE_BUSY`, `retry_after` = 200 ms; the fence never waits, N82). The API already retried with backoff for up to 30 s. | Retry after `retry_after`. Reads are unaffected. |
 | `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: purge running on the document being retained, namespace cutover in progress, page already refreshing, snapshot already running. | `WaitOperation(existing_operation_id)` then resubmit. |
 | `OperationConflict{reason: IDEMPOTENCY_KEY_REUSED}` | `ALREADY_EXISTS` | `request_id`/`operation_id` reused with a different request hash; namespace/page `name` already taken. | Use a fresh id; the stored one is bound to a different request. |
 | `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation, etag mismatch, `Invalidate` on a non-fact or already-invalidated id, namespace `DELETING`, snapshot base version pruned, `StreamSnapshot` of a version the delete cascade marked `expired` (`SNAPSHOT_EXPIRED`, N59). | Read the current state, decide, resubmit. Do not blind-retry. |
@@ -177,6 +177,8 @@ at most one Engram detail plus, when a retry hint exists, `RetryInfo`.
 | — | `DEADLINE_EXCEEDED` | The deadline elapsed. For `Recall` the stream may already have delivered results; the trailing `RecallStats` is then missing. | Retry with a larger deadline or lower budget. |
 | — | `UNIMPLEMENTED` | Phase-gated service (`PageService`, `ExportService` before phase 3). | None. |
 | — | `INTERNAL` | Bug or invariant violation (e.g. embedding dims mismatch). Logged with trace id. | Report `x-engram-trace-id`. |
+
+Two further details exist only on the write path and never reach public callers: `DocumentBusy{document_id, retry_after}` (`CommitChunk` could not take the shared per-document lock, retryable under `P-frozen`, N83) and `InputBlobMissing{blob_key, input, content_hash, attempt}` (a purged cache or staging blob; the workflow re-runs extract and embed at most twice, N100). `PreconditionFailed` gains the type `MOVE_STATE_TOO_LARGE` (admin move planning, N81).
 
 Failed **operations** carry the same model inside `Operation.error` (`OperationError{code,
 message, details[], retryable}`) so a client that polls sees the same detail types it would have
@@ -573,8 +575,8 @@ message MetadataFilter {
 
 #### `memory/v1/errors.proto`
 
-The seven typed details of 4.1.6 plus the enums they need (`ResourceKind`, `NamespaceState`,
-`QuotaScope`, `FreezeReason`, `OperationConflictReason`). `NamespaceState` is defined here, not in
+The seven typed details of 4.1.6, the two write-path-internal ones (`DocumentBusy`, `InputBlobMissing`) and the enums they need (`ResourceKind`, `NamespaceState`,
+`QuotaScope`, `FreezeReason` — now `MOVE`, `RESTORE`, `DELETE`, `FENCE_BUSY` —, `OperationConflictReason`). `WrongShardOrEpoch` gained `target_shard_id` (5) and `next_epoch` (6) for the `MOVED_OUT` routing hint (N98). `NamespaceState` is defined here, not in
 `namespace.proto`, because `WrongShardOrEpoch` needs it and `errors.proto` must not import service
 files; it gained `RESTORING` (N64) and `MOVED_OUT` — the value a read sees between cutover
 sub-steps (c) and (d) and re-resolves on in a bounded loop (N52). Each message's comment names its gRPC code and the client action. Full file under
@@ -588,7 +590,7 @@ CONSOLIDATE, REFRESH_PAGE, CREATE_SNAPSHOT, MOVE_NAMESPACE), `state` (PENDING, R
 SUCCEEDED, FAILED, CANCELLED), `progress{units_total, units_done, units_failed, units_skipped,
 phase}` (units = chunks for retain), `error` (Status-like), `deferred{quota, resume_at, scope}`,
 `result` (kind-specific flat message: `document_version`, `facts_written`, `chunks_reused`,
-`rows_purged`, `snapshot_version`, …), `timestamps`, `finished_at`, `request_id` and the
+`rows_purged`, `snapshot_version`, `timestamps_clamped` (N86), …), `timestamps`, `finished_at`, `request_id` and the
 `consolidation_lag` hint promised by D16. Cancellation is cooperative (next activity boundary);
 already-committed chunks stay visible. `WaitOperation` returns `{operation, timed_out}` so the two
 return paths are unambiguous. `CONSOLIDATE` and `MOVE_NAMESPACE` are listed (never client-created)
@@ -621,7 +623,16 @@ briefly retried. Full file under `plans/engram/proto/memory/v1/operation.proto`.
   and the extractor's "earlier if the chunk quotes older material" rule did the same, so
   "leak-free" depended on a client and an LLM. Every fact and chunk now carries
   `mentioned_at = RetainItem.timestamp` exactly; the quoted-older-date judgement lands in
-  `Memory.said_at` (facts only, display and ranking).
+  `Memory.said_at` (facts only, display and ranking). For a chunk, `mentioned_at` is the **maximum**
+  timestamp of every item whose bytes it covers (for an `APPEND` re-chunk also the `mentioned_at`
+  of every base chunk the new text overlaps), facts inherit it, and a hard chunk boundary is forced
+  between items more than 24 h apart (N86); document-local timestamp regressions are accepted,
+  clamped up, and reported as `OperationResult.timestamps_clamped`.
+- **`as_of` and versioned evidence (N85, review-2 G-7).** Under `as_of = T` an observation
+  version's `source_fact_ids`, `quotes` and `proof_count` are that version's own
+  `observation_version_sources` rows joined to live facts with `mentioned_at <= T`; the chunk arm
+  also requires `embedding_effective_at <= T` (the newest `mentioned_at` covered by the summary in
+  the embedded header), and `ChunkInfo.header` is returned empty whenever `as_of` is set.
 - **`prefer_observations`** (field 18) is the Hindsight knob page refresh relies on (§5.3): rank an
   observation ahead of the facts it cites and suppress those facts when the observation fits.
 - **`Operation`/`operation_id` accept any UUID** (N72): server-minted ids are UUIDv7, derived
@@ -705,8 +716,13 @@ service MemoryService {
   // Invalidate soft-hides one FACT from Recall/Reflect/Export (sets
   // `invalidated_at`). Observations keep the source row but are marked
   // stale_delete and hidden from Recall until reconsolidated (decisions D8,
-  // N41: their text was derived from the invalidated content). Scope
-  // memory.write. Synchronous.
+  // N41: their text was derived from the invalidated content). The effect is
+  // reversible per version (decision N84): every version whose prompt named
+  // the fact, and its lineage descendants, gets hidden_by_invalidation + 1
+  // once, and Restore decrements exactly that set. The transaction commits
+  // with synchronous_commit = remote_apply; with no synchronous standby the
+  // call returns UNAVAILABLE rather than acknowledging optimistically
+  // (decision N92). Scope memory.write. Synchronous.
   rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
   // Restore clears `invalidated_at` on a fact. Scope memory.write. Synchronous.
   rpc Restore(RestoreRequest) returns (RestoreResponse);
@@ -723,6 +739,10 @@ message RetainItem {
   // exactly this value: it is the only `as_of` key and cannot be overridden
   // by the client or moved by the extractor (decision D9, review F-2). A
   // source that quotes older material gets the older date in `said_at`.
+  // Timestamps within a document may regress (re-ingest, benchmark replays);
+  // they are accepted and clamped up to the running maximum when chunks are
+  // built (decision N86), and the operation result reports
+  // OperationResult.timestamps_clamped.
   google.protobuf.Timestamp timestamp = 2;
   // Free-text context given to the extractor ("chat with Alice about the
   // Q3 plan"), ≤ 2 KiB. Not searchable; stored on the document version.
@@ -819,6 +839,18 @@ message RecallRequest {
   // (none if the first version is later). Guarantee: nothing derived from
   // content mentioned after T is returned. Unset = no cut-off. Independent
   // of query_timestamp: as_of hides, query_timestamp anchors.
+  // Under as_of = T (decision N85, review-2 G-7):
+  //   * an observation version's evidence (`source_fact_ids`, `quotes`,
+  //     `proof_count`) is that version's own observation_version_sources rows
+  //     joined to facts that are live AND mentioned_at <= T, never the
+  //     current working set;
+  //   * the chunk arm requires `embedding_effective_at <= T AND
+  //     mentioned_at <= T`, where embedding_effective_at is the newest
+  //     mentioned_at covered by the summary embedded into the chunk header
+  //     (accepted cost: after a summary grows, older chunks are invisible to
+  //     as_of queries earlier than the summary's coverage; the fact arm
+  //     embeds without header and is unaffected);
+  //   * `ChunkInfo.header` is returned empty.
   google.protobuf.Timestamp as_of = 9;
   // Include raw chunks (fifth arm) in the results.
   bool include_chunks = 10;
@@ -829,9 +861,12 @@ message RecallRequest {
   int32 max_results = 12;
   // Run the cross-encoder rerank. Unset = true. When false, when the budget's
   // rerank depth is 0 (LOW, decision N53), or when the remaining deadline is
-  // < 150 ms at rerank time, results carry Scores.stage = FUSED. A deadline
-  // skip is counted against the rerank-skip SLO (N53), not treated as a
-  // benign degradation.
+  // < 106 ms at rerank time (rerank p95 + pack + stream + 8 ms, decision
+  // N106), results carry Scores.stage = FUSED. The SLO assumes a client
+  // deadline of at least 300 ms; a skip at a shorter deadline is by design
+  // and not an SLO breach. At 300 ms or more a deadline skip is counted
+  // against the rerank-skip SLO (N53, N106), not treated as a benign
+  // degradation.
   optional bool rerank = 13;
   // Populate Scores.arm_ranks and per-stage candidate counts in RecallStats.
   bool explain = 14;
@@ -945,7 +980,10 @@ message ObservationInfo {
   // after reconsolidation (per-version, permanent — review F-1).
   bool stale = 5;
   // Verbatim quotes from source facts, aligned with source_fact_ids where
-  // available.
+  // available. Evidence is versioned (decision N85): for any returned
+  // version, current or as_of, `source_fact_ids`, `quotes` and `proof_count`
+  // are that version's rows, filtered to live facts with mentioned_at <= as_of
+  // when as_of is set.
   repeated string quotes = 6;
 }
 
@@ -953,6 +991,8 @@ message ObservationInfo {
 message ChunkInfo {
   // Contextual header prepended for embedding/extraction:
   // "[doc summary ≤ 200 chars] > [heading path]". Not part of `text`.
+  // Empty whenever the request carried `as_of` (decision N85): the summary
+  // may name content mentioned after T.
   string header = 1;
   // SHA-256 (hex) of the chunk text: its identity within the document.
   string content_hash = 2;
@@ -980,6 +1020,11 @@ message Memory {
   TemporalWindow occurred = 10;
   // When the system learned it: the RetainItem `timestamp`, set by the
   // server; the as_of visibility key for facts and chunks (decision D9).
+  // For a chunk it is the maximum timestamp of every item whose bytes the
+  // chunk covers (for an APPEND re-chunk also the mentioned_at of every base
+  // chunk the new text overlaps); facts inherit the chunk value (decision
+  // N86). A hard chunk boundary is forced between consecutive items whose
+  // timestamps differ by more than 24 h.
   google.protobuf.Timestamp mentioned_at = 11;
   // Resolved entities (facts) or entities mentioned (chunks).
   repeated EntityRef entities = 12;
@@ -1135,8 +1180,9 @@ message ReflectRequest {
   // Budget used by every internal search tool call.
   Budget budget = 4;
   TagFilter tag_filter = 5;
-  // Same semantics as RecallRequest.as_of, applied to every tool call of the
-  // session (forced and free), so the answer is leak-free at T.
+  // Same semantics as RecallRequest.as_of (including the versioned-evidence
+  // and empty-chunk-header rules of decision N85), applied to every tool call
+  // of the session (forced and free), so the answer is leak-free at T.
   google.protobuf.Timestamp as_of = 6;
   google.protobuf.Timestamp query_timestamp = 7;
   // Optional JSON Schema (draft 2020-12) the final answer must satisfy; the
@@ -1362,9 +1408,19 @@ manifest blob by `ordinal`); every activity result larger than 4 KiB travels by 
 `ExtractChunkResult.cache_key`, `EmbedChunkResult.staging_blob_key` (the earlier 512 KiB spill let
 ≈ 400 KiB per chunk into the history), `ResolveEntitiesResult.result_blob_key`,
 `BuildLinksResult.result_blob_key` — and `CommitChunkInput` is **keys-only** (fields 4–7 reserved),
-so a Temporal history holds ids, hashes and keys, never fact text or vectors, and a document
-delete reaches it by deleting blobs; whatever still travels inline is encrypted by a
-`DataConverter` payload codec (AES-GCM, per-shard key). Activity results: `ChunkPlan` (the
+so a Temporal history holds ids, hashes, keys and ciphertext, and a document delete reaches the
+large copies by deleting blobs. **Confidentiality wording (N99, review-2 G-20):** text appears in
+histories only as ciphertext, at most 4 KiB per activity result, plus `ChunkWork.header`/`context`/
+`metadata_json`/`entity_hints`; the `DataConverter` payload codec (AES-256-GCM) uses a
+**per-namespace data key** wrapped by the shard key (key id in payload metadata, namespace id in
+the workflow header), deleting the wrapped key is the shredding step of a namespace or tenant
+delete, and a key version is destroyed only after rotation time + 7 d workflow run timeout + 7 d
+Temporal retention. `ChunkWork` replaces the singular `item_index` (9, reserved) by
+`item_indexes[]` (17) and gains `render_hash` (18, N87); `LoadItemResult` carries the APPEND base
+and the `ver/{sha256}` body blob (N104); `StoreProposalInput/Result` and `ApplyBatchInput/Result`
+carry `candidate_versions` and the `APPLIED | ALREADY | DISCARDED | CAPACITY_EXCEEDED` outcome with
+the flagged candidate versions (N79); `CopyProgress` is the resumable range-copy heartbeat (N88);
+`MoveInput.freeze_watchdog` is scaled by namespace size (N90) and `PurgeInput.xcache_grace` is 24 h (N100). Activity results: `ChunkPlan` (the
 content-hash delta: new / unchanged / un-retired / retired hashes), `SummarizeDocumentResult`,
 `ExtractChunkResult` (`ExtractedFact` with 5W, occurrence window, `mentioned_at` = the item
 timestamp copied by the activity, `said_at` from the extractor, entities, causal relations, cache
@@ -1386,14 +1442,26 @@ schema_version, event_id, operation_id, shard_id, oneof payload}`. Payloads:
 `DocumentDeleted`, `FactInvalidated`, `FactRestored`, `ObservationUpserted`,
 `ObservationRetired`, `ObservationsMarkedStale`, `EntityUpserted`, `EntitiesMerged`,
 `PageVersionCreated`, `PageDeleted`, `PagesMarkedStale`, `SnapshotCreated`, `RowsPurged`,
-`TokenUsageRecorded`, `NamespacePurged` — one per state change that a move must replay or an index
-must learn about. Events are **thin**: ids, hashes and the small scalar changes, never embeddings
-or long text; the move replayer and an external index fetch full rows by id from the shard at
-the same epoch (rows are immutable except for the flags the events carry). This keeps an outbox
-row at a few hundred bytes and makes replay idempotent by `(namespace_id, seq)`; a fetch that
-finds no row (a later purge already ran) is a no-op, and the later purge event restores
-consistency. Rejected: fat events carrying full rows (≈ 3 KB of vectors per fact ⇒ the outbox
-would be the largest table on the shard). Full file under
+`TokenUsageRecorded`, `NamespacePurged`, `RestoreMarker`, and — added by N81 so that every
+writer of a namespace table is covered for the move replay — `ProposalStored`,
+`ProposalDiscarded`, `BatchApplied`, `IdempotencyKeyStored`, `OperationTransitioned`,
+`BlobTombstoned`, `VersionsFlagged`, `SnapshotsExpired` (oneof fields 40–47, additive). Events are
+**thin and bounded** (N80): ids inside a payload are 16-byte `bytes` (≈ 18 B encoded; `batch_key`
+is 32 bytes), an event carries at most 256 ids in total, a larger set is paged as consecutive
+events of the same type in the same transaction with `page` and `page_count` (group key
+`document_id`, `deleted_at` or `batch_key`; a group is complete only when all pages are seen), and
+above 4,096 ids one event is sent with `ids_elided = true` and counts only — consumers and the
+move replay then read the ids from the store by `document_id`. `RowsPurged` lost its id list
+(field 2 reserved) for `(table, document_id, count, min_key, max_key)`. Every encoded event is
+≤ 16 KiB by construction. Each message comment carries a `replay:` annotation naming the rows the
+move replays for it; `internal/move/replay_map.go` is generated from them (N81, §5.5.1 step 3).
+Other events stay as thin as before: the move replayer and an external index fetch full rows by
+id from the shard at the same epoch (rows are immutable except for the flags the events carry).
+This keeps an outbox row at a few hundred bytes and makes replay idempotent by `(namespace_id,
+seq)`; a fetch that finds no row (a later purge already ran) is a no-op, and the later purge event
+restores consistency. Rejected: fat events carrying full rows (≈ 3 KB of vectors per fact ⇒ the
+outbox would be the largest table on the shard); unbounded id lists (a 100 k-fact delete wrote one
+multi-megabyte payload against the 16 KiB CHECK, review-2 G-2). Full file under
 `plans/engram/proto/engram/internal/events/v1/events.proto`.
 
 ### 4.3 Tag-match modes: truth table
@@ -1449,7 +1517,7 @@ may be combined.
 | Default | server `now()` | unset (no cut-off) |
 | Effect | Resolves relative expressions in the query ("last week", "yesterday") and orders the temporal arm by distance to it; feeds the recency boost. | Filters **every arm** to `mentioned_at ≤ as_of` for facts and chunks, and selects, per observation and per page, the latest version with `effective_at ≤ as_of`. |
 | Can it change *which* items are eligible? | No — only ranks/scores. | Yes — it is a visibility boundary. |
-| Applied where | temporal arm, boosts | inside each arm's SQL (`WHERE mentioned_at <= $as_of` on `facts`/`chunks`; `observation_versions.effective_at <= $as_of AND (superseded_at IS NULL OR superseded_at > $as_of)`, the precomputed form of "latest version with `effective_at ≤ T`", N33), and in graph expansion when fetching neighbours, so an invisible fact cannot even be a hop. |
+| Applied where | temporal arm, boosts | inside each arm's SQL (`WHERE mentioned_at <= $as_of` on `facts`, `WHERE mentioned_at <= $as_of AND embedding_effective_at <= $as_of` on `chunks` (N85); `observation_versions.effective_at <= $as_of AND (superseded_at IS NULL OR superseded_at > $as_of)`, the precomputed form of "latest version with `effective_at ≤ T`", N33), and in graph expansion when fetching neighbours, so an invisible fact cannot even be a hop. |
 | Typical use | "what did I plan for next Tuesday?" asked on 2026-06-01 | leak-free evaluation: answer question *k* of a conversation as if later turns did not exist |
 
 Definitions (D9 as amended, review F-2): a fact's `mentioned_at` is **the item's `timestamp`, set
@@ -1458,13 +1526,24 @@ cannot be overridden per item (the former `RetainItem.mentioned_at` is reserved)
 extractor cannot move it. The model's judgement of when the source *said* it (a day-30 session
 quoting "on day 3 Alice wrote …") is `said_at`, used for display and the temporal/recency ranking
 only — never for visibility, because a leak-free cut-off must not depend on an LLM or a client.
-`occurred_start/end` is when it *happened*. Chunks carry `mentioned_at = item.timestamp`, so the
-fact arm and the chunk arm agree on what "as of T" means. An observation version's `effective_at = max(mentioned_at)` over
+`occurred_start/end` is when it *happened*. A chunk's `mentioned_at` is the **maximum** timestamp
+of every item whose bytes it covers (for an `APPEND` re-chunk also of every base chunk the new
+text overlaps) and its facts inherit it (N86), so the fact arm and the chunk arm agree on what
+"as of T" means; a hard chunk boundary is forced between consecutive items more than 24 h apart,
+which bounds the relative-date error of the extraction prompt, and per-document timestamp
+regressions are clamped up (reported as `timestamps_clamped`) rather than rejected. An observation version's `effective_at = max(mentioned_at)` over
 **every fact shown to the consolidation prompt** that wrote it (its inputs, of which the cited
 sources are a subset), clamped to be ≥ the `effective_at` of every observation shown and of the
 previous version (D9 as amended, N29: the model that wrote it saw all of them; TLC
 `AsOf_CitedOnly` shows the leak with cited sources only); a page version's `effective_at`
-likewise over every evidence item shown to the refresh prompt, with the same clamp. The guarantee `as_of = T` gives is therefore: *no fact, chunk, observation version or
+likewise over every evidence item shown to the refresh prompt, with the same clamp. Evidence is versioned (N85): an observation version's sources, quotes and `proof_count` are the
+rows of `observation_version_sources` for that version, joined to live facts with `mentioned_at ≤
+T`. A chunk's embedded header may summarise later items, so the chunk arm adds
+`embedding_effective_at ≤ T` (`embedding_effective_at` = the `mentioned_at` of the newest item the
+header's summary covers) and `ChunkInfo.header` is returned empty under `as_of`; the accepted cost
+is that after a summary grows, older chunks are invisible to `as_of` queries earlier than the
+summary's coverage (the fact arm embeds without a header and is unaffected). The guarantee `as_of
+= T` gives is therefore: *no fact, chunk, observation version or
 page version derived from content mentioned after T is returned* — including through graph
 expansion and including the Reflect agent's tool calls (`ReflectRequest.as_of` is applied to every
 tool call of the session).
@@ -1498,9 +1577,13 @@ Edge rules:
   every `mentioned_at` returns an empty stream plus `RecallStats` with `total_candidates = 0`.
 - `as_of` is orthogonal to `invalidated_at`/`retired_at`: those filters always apply, and
   `as_of` never resurrects an invalidated fact even if it was invalidated after T (curation is
-  not time-travelled; a curator's decision is meant to stick).
+  not time-travelled; a curator's decision is meant to stick). Invalidation also hides every
+  observation version that names the fact, superseded ones included, through the reversible
+  `hidden_by_invalidation` counter (N84), so an old `as_of` cannot serve a version written with the
+  invalidated fact in its prompt; `Restore` brings exactly those versions back.
 - `as_of` never resurrects an observation version derived from deleted content: a version whose
-  prompt inputs named a since-deleted fact carries `derived_from_deleted` permanently and is
+  prompt inputs named a since-deleted fact — or whose prompt showed the text of such a version,
+  through `observation_version_lineage` (N79) — carries `derived_from_deleted` permanently and is
   excluded at every T, even after the observation was reconsolidated and is live again (N41,
   review F-1). Only versions written without the deleted content are servable in their
   `[effective_at, superseded_at)` range.
@@ -1863,3 +1946,28 @@ results already delivered.
 | F-6, F-7 | N53, N54 | `Budget` rerank depth 0/50/150; `RecallRequest.rerank` skip is an SLO breach; example timings. |
 | F-42 | N71 | Reflection serves `memory.v1` only (4.8). |
 | F-21 | D4 | `UNAVAILABLE` row: only catalog misses fail. |
+
+**Review-2 follow-ups applied (REVIEW-2.md → register D21 → §4 and `proto/`):**
+
+| Finding | Register | What changed here |
+|---|---|---|
+| G-1 | N79 | `workflow.proto`: `ObservationVersionRef`, `StoreProposalInput/Result` (`candidate_versions`), `ApplyBatchInput/Result` with `ApplyOutcome` (`DISCARDED` carries `missing_fact_ids` and `flagged_candidate_versions`); 4.4 and 4.2 text: lineage-derived versions are excluded at every `as_of`. |
+| G-2 | N80 | `events.proto`: payload ids are 16-byte `bytes`, ≤ 256 per event, `page`/`page_count`, `ids_elided` + counts above 4,096 (consumers read by `document_id`), `RowsPurged{table, document_id, count, min_key, max_key}` (field 2 `ids` reserved); `DeleteDocument` comment states the SLO. |
+| G-3 | N81 | `events.proto` oneof 40–47: `ProposalStored`, `ProposalDiscarded`, `BatchApplied`, `IdempotencyKeyStored`, `OperationTransitioned`, `BlobTombstoned`, `VersionsFlagged` (+ `VersionFlagReason`), `SnapshotsExpired`; `replay:` annotations in every message comment; `DocumentDeleted` documents that `snapshots_expired` never existed; `PreconditionFailed` type `MOVE_STATE_TOO_LARGE`. |
+| G-4 | N82 | `errors.proto`: `NamespaceFrozen` also for a refused fence try-lock, `FreezeReason` gains `DELETE` and `FENCE_BUSY` (200 ms); `ExportInput.base_open_gaps` (exports take no exclusive fence). |
+| G-5 | N83 | `errors.proto`: `DocumentBusy` (write-path internal, retryable). |
+| G-6 | N84 | `Invalidate` comment: reversible per-version counter; 4.4 edge rule for invalidation and superseded versions; `VersionFlagReason` `INVALIDATED`/`RESTORED`. |
+| G-7 | N85 | `RecallRequest.as_of` and `ReflectRequest.as_of` comments (versioned evidence, `embedding_effective_at`), `ChunkInfo.header` empty under `as_of`, `ObservationInfo.quotes` comment; 4.4 definitions, applied-where row and worked guarantee. |
+| G-8 | N86 | `ChunkWork.item_indexes` (17; `item_index` 9 reserved), `Memory.mentioned_at` and `RetainItem.timestamp` comments (max rule, 24 h forced boundary, clamp), `OperationResult.timestamps_clamped` (9); 4.4. |
+| G-9 | N87 | `ChunkWork.render_hash` (18), `ExtractChunkResult.cache_key` comment, `RetainDocumentInput.retain_mission` (14). |
+| G-10, G-11 | N88, N89 | `workflow.proto`: `CopyProgress` (resumable key-range heartbeat), `MoveCheckpoint.copy_start_seq` comment (single floor `p0`). |
+| G-12 | N90 | `MoveInput.freeze_watchdog` (12), `MoveCheckpoint.verify_watermark` (8). |
+| G-13 | N92 | `DeleteDocument` and `Invalidate` comments: `remote_apply`, `UNAVAILABLE` without a synchronous standby. |
+| G-18 | N97 | `MoveCheckpoint.drained_workflow_ids` (7), `cutover_step` (9). |
+| G-19 | N98 | `WrongShardOrEpoch.target_shard_id` (5) and `next_epoch` (6), API-internal and stripped before leaving the API; 4.1.6 row. |
+| G-20 | N99 | `workflow.proto` header and 4.2 description: ciphertext-only wording, per-namespace data key, key-destruction timing. |
+| G-21 | N100 | `errors.proto`: `InputBlobMissing`; `PurgeInput.xcache_grace` (9). |
+| G-26 | N104 | `LoadItemResult` (body blob key and hash), `RetainResume.body_blob_key` (8). |
+| G-28 | N106 | 4.1.2 and `RecallRequest.rerank` comment: skip below 106 ms, SLO assumes a ≥ 300 ms client deadline. |
+| G-14, G-15, G-16, G-22, G-23, G-24, G-25, G-27, G-29, G-30, G-17 | N93, N94, N95, N91, N101, N102, N103, N105, N107, N108, N96 | No contract change in §4 or `proto/` (storage, role, schedule and formal-method items). |
+| — | — | `common.proto` and `memory.proto` inline copies regenerated byte-identical from the files (`memory.proto` changed; `common.proto` verified unchanged). |

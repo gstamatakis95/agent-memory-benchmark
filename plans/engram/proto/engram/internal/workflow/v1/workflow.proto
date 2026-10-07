@@ -671,6 +671,12 @@ message ExportInput {
   // Outbox positions bounding the delta.
   int64 base_outbox_seq = 8;
   int64 outbox_seq = 9;
+  // Outbox seqs below base_outbox_seq that were not visible in the base
+  // snapshot (writers in flight when it was taken). The delta reads
+  // `seq > base_outbox_seq OR seq = ANY(base_open_gaps)`: exports take no
+  // exclusive fence (decision N82), so the cut is a strict prefix plus
+  // explicit gaps resolved with the N50 anti-join.
+  repeated int64 base_open_gaps = 10;
 }
 
 // ExportResult reports the written files.
@@ -724,7 +730,9 @@ message CopyProgress {
 // restartable (decision D5 states).
 message MoveCheckpoint {
   string state = 1;
-  // p0: max(outbox.seq) read inside the copy snapshot. Replay is the anti-join
+  // p0: max(outbox.seq) read inside the copy snapshot taken behind the barrier,
+  // recorded once before the first range and the single replay floor for the
+  // whole move (decision N88). Replay is the anti-join
   // `seq > p0 AND NOT EXISTS (move_applied)` (decision N50); applied_seq is
   // informational, never a read cursor.
   int64 copy_start_seq = 2;

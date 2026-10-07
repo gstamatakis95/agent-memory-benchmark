@@ -42,7 +42,7 @@ internal/
   pages/                 PageService core: sources, staleness, delta refresh
   workflows/             Temporal workflows + activity interfaces + retry policies + queue naming
   outbox/                Relay (advisory-lock election, cursor, gap watchlist) + Sink implementations
-  move/                  MoveOrchestrator: D5 phases as workflow + fenced activities
+  move/                  MoveOrchestrator: D5 phases as workflow + fenced activities; `replay_map.go` = the total event → rows table generated from `events.proto` annotations (N81)
   export/                SnapshotBuilder + Streamer
   quota/                 Limiter (rates), Meter (tokens), Deferral
   config/                layered config system → tenant → namespace; typed Resolved struct
@@ -403,10 +403,13 @@ type Forwarder interface {
 	Stream(ctx context.Context, cell, fullMethod string, desc *grpc.StreamDesc, req proto.Message) (grpc.ClientStream, error)
 }
 
-// Retry executes fn with the D2/D5 retry contract: on WrongShardOrEpoch one re-resolve for writes, and for
-// READS that observe namespace_state = MOVED_OUT (the cutover (c)–(d) window, §5.5) a bounded re-resolve loop
-// of ≤ 5 s with jittered 50 → 500 ms backoff, like NamespaceFrozen (N52, review F-20); bounded backoff (≤ 30 s)
-// on NamespaceFrozen for writes. FAILED_PRECONDITION surfaced during a move is counted against the availability
+// Retry executes fn with the D2/D5 retry contract: on WrongShardOrEpoch one re-resolve for writes; on
+// namespace_state = MOVED_OUT (the cutover (c)–(d) window, §5.5) it FIRST follows the detail's target hint
+// (target_shard_id, next_epoch from the `moved_out` ownership row, N98) straight to the target shard, using no
+// catalog at all, and verifies ownership at the target's fence; a READ that cannot follow the hint re-resolves
+// in a bounded loop of ≤ 5 s with jittered 50 → 500 ms backoff, like NamespaceFrozen (N52, review F-20); bounded
+// backoff (≤ 30 s) on NamespaceFrozen for writes, including the N82 FENCE_BUSY refusal (200 ms). The hint fields
+// are stripped before an error is returned to a caller outside the API. FAILED_PRECONDITION surfaced during a move is counted against the availability
 // SLI by the telemetry hook.
 func Retry(ctx context.Context, r catalog.Resolver, sr ShardRouter, scope authz.RequestScope, mode store.AccessMode, fn func(ctx context.Context, h *ShardHandle, scope authz.RequestScope) error) error
 ```
@@ -518,7 +521,7 @@ type Prefix struct { ShardID int32; TenantID string; NamespaceID string }
 func (p Prefix) String() string // "7/acme/018f…/"
 func (p Prefix) Key(parts ...string) string
 
-type Kind string // "ledger" | "xcache" | "docsum" | "consolidate" | "pages" | "export" | "staging" (§3.6)
+type Kind string // "ledger" | "xcache" | "docsum" | "consolidate" | "pages" | "export" | "staging" | "ver" (§3.6; "ver" = the full reconstructed body of a document version, N104)
 
 type ObjectInfo struct { Key string; Size int64; ETag string; SHA256 [32]byte; LastModified time.Time; Metadata map[string]string }
 type PutOptions struct { ContentType string; Metadata map[string]string; IfNoneMatch bool /* content-addressed puts: skip if present */ }
@@ -548,8 +551,12 @@ type Tombstoner interface {
 }
 ```
 
+`PurgeDocument` deletes `xcache`/`ecache`/`staging` objects only when no live chunk references the hash **and** the
+object is older than `xcache_grace = 24 h` (`Store.Head` supplies `LastModified`; N100) — a purge never races an
+in-flight activity, and a `CommitChunk` that still meets a missing blob fails with `InputBlobMissing` (§5.1.2).
 Key layout (§3.6 has the full table): `{shard}/{tenant}/{ns}/ledger/{sha256}` for raw bodies > 64 KiB (N7),
-`…/xcache/{sha256(chunk_hash‖prompt_version‖model‖schema_version)}.json` (D11), `…/docsum/…`, `…/pages/{page_id}/v{n}.md`,
+`…/xcache/{sha256(chunk_hash‖prompt_version‖model‖schema_version‖render_hash)}.json` (D11, N87), `…/ver/{sha256}`
+(version body, N104), `…/docsum/…`, `…/pages/{page_id}/v{n}.md`,
 `…/export/v{n}/…` (D12), `…/staging/…` (N13); pgBackRest repositories live under `_backups/shard-{id}/`, outside
 every tenant prefix (N23).
 
@@ -576,7 +583,7 @@ type AccessMode int
 
 const (
 	Read  AccessMode = iota + 1 // plain SELECT: ownership state IN ('active','frozen'), epoch ignored, no lock
-	Write                       // fence prelude: pg_advisory_xact_lock_shared(hashtextextended(namespace_id::text, 0)) then a plain SELECT state, epoch; requires state = 'active' AND epoch = scope.Epoch (D2 as amended)
+	Write                       // fence prelude: engram_try_ns_fence(namespace_id) = pg_try_advisory_xact_lock_shared over engram_ns_lock_keys (never waits, N82; refused → NamespaceFrozen{FENCE_BUSY, 200 ms}) then a plain SELECT state, epoch; requires state = 'active' AND epoch = scope.Epoch (D2 as amended)
 )
 
 type Scope struct { TenantID string; NamespaceID string; Epoch int64; Mode AccessMode }
@@ -600,18 +607,32 @@ type Tx interface {
 	Idempotency() IdempotencyRepo
 	TokenUsage() TokenUsageRepo
 	Ownership() OwnershipRepo // read-only for engram_app; writes are admin/move-only
+	DocLocks() DocLockRepo    // per-document advisory lock (N83)
+	Consolidation() ConsolidationRepo // fact_consolidation + consolidation_state (N95)
+}
+
+// DocLockRepo is the per-document lock of N83, one key form `engram_doc_lock_keys(namespace_id, document_id)` (the two
+// int4 keys hashtext(namespace_id), hashtext(document_id), N103). CommitChunk uses TryShared and maps a refusal to the
+// retryable errs.DocumentBusy (100 ms); FinalizeVersion, the delete cascade and PurgeDocument use Exclusive under
+// lock_timeout = 5 s. The ack's version assignment takes no advisory lock (documents row FOR UPDATE only, N56).
+type DocLockRepo interface {
+	TryShared(ctx context.Context, documentID string) error // errs.DocumentBusy on refusal
+	Exclusive(ctx context.Context, documentID string) error // pg_advisory_xact_lock under lock_timeout 5 s
 }
 
 type TxOptions struct { StatementTimeout time.Duration /* 30 s writers (= idle_in_transaction_session_timeout, A-F1: the D6 gap watch and the D5 copy barrier depend on it), 5 s recall */; Isolation pgx.TxIsoLevel; ReadOnly bool }
 
 // WithNamespaceTx runs fn inside a transaction that (1) SET LOCALs engram.namespace_id,
 // engram.tenant_id, engram.epoch and statement_timeout, (2) runs the FENCE PRELUDE for scope.Mode —
-// for Write: `SELECT pg_advisory_xact_lock_shared(hashtextextended($ns::text, 0))` (held to commit, so the
-// move's barrier/freeze, a restore and an export, which take the EXCLUSIVE advisory lock, wait for every
-// in-flight writer and block new ones in a fair queue) followed by a plain
+// for Write: `SELECT engram_try_ns_fence($ns)`, i.e. `pg_try_advisory_xact_lock_shared` over
+// engram_ns_lock_keys (held to commit, so the move's barrier/freeze, the delete freeze and a restore, which take
+// the EXCLUSIVE advisory lock under lock_timeout 5 s, wait for every in-flight writer; a writer that arrives
+// while an exclusive request holds or is queued is REFUSED AT ONCE and the statement ends with the retryable
+// NamespaceFrozen{FENCE_BUSY, 200 ms}, so no pooled connection waits — N82; exports take no exclusive fence at
+// all) followed by a plain
 // `SELECT state, epoch FROM namespace_ownership WHERE namespace_id = $1` (no row lock: the row is the fence
 // VALUE); for Read: the SELECT only — (3) commits if fn returns nil. Ownership failures surface as
-// errs.WrongShardOrEpoch or errs.NamespaceFrozen before fn runs. The former `FOR SHARE` row lock was dropped
+// errs.WrongShardOrEpoch or errs.NamespaceFrozen before fn runs. The former `FOR SHARE` row lock on `namespace_ownership` was dropped
 // (D2 as amended, review F-5): Postgres grants a compatible row lock without queueing behind a waiting
 // FOR UPDATE, so a continuous stream of writers could starve the barrier, and each extra share locker
 // allocates a MultiXactId. Heavyweight (advisory) locks queue fairly and cost no multixacts.
@@ -622,6 +643,8 @@ func WithNamespaceTx(ctx context.Context, p Pool, scope Scope, o TxOptions, fn f
 // before commit (A-F1; engramlint sql fails a builder that runs anything after it).
 type OutboxRepo interface {
 	Append(ctx context.Context, ev *eventsv1.Event) (seq int64, err error)
+	AppendAll(ctx context.Context, evs []*eventsv1.Event) (seqs []int64, err error) // ONE multi-row INSERT for a transaction that emits several events (paged events, N80; the N81 companions): still the last statement
+	PagesOf(ids [][]byte, perEvent int) [][][]byte // splits an id set into pages of ≤ 256; callers set page/page_count; above 4,096 ids the caller emits ONE event with ids_elided and counts (N80)
 	ReadFrom(ctx context.Context, afterSeq int64, limit int) ([]OutboxRow, error)        // relay; no namespace fence (shard-level, admin conn)
 	ReadNamespaceUnapplied(ctx context.Context, p0 int64, limit int) ([]OutboxRow, error)  // move consumer (N50): `WHERE namespace_id = $ns AND seq > $p0 AND NOT EXISTS (SELECT 1 FROM move_applied m WHERE m.namespace_id = o.namespace_id AND m.seq = o.seq) ORDER BY seq LIMIT $n` — a SINGLE source-side statement against the source's lagging copy of move_applied (the table exists on both shards, §3.3.1); an anti-join, never `seq > applied`, so a seq that commits out of order below the highest applied one is still found (review F-3)
 	Cursor(ctx context.Context, consumer string) (int64, error)
@@ -635,7 +658,7 @@ type FactRepo interface { // representative; the other repositories follow the s
 	RetireByChunkHashes(ctx context.Context, documentID string, hashes [][32]byte, now time.Time) (int64, error)
 	RetireStaleExtraction(ctx context.Context, documentID string, now time.Time) ([]string, error) // N58: `UPDATE facts SET retired_at = now(), purge_after = now() + 1 h WHERE … document_id = $1 AND retired_at IS NULL AND extraction_key <> (SELECT extraction_key FROM chunks c WHERE c.chunk_id = facts.chunk_id) RETURNING memory_id` — run by FinalizeVersion so a prompt/model bump never leaves two live fact sets on a kept chunk
 	Unretire(ctx context.Context, documentID string, hashes [][32]byte) (int64, error)
-	SetInvalidated(ctx context.Context, memoryID string, at *time.Time) error // Invalidate / Restore (D8)
+	SetInvalidated(ctx context.Context, memoryID string, at *time.Time) (changed bool, err error) // Invalidate / Restore (D8); `changed` is true only on the NULL ↔ set transition, which is the only time the N84 counter moves
 	ByIDs(ctx context.Context, ids []string, asOf *time.Time) ([]Fact, error)
 	NearestByOccurrence(ctx context.Context, anchor time.Time, window *TemporalWindow, n int, f index.Filter) ([]Fact, error) // temporal arm (N68): two btree probes on (namespace_id, occurred_start) — the n nearest before and after `anchor`, clipped to `window` — instead of sorting every overlapping fact
 }
@@ -643,33 +666,38 @@ type FactRepo interface { // representative; the other repositories follow the s
 
 The ownership check is exactly the D2 statement; for `Read` it is `SELECT state FROM namespace_ownership WHERE
 namespace_id=$1` (no epoch comparison, no lock) and the store rejects `incoming`/`moved_out`/missing with
-`WrongShardOrEpoch{State}` and accepts `active`/`frozen`. The write check compares the epoch; a mismatch is
+`WrongShardOrEpoch{State}` and accepts `active`/`frozen`; a `moved_out` row also yields the target hint
+`{TargetShardID, NextEpoch}` (N98). The write check compares the epoch; a mismatch is
 `WrongShardOrEpoch{Expected: scope.Epoch, Observed: row.Epoch}`. Because every writer holds the *shared*
-advisory lock on `hashtextextended(namespace_id::text, 0)` until commit and the move executor's barrier and
+advisory lock on `engram_ns_lock_keys(namespace_id)` until commit and the move executor's barrier and
 freeze take the *exclusive* one on the same key, an in-flight write either commits before the freeze or
-observes it; heavyweight locks queue fairly (a waiting exclusive request blocks later shared requests), so a
-busy namespace cannot starve its own move — the mechanism §7 `ShardMove.tla` models and the F-5 review made
-explicit. Statements that need the row *value* under the lock (freeze, cutover) still `UPDATE` the row with a
+observes it; heavyweight locks queue fairly for the exclusive taker (it waits for the writers in flight when it
+asked) while writers that arrive behind it are refused by their try-lock (N82), so a busy namespace cannot
+starve its own move and cannot exhaust the pool while it waits — the mechanism §7 `ShardMove.tla` models (W-11:
+`OtherNamespaceProgress`, starvation-freedom of the mover) and the F-5 review made explicit. Roles: `engram_app`
+and `engram_worker` run with `lock_timeout = 2 s`, `engram_move` and `engram_admin` with 10 s. Statements that need the row *value* under the lock (freeze, cutover) still `UPDATE` the row with a
 state predicate; nothing takes a row lock as a fence any more.
 
 Repository summary (full DDL in §3):
 
 | Repository | Key methods | Notes |
 |---|---|---|
-| `DocumentRepo` | `Upsert`, `Get`, `List`, `BeginVersion`, `ActivateVersion`, `MarkDeleted` | `document_id` client-chosen, ≤ 256 B |
-| `ChunkRepo` | `LiveByHashes`, `RetiredByHashes`, `InsertBatch`, `Retire`, `Unretire` | identity `(ns, document_id, content_hash)` (D8) |
+| `DocumentRepo` | `Upsert`, `Get`, `List`, `BeginVersion`, `ActivateVersion`, `MarkDeleted`, `SetBody(version, bodyKey, bodyHash)` (`WHERE body_key IS NULL`, N104) | `document_id` client-chosen, ≤ 256 B; `LoadItem` stores the full version body at `ver/{sha256}` and the next APPEND reads that single object |
+| `ChunkRepo` | `LiveByHashes`, `RetiredByHashes`, `InsertBatch` (writes `mentioned_at` = max over covered items and `embedding_effective_at`, N85/N86), `Retire(documentID, version)` (retire subquery scoped to `(namespace_id, document_id, version)`, N107), `Unretire` | identity `(ns, document_id, content_hash)` (D8) |
 | `LinkRepo` | `InsertBatch`, `DeleteTouching(factIDs)`, `Neighbours(seed, kinds, limit)` | `fact_links` hash-partitioned; graph arm uses `Neighbours`, which joins `facts` and requires `live` on **both** endpoints (N61: `NoOrphanLinks` = "no traversal through a non-live fact"); `DeleteTouching` runs in `PurgeDocument`, never in the synchronous cascade |
 | `EntityRepo` | `Similar(name, type, threshold)` (pg_trgm), `UpsertSorted(entities)` (one `INSERT … SELECT FROM unnest($sorted) ON CONFLICT … DO UPDATE`, rows in `canonical_norm` order so two concurrent `CommitChunk`s never deadlock — N69, review F-41), `AddAlias`, `InsertMentions`, `DeleteMentionsByFacts` | per-namespace; merge writes aliases, never deletes entities; mentions are deleted by the purge (N61) |
-| `ObservationRepo` | `Insert`, `NewVersion`, `AddSources`, `AddInputs`, `DeleteStaleSources(obsID, keep)`, `DeleteSourcesByFacts`, `DeleteInputsByFacts`, `LockLiveInputs(factIDs)` (`FOR SHARE`, N41), `MarkStale(write\|delete)`, `MarkVersionsDerivedFromDeleted(factIDs)`, `LatestAsOf(ids, T)` | D9 versioning; the trigger retires at 0 sources, marks the observation `stale_delete` and sets `observation_versions.derived_from_deleted` on exactly the versions whose inputs named the victim — per version, permanent, never cleared by an apply (N41, review F-1); an update calls `AddSources`/`AddInputs` **before** `DeleteStaleSources` so the zero-sources trigger never fires inside the update (N57, review F-11); `LatestAsOf` skips `derived_from_deleted` versions at every T |
+| `ObservationRepo` | `Insert`, `NewVersion`, `AddSources`, `AddInputs`, `DeleteStaleSources(obsID, keep)`, `DeleteSourcesByFacts`, `DeleteInputsByFacts`, `LockLiveInputs(factIDs)` (`FOR SHARE`, N41), `LockCandidateVersions(refs)` (`FOR SHARE`, requires `NOT derived_from_deleted AND hidden_by_invalidation = 0 AND retired_at IS NULL`, N79/N84), `InsertLineage(obsID, version, candidates)` (`observation_version_lineage`, same tx as the version row), `InsertVersionSources` (N85), `MarkStale(write\|delete)`, `MarkVersionsDerivedFromDeleted(factIDs)` + `FlagLineageDescendants(seed, maxDepth=64)` (recursive CTE; fails closed with `stale_delete` on the frontier), `AdjustInvalidation(factID, +1\|-1)` (the N84 counter over naming versions and descendants, superseded included), `LatestAsOf(ids, T)` | D9 versioning; the trigger retires at 0 sources, marks the observation `stale_delete` and sets `observation_versions.derived_from_deleted` on exactly the versions whose inputs named the victim — per version, permanent, never cleared by an apply (N41, review F-1); an update calls `AddSources`/`AddInputs` **before** `DeleteStaleSources` so the zero-sources trigger never fires inside the update (N57, review F-11); `LatestAsOf` skips `derived_from_deleted` versions at every T and versions with `hidden_by_invalidation > 0`; `update` deletes only sources the model was shown and dropped (N79) |
 | `PageRepo` | `Insert`, `NewVersion`, `SetSources`, `DeleteSourcesByFacts`, `MarkStale(write\|delete)`, `Search(query, vector, filter, asOf, limit)` (BM25 ∪ HNSW over `page_versions`, N73) | markdown lives in blob |
 | `OperationRepo` | `Insert`, `Get`, `List`, `Transition(from,to)`, `SetProgress(unitsDone, unitsFailed, phase)` (absolute values, written **once per wave** by the workflow — N69, review F-36: a per-chunk increment serialised all 32 commits of a document on one row), `Defer(until)`, `PendingWithoutWorkflow(olderThan)` | states `PENDING/RUNNING/DEFERRED/SUCCEEDED/FAILED/CANCELLED` (N35; a partial failure is `SUCCEEDED` with `progress.units_failed > 0`) |
 | `StatsRepo` | `Refresh()` (`count(*)` over the `WHERE live` partial indexes per namespace, run only by the **stats sweeper** — `engram_admin`, every 60 s per namespace, one read per tick — which also flips `namespace_stats.large` at 20 k live facts with hysteresis at 10 k, N55), `Get` | `namespace_stats` is **derived**, never written on the commit path by `CommitChunk`, `FinalizeVersion` or the delete cascade (N69); `max_facts` tolerates one refresh interval of staleness |
-| `DocumentRepo.SetChunksDone(v, n)` / `OperationRepo.SetProgress` | written **once per wave** by the workflow (`MarkProgress`), never per chunk | a per-chunk `UPDATE` of the version row after the N40 `FOR SHARE` would deadlock two commits of the same version (§3.3.1) |
+| `DocumentRepo.SetChunksDone(v, n)` / `OperationRepo.SetProgress` | written **once per wave** by the workflow (`MarkProgress`), never per chunk | a per-chunk `UPDATE` of the version row would serialise the 32 parallel commits of a document on one row (§3.3.1) |
 | `SnapshotRepo` | `Insert`, `ExpireContaining(documentID)` (`UPDATE export_snapshots SET state = 'expired', expired_at = now() WHERE … state = 'ready' AND created_at >= <document's first version>`, run by the delete cascade — N59), `List`, `Get` | `StreamSnapshot` refuses `expired` versions with `PreconditionFailed{SNAPSHOT_EXPIRED}` |
-| `LedgerRepo` | `Append` | append-only; no update/delete method exists |
+| `LedgerRepo` | `Append` | append-only; no update/delete method exists; ledger rows are deleted only by explicit document, namespace or tenant delete (admin role, after the `document_versions` rows), never by a replace/append retire (N104) |
+| `ConsolidationRepo` | `PendingFacts(limit)` (live facts above `consolidation_state.watermark_memory_id` with no `fact_consolidation` row), `MarkConsolidated(batchKey, factIDs)` (insert-only, `ON CONFLICT DO NOTHING`), `Stamp(factID, note)` (`failed`/`capacity`), `AdvanceWatermark()` (never past `uuidv7(now() − 2 × statement_timeout)`, N95) | `facts.consolidated_at` and `facts_unconsolidated_idx` no longer exist; covered by `BatchApplied` |
 | `IdempotencyRepo` | `Get`, `Put`, `Expire(olderThan)` | 24 h (D1) |
 | `TokenUsageRepo` | `Add(day, op, model, prompt, completion, cost)`, `SumDay` | moves with the namespace (D13) |
-| `OwnershipRepo` | `Get`, `Insert(incoming)`, `LockExclusive()` (transaction-scoped `pg_advisory_xact_lock(engram_ns_lock_key(ns))` — freeze, cutover (b)/(c), rollback, delete freeze, restore; waits for every shared holder and blocks new writers in a fair queue), `LockExclusiveSession()` / `UnlockSession()` (the **session-level** `pg_advisory_lock`/`pg_advisory_unlock` form on a direct connection, N15 — the copy barrier and the export snapshot, which must release the lock without ending their `REPEATABLE READ` transaction, §3.3 lock-discipline table), `Transition(from,to,epoch, freezeReason)` (state-predicate `UPDATE` under the exclusive lock) | write methods require the `engram_move` (or admin) role; the target-side bulk load runs as `engram_move_load` (`BYPASSRLS`, `INSERT` only on the copied namespace tables, `SELECT` on `namespace_ownership`/`shard_meta`) with the per-batch fence = shared advisory lock + `state = 'incoming' AND epoch = e + 1`, because `COPY FROM` is refused on RLS tables (N51, review F-4) |
+| `OwnershipRepo` | `Get`, `Insert(incoming)`, `LockExclusive()` (transaction-scoped `pg_advisory_xact_lock` over `engram_ns_lock_keys(ns)` under `lock_timeout` 5 s with jittered retry — freeze, cutover (b)/(c), rollback, delete freeze, restore; waits for every shared holder, later writers are refused by their try-lock, N82), `LockExclusiveSession()` / `UnlockSession()` (the **session-level** `pg_advisory_lock`/`pg_advisory_unlock` form on a direct connection, N15 — the copy barrier, which must release the lock without ending its `REPEATABLE READ` transaction, §3.3 lock-discipline table; exports no longer use it, N82), `Transition(edge, epoch, …)` (state-predicate `UPDATE`; the edges, their roles and the `moved_out` target fields are generated from the §3.3.1 transition table, N101/N103, including `moved_out → incoming` for a move back, N93), `SetMoveEpoch` (N88: `move_epoch` = target epoch, set by the `start_move` edge, cleared by abort/thaw/activate; the views `purgeable_namespaces` and `schedulable_namespaces` exclude such namespaces) | write methods require the `engram_move` (or admin) role; **there is no `engram_move_load` any more** (N91): `engram_move` has no `BYPASSRLS`, loads each range through a session `TEMP` table and `INSERT … SELECT … ON CONFLICT` under `ns_isolation` after re-checking the target row (`state = 'incoming'`, matching epoch) with `SET LOCAL session_replication_role = replica` (`GRANT SET ON PARAMETER`, PG 15+); source cleanup is the `engram_migrate`-owned `SECURITY DEFINER` function `engram_cleanup_namespace`, which never deletes the ownership row (N93) |
+| `ReplayRepo` | `Upsert(table, rows, class)` with the N81 semantics (immutable tables `DO NOTHING`; mutable tables `DO UPDATE` of mutable columns `WHERE … IS DISTINCT FROM`, `engram.replay = 'on'`), `VerifyFK()` (calls `engram_verify_fk(ns)`: orphan count per foreign key, must be 0), `Purged(table, documentID, minKey, maxKey)` | target side of the move; the event → `(table, key expression)` mapping is `internal/move/replay_map.go`, generated from the `replay:` annotations of `events.proto`; each `store.Queries` entry declares `writes` plus the covering event, `frozen_recopy` or `derived`, and the build fails on an uncovered table (N81) |
 | `MoveAppliedRepo` | `RecordApplied(seq)` (target, `INSERT … ON CONFLICT DO NOTHING RETURNING seq` in the same tx as the event's apply — the authoritative exactly-once guard), `MirrorApplied(seqs)` (source, the mover's lagging copy, written after the target commit so the anti-join is one source-side statement), `SetLagSeq(seq)` (`namespace_ownership.move_applied_seq`, lag reporting only), `DeleteForMove` (both copies at done/rolled_back) | N50, §3.3.1: a crash between the two inserts only makes the next round re-read an event the target then drops |
 
 **(c) Dependencies.** `errs`, `telemetry`, `gen/go/engram/internal/events/v1`, `pgx/v5`, `pgxpool`.
@@ -683,7 +711,7 @@ policy (a query without `SET LOCAL` returns zero rows), the append-only ledger (
 `ingest_ledger` raises), and the shared/exclusive advisory-lock interaction (a writer that started before
 freeze commits; one that starts after fails; a stream of writers arriving every 5 ms cannot delay the exclusive
 lock past the longest in-flight writer — the F-5 starvation case, run as a two-session test on PG 16 before any
-move code exists), plus `COPY FROM STDIN` as `engram_move_load` with the explicit fence (N51).
+move code exists), plus the target-side range load as `engram_move` under RLS (a stream carrying another `namespace_id` fails the policy, a load into a non-`incoming` namespace is refused, replica mode skips the append-only and `*_touch` triggers — N91), `TestFence_TryLockRefusedBehindWaiter` (a shared try-lock behind a queued exclusive request is refused; PG 16), `TestFence_PoolNotExhausted` (32-writer hot namespace plus a freeze: recall p95 on a second namespace of the same shard does not move), `TestDocLock_NoStarvation` (continuous `CommitChunk`s must not delay `FinalizeVersion`, the ack or the cascade beyond `lock_timeout`), and the property test that every event type at its stated maxima encodes to ≤ 16 KiB (N80).
 
 #### 2.2.8 `internal/index` — search index abstraction
 
@@ -707,7 +735,7 @@ type Kind int // KindFact | KindObservation | KindChunk
 
 type Hit struct { ID string; Kind Kind; Score float64 /* arm-local raw score (cosine or BM25); the planner min–max normalises it PER QUERY to [0, 1] before anything is exposed in Scores (N67: raw BM25 is partition-relative and a weak cross-tenant channel) */; MentionedAt time.Time }
 type Filter struct {
-	AsOf *time.Time               // mentioned_at ≤ AsOf, applied inside the predicate (D9)
+	AsOf *time.Time               // mentioned_at ≤ AsOf, applied inside the predicate (D9); the CHUNK arm also requires embedding_effective_at ≤ AsOf (N85), and observation hits are the version's own evidence rows (observation_version_sources) joined to live facts with mentioned_at ≤ AsOf
 	FactTypes []memoryv1.FactType
 	Tags []string
 	TagMode memoryv1.TagMatchMode // ANY | ANY_STRICT | ALL | ALL_STRICT | EXACT (D10, §4.3)
@@ -719,8 +747,8 @@ type Filter struct {
 type SemanticPlan int
 
 const (
-	PlanExact      SemanticPlan = iota + 1 // namespace below 20 k live facts: exact scan over (namespace_id) + live, `embedding <=> $q` ordered, ≈ 30 MB of halfvec, 5–15 ms, never truncated
-	PlanPartialHNSW                        // namespace flagged `large`: its own partial index `WHERE namespace_id = …`, built when the flag flips
+	PlanExact      SemanticPlan = iota + 1 // namespace below 20 k live rows: exact scan over (namespace_id) + live, `embedding <=> $q` ordered; ≤ 20,000 rows × ≈ 3 KB heap with `STORAGE MAIN` embeddings (N94: the earlier "30 MB, 5–15 ms" figure is withdrawn until M0.6 measures it cold for facts, chunks and observation versions), never truncated
+	PlanPartialHNSW                        // only in the band where the shared index fails (N94): `live_rows >= 20,000 AND live_rows < 2 % of the partition's live rows`; its own partial index `WHERE namespace_id = …`, built by `engramctl index` when the flag flips (on a move target only after copy and catch-up, N89)
 	PlanPartitionHNSW                      // fallback: the shared partition index with iterative relaxed-order scan
 )
 
@@ -753,7 +781,7 @@ type Sink interface {
 }
 ```
 
-Search methods take the fenced `tx` so `SET LOCAL engram.namespace_id` (partition pruning + RLS) and `SET LOCAL
+Under `Filter.AsOf` a chunk hit's `Header` is returned empty (N85). Search methods take the fenced `tx` so `SET LOCAL engram.namespace_id` (partition pruning + RLS) and `SET LOCAL
 hnsw.ef_search / hnsw.iterative_scan` apply. `Filter.AsOf` is rendered into the `WHERE` of every arm, never
 applied post hoc (D9). **Liveness join (N44):** every implementation's hits are joined with
 `facts.retired_at IS NULL AND invalidated_at IS NULL` (observation versions: `live`) at read time, inside `tx`,
@@ -788,8 +816,10 @@ Pure Go, no I/O.
 ```go
 package chunk
 
-type Document struct { DocumentID string; Content string /* raw text/markdown */; Context string /* item.context, appended to the header if present */ }
-type Options struct { TargetChars int /* 3000 */; MinChars int /* 500 */; MaxChars int /* 4000 */; Summary string /* ≤ 200 chars, from SummarizeDocument; "" on first pass */; SummaryID string /* id of the summary in use; part of header_hash (N60) */ }
+type Item struct { Timestamp time.Time /* the item's server-set timestamp */; ByteStart, ByteEnd int /* span in Document.Content */ }
+type Document struct { DocumentID string; Content string /* raw text/markdown */; Items []Item /* in order; Content is their concatenation (APPEND: base body ‖ "\n\n" ‖ new bodies) */; BaseChunks []BaseChunk /* APPEND only: the last base chunk(s) the new text re-chunks, with their MentionedAt (N86) */; Context string /* item.context, appended to the header if present */ }
+type BaseChunk struct { ByteStart, ByteEnd int; MentionedAt time.Time }
+type Options struct { MaxItemGap time.Duration /* 24 h: a HARD boundary is forced between consecutive items whose timestamps differ by more than this (N86) */; TargetChars int /* 3000 */; MinChars int /* 500 */; MaxChars int /* 4000 */; Summary string /* ≤ 200 chars, from SummarizeDocument; "" on first pass */; SummaryID string /* id of the summary in use; part of header_hash (N60) */ }
 type Chunk struct {
 	Ordinal int
 	ContentHash [32]byte                         // sha256(Text) — identity within the document (D8)
@@ -800,10 +830,16 @@ type Chunk struct {
 	ByteStart int
 	ByteEnd int
 	Tokens int                                   // cl100k_base estimate
+	ItemIndexes []int                            // every item whose bytes the chunk covers, ascending (N86; replaces the singular item index)
+	MentionedAt time.Time                        // max over ItemIndexes' timestamps and, for an APPEND re-chunk, over the BaseChunks the new text overlaps (N86); facts inherit it; the as_of key
 }
 
+// Result of Chunker.Chunk also reports how many item timestamps were clamped up to the running maximum (regressions are
+// accepted, not rejected, so re-ingest and benchmark replays keep working) — surfaced as OperationResult.timestamps_clamped.
+type Chunked struct { Chunks []Chunk; TimestampsClamped int }
+
 type Chunker interface {
-	Chunk(ctx context.Context, doc Document, o Options) ([]Chunk, error)
+	Chunk(ctx context.Context, doc Document, o Options) (Chunked, error)
 }
 
 // HeaderBuilder is separate so the header can be recomputed when only the summary changed
@@ -821,8 +857,9 @@ type HeaderBuilder interface {
 func SummaryPolicy(mode memoryv1.UpdateMode, prevBytes, newBytes int) (recompute bool)
 ```
 
-The hash excludes the header so a re-summarised document does not invalidate the extraction cache or force
-re-extraction of unchanged sections. Three rules keep the header cheap (N60): the summary is recomputed only on
+The *content* hash excludes the header, so chunk identity survives a re-summary; since N87 the extraction cache key
+does include `header_hash` (through `render_hash`), so a changed summary or heading path re-extracts through the
+ordinary retain path (open interaction with N60 recorded as PD-26). Three rules keep the header cheap (N60): the summary is recomputed only on
 `REPLACE` or when the document has grown by more than 25 % since the summary in use, so an append-only
 conversation re-summarises every ~4th doubling, not every turn; `header_hash` covers the heading path and the
 *summary id*, so a byte-identical summary never trips it; and the header is embedded into the **chunk vector
@@ -838,7 +875,8 @@ review F-14).
 A/B in §8) → `SentenceChunker` (evaluation only).
 
 **(e) Test seam.** Golden files (`testdata/*.md` → expected boundaries + hashes) and rapid properties:
-concatenation of chunks equals input, every chunk within `[min, max]` except a possibly short last chunk,
+a chunk built from two items with non-monotone timestamps takes the later timestamp (`AsOf_ChunkTwoItems.cfg`, W-10),
+a boundary is forced across a gap over 24 h, concatenation of chunks equals input, every chunk within `[min, max]` except a possibly short last chunk,
 determinism.
 
 #### 2.2.10 `internal/extract` — structured extraction with prompt versioning and cache
@@ -865,14 +903,18 @@ type Fact struct {
 	Why           string
 	OccurredStart *time.Time
 	OccurredEnd   *time.Time
-	MentionedAt   time.Time  // ALWAYS the item timestamp, set by the activity from ChunkInput.ItemTimestamp (D9 as amended): the extractor's output has no say in the as_of key (review F-2)
+	MentionedAt   time.Time  // ALWAYS the chunk's mentioned_at (max over the items it covers, N86), set by the activity from ChunkInput.ItemTimestamp (D9 as amended): the extractor's output has no say in the as_of key (review F-2)
 	SaidAt        *time.Time // the extractor's "as said on" date when the chunk quotes older material; display and ranking only, never a visibility key
 	Entities      []EntityMention
 	Causes        []CausalRef
 	Confidence    float32
 }
 
-type ChunkInput struct { Header, Text string; ContentHash [32]byte; ItemTimestamp time.Time; EntityHints, Tags []string }
+type ChunkInput struct { Header, Text string; ContentHash [32]byte; ItemTimestamp time.Time /* = chunk.MentionedAt */; Context string; Metadata map[string]any; EntityHints, Tags []string; Mission string /* retain.mission */; HeaderHash [32]byte }
+
+// RenderHash covers every prompt input (N87, review-2 G-9): sha256(day(mentioned_at) ‖ context ‖ canonical(metadata) ‖
+// sorted(entity_hints) ‖ retain.mission ‖ header_hash). A change to any of them is a new cache key and re-extracts.
+func RenderHash(in ChunkInput) [32]byte
 type Extraction struct { Facts []Fact; PromptVersion string; Model gateway.Model; SchemaVersion string; Usage gateway.Usage; FromCache bool }
 
 type Extractor interface {
@@ -882,9 +924,9 @@ type Extractor interface {
 	SchemaVersion() string
 }
 
-type CacheKey struct { Prefix blob.Prefix; ChunkHash [32]byte; PromptVersion string; Model gateway.Model; SchemaVersion string }
+type CacheKey struct { Prefix blob.Prefix; ChunkHash [32]byte; PromptVersion string; Model gateway.Model; SchemaVersion string; RenderHash [32]byte }
 
-func (k CacheKey) BlobKey() string // "{shard}/{tenant}/{ns}/xcache/{sha256(chunk_hash‖prompt‖model‖schema)}.json"
+func (k CacheKey) BlobKey() string // "{shard}/{tenant}/{ns}/xcache/{sha256(chunk_hash‖prompt‖model‖schema‖render_hash)}.json" — equal to chunks.extraction_key (N87)
 
 type Cache interface {
 	Get(ctx context.Context, k CacheKey) (*Extraction, bool, error)
@@ -907,8 +949,7 @@ validation message appended (§6). The decoder discards any `mentioned_at` the m
 same cache key) → `RuleExtractor` (regex "one fact per paragraph", tests and cost-free smoke runs).
 
 **(e) Test seam.** Record/replay gateway; goldens keyed by prompt version so a prompt bump shows exactly which
-extractions changed; cache tests assert the key changes with each of the four inputs and never with the header
-alone.
+extractions changed; cache tests assert the key changes with each of the five inputs (chunk hash, prompt, model, schema, `render_hash`) and with each component of `render_hash` (timestamp day, context, metadata, hints, mission, header hash), and not with anything outside them; hit rate is that of identical text under identical rendered variables (§6.8).
 
 #### 2.2.11 `internal/entity` — per-namespace fuzzy resolution
 
@@ -1038,7 +1079,7 @@ type Sink interface { // batches of 10, then the trailing stats
 }
 
 type PlannerDeps struct { Embedder QueryEmbedder /* LRU keyed (namespace, sha256("search_query: "+text)) */; Arms []Arm; Fuser Fuser; Reranker Reranker; Booster Booster; Packer Packer; Counter TokenCounter /* cl100k_base */ }
-type PlannerOptions struct { ArmDeadline time.Duration /* 60 ms */; GraphWaveBudget time.Duration /* 30 ms per seeding wave (N54) */; RerankReserve time.Duration /* 150 ms */; RerankBudget time.Duration /* 90 ms at 50 pairs (N54) */; EmbedDeadline time.Duration /* 40 ms */; RerankTop map[Budget]int /* 0/50/150 (N53) */ }
+type PlannerOptions struct { ArmDeadline time.Duration /* 60 ms */; GraphWaveBudget time.Duration /* 30 ms per seeding wave (N54) */; RerankReserve time.Duration /* 106 ms = rerank p95 90 + pack 3 + stream 5 + 8 (N106) */; RerankBudget time.Duration /* 90 ms at 50 pairs (N54) */; EmbedDeadline time.Duration /* 40 ms */; RerankTop map[Budget]int /* 0/50/150 (N53) */ }
 
 type Planner interface {
 	Run(ctx context.Context, tx store.Tx, idx index.Index, q *Query, sink Sink) error
@@ -1052,12 +1093,16 @@ budget: wave 1 is seeded from the lexical top-20 the moment lexical returns (so 
 wave 2 from the semantic top-20 when semantic returns. The critical path is authz 2 → embed 25 → semantic 60 →
 graph wave 2 30 → fuse 1 → rerank 90 → pack 3 → stream 5 = 216 ms p95 at MID (review F-7: seeding one graph
 pass behind *both* seed arms at a full 60 ms made it ≈ 276 ms). Every other arm gets
-`min(ArmDeadline, remaining − rerankReserve − packReserve)`. The temporal arm is a two-sided btree probe
+`min(ArmDeadline, remaining − rerankReserve − packReserve)`. The rerank-skip rule (N106, review-2 G-28): rerank
+is skipped when the remaining deadline is below `RerankReserve` = 106 ms; the SLO assumes a client deadline of at
+least 300 ms, under which a skip occurs only when the pre-rerank path exceeds `deadline − 106 ms` = 194 ms — a p99
+property of that path (M0.5 measures its p95/p99, M1.2's < 1 % criterion is judged against it); at client deadlines
+below 300 ms skipping is by design and is not an SLO breach. The temporal arm is a two-sided btree probe
 around `query_timestamp` (`FactRepo.NearestByOccurrence`, N68), never a sort of every overlapping fact. Arm
 scores are min–max normalised per query before fusion statistics are exposed (N67). Rerank runs on
 `RerankTop[budget]` pairs (0 at LOW); a skip for lack of deadline sets `stage = FUSED`, increments
 `engram_recall_rerank_skipped_total{shard, reason}` and is an **SLO breach** (N53), not a benign degradation —
-the reranker is a sized dependency (A-R1: ≥ 80 k pairs/s per cell). The planner records per-stage timings and
+the reranker is a sized dependency (A-R1: ≥ 80 k pairs/s per cell; deadline-skips at client deadlines < 300 ms are excluded from the breach count, N106). Under `as_of` the chunk arm adds `embedding_effective_at ≤ T`, `ChunkInfo.header` is returned empty and observation evidence is the version's own rows (N85). The planner records per-stage timings and
 arm statuses into `RecallStats`. Rejected: `errgroup` with a shared deadline (one slow arm would take the
 others with it); `rerank_top.mid = 150` with `bge-reranker-v2-m3` (240 k pairs/s per cell — a GPU fleet nobody
 has provisioned, review F-6).
@@ -1073,7 +1118,7 @@ as_of leakage, cap adherence).
 **(e) Test seam.** Each stage is pure or takes `tx`+`idx`; rapid properties mirror the Lean theorems: RRF
 permutation invariance (exact, over `big.Rat`) and monotonicity, packing never exceeds the budget and skips
 exactly the items that do not fit, boost factor always in `[0.75, 1.25]`; a deadline test with a fake clock
-asserts the 216 ms critical path and that the rerank-skip counter stays at zero under the budgeted latencies.
+asserts the 216 ms critical path, that the rerank-skip counter stays at zero under the budgeted latencies at a 300 ms deadline, and the 106 ms reserve.
 
 #### 2.2.14 `internal/consolidate` — facts → observations (phase 2)
 
@@ -1087,7 +1132,7 @@ idempotently by `op_key` over the stored list after re-verifying every input `FO
 ```go
 package consolidate
 
-type Batch struct { FactIDs []string /* sorted */; Facts []store.Fact; BatchKey [32]byte /* sha256(sorted fact ids ‖ prompt_version ‖ model) */ }
+type Batch struct { FactIDs []string /* sorted; selected as store.ConsolidationRepo.PendingFacts — live facts above the watermark with no fact_consolidation row (N95) */; Facts []store.Fact; BatchKey [32]byte /* sha256(sorted fact ids ‖ prompt_version ‖ model) */ }
 
 type OpKind string // "create" | "update" | "delete"
 
@@ -1112,7 +1157,7 @@ type Validator interface {
 }
 
 // Proposal is the write-once record of what the prompt saw and what it answered (N43).
-type Proposal struct { BatchKey [32]byte; Ops []Op /* op_index order; creates carry a pre-minted ObservationID */; InputFactIDs []string /* the RENDERED evidence: batch facts ∪ the quoted sources actually shown for each candidate (≤ 5 per candidate, N47) — not every source of every candidate, which inflated inputs to ≈ 210 per version and let one session delete hide ≈ 1 600 observations (N41 as amended, review F-9) */; CandidateVersions []store.ObservationVersionRef }
+type Proposal struct { BatchKey [32]byte; Ops []Op /* op_index order; creates carry a pre-minted ObservationID */; InputFactIDs []string /* the RENDERED evidence: batch facts ∪ the quoted sources actually shown for each candidate (≤ 5 per candidate, N47) — not every source of every candidate, which inflated inputs to ≈ 210 per version and let one session delete hide ≈ 1 600 observations (N41 as amended, review F-9) */; CandidateVersions []store.ObservationVersionRef /* EVERY candidate version whose text was shown, including the observation's own previous version; one observation_version_lineage edge per entry (N79) */ }
 
 type ProposalStore interface {
 	// Store inserts ON CONFLICT (namespace_id, batch_key) DO NOTHING and returns the stored proposal — the
@@ -1125,15 +1170,24 @@ type ProposalStore interface {
 type Applier interface {
 	// Apply runs in one fenced tx over the STORED proposal: consolidation_applied(op_key) insert ON CONFLICT
 	// DO NOTHING gates each op and commits with the effects (N43); every InputFactIDs row is re-read FOR SHARE
-	// and must be live, else errs.ProposalDiscarded and nothing is written (N41); new observation_versions get
+	// and must be live, AND every CandidateVersions entry is locked FOR SHARE and must satisfy
+	// NOT derived_from_deleted AND hidden_by_invalidation = 0 AND retired_at IS NULL, else errs.ProposalDiscarded
+	// (carrying the missing facts and the flagged versions) and nothing is written (N41, N79, N84); each new
+	// version also writes its observation_version_lineage edges (one per CandidateVersions entry) and its
+	// observation_version_sources rows (N85), and the batch is recorded with fact_consolidation rows, not a column
+	// on facts (N95); new observation_versions get
 	// effective_at = max(mentioned_at over inputs, effective_at over CandidateVersions, previous version) (D9)
 	// and their observation_inputs rows; outbox events last (A-F1).
 	// Statement order for an update (N57, review F-11): INSERT the new version, its observation_sources
 	// (ON CONFLICT DO NOTHING) and observation_inputs FIRST, then DELETE the sources not in the new set — the
 	// zero-sources trigger then always sees a non-empty set and cannot retire the observation inside its own
-	// update. Apply clears observations.stale_write/stale_delete; it NEVER touches
-	// observation_versions.derived_from_deleted — that flag is per version and permanent (N41): the new version
-	// is live, an older version written with since-deleted content stays hidden at every as_of.
+	// update. An update deletes only observation_sources rows the model was shown and dropped, never unshown ones
+	// (N79: proof_count does not erode). Apply clears observations.stale_write/stale_delete; it NEVER touches
+	// observation_versions.derived_from_deleted or hidden_by_invalidation — those are per version (N41, N84): the
+	// new version is live, an older version written with since-deleted content stays hidden at every as_of. A
+	// stale or flagged observation is rebuilt as a ROOT version from live sources (no flagged text in the prompt,
+	// no lineage edge to a flagged ancestor), at most consolidate.max_rebuilds_per_round (default 50 per
+	// namespace per wave, oldest first); the rest stay hidden (N79).
 	Apply(ctx context.Context, tx store.Tx, p Proposal) (applied int, err error)
 }
 
@@ -1146,7 +1200,8 @@ type Consolidator interface {
 Swappable.** `LLMProposer` → `RecordReplayProposer` (tests) → `NoopConsolidator` (namespaces with consolidation
 disabled). **(e) Test seam.** Model-based test derived from `Consolidation.tla` (§7): random at-least-once
 re-execution of `Apply` must yield exactly one effect per `op_key`; the source-count trigger is tested on
-testcontainers.
+testcontainers; T1 property test: any version reachable by lineage from a flagged version is flagged
+(`DocLifecycle_NoLineage.cfg` must fail with the G-1 trace, W-2).
 
 #### 2.2.15 `internal/reflect` — bounded agent loop (phase 2)
 
@@ -1264,13 +1319,14 @@ func OpSweeper(ctx workflow.Context, in *workflowv1.OpSweeperInput) error
 // Every activity input embeds workflowv1.WorkflowScope{namespace_id, tenant_id, shard_id, epoch, blob_prefix};
 // activities re-check ownership through store.WithNamespaceTx (D4).
 type RetainActivities interface {
+	LoadItem(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.LoadItemResult, error) // assigns the APPEND base under the documents row lock (N56); reads the base's single `ver/{sha256}` body blob and writes this version's (N104)
 	Chunk(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.ChunkPlan, error)
 	SummarizeDocument(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.SummarizeDocumentResult, error)
 	ExtractChunk(ctx context.Context, scope *workflowv1.WorkflowScope, w *workflowv1.ChunkWork) (*workflowv1.ExtractChunkResult, error)
 	EmbedChunk(ctx context.Context, scope *workflowv1.WorkflowScope, w *workflowv1.ChunkWork, x *workflowv1.ExtractChunkResult) (*workflowv1.EmbedChunkResult, error)
 	ResolveEntities(ctx context.Context, scope *workflowv1.WorkflowScope, x *workflowv1.ExtractChunkResult) (*workflowv1.ResolveEntitiesResult, error)
 	BuildLinks(ctx context.Context, scope *workflowv1.WorkflowScope, x *workflowv1.ExtractChunkResult, e *workflowv1.EmbedChunkResult, r *workflowv1.ResolveEntitiesResult) (*workflowv1.BuildLinksResult, error)
-	CommitChunk(ctx context.Context, in *workflowv1.CommitChunkInput) (*workflowv1.CommitChunkResult, error)
+	CommitChunk(ctx context.Context, in *workflowv1.CommitChunkInput) (*workflowv1.CommitChunkResult, error) // errors: errs.DocumentBusy (retryable, N83), errs.InputBlobMissing (non-retryable here; the WORKFLOW re-runs ExtractChunk + EmbedChunk, ≤ 2 re-runs, then chunk_failed — N100)
 	FinalizeVersion(ctx context.Context, in *workflowv1.FinalizeVersionInput) (*workflowv1.FinalizeVersionResult, error)
 }
 
@@ -1290,11 +1346,22 @@ type Client interface { // used by engram-api; wraps client.Client
 	WaitResult(ctx context.Context, workflowID string, timeout time.Duration) (done bool, err error) // WaitOperation long-poll (N70): GetWorkflow(id).Get bounded by timeout; the api caps open waits per process
 }
 
-// DataConverter returns the Temporal converter every client and worker is built with (N59, review F-25): the
-// default proto converter wrapped in a payload codec that encrypts each payload with AES-256-GCM under a
-// per-shard key from the secret store (key id in the payload metadata, rotated by `engramctl`). Temporal UI/CLI
-// users see ciphertext; a codec server for the UI is deliberately not deployed.
+// DataConverter returns the Temporal converter every client and worker is built with (N59, N99, review F-25,
+// review-2 G-20): the default proto converter wrapped in a payload codec that encrypts each payload with AES-256-GCM
+// under a PER-NAMESPACE data key wrapped by the shard key (key id in the payload metadata, namespace id in the
+// workflow header; rotated by `engramctl`). Deleting the wrapped data key is the shredding step of a namespace or
+// tenant delete. A shard-key or data-key version is destroyed only after rotation time + max workflow run timeout
+// (7 d) + Temporal retention (7 d). Temporal UI/CLI users see ciphertext; a codec server for the UI is deliberately
+// not deployed. Accurate claim: text appears in histories only as ciphertext, at most 4 KiB per activity result, plus
+// ChunkWork.header/context/metadata_json/entity_hints; histories expire with retention 7 d and are unreadable after
+// key destruction.
 func DataConverter(keys KeyProvider) converter.DataConverter
+
+type KeyProvider interface {
+	DataKey(ctx context.Context, namespaceID string, keyID string) (key []byte, err error) // unwraps the namespace data key with the shard key
+	CurrentKeyID(namespaceID string) string
+	Shred(ctx context.Context, namespaceID string) error // deletes the wrapped data key (namespace/tenant delete)
+}
 
 // Payload rule (N59, review F-18): every activity result larger than 4 KiB travels by blob key —
 // ExtractChunkResult.cache_key, EmbedChunkResult.staging_blob_key, ResolveEntitiesResult.result_blob_key,
@@ -1317,11 +1384,13 @@ is written once per wave by the workflow (`OperationRepo.SetProgress`, N69), not
 | `SummarizeDocument`, `ExtractChunk` | 2 s | ×2, cap 60 s | 8 | `PermanentLLMError`, `ValidationError` (after 1 re-prompt), `WrongShardOrEpoch` |
 | `EmbedChunk` | 1 s | ×2, cap 30 s | 8 | `PermanentLLMError` (incl. wrong dims), `WrongShardOrEpoch` |
 | `ResolveEntities`, `BuildLinks` | 1 s | ×2, cap 30 s | 5 | `WrongShardOrEpoch` |
-| `CommitChunk`, `FinalizeVersion` | 1 s | ×1.5, cap 5 s | unlimited within a 10 min `ScheduleToClose` (`P-frozen`, §5.8) | `WrongShardOrEpoch`; `NamespaceFrozen` is retryable because the mover terminates and restarts the workflow on the target within the freeze window (D5 step 5) |
+| `CommitChunk`, `FinalizeVersion` | 1 s | ×1.5, cap 5 s | unlimited within a 10 min `ScheduleToClose` (`P-frozen`, §5.8) | `WrongShardOrEpoch`, `InputBlobMissing` (handled by the workflow, N100); `DocumentBusy` (100 ms) and the N82 `FENCE_BUSY` refusal (200 ms) are retryable; `NamespaceFrozen` is retryable because the mover terminates and restarts the workflow on the target within the freeze window (D5 step 5) |
 | `ConsolidateBatch` | 5 s | ×2, cap 5 min | 6 | `PermanentLLMError`, `WrongShardOrEpoch`; `QuotaExceeded` → workflow sleeps until reset (`DEFERRED`) |
 | `PurgeBlobs`, `PurgeRows` | 5 s | ×2, cap 10 min | unlimited (heartbeat) | `WrongShardOrEpoch` |
-| Move `Copy`, `CatchUp` | 5 s | ×2, cap 5 min | 20 | `WrongShardOrEpoch` (fence broken → rollback) |
-| Move `Freeze`, `Cutover` | 1 s | ×2, cap 10 s | 5 | `MovePrecondition` (CAS lost → rollback) |
+| Move `Copy` (resumable key ranges), `CatchUp` | 5 s | ×2, cap 5 min | 20 | `WrongShardOrEpoch` (fence broken → rollback) |
+| Move `Freeze`, `CutoverBegin` | 1 s | ×2, cap 10 s | 5 | `MovePrecondition` (CAS lost → rollback) |
+| Move `CutoverTarget`/`CutoverSource` (`P-cutover`) | 100 ms | ×1.5, cap 1 s | within 60 s | `MovePrecondition`; failure before (c) → rollback, after (c) never |
+| Move `CutoverCatalog` (d) | 100 ms | ×1.5, cap 1 s | **unlimited, idempotent** (off every read path, N98) | `MovePrecondition` |
 | `Export*` | 5 s | ×2, cap 5 min | 10 | `ValidationError` |
 
 A `WrongShardOrEpoch` in any activity fails the workflow with a typed failure; the move executor restarts the
@@ -1332,7 +1401,8 @@ Activities are interfaces; `FakeActivities` for `testsuite` workflow tests. **(e
 `testsuite.WorkflowTestSuite` with mocked activities: fan-out bound, idempotent re-execution, `ContinueAsNew` at
 100 chunks and at 20 MB of history (measured through the SDK's history-size metric in T2), deferral on quota;
 a payload test asserts no activity input or result in a recorded history exceeds `MaxInlineResultBytes` and
-that every payload is ciphertext under the codec (`TestIso_Temporal_PayloadsEncrypted`); a chaos test on
+that every payload is ciphertext under the codec (`TestIso_Temporal_PayloadsEncrypted`) and that a namespace's payloads
+are unreadable after `KeyProvider.Shred`; a chaos test on
 testcontainers Temporal kills workers mid-`CommitChunk` and asserts no duplicate facts.
 
 #### 2.2.18 `internal/outbox` — relay, cursors, gap watchlist, sinks
@@ -1349,6 +1419,12 @@ idle_in_transaction_session_timeout = 30 s`).
 package outbox
 
 type Event struct { Seq int64; NamespaceID string; Epoch int64; Type string; Payload *eventsv1.Event; CreatedAt time.Time }
+
+// Group reassembles a paged event group (N80): pages of the same type and group key (document_id, deleted_at or
+// batch_key) are complete only when all `page_count` pages have been seen; an `ids_elided` event is complete on its
+// own and the consumer reads the ids from the store by document_id. The move replay does NOT use Group: it treats
+// each page independently (N81).
+type Group interface { Add(e Event) (complete bool); Ids() [][]byte; Elided() bool }
 
 // Sink consumes events in seq order; Apply must be idempotent by (namespace_id, seq).
 type Sink interface {
@@ -1372,7 +1448,8 @@ type GapWatch interface { Note(seq int64, seenAt time.Time); Due(now time.Time) 
 The relay holds a *shard-level* connection (`engram_relay` role, RLS-bypassing read on `outbox` only, since it
 must see every namespace) — the one deliberate exception to "every connection has a namespace scope", justified
 because the outbox carries no content beyond the proto payload the consumer needs and the relay never writes
-namespace tables. Cursor advancement per sink is a separate transaction from sink `Apply`, so at-least-once
+namespace tables. Every event encodes to ≤ 16 KiB by construction (ids are 16-byte `bytes`, ≤ 256 per event, paged above that, elided
+above 4,096 — N80); the relay still treats a payload that fails to decode as a poison event. Cursor advancement per sink is a separate transaction from sink `Apply`, so at-least-once
 delivery is the contract and sinks are idempotent. Rejected: exactly-once via two-phase commit into the external
 engine (not available; idempotent keys are cheaper and provable, §7 `Outbox.tla`).
 
@@ -1385,9 +1462,9 @@ namespace.
 #### 2.2.19 `internal/move` — namespace move orchestrator (D5)
 
 **(a) Responsibility.** Implement the D5 state machine as Temporal workflow `move/{namespace_id}/{epoch}` on
-task queue `shard-{target}` (new decision N2) with activities `Plan, Copy, CatchUp, Freeze, Drain, Verify, Cutover,
-Restart, Cleanup, Rollback` (§5.5.1), each re-checking the fence before acting. This is the only code path allowed two shard
-handles at once; it never runs a statement that references both.
+task queue `shard-{target}` (new decision N2) with activities `Plan, Copy, CatchUp, VerifyDeep, Freeze, Drain, Verify,
+VerifyFK, CutoverBegin/Target/Source/Catalog, Restart, Cleanup, Rollback` (§5.5.1), each re-checking the fence before
+acting. This is the only code path allowed two shard handles at once; it never runs a statement that references both.
 
 **(b) Interfaces.**
 
@@ -1398,86 +1475,98 @@ type Phase string // planned | copying | catching_up | frozen | cutover | cleani
 
 // Fence is asserted at the start of every activity against the catalog row, the source
 // ownership row and the target ownership row; any mismatch → errs.WrongShardOrEpoch (non-retryable → Rollback).
-type Fence struct { NamespaceID string; TenantID string; Source, Target int32; Epoch int64 /* e; target holds e+1 'incoming' until cutover */; MoveID string; ExpectPhase Phase }
+type Fence struct { NamespaceID string; TenantID string; Source, Target int32; Epoch int64 /* e; target holds e+1 'incoming' until cutover (or a stale 'moved_out' row it is advanced from, N93) */; MoveID string; ExpectPhase Phase }
 
 type Activities interface {
-	Plan(ctx context.Context, f Fence) (*PlanResult, error)                       // target ownership(e+1, incoming); catalog namespaces.state='moving'
-	Copy(ctx context.Context, f Fence) (*CopyResult, error)                       // copy barrier (N45 + D2 amended): EXCLUSIVE SESSION-level advisory lock (`pg_advisory_lock`) on the mover's direct source connection — waits fairly for every shared-holding writer, blocks new ones — then `BEGIN REPEATABLE READ; SELECT max(seq) …` (first statement fixes snapshot and p0 together), `pg_advisory_unlock`, COPY TO in that snapshot; COPY FROM STDIN on the target as `engram_move_load` (BYPASSRLS) with the per-batch fence = shared advisory lock + `state='incoming' AND epoch=e+1` (N51: COPY FROM is refused on RLS tables); blob prefix copy; heartbeats
-	CatchUp(ctx context.Context, f Fence, p0 int64) (*CatchUpResult, error)      // anti-join replay (N50) as ONE source-side statement against the source's lagging copy of move_applied: rows with seq > p0 AND NOT EXISTS move_applied, re-read by id, upserted on the target with `move_applied … ON CONFLICT DO NOTHING RETURNING seq` in the same tx (authoritative), then the keys mirrored into the source copy and move_applied_seq updated for lag only; rounds until lag < 100 events or < 5 s; gives up after 10 rounds → Rollback (N45). Never `seq > applied`: an out-of-order commit below the watermark would be skipped (review F-3)
-	Freeze(ctx context.Context, f Fence) error                                    // catalog 'frozen'; source ownership 'frozen', freeze_reason='move' (same epoch) under the EXCLUSIVE advisory lock
-	Drain(ctx context.Context, f Fence) (*DrainResult, error)                     // one final anti-join pass (complete: no writer holds a seq after Freeze); terminate ns workflows on the source queue — same Temporal cluster, N71; record their workflow ids (D5 step 5)
-	Verify(ctx context.Context, f Fence) error                                    // both sides static: counts always, checksums ≤ 1 M facts, 1 % sample above; before Cutover (§5.5.1)
-	CutoverBegin(ctx context.Context, f Fence) error                              // (a) namespace_moves 'cutover' — the persisted point of no return (CAS on state='frozen')
+	Plan(ctx context.Context, f Fence) (*PlanResult, error)                       // target ownership(e+1, incoming) or moved_out → incoming (N93); source outbox_cursors + move_epoch (pauses purges and shard schedulers, N88/N97); catalog namespaces.state='moving'; fixes the freeze watchdog max(120 s, 60 s + 1 s per 10,000 live facts) ≤ 15 min (N90)
+	Copy(ctx context.Context, f Fence) (*CopyResult, error)                       // copy barrier ONCE (N45 + D2 amended): EXCLUSIVE SESSION-level advisory lock on the mover's direct source connection under lock_timeout 5 s, then `BEGIN REPEATABLE READ; SELECT max(seq) …` (first statement fixes snapshot and p0 together), `pg_advisory_unlock`; p0 recorded once = the SINGLE replay floor (N88). Each table in key ranges (≤ 100,000 rows or ≤ 60 s, up to 4 parallel `facts` streams), each range under its own short REPEATABLE READ snapshot (N89), COPY into a session TEMP table on the target and `INSERT … SELECT … ON CONFLICT` under RLS with `SET LOCAL session_replication_role = replica`, per-range fence = engram_try_ns_fence + `state='incoming' AND epoch=e+1` (N91); resumes at the first range without a completion mark from `CopyProgress{table,last_key}`; blob prefix copy; heartbeats; the frozen re-copy class is NOT copied here
+	CatchUp(ctx context.Context, f Fence, p0 int64) (*CatchUpResult, error)      // anti-join replay (N50) as ONE source-side statement against the source's lagging copy of move_applied: rows with seq > p0 AND NOT EXISTS move_applied, replayed through the TOTAL event → (table, key) mapping `replay_map.go` (N81; FK-closed, immutable tables DO NOTHING, mutable tables DO UPDATE of mutable columns IS DISTINCT FROM, ids_elided events by document_id), `move_applied … ON CONFLICT DO NOTHING RETURNING seq` in the same target tx (authoritative), then mirrored into the source copy and move_applied_seq updated for lag only; rounds until lag < 100 events or < 5 s; gives up after 10 rounds → Rollback (N45). Never `seq > applied` (review F-3)
+	VerifyDeep(ctx context.Context, f Fence) error                               // pre-freeze, namespace still active (N90): per table count(*) and index-only bit_xor(hashtextextended(pk::text,0)) over the stable cohort created_at < W, plus a full-content sample (hash % 64 = 0, 1,000–20,000 rows per table); mismatch → one more catch-up round, then Rollback
+	Freeze(ctx context.Context, f Fence) error                                    // catalog 'frozen'; source ownership 'frozen', freeze_reason='move' (same epoch) under the EXCLUSIVE advisory lock (lock_timeout 5 s, jittered retry); arms the watchdog until cutover (c) (N98)
+	Drain(ctx context.Context, f Fence) (*DrainResult, error)                     // final anti-join pass (complete: no writer holds a seq after Freeze); re-copy the frozen class (quota_counters, namespace_stats, batch_jobs, outbox_cursors rows; ≤ 10,000 rows else MOVE_STATE_TOO_LARGE, N81); read in-flight operations from the SOURCE `operations` rows RUNNING/PENDING/DEFERRED — never ListWorkflow (N97); terminate their workflows on the source queue (same Temporal cluster, N71); record workflow ids
+	Verify(ctx context.Context, f Fence) error                                    // freeze window (N90): count(*) both sides, PK hash of the delta cohort (created_at/updated_at ≥ W), 4,096 sampled rows' content, full PK hash for tables ≤ 2 M rows; hashes exclude updated_at and use sha256(embedding::bytea), never row_to_json
+	VerifyFK(ctx context.Context, f Fence) error                                  // anti-join count of orphans per foreign key on the target, must be 0 — outside the freeze window and again over the rows touched by the final pass (N88)
+	CutoverBegin(ctx context.Context, f Fence) error                              // (a) namespace_moves 'cutover' — records intent, NOT the point of no return (N98)
 	CutoverTarget(ctx context.Context, f Fence) error                             // (b) target ownership 'active' @ e+1 — own activity, sub-second retry (N52)
-	CutoverSource(ctx context.Context, f Fence) error                             // (c) source ownership 'moved_out' — own activity, sub-second retry
-	CutoverCatalog(ctx context.Context, f Fence) error                            // (d) catalog shard=target, epoch=e+1, state='active' + NOTIFY — own activity, sub-second retry; then Restart = (e). Four txs in three databases, never one; the (c)–(d) window is what reads re-resolve through (N52)
-	Restart(ctx context.Context, f Fence, d *DrainResult) error                   // re-execute the recorded workflows on shard-{target} with the same ids and epoch e+1
-	Cleanup(ctx context.Context, f Fence) error                                   // after 24 h grace: MoveService.CleanupMove admin RPC purges source rows + old blob prefix (admin role, D5 step 7)
-	Rollback(ctx context.Context, f Fence, reason string) error                   // target ownership → moved_out/deleted rows; source 'active'; catalog 'active'; only before CutoverBegin
+	CutoverSource(ctx context.Context, f Fence) error                             // (c) source `frozen → moved_out`, freeze_reason NULL, target_shard_id + target_epoch recorded — THE point of no return (N98); watchdog cancelled here
+	CutoverCatalog(ctx context.Context, f Fence) error                            // (d) catalog shard=target, epoch=e+1, state='active' + NOTIFY — retried indefinitely and idempotently, off every read path. Four txs in three databases, never one; requests in the (c)–(d) window follow the MOVED_OUT target hint (N98)
+	Restart(ctx context.Context, f Fence, d *DrainResult) error                   // each recorded operation: ns/{ns}/op/{op} on shard-{target}, WorkflowIDReusePolicy TERMINATE_IF_RUNNING, memo epoch e+1; AlreadyStarted is done only on queue shard-{target} with memo epoch e+1; then the reconcile loop compares target operations with DescribeWorkflowExecution until stable (N97)
+	Cleanup(ctx context.Context, f Fence) error                                   // after 24 h grace: MoveService.CleanupMove admin RPC → `engram_cleanup_namespace` (SECURITY DEFINER) deletes data rows, cursor, move_applied, old blob prefix; NEVER the ownership row (moved_out is a permanent fence value, N93)
+	Rollback(ctx context.Context, f Fence, reason string) error                   // before (c) only: ReleaseNamespace(target, e+1) if (b) committed, then source 'frozen → active', catalog 'active'; target rows removed; move_epoch cleared (lifts the purge pause)
 }
 
 type Orchestrator interface { // admin surface (MoveService)
 	Start(ctx context.Context, namespaceID string, target int32, o Options) (*Ref, error)
 	Status(ctx context.Context, moveID string) (*Status, error)
-	Abort(ctx context.Context, moveID string) error // rollback if before cutover, else error
+	Abort(ctx context.Context, moveID string) error // rollback if before cutover sub-step (c), else error
 }
 
 type Options struct {
 	DrainWait time.Duration     // 15 s default, 60 s max (D5 step 4)
-	FreezeWatchdog time.Duration // 120 s: Rollback if Cutover has not committed (D5 step 4)
+	FreezeWatchdog func(liveFacts int64) time.Duration // max(120 s, 60 s + 1 s per 10,000 live facts), cap 15 min (N90); armed until cutover (c), not (a)
 	CatchUpMaxLag int           // 100 events
 	CatchUpMaxAge time.Duration // 5 s
 	CatchUpMaxRounds int        // 10 (N45): then Rollback
 	CleanupGrace time.Duration  // 24 h
-	CopyBatchRows int           // 10 000 per COPY segment (heartbeat granularity)
-	CutoverRetry RetryPolicy    // 100 ms / ×1.5 / 1 s, unlimited within a 60 s ScheduleToClose, for CutoverTarget/Source/Catalog (N52)
+	CopyRangeRows int           // 100 000 rows per key range (N88) …
+	CopyRangeMaxAge time.Duration // … or 60 s, each range under its own short snapshot (alert at 5 min, N89)
+	CopyStreams int             // up to 4 parallel `facts` streams (one per hash-partition group)
+	FrozenClassMaxRows int      // 10 000 (N81)
+	CutoverRetry RetryPolicy    // 100 ms / ×1.5 / 1 s, unlimited within a 60 s ScheduleToClose before (c); (d) unlimited (N52, N98)
 	CutoverAlertAfter time.Duration // 2 s: "cutover in progress" alert while (c) has committed and (d) has not
 }
 ```
 
-Fencing details: `Copy` takes the **exclusive session-level advisory lock**
-`pg_advisory_lock(engram_ns_lock_key(ns))` on its *direct* source connection (N15: session locks do not survive
-transaction pooling) for the few milliseconds it needs to open its `REPEATABLE READ` snapshot (the copy barrier,
-N45): the snapshot transaction's first statement `SELECT max(seq) FROM outbox WHERE namespace_id = $ns` fixes the
-snapshot and `p0` together while the lock is held, then `pg_advisory_unlock` releases it without ending the
-transaction and the `COPY … TO STDOUT` statements stream in that snapshot — so no writer that drew a lower `seq`
-can commit after it (TLC `ShardMove_NoBarrier`); because every writer holds the *shared* transaction-level lock to
-commit and heavyweight locks queue fairly, the barrier waits exactly for the writers in flight when it was
-requested and no stream of new writers can starve it (D2 as amended, review F-5 — the former
-`FOR SHARE`/`FOR UPDATE` row-lock pair had no such guarantee). The target is loaded with `COPY … FROM STDIN
-BINARY` as `engram_move_load`, a `BYPASSRLS` role with `INSERT` only on the copied namespace tables, each
-10 k-row batch in its own transaction that runs the fence prelude with the `incoming` predicate — shared
-advisory lock, then `state='incoming' AND epoch=e+1` (N51: PostgreSQL refuses `COPY FROM` on a table with
-row-level security, so the RLS "second fence for free" could not be used on the load side; the source-side fence
-is unchanged). `CatchUp` and `Drain` replay by **anti-join** against `move_applied` (N50), which exists on
-*both* shards: the target copy is authoritative (`ON CONFLICT DO NOTHING RETURNING seq` in the apply
-transaction), the source keeps the mover's lagging copy written after each target commit, so the anti-join is a
-single source-side statement and `move_applied_seq` is a lag indicator only. The namespace-confined
-`engram_move` cannot see other namespaces' sequence numbers, so a hole between two of its own seqs is
-indistinguishable from another namespace's seq and a `seq > applied` cursor silently skipped a lower seq that
-committed late (review F-3); the anti-join on `outbox_ns_seq_idx` + the `move_applied` PK re-finds it on the next
-round (a key the target already holds is dropped by its `ON CONFLICT`), and after `Freeze` (no writer holds a
-seq) one pass is complete. `Freeze` takes the same
-exclusive advisory lock and therefore waits for in-flight writers to finish — after it commits, no new writer
-can pass the D2 check; it sets `freeze_reason = 'move'` (the `CHECK` constraint requires it). `CutoverBegin`
-is a CAS on `namespace_moves.state='frozen'` and `CutoverCatalog` on `namespaces.epoch=e`, so a concurrent
-restore-from-backup (which also bumps epoch) fails the CAS and the move fails loudly rather than fighting (a
-rollback is only possible before `CutoverBegin`). Sub-steps (b), (c), (d) are three activities with
-`CutoverRetry` (N52): a worker crash after (c) leaves reads failing `WrongShardOrEpoch{MOVED_OUT}` only until the
-next sub-second attempt commits (d), and the API's bounded re-resolve loop (≤ 5 s) covers that window; the
-`P-catalog` policy's 500 ms → 5 s backoff over 20 attempts would have left the namespace unreadable for
-minutes. One Temporal cluster serves the fleet (N71), so `Drain` lists and terminates source-queue workflows
-and `Restart` starts them on the target queue through the same client even across cells. `Restart` re-executes the recorded workflows with their original
-ids (hence the same `operation_id`s) and the new epoch; per-chunk idempotency keys exclude the epoch (D11), so
-already-committed chunks on the target (copied or replayed) are detected by content hash and skipped, not re-extracted.
+Fencing details: `Copy` takes the **exclusive session-level advisory lock** (the keys of `engram_ns_lock_keys(ns)`)
+on its *direct* source connection (N15: session locks do not survive transaction pooling) **once**, for the few
+milliseconds it needs to open its first `REPEATABLE READ` snapshot (the copy barrier, N45, N88): the snapshot
+transaction's first statement `SELECT max(seq) FROM outbox WHERE namespace_id = $ns` fixes the snapshot and `p0`
+together while the lock is held, then `pg_advisory_unlock` releases it without ending the transaction — so no writer
+that drew a lower `seq` can commit after it (TLC `ShardMove_NoBarrier`). Because every writer holds the *shared*
+transaction-level lock to commit, the barrier waits exactly for the writers in flight when it was requested, and a
+writer that arrives behind it is refused by its try-lock and retries after 200 ms (N82), no stream of new writers can
+starve it and none holds a pooled connection while it waits (D2 as amended, review F-5; W-11). Later ranges use their
+own short snapshots, not the barrier: `p0` stays the single floor and the skew between range snapshots is repaired by
+the replay, which is total and FK-closed (N81); purges of the namespace are paused through `move_epoch` so no parent can
+vanish between range snapshots (N88). The target is loaded **without `BYPASSRLS`** (N91): `COPY` into a session
+`TEMP` table, then `INSERT … SELECT … ON CONFLICT` under `ns_isolation`, in a transaction that re-checks the target
+row (`state='incoming' AND epoch=e+1`, after `engram_try_ns_fence`) and runs `SET LOCAL session_replication_role =
+replica`; `engram_check_ownership` is `ENABLE ALWAYS`, and `VerifyFK` replaces the foreign-key triggers the load
+skips. `CatchUp` and `Drain` replay by **anti-join** against `move_applied` (N50), which exists on *both* shards: the
+target copy is authoritative (`ON CONFLICT DO NOTHING RETURNING seq` in the apply transaction), the source keeps the
+mover's lagging copy written after each target commit, so the anti-join is a single source-side statement and
+`move_applied_seq` is a lag indicator only. The namespace-confined `engram_move` cannot see other namespaces'
+sequence numbers, so a hole between two of its own seqs is indistinguishable from another namespace's seq and a `seq >
+applied` cursor silently skipped a lower seq that committed late (review F-3); the anti-join on `outbox_ns_seq_idx` +
+the `move_applied` PK re-finds it on the next round, and after `Freeze` (no writer holds a seq) one pass is complete.
+`Freeze` takes the same exclusive advisory lock and therefore waits for in-flight writers to finish — after it
+commits, no new writer can pass the D2 check; it sets `freeze_reason = 'move'` (the `CHECK` constraint requires it).
+`CutoverBegin` is a CAS on `namespace_moves.state='frozen'` and `CutoverCatalog` on `namespaces.epoch=e`, so a
+concurrent restore-from-backup (which also bumps epoch) fails the CAS and the move fails loudly rather than fighting.
+**Rollback is possible until sub-step (c)** (N98): a failure before (c), including a target outage after (b), calls
+`ReleaseNamespace(target, e+1)` and thaws the source — safe because nothing routes to the target before (c); the
+watchdog stays armed until (c) commits. After (c) the move can only complete: the `moved_out` row carries
+`target_shard_id`/`target_epoch`, requests in the window follow that hint to the target without the catalog, and
+sub-step (d) is retried indefinitely and idempotently, so a catalog failover (≥ 30 s) causes no read outage beyond
+the N52 bounded loop. Sub-steps (b), (c), (d) are three activities with `CutoverRetry` (N52). One Temporal cluster
+serves the fleet (N71), so `Drain` terminates source-queue workflows and `Restart` starts them on the target queue
+through the same client even across cells. `Restart` re-executes the recorded operations with their original ids
+(hence the same `operation_id`s) and the new epoch; per-chunk idempotency keys exclude the epoch (D11), so
+already-committed chunks on the target (copied or replayed) are detected by content hash and skipped, not
+re-extracted. Every shard-wide scheduler (op-sweeper, DEFERRED resumer, `purge-sweep`, `consolidate-sweep`,
+`page-cron`, `outbox-trim`, stats sweeper) joins `namespace_ownership` and acts only on `active` rows (N97), so the
+source never starts a copied operation.
 
 **(c) Dependencies.** `catalog`, `router`, `store`, `blob`, `outbox` (MoveSink), `workflows` (client), `errs`,
 `telemetry`. **(d) Swappable.** `TemporalOrchestrator` → `InlineOrchestrator` (runs phases sequentially
 in-process for tests). **(e) Test seam.** Model-based test from `ShardMove.tla` (§7) with `MemoryCatalog` + two
 `FakeTx` shards and randomised concurrent retain/consolidate/delete, including the F-3 interleaving (writer
 draws seq 102, a later writer commits 103 first, the mover applies 103, 102 commits, freeze — the anti-join must
-replay 102); chaos test on testcontainers kills the worker in every phase, including between `CutoverSource`
-and `CutoverCatalog`, and asserts the invariants (one active owner, no loss/duplication, eventual
+replay 102), a version flagged on the source during catch-up with no covering event (`ShardMove_DeleteDuringCatchup`),
+an idempotency key not replayed (`ShardMove_RetryAfterCutover`), a per-table restart with a new snapshot under enforced
+foreign keys (`ShardMove_PerTableNewSnapshot`) and a target outage after (b) (rollback by `ReleaseNamespace`); chaos test
+on testcontainers kills the worker in every phase, including between `CutoverSource`
+and `CutoverCatalog`, and a workflow started 0.5 s before the freeze, and asserts the invariants (one active owner, no loss/duplication, eventual
 done/rolled_back, reads unavailable for less than the bounded re-resolve window).
 
 #### 2.2.20 `internal/export` — snapshots for local agentic search (phase 3)
@@ -1640,8 +1729,9 @@ type Writer interface {
 type Reader interface { Get(ctx context.Context, tx store.Tx, ledgerID string) (*Entry, error); ListByDocument(ctx context.Context, tx store.Tx, documentID string, page store.Page) ([]Entry, string, error) }
 ```
 
-Namespace delete and document purge remove ledger rows via the admin role only (the trigger
-admits `DELETE` for `engram_admin`/`engram_move` and nothing else, §3.1). **(c)** `store`, `blob`, `errs`. **(d)/(e)** see §2.3.
+Explicit document delete, namespace delete and tenant delete remove ledger rows via the admin role only (the trigger
+admits `DELETE` for `engram_admin` and the move rollback path and nothing else, §3.1); a `REPLACE`/`APPEND`
+retire never deletes ledger rows — the ledger holds only the per-request delta, and the superseded versions' `ver/{sha256}` body blobs are what the purge removes (N104). **(c)** `store`, `blob`, `errs`. **(d)/(e)** see §2.3.
 
 #### 2.2.25 `adapters/mcp` — MCP server
 
@@ -1703,7 +1793,7 @@ Cobra commands (each maps to `memory.admin.v1` or to direct DB access with an ad
 
 | Command | Does |
 |---|---|
-| `shard provision --id 7 --cell a --dsn …` (operator alias: `shard add`, §9.5) | creates DB, roles (`engram_migrate` owner/DDL only, `engram_app` NOBYPASSRLS, `engram_relay`, `engram_move`, `engram_move_load` BYPASSRLS/INSERT-only for the move target load (N51), `engram_admin`), extensions, partitions, RLS policies; registers in the catalog as `provisioning` |
+| `shard provision --id 7 --cell a --dsn …` (operator alias: `shard add`, §9.5) | creates DB, roles (`engram_migrate` owner/DDL only, `engram_app` NOBYPASSRLS, `engram_relay`, `engram_move` NOBYPASSRLS — the BYPASSRLS loader role `engram_move_load` of N51 is removed, N91 —, `engram_admin`; sets the role `lock_timeout` defaults of N82 and `GRANT SET ON PARAMETER session_replication_role TO engram_move`), extensions, partitions, RLS policies; registers in the catalog as `provisioning` |
 | `index --shard 7 --namespace <ns>` | owner-run DDL as `engram_migrate`: `CREATE INDEX CONCURRENTLY facts_hnsw_ns_<12 hex> … WHERE namespace_id = '<ns>'` on the namespace's partition when the stats sweeper flipped `large` (N55); `index drop` at purge or move cleanup. The only path that creates the per-namespace partial HNSW — api and worker never run DDL |
 | `shard migrate --id 7 [--all --cell a]` | goose migrations per shard with lock; `--canary` runs one shard and stops (§9) |
 | `shard activate / full / drain / readonly / retire` | catalog `SetShardState` over the aligned states `provisioning → active ↔ full ↔ draining → readonly → retired` (review F-27) |
@@ -1768,8 +1858,10 @@ const (
 	KindValidation         Kind = iota + 1 // INVALID_ARGUMENT  + memoryv1.ValidationError{field_violations}
 	KindNotFound                           // NOT_FOUND         + memoryv1.NotFound{resource, id}
 	KindQuotaExceeded                      // RESOURCE_EXHAUSTED+ memoryv1.QuotaExceeded{quota, limit, retry_after} (+ google.rpc.RetryInfo)
-	KindWrongShardOrEpoch                  // FAILED_PRECONDITION + memoryv1.WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state}
-	KindNamespaceFrozen                    // FAILED_PRECONDITION + memoryv1.NamespaceFrozen{namespace_id, retry_after}
+	KindWrongShardOrEpoch                  // FAILED_PRECONDITION + memoryv1.WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state, target_shard_id, next_epoch} (the last two only for MOVED_OUT, API-internal, N98)
+	KindNamespaceFrozen                    // FAILED_PRECONDITION + memoryv1.NamespaceFrozen{namespace_id, retry_after, reason} (also the N82 FENCE_BUSY refusal, 200 ms)
+	KindDocumentBusy                       // ABORTED (never public) + memoryv1.DocumentBusy{document_id, retry_after}; retryable under P-frozen, 100 ms (N83)
+	KindInputBlobMissing                   // never public; memoryv1.InputBlobMissing{blob_key, input, content_hash, attempt}; non-retryable as an activity error, the workflow re-runs extract + embed ≤ 2 times (N100)
 	KindOperationConflict                  // ABORTED (concurrent conflict) or ALREADY_EXISTS (idempotency-key reuse, D1) + memoryv1.OperationConflict{operation_id, existing_operation_id, reason}
 	KindPreconditionFailed                 // FAILED_PRECONDITION + memoryv1.PreconditionFailed{violations[]{type, subject, description}}
 	KindUnavailable                        // UNAVAILABLE       + google.rpc.RetryInfo
@@ -1791,7 +1883,10 @@ func Validation(field, desc string) *Error
 func NotFound(resource, id string) *Error
 func QuotaExceeded(quota string, limit int64, retryAfter time.Duration) *Error
 func WrongShardOrEpoch(ns string, expected, actual int64, state memoryv1.NamespaceState) *Error
-func NamespaceFrozen(ns string, retryAfter time.Duration) *Error
+func WrongShardOrEpochMovedOut(ns string, expected, actual int64, targetShard int32, nextEpoch int64) *Error // carries the routing hint (N98); StripShardHint(err) removes it before the error leaves the API
+func NamespaceFrozen(ns string, retryAfter time.Duration, reason memoryv1.FreezeReason) *Error
+func DocumentBusy(documentID string) *Error
+func InputBlobMissing(blobKey, input string, contentHash [32]byte, attempt int) *Error
 func OperationConflict(operationID, existingOperationID string, reason memoryv1.OperationConflictReason) *Error
 func PreconditionFailed(typ, subject, desc string) *Error
 func Unavailable(desc string, retryAfter time.Duration) *Error
@@ -1800,14 +1895,14 @@ func Wrap(kind Kind, msg string, cause error) *Error
 
 // Predicates used by workflows and the router.
 func Is(err error, k Kind) bool
-func IsRetryable(err error) bool // Unavailable, Deadline, NamespaceFrozen (bounded by the caller)
+func IsRetryable(err error) bool // Unavailable, Deadline, NamespaceFrozen, DocumentBusy (bounded by the caller)
 func Retryable(err error) bool   // alias kept for Temporal's ApplicationError classification
 
 // Mapping helpers.
 func ToStatus(err error) *status.Status        // unknown errors → INTERNAL with a redacted message; details attached
 func ToConnect(err error) *connect.Error       // same codes/details via connect.Error.AddDetail
 func FromStatus(st *status.Status) *Error      // client side (router.Forward, engram-mcp)
-func TemporalType(err error) string            // ApplicationError type name: "WrongShardOrEpoch", "NamespaceFrozen", "ValidationError", "PermanentLLMError", "QuotaExceeded"
+func TemporalType(err error) string            // ApplicationError type name: "WrongShardOrEpoch", "NamespaceFrozen", "DocumentBusy", "InputBlobMissing", "ValidationError", "PermanentLLMError", "QuotaExceeded"
 ```
 
 Mapping table (authoritative for §4 and for the retry policies in §2.2.17):
@@ -1817,8 +1912,10 @@ Mapping table (authoritative for §4 and for the retry policies in §2.2.17):
 | `Validation` | `INVALID_ARGUMENT` | `ValidationError` | no | api, chunk, extract, config, index (tags) |
 | `NotFound` | `NOT_FOUND` | `NotFound` | no | authz (cross-tenant namespace, by design), store |
 | `QuotaExceeded` | `RESOURCE_EXHAUSTED` | `QuotaExceeded` + `RetryInfo` | yes (after `retry_after`) | quota via authz (rates); workflows defer instead of failing (tokens/facts) |
-| `WrongShardOrEpoch` | `FAILED_PRECONDITION` | `WrongShardOrEpoch` | writes: once (router re-resolve); reads on `MOVED_OUT`: bounded loop ≤ 5 s (N52) | store ownership check, move fence |
-| `NamespaceFrozen` | `FAILED_PRECONDITION` | `NamespaceFrozen` | bounded (≤ 30 s) | store ownership check (write mode) |
+| `WrongShardOrEpoch` | `FAILED_PRECONDITION` | `WrongShardOrEpoch` | writes: once (router re-resolve); `MOVED_OUT`: follow the target hint first, reads then a bounded loop ≤ 5 s (N52, N98) | store ownership check, move fence |
+| `NamespaceFrozen` | `FAILED_PRECONDITION` | `NamespaceFrozen` | bounded (≤ 30 s) | store ownership check (write mode); the fence try-lock refusal (`FENCE_BUSY`, N82) |
+| `DocumentBusy` | `ABORTED` (write path only) | `DocumentBusy` | yes (100 ms, within `P-frozen`) | `CommitChunk` shared try-lock on `engram_doc_lock_keys` (N83) |
+| `InputBlobMissing` | — (activity error only) | `InputBlobMissing` | not by Temporal; the workflow re-runs extract + embed ≤ 2× (N100) | `CommitChunk` reading a purged cache/staging blob |
 | `OperationConflict` | `ABORTED` (concurrent conflict) / `ALREADY_EXISTS` (`IDEMPOTENCY_KEY_REUSED`, D1) | `OperationConflict` | no | api idempotency (same `request_id`/`operation_id`, different payload) → `ALREADY_EXISTS`; purge, cutover or refresh in progress → `ABORTED` |
 | `PreconditionFailed` | `FAILED_PRECONDITION` | `PreconditionFailed` | no | catalog CAS, move Cutover, field-mask/version checks |
 | `Unavailable` | `UNAVAILABLE` | `RetryInfo` | yes | catalog miss when down, gateway 429/5xx, Temporal start failure, shard down |
@@ -1836,7 +1933,7 @@ workflows (the Temporal non-retryable list must be by type).
 | Embedding concurrency | 64 in flight per process; batch ≤ 64 texts per call | `gateway.RateLimiter` | embedding is cheap and fast; cap protects the gateway, not us |
 | Per-shard Postgres pool | 16 conns per process per shard; ≤ 32 shards per cell → ≤ 512 per process; pgbouncer `default_pool_size=24` per shard, `max_client_conn=500` (§9.1) | `router.Options.PoolSize` | D3 cell bound |
 | Recall arm parallelism | 5 arms, each one pooled conn; ≤ 50 QPS/shard target → ≤ 250 concurrent arm queries per shard ≤ pool headroom with p95 60 ms | `recall.Planner` | keeps the pool below saturation at target QPS |
-| Rerank depth | 0 / 50 / 150 pairs by budget (N53), ≤ 300 per gateway call (D15); 1 call per recall; the cell must sustain ≥ 80 k pairs/s (A-R1) | `recall.GatewayReranker`, `config.Resolved.Recall.RerankTop` | review F-6: the reranker is a sized dependency |
+| Rerank depth | 0 / 50 / 150 pairs by budget (N53), ≤ 300 per gateway call (D15); 1 call per recall; the cell must sustain ≥ 80 k pairs/s (A-R1); skipped below a 106 ms remaining deadline (N106) | `recall.GatewayReranker`, `config.Resolved.Recall.RerankTop` | review F-6: the reranker is a sized dependency |
 | Graph arm | two seeded waves × 30 ms sub-budget, shared node budget 100/300/1000 | `recall.Planner` | N54 critical path |
 | `WaitOperation` long-polls | ≤ 2 000 parked on Temporal per API process; beyond: jittered DB poll | `api.Options.MaxOpenWaits` | N70 |
 | Temporal history | continue-as-new every 100 chunks or 20 MB; no inline activity result > 4 KiB | `workflows` | N59 |
@@ -1845,7 +1942,10 @@ workflows (the Temporal non-retryable list must be by type).
 | Temporal pollers | 2 workflow + 2 activity pollers per `shard-{id}` queue; max concurrent activities 64 per worker (§5.1.6, §9.1) | worker options | D3 |
 | Consolidation | 8 facts per LLM call, ≤ 100 facts per round, 1 round in flight per namespace | `Consolidate` workflow (singleton id) | D12 |
 | Reflect | ≤ 10 iterations, ≤ 100 k context tokens, ≤ 300 s, tool deadline 10 s, ≤ 4 concurrent reflects per namespace (`RESOURCE_EXHAUSTED` beyond) | `reflect.Caps`, api semaphore | D12 |
-| Move copy | 10 000 rows per COPY segment (loaded as `engram_move_load`, per-batch fence = shared advisory lock + `incoming @ e + 1`, N51); barrier = session-level exclusive lock on a direct connection; 1 move in flight per namespace; ≤ 4 concurrent moves per cell; cutover sub-steps retried sub-second (N52) | `move.Options`, admin API | keeps freeze windows short and source IOPS bounded |
+| Move copy | key ranges of ≤ 100 000 rows or ≤ 60 s, each under its own short snapshot (alert at 5 min), up to 4 parallel `facts` streams, loaded as `engram_move` through a `TEMP` table under RLS in replica mode (N88, N89, N91); barrier taken once = session-level exclusive lock on a direct connection under `lock_timeout` 5 s; 1 move in flight per namespace; ≤ 4 concurrent moves per cell; cutover sub-steps retried sub-second, (d) indefinitely (N52, N98) | `move.Options`, admin API | keeps freeze windows short, source `xmin` pinning bounded and source IOPS bounded |
+| Fence acquisition | writers never wait: `pg_try_advisory_xact_lock_shared`, refusal → `NamespaceFrozen{FENCE_BUSY, 200 ms}`; exclusive takers under `lock_timeout` 5 s with jittered retry; role `lock_timeout` 2 s (`engram_app`, `engram_worker`) / 10 s (`engram_move`, `engram_admin`) | `store.WithNamespaceTx`, role defaults | N82: no pooled connection is held behind a queued freeze |
+| Per-document lock | `CommitChunk` shared try-lock (`DocumentBusy`, 100 ms); `FinalizeVersion`, cascade, `PurgeDocument` exclusive under 5 s | `store.DocLockRepo` | N83: no `FOR SHARE` multixact churn, no ack latency behind ingest |
+| Outbox event size | ≤ 256 ids and ≤ 16 KiB per event; paged; elided above 4,096 ids | `store.OutboxRepo.PagesOf`, `outbox.Group` | N80: the CHECK is only a backstop |
 | Catalog resolver | LRU 100 k entries; single-flight per key; LISTEN reconnect backoff 1 s → 30 s | `catalog.ResolverOptions` | D4 |
 | Embedding LRU (queries) | 10 000 entries per process, keyed `(namespace_id, sha256(prefixed text))` | `recall.QueryEmbedder` | repeat queries skip the 25 ms hop |
 | Streaming / request size | `Recall` batches of 10; `StreamSnapshot` 1 MiB parts; `Retain` ≤ 100 items, ≤ 8 MiB total and ≤ 1 MiB per item (§4.1.8), raw body > 64 KiB to blob (N7) | `api` helpers and validation | D10, D12; keeps the ledger tx small |
@@ -1855,7 +1955,7 @@ workflows (the Temporal non-retryable list must be by type).
 | Id | Decision | Rationale | Rejected |
 |---|---|---|---|
 | N1 | Add leaf package `internal/errs` to the D14 layout: typed errors + gRPC/Connect/Temporal mapping; nothing under `internal/` may be imported by it. *(adopted as N1 in the register)* | Store, services and workflows produce typed errors but may not import `internal/api`. | `internal/api/errors.go` (violates the dependency rule). |
-| N2 | The move workflow `move/{namespace_id}/{epoch}` runs on task queue `shard-{target}`; the executing worker opens a second, move-scoped pool to the source (`engram_move` role: read + outbox read + ownership `UPDATE` under the exclusive advisory lock) and loads the target as `engram_move_load` (N51). It is the only code path allowed two shard handles. *(adopted as N2 in the register)* | Keeps "one task queue per shard"; the target worker is the one that must be healthy for the move to be useful. | A cell-wide `moves` queue (breaks the per-shard queue rule; harder to reason about pollers). |
+| N2 | The move workflow `move/{namespace_id}/{epoch}` runs on task queue `shard-{target}`; the executing worker opens a second, move-scoped pool to the source (`engram_move` role: read + outbox read + ownership `UPDATE` under the exclusive advisory lock) and loads the target through a `TEMP` table under RLS in replica mode with the same role (N91; the `engram_move_load` role of N51 is removed). It is the only code path allowed two shard handles. *(adopted as N2 in the register)* | Keeps "one task queue per shard"; the target worker is the one that must be healthy for the move to be useful. | A cell-wide `moves` queue (breaks the per-shard queue rule; harder to reason about pollers). |
 | N3 | Per-shard Temporal schedule `shard/{id}/op-sweeper` (every 60 s) starts a workflow for any `PENDING` operation older than 2 min with no workflow; the API still returns `UNAVAILABLE` when `StartWorkflow` fails after the ledger commit. *(adopted as N3 in the register)* | Closes the crash window between the ledger commit and `StartWorkflow` without weakening the ack. | Ack before `StartWorkflow` and rely solely on the sweeper (silently extends visibility lag). |
 | N4 | The outbox relay uses a shard-level `engram_relay` role that bypasses RLS for `SELECT` on `outbox` only (`outbox_cursors` has no namespace column); events carry every field a consumer needs, so the relay never reads another table. *(adopted as N4 in the register, reworded as here)* | The relay must read every namespace's events in `seq` order; per-namespace scans would be O(namespaces) per batch. | Running the relay under `engram_app` with a loop over namespaces. |
 | N5 | A cross-tenant namespace returns `NOT_FOUND`; a same-tenant namespace outside the allowlist, or a missing scope, returns `PERMISSION_DENIED`; `deleting` returns `FAILED_PRECONDITION`. *(adopted as N5 in the register)* | Prevents namespace-id enumeration across tenants while keeping same-tenant misconfiguration diagnosable. | `PERMISSION_DENIED` for cross-tenant too (an existence oracle); `NOT_FOUND` for same-tenant (hides the real problem). |
@@ -1890,3 +1990,30 @@ workflows (the Temporal non-retryable list must be by type).
 | F-2 | D9 (amended) | `extract.Fact.MentionedAt` = item timestamp set by the activity; `SaidAt` added; decoder discards model `mentioned_at`. |
 | F-33 | N73 | Reflect `search_pages` tool + map/reduce at the context cap; `pages.Service.Search`, `index.SearchPages`, `PageRepo.Search`; MCP `search_pages`. |
 | F-23, F-27 | N64, F-27 | `catalog.NamespaceState` gains `creating`/`restoring`; `catalog.ShardState` aligned with the catalog SQL and `adminv1.ShardState`; `engramctl shard` states. |
+
+**Review-2 follow-ups applied (REVIEW-2.md → register D21 → this section):**
+
+| Finding | Register | What changed here |
+|---|---|---|
+| G-1 | N79 | `consolidate.Proposal.CandidateVersions` = every shown candidate version incl. the previous one; `Applier.Apply` re-verifies them `FOR SHARE` (not flagged, no invalidation, not retired), writes lineage and version-source rows, deletes only shown-and-dropped sources, root rebuilds with `max_rebuilds_per_round`; `ObservationRepo.LockCandidateVersions`, `InsertLineage`, `FlagLineageDescendants` (depth 64, fail closed). |
+| G-2 | N80 | `OutboxRepo.AppendAll` (one multi-row last statement), `PagesOf`; `outbox.Group` reassembly; event-size limits in §2.5 and the T1 property test. |
+| G-3 | N81 | `store.ReplayRepo`, `Queries` coverage rule, `internal/move/replay_map.go`; `move.Activities.CatchUp` replays through the total mapping; `Drain` re-copies the frozen class (`MOVE_STATE_TOO_LARGE`); the new events are emitted by `OperationRepo`, `IdempotencyRepo`, `ConsolidationRepo`, `SnapshotRepo` and the blob tombstoner. |
+| G-4 | N82 | `store.WithNamespaceTx` write prelude = `engram_try_ns_fence` (never waits, `NamespaceFrozen{FENCE_BUSY, 200 ms}`); `OwnershipRepo.LockExclusive` under `lock_timeout` 5 s with jitter; role `lock_timeout` defaults; exports no longer use the session lock; new store tests; §2.5 rows. |
+| G-5 | N83 | `store.DocLockRepo` (`TryShared` → `errs.DocumentBusy`, `Exclusive`); `errs.KindDocumentBusy`; retry-table rows. |
+| G-6 | N84 | `FactRepo.SetInvalidated` returns `changed`; `ObservationRepo.AdjustInvalidation(±1)`; `LatestAsOf` skips `hidden_by_invalidation > 0`. |
+| G-7 | N85 | `index.Filter.AsOf` comment (chunk `embedding_effective_at`, versioned evidence), empty chunk header under `as_of`, `ChunkRepo.InsertBatch`, `ObservationRepo.InsertVersionSources`. |
+| G-8 | N86 | `chunk.Item`, `chunk.Chunk.ItemIndexes/MentionedAt`, `Options.MaxItemGap` (24 h forced boundary), `Chunked.TimestampsClamped`; `extract.ChunkInput.ItemTimestamp` = chunk `mentioned_at`. |
+| G-9 | N87 | `extract.RenderHash`, `CacheKey.RenderHash`, `BlobKey` and `chunks.extraction_key` include it; cache test seam; N87 × N60 interaction noted (PD-26 in §5). |
+| G-10, G-11, G-12, G-22 | N88–N91 | `move.Activities` rewritten: barrier once, single floor `p0`, key-range `Copy` with `CopyProgress`, `VerifyDeep`/`Verify`/`VerifyFK`, scaled `FreezeWatchdog`, `engram_move` TEMP-table load under RLS (no `engram_move_load`), `Options` fields; N2 row corrected. |
+| G-13 | N92 | Failover/delete-durability behaviour referenced from `Drain`/`Restart` reuse (restore procedure) and the `UNAVAILABLE` rule; §5.4.1 and §5.5.4 hold the procedure. |
+| G-14 | N93 | `OwnershipRepo.Transition` edges from the §3.3.1 table incl. `moved_out → incoming`; `Cleanup` through `engram_cleanup_namespace`, never deleting the ownership row. |
+| G-16 | N95 | `store.ConsolidationRepo` (`PendingFacts`, `MarkConsolidated`, `Stamp`, `AdvanceWatermark`); `consolidate.Batch` selection. |
+| G-18 | N97 | `Drain` reads `operations`, `Restart` with `TERMINATE_IF_RUNNING` + memo epoch + reconcile loop; every scheduler acts on `active` ownership only. |
+| G-19 | N98 | `router.Retry` follows the `MOVED_OUT` target hint first; `errs.WrongShardOrEpochMovedOut`/`StripShardHint`; cutover (c) is the point of no return, (d) indefinite; `Rollback` before (c) only. |
+| G-20 | N99 | `workflows.DataConverter` per-namespace data key wrapped by the shard key; `KeyProvider.DataKey/CurrentKeyID/Shred`; key-destruction timing; payload test seam. |
+| G-21 | N100 | `RetainActivities.CommitChunk` contract (`DocumentBusy`, `InputBlobMissing`), `errs.KindInputBlobMissing`, `blob` `xcache_grace` rule, `ver` key kind. |
+| G-26 | N104 | `RetainActivities.LoadItem`, `blob.Kind "ver"`, `DocumentRepo.SetBody`, `LedgerRepo` retire rule. |
+| G-28 | N106 | `recall.PlannerOptions.RerankReserve` = 106 ms; skip-rate statement; §2.5 rerank row. |
+| G-29 | N107 | `ChunkRepo.Retire(documentID, version)` document-scoped subquery. |
+| G-15 | N94 | `index.SemanticPlan` comments: withdrawn 30 MB / 5–15 ms figure, partial HNSW band `20,000 ≤ live_rows < 2 % of the partition`. |
+| G-17, G-23, G-24, G-25, G-27, G-30 | N96, N101, N102, N103, N105, N108 | No module-interface change beyond the rows above (formal work items, transition table, accepted residual channel, one lock-key form `engram_ns_lock_keys`/`engram_doc_lock_keys`, schedule, cascade leaves `invalidated_at`). |

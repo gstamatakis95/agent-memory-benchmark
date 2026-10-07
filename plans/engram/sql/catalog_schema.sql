@@ -152,6 +152,12 @@ CREATE TRIGGER namespaces_touch BEFORE UPDATE ON namespaces
 
 -- -----------------------------------------------------------------------------
 -- namespace_moves: one row per move attempt (D5). At most one live move per namespace.
+-- Cutover order (N98): (a) CutoverBegin records intent (cutover_at), not a point of no return;
+-- (b) the target ownership row goes incoming -> active at epoch e + 1; (c) the source row goes
+-- frozen -> moved_out carrying target_shard_id and target_epoch (moved_out_at, the point of no
+-- return); (d) the catalog flip, retried indefinitely and idempotently. The API routes from the
+-- moved_out row's WrongShardOrEpoch detail, so (d) is on no read path and a catalog failover
+-- causes no read outage beyond the bounded re-resolve loop (N52).
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespace_moves (
   move_id                uuid PRIMARY KEY,
@@ -171,7 +177,8 @@ CREATE TABLE namespace_moves (
   created_at             timestamptz NOT NULL DEFAULT now(),
   updated_at             timestamptz NOT NULL DEFAULT now(),
   frozen_at              timestamptz,
-  cutover_at             timestamptz,
+  cutover_at             timestamptz,               -- CutoverBegin recorded intent (a): NOT the point of no return (N98)
+  moved_out_at           timestamptz,               -- cutover (c) committed on the source: the point of no return (N98); the catalog flip (d) follows, retried indefinitely
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
   CHECK (to_epoch = from_epoch + 1)
@@ -228,6 +235,7 @@ CREATE TABLE deletion_log (
   subject_id    text NOT NULL,
   epoch         bigint NOT NULL,
   deleted_at    timestamptz NOT NULL,
+  details       jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(details) = 'object'),   -- N79: mirrors the shard row, e.g. {"lineage_flagged": n, "lineage_frontier": m}
   received_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (namespace_id, kind, subject_id, deleted_at)
 );

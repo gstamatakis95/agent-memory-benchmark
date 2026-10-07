@@ -679,7 +679,7 @@ matching change note opens a ticket automatically.
 | ND-6 | Every store query is registered in `store.Queries` so the RLS canary is exhaustive; `engramlint sql` enforces explicit `namespace_id` predicates in addition to RLS. *(adopted as N19 in the register)* | Exhaustiveness is what makes the canary a proof, not a sample. | Sampling a few queries. |
 | ND-7 | `token_usage` rows carry `price_version`; cost is computed at write time and never re-priced. *(adopted as N20 in the register)* | Historical cost reports must be reproducible. | Pricing at report time. |
 
-### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `REVIEW-2.md`)
+### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `reviews/round-2.md`)
 
 | Id | Test or procedure added in §8 | Where |
 |---|---|---|

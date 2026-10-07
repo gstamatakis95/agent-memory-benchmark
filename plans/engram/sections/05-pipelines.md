@@ -2227,7 +2227,7 @@ case cannot arise there).
 | PD-29 | `LoadItem` writes the version's body blob `ver/{sha256}` and then sets `body_key`/`body_hash` on the already-created version row (`WHERE body_key IS NULL`), because the version row is created in the ack transaction, before any activity runs. N104 words this as "before the version row is created". | §5.1.2 step 1 | | adopted as N110(d) |
 | PD-30 | Export deltas use `to_seq` plus `open_gaps[]` (the N50 anti-join idea) instead of an exclusive fence, so `to_seq` alone no longer closes the range. | §5.7 | | N82, concretised here |
 
-**Review follow-ups applied (REVIEW.md → register D20 → this section):**
+**Review follow-ups applied (reviews/round-1.md → register D20 → this section):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -2251,7 +2251,7 @@ case cannot arise there).
 | F-43, F-44 | N72 | `request_hash` over normalised protojson; `operation_id` validated as any UUID (§5.1.1). |
 | F-34 | N74 | `RetainBackfill` noted as Phase 2. |
 
-**Review-2 follow-ups applied (REVIEW-2.md → register D21 → this section):**
+**Review-2 follow-ups applied (reviews/round-2.md → register D21 → this section):**
 
 | Finding | Register | What changed here |
 |---|---|---|

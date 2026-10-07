@@ -2136,7 +2136,7 @@ while reading them were fixed in those sections during editing):
   `document_versions` (arbitrated since N83 by the per-document advisory lock instead of `FOR SHARE`), and the copy barrier in 3.5. Section 5's cascade, apply, finalize
   and move steps and section 8's tests follow these tables; `observation_inputs` is in the D3
   sizing row at its N47-capped size (3.7).
-- The second adversarial review (`REVIEW-2.md`, register D21, N79 to N108) changed this section
+- The second adversarial review (`reviews/round-2.md`, register D21, N79 to N108) changed this section
   and both SQL files as the D21 sub-table below lists. Other sections must follow: the fence is a
   try-lock over `engram_ns_lock_keys`/`engram_doc_lock_keys` (§5.1, §5.4, §5.5, §2), the move uses
   `engram_move` only with the `TEMP`-table load and `engram_cleanup_namespace` (§5.5, §9), the
@@ -2147,7 +2147,7 @@ while reading them were fixed in those sections during editing):
   `maintenance_work_mem = 2 GB` is the one value both sections use; workers report tenant
   usage deltas to the catalog through the API, never directly (D4; the §3.2 wording stands).
 
-**Review follow-ups applied in this section and the SQL** (`REVIEW.md` finding → register row →
+**Review follow-ups applied in this section and the SQL** (`reviews/round-1.md` finding → register row →
 what changed here):
 
 | Finding | Register | Change in §3 / `shard_schema.sql` / `catalog_schema.sql` |
@@ -2177,7 +2177,7 @@ preamble): F-4's `engram_move_load` is gone (G-22), F-5's blocking shared lock b
 (G-1), N48's observation-level invalidation became a counter (G-6), N55 now covers all three
 vector arms (G-15), N64's state machine is data and tighter (G-14, G-23).
 
-**D21 follow-ups applied in this section and the SQL** (`REVIEW-2.md` finding → register row →
+**D21 follow-ups applied in this section and the SQL** (`reviews/round-2.md` finding → register row →
 what changed in §3 / `shard_schema.sql` / `catalog_schema.sql`):
 
 | Finding | Register | Change |

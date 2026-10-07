@@ -235,7 +235,7 @@ Phase 0 foundations ≈ 9 engineer-weeks (includes a 3-week Phase 0' that resolv
 | N48 | `Invalidate(memory_id)` marks every observation that used the fact as `stale_delete` (hidden until reconsolidated), by the same argument as N41; `Restore` marks them `stale_write` (visible). | §5 |
 | N49 | A retain whose version is superseded by a newer one before it finalises ends `SUCCEEDED` with `superseded_by = <version>` in the operation result; no new operation state is introduced (N35). | §5 |
 
-## D20. Corrections from the adversarial review (binding; `REVIEW.md` has the findings, this table has the decisions)
+## D20. Corrections from the adversarial review (binding; `reviews/round-1.md` has the findings, this table has the decisions)
 
 | Id | Decision | Amends | Finding |
 |---|---|---|---|
@@ -269,7 +269,7 @@ Phase 0 foundations ≈ 9 engineer-weeks (includes a 3-week Phase 0' that resolv
 | N77 | §7.1 and the executive summary state exactly which TLC configurations completed; the CI gate is the set of design configurations that complete in minutes (bounds shrunk until they do), the nightly job runs the larger ones with a 30-minute cap and reports INCOMPLETE as such; `AsOf.tla` gains the previous version's inputs and a delete action, `DocLifecycle.tla` a `cited ⊂ inputs` apply variant, `ShardMove.tla` multi-snapshot copy and `Holding`-independent replay (open work items in §7.6). | N46 | F-15 |
 | N78 | Realisation details from the data-model pass: `move_applied` exists on both shards (target authoritative via `ON CONFLICT` in the apply transaction, source a lagging copy written after the target commit) so the N50 anti-join is one source-side statement; the copy barrier's exclusive advisory lock is session-level on the mover's direct connection and is released after the `REPEATABLE READ` snapshot's first statement; the delete cascade retires facts before it deletes `observation_sources`/`observation_inputs` rows (the evidence triggers depend on that order); partial HNSW indexes for large namespaces are created by owner-run DDL (`engramctl index`, role `engram_migrate`). | N50, N51, N55, N61 | §3 |
 
-## D21. Corrections from the second adversarial review (binding; `REVIEW-2.md` has the findings)
+## D21. Corrections from the second adversarial review (binding; `reviews/round-2.md` has the findings)
 
 Where a row below restates a mechanism of D2, D5, D16, N40–N78, the row here wins until the propagation pass folds it into the original row (N103). "Event" always means an outbox event written in the same transaction as the change it describes. All ids inside events are 16-byte `bytes`.
 

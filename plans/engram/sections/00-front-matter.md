@@ -1,6 +1,6 @@
 # Engram: implementation plan for a Go + Postgres agent-memory service
 
-**Status:** design plan, v1.2 (2026-10-07, after two adversarial reviews — `REVIEW.md` / register D20 and `REVIEW-2.md` / register D21). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
+**Status:** design plan, v1.2 (2026-10-07, after two adversarial reviews — `reviews/round-1.md` / register D20 and `reviews/round-2.md` / register D21). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
 **Scope:** everything needed to build, verify and operate a Hindsight-class long-term memory service in Go,
 exposed as gRPC (`memory.v1`), with PostgreSQL 16 as the per-shard system of record, Temporal for
 asynchronous work, an AI gateway for every model call and blob storage for large or immutable data.
@@ -8,7 +8,7 @@ asynchronous work, an AI gateway for every model call and blob storage for large
 This document is standalone. It shares a repository with an unrelated benchmark project and does not
 change that project's constraints.
 
-**Second review (2026-10-07).** A second adversarial review (`REVIEW-2.md`, findings G-1 to G-30)
+**Second review (2026-10-07).** A second adversarial review (`reviews/round-2.md`, findings G-1 to G-30)
 tested the plan as amended by the first. Register block D21 (N79 to N108) is binding and has been
 applied to every section: transitive observation hiding through version lineage (N79), bounded
 paged outbox events (N80), a total event-driven replay mapping for moves (N81), a try-lock

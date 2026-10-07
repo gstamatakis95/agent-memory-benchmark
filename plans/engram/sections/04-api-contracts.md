@@ -1930,7 +1930,7 @@ results already delivered.
 | — | `PageService` and `ExportService` are registered from day one and answer `UNIMPLEMENTED` until phase 3 (4.1.6). | adopted as N14 |
 | — | Authorization outcomes of 4.1.1: cross-tenant → `NOT_FOUND`; same-tenant allowlist or scope → `PERMISSION_DENIED`; `DELETING` → `FAILED_PRECONDITION`. | adopted as N5 |
 
-**Review follow-ups applied (REVIEW.md → register D20 → §4 and `proto/`):**
+**Review follow-ups applied (reviews/round-1.md → register D20 → §4 and `proto/`):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -1947,7 +1947,7 @@ results already delivered.
 | F-42 | N71 | Reflection serves `memory.v1` only (4.8). |
 | F-21 | D4 | `UNAVAILABLE` row: only catalog misses fail. |
 
-**Review-2 follow-ups applied (REVIEW-2.md → register D21 → §4 and `proto/`):**
+**Review-2 follow-ups applied (reviews/round-2.md → register D21 → §4 and `proto/`):**
 
 | Finding | Register | What changed here |
 |---|---|---|

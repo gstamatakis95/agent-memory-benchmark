@@ -1,6 +1,6 @@
 # Engram: implementation plan for a Go + Postgres agent-memory service
 
-**Status:** design plan, v1.2 (2026-10-07, after two adversarial reviews — `REVIEW.md` / register D20 and `REVIEW-2.md` / register D21). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
+**Status:** design plan, v1.2 (2026-10-07, after two adversarial reviews — `reviews/round-1.md` / register D20 and `reviews/round-2.md` / register D21). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
 **Scope:** everything needed to build, verify and operate a Hindsight-class long-term memory service in Go,
 exposed as gRPC (`memory.v1`), with PostgreSQL 16 as the per-shard system of record, Temporal for
 asynchronous work, an AI gateway for every model call and blob storage for large or immutable data.
@@ -8,7 +8,7 @@ asynchronous work, an AI gateway for every model call and blob storage for large
 This document is standalone. It shares a repository with an unrelated benchmark project and does not
 change that project's constraints.
 
-**Second review (2026-10-07).** A second adversarial review (`REVIEW-2.md`, findings G-1 to G-30)
+**Second review (2026-10-07).** A second adversarial review (`reviews/round-2.md`, findings G-1 to G-30)
 tested the plan as amended by the first. Register block D21 (N79 to N108) is binding and has been
 applied to every section: transitive observation hiding through version lineage (N79), bounded
 paged outbox events (N80), a total event-driven replay mapping for moves (N81), a try-lock
@@ -2651,7 +2651,7 @@ workflows (the Temporal non-retryable list must be by type).
 | N7 | Retain items with a raw body > 64 KiB store the body in blob (`…/ledger/{sha256}`) *before* the ledger transaction; the ledger row keeps the hash and key. *(adopted as N7 in the register)* | Keeps the ack transaction small; content addressing makes the pre-write idempotent. | Inline bodies of any size (bloats the ledger table and the tx). |
 | N8 | Streams fix `RequestScope` at open; token expiry mid-stream does not abort the stream. *(adopted as N8 in the register)* | Reflect may legitimately run 300 s. | Per-message re-verification. |
 
-**Review follow-ups applied (REVIEW.md → register D20 → this section):**
+**Review follow-ups applied (reviews/round-1.md → register D20 → this section):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -2679,7 +2679,7 @@ workflows (the Temporal non-retryable list must be by type).
 | F-33 | N73 | Reflect `search_pages` tool + map/reduce at the context cap; `pages.Service.Search`, `index.SearchPages`, `PageRepo.Search`; MCP `search_pages`. |
 | F-23, F-27 | N64, F-27 | `catalog.NamespaceState` gains `creating`/`restoring`; `catalog.ShardState` aligned with the catalog SQL and `adminv1.ShardState`; `engramctl shard` states. |
 
-**Review-2 follow-ups applied (REVIEW-2.md → register D21 → this section):**
+**Review-2 follow-ups applied (reviews/round-2.md → register D21 → this section):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -4845,7 +4845,7 @@ while reading them were fixed in those sections during editing):
   `document_versions` (arbitrated since N83 by the per-document advisory lock instead of `FOR SHARE`), and the copy barrier in 3.5. Section 5's cascade, apply, finalize
   and move steps and section 8's tests follow these tables; `observation_inputs` is in the D3
   sizing row at its N47-capped size (3.7).
-- The second adversarial review (`REVIEW-2.md`, register D21, N79 to N108) changed this section
+- The second adversarial review (`reviews/round-2.md`, register D21, N79 to N108) changed this section
   and both SQL files as the D21 sub-table below lists. Other sections must follow: the fence is a
   try-lock over `engram_ns_lock_keys`/`engram_doc_lock_keys` (§5.1, §5.4, §5.5, §2), the move uses
   `engram_move` only with the `TEMP`-table load and `engram_cleanup_namespace` (§5.5, §9), the
@@ -4856,7 +4856,7 @@ while reading them were fixed in those sections during editing):
   `maintenance_work_mem = 2 GB` is the one value both sections use; workers report tenant
   usage deltas to the catalog through the API, never directly (D4; the §3.2 wording stands).
 
-**Review follow-ups applied in this section and the SQL** (`REVIEW.md` finding → register row →
+**Review follow-ups applied in this section and the SQL** (`reviews/round-1.md` finding → register row →
 what changed here):
 
 | Finding | Register | Change in §3 / `shard_schema.sql` / `catalog_schema.sql` |
@@ -4886,7 +4886,7 @@ preamble): F-4's `engram_move_load` is gone (G-22), F-5's blocking shared lock b
 (G-1), N48's observation-level invalidation became a counter (G-6), N55 now covers all three
 vector arms (G-15), N64's state machine is data and tighter (G-14, G-23).
 
-**D21 follow-ups applied in this section and the SQL** (`REVIEW-2.md` finding → register row →
+**D21 follow-ups applied in this section and the SQL** (`reviews/round-2.md` finding → register row →
 what changed in §3 / `shard_schema.sql` / `catalog_schema.sql`):
 
 | Finding | Register | Change |
@@ -6855,7 +6855,7 @@ results already delivered.
 | — | `PageService` and `ExportService` are registered from day one and answer `UNIMPLEMENTED` until phase 3 (4.1.6). | adopted as N14 |
 | — | Authorization outcomes of 4.1.1: cross-tenant → `NOT_FOUND`; same-tenant allowlist or scope → `PERMISSION_DENIED`; `DELETING` → `FAILED_PRECONDITION`. | adopted as N5 |
 
-**Review follow-ups applied (REVIEW.md → register D20 → §4 and `proto/`):**
+**Review follow-ups applied (reviews/round-1.md → register D20 → §4 and `proto/`):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -6872,7 +6872,7 @@ results already delivered.
 | F-42 | N71 | Reflection serves `memory.v1` only (4.8). |
 | F-21 | D4 | `UNAVAILABLE` row: only catalog misses fail. |
 
-**Review-2 follow-ups applied (REVIEW-2.md → register D21 → §4 and `proto/`):**
+**Review-2 follow-ups applied (reviews/round-2.md → register D21 → §4 and `proto/`):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -9127,7 +9127,7 @@ case cannot arise there).
 | PD-29 | `LoadItem` writes the version's body blob `ver/{sha256}` and then sets `body_key`/`body_hash` on the already-created version row (`WHERE body_key IS NULL`), because the version row is created in the ack transaction, before any activity runs. N104 words this as "before the version row is created". | §5.1.2 step 1 | | adopted as N110(d) |
 | PD-30 | Export deltas use `to_seq` plus `open_gaps[]` (the N50 anti-join idea) instead of an exclusive fence, so `to_seq` alone no longer closes the range. | §5.7 | | N82, concretised here |
 
-**Review follow-ups applied (REVIEW.md → register D20 → this section):**
+**Review follow-ups applied (reviews/round-1.md → register D20 → this section):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -9151,7 +9151,7 @@ case cannot arise there).
 | F-43, F-44 | N72 | `request_hash` over normalised protojson; `operation_id` validated as any UUID (§5.1.1). |
 | F-34 | N74 | `RetainBackfill` noted as Phase 2. |
 
-**Review-2 follow-ups applied (REVIEW-2.md → register D21 → this section):**
+**Review-2 follow-ups applied (reviews/round-2.md → register D21 → this section):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -11547,7 +11547,7 @@ matching change note opens a ticket automatically.
 | ND-6 | Every store query is registered in `store.Queries` so the RLS canary is exhaustive; `engramlint sql` enforces explicit `namespace_id` predicates in addition to RLS. *(adopted as N19 in the register)* | Exhaustiveness is what makes the canary a proof, not a sample. | Sampling a few queries. |
 | ND-7 | `token_usage` rows carry `price_version`; cost is computed at write time and never re-priced. *(adopted as N20 in the register)* | Historical cost reports must be reproducible. | Pricing at report time. |
 
-### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `REVIEW-2.md`)
+### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `reviews/round-2.md`)
 
 | Id | Test or procedure added in §8 | Where |
 |---|---|---|
@@ -12485,7 +12485,7 @@ tenant's `engram_quota_events_total{action="resume"}` increments.
 | ND-13 | Secrets are file-mounted (`/run/secrets`), re-read every 60 s and on `SIGHUP`; per-shard DSN rotation is a scripted `engramctl secret rotate` with pgbouncer `RELOAD` first. *(adopted as N24 in the register)* | No restarts for rotation; no secrets in `docker inspect`. | Environment-variable secrets; restart-to-rotate. |
 | ND-14 | Restore fences with `FreezeReason=RESTORE`, bumps the epoch of every namespace on the shard, restarts in-flight operations with the new epoch, resets consumer cursors beyond `max(seq)` and emits a Kafka `RestoreMarker`. *(adopted as N23; `RestoreMarker` is an `events.proto` oneof case in the register)* | D1 requires the bump; the rest makes the restored state observable to every consumer. | Silent restore. |
 
-### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `REVIEW-2.md`)
+### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `reviews/round-2.md`)
 
 | Id | Operational change in §9 | Where |
 |---|---|---|
@@ -12503,8 +12503,8 @@ tenant's `engram_quota_events_total{action="resume"}` increments.
 
 ## 10. Phased roadmap
 
-Effort follows D17 as amended after the first adversarial review (`REVIEW.md` F-16) and again
-after the second (`REVIEW-2.md` G-27, N105): Phase 0 ≈ 15 engineer-weeks (ew) **including a
+Effort follows D17 as amended after the first adversarial review (`reviews/round-1.md` F-16) and again
+after the second (`reviews/round-2.md` G-27, N105): Phase 0 ≈ 15 engineer-weeks (ew) **including a
 3-week Phase 0′ of measurements and a 3.5-ew Phase 0″** that lands decisions N79 to N108 in the
 sections, SQL and protos and the failing configurations for G-1, G-3, G-6 and G-10 before any
 move or consolidation code is written; Phase 1 ≈ 45 ew (moves behind an admin flag); Phase 2
@@ -12711,7 +12711,7 @@ land in weeks 5–8, before M1.8 and M1.5, and are preconditions of M1.5 and M2.
 | Restore and failover drills | `engramctl backup drill --shard N --with-deletes`; `engramctl shard failover N` in the `ha` profile (both §8.4 variants) | drill report in `_backups/drills/` |
 | Cost per haystack / per 1 k facts vs Table 6.8-B | `engramctl report weekly` | weekly report |
 
-### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `REVIEW-2.md`)
+### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `reviews/round-2.md`)
 
 | Id | Decision applied in §10 | Where |
 |---|---|---|
@@ -13210,7 +13210,7 @@ Phase 0 foundations ≈ 9 engineer-weeks (includes a 3-week Phase 0' that resolv
 | N48 | `Invalidate(memory_id)` marks every observation that used the fact as `stale_delete` (hidden until reconsolidated), by the same argument as N41; `Restore` marks them `stale_write` (visible). | §5 |
 | N49 | A retain whose version is superseded by a newer one before it finalises ends `SUCCEEDED` with `superseded_by = <version>` in the operation result; no new operation state is introduced (N35). | §5 |
 
-## D20. Corrections from the adversarial review (binding; `REVIEW.md` has the findings, this table has the decisions)
+## D20. Corrections from the adversarial review (binding; `reviews/round-1.md` has the findings, this table has the decisions)
 
 | Id | Decision | Amends | Finding |
 |---|---|---|---|
@@ -13244,7 +13244,7 @@ Phase 0 foundations ≈ 9 engineer-weeks (includes a 3-week Phase 0' that resolv
 | N77 | §7.1 and the executive summary state exactly which TLC configurations completed; the CI gate is the set of design configurations that complete in minutes (bounds shrunk until they do), the nightly job runs the larger ones with a 30-minute cap and reports INCOMPLETE as such; `AsOf.tla` gains the previous version's inputs and a delete action, `DocLifecycle.tla` a `cited ⊂ inputs` apply variant, `ShardMove.tla` multi-snapshot copy and `Holding`-independent replay (open work items in §7.6). | N46 | F-15 |
 | N78 | Realisation details from the data-model pass: `move_applied` exists on both shards (target authoritative via `ON CONFLICT` in the apply transaction, source a lagging copy written after the target commit) so the N50 anti-join is one source-side statement; the copy barrier's exclusive advisory lock is session-level on the mover's direct connection and is released after the `REPEATABLE READ` snapshot's first statement; the delete cascade retires facts before it deletes `observation_sources`/`observation_inputs` rows (the evidence triggers depend on that order); partial HNSW indexes for large namespaces are created by owner-run DDL (`engramctl index`, role `engram_migrate`). | N50, N51, N55, N61 | §3 |
 
-## D21. Corrections from the second adversarial review (binding; `REVIEW-2.md` has the findings)
+## D21. Corrections from the second adversarial review (binding; `reviews/round-2.md` has the findings)
 
 Where a row below restates a mechanism of D2, D5, D16, N40–N78, the row here wins until the propagation pass folds it into the original row (N103). "Event" always means an outbox event written in the same transaction as the change it describes. All ids inside events are 16-byte `bytes`.
 

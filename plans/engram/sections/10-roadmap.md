@@ -1,7 +1,7 @@
 ## 10. Phased roadmap
 
-Effort follows D17 as amended after the first adversarial review (`REVIEW.md` F-16) and again
-after the second (`REVIEW-2.md` G-27, N105): Phase 0 ≈ 15 engineer-weeks (ew) **including a
+Effort follows D17 as amended after the first adversarial review (`reviews/round-1.md` F-16) and again
+after the second (`reviews/round-2.md` G-27, N105): Phase 0 ≈ 15 engineer-weeks (ew) **including a
 3-week Phase 0′ of measurements and a 3.5-ew Phase 0″** that lands decisions N79 to N108 in the
 sections, SQL and protos and the failing configurations for G-1, G-3, G-6 and G-10 before any
 move or consolidation code is written; Phase 1 ≈ 45 ew (moves behind an admin flag); Phase 2
@@ -208,7 +208,7 @@ land in weeks 5–8, before M1.8 and M1.5, and are preconditions of M1.5 and M2.
 | Restore and failover drills | `engramctl backup drill --shard N --with-deletes`; `engramctl shard failover N` in the `ha` profile (both §8.4 variants) | drill report in `_backups/drills/` |
 | Cost per haystack / per 1 k facts vs Table 6.8-B | `engramctl report weekly` | weekly report |
 
-### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `REVIEW-2.md`)
+### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `reviews/round-2.md`)
 
 | Id | Decision applied in §10 | Where |
 |---|---|---|

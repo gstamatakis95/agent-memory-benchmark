@@ -914,7 +914,7 @@ tenant's `engram_quota_events_total{action="resume"}` increments.
 | ND-13 | Secrets are file-mounted (`/run/secrets`), re-read every 60 s and on `SIGHUP`; per-shard DSN rotation is a scripted `engramctl secret rotate` with pgbouncer `RELOAD` first. *(adopted as N24 in the register)* | No restarts for rotation; no secrets in `docker inspect`. | Environment-variable secrets; restart-to-rotate. |
 | ND-14 | Restore fences with `FreezeReason=RESTORE`, bumps the epoch of every namespace on the shard, restarts in-flight operations with the new epoch, resets consumer cursors beyond `max(seq)` and emits a Kafka `RestoreMarker`. *(adopted as N23; `RestoreMarker` is an `events.proto` oneof case in the register)* | D1 requires the bump; the rest makes the restored state observable to every consumer. | Silent restore. |
 
-### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `REVIEW-2.md`)
+### New decisions: D21 "Review-2 follow-ups applied" (second adversarial review, `reviews/round-2.md`)
 
 | Id | Operational change in §9 | Where |
 |---|---|---|

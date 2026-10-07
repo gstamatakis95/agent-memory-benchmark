@@ -1963,7 +1963,7 @@ workflows (the Temporal non-retryable list must be by type).
 | N7 | Retain items with a raw body > 64 KiB store the body in blob (`…/ledger/{sha256}`) *before* the ledger transaction; the ledger row keeps the hash and key. *(adopted as N7 in the register)* | Keeps the ack transaction small; content addressing makes the pre-write idempotent. | Inline bodies of any size (bloats the ledger table and the tx). |
 | N8 | Streams fix `RequestScope` at open; token expiry mid-stream does not abort the stream. *(adopted as N8 in the register)* | Reflect may legitimately run 300 s. | Per-message re-verification. |
 
-**Review follow-ups applied (REVIEW.md → register D20 → this section):**
+**Review follow-ups applied (reviews/round-1.md → register D20 → this section):**
 
 | Finding | Register | What changed here |
 |---|---|---|
@@ -1991,7 +1991,7 @@ workflows (the Temporal non-retryable list must be by type).
 | F-33 | N73 | Reflect `search_pages` tool + map/reduce at the context cap; `pages.Service.Search`, `index.SearchPages`, `PageRepo.Search`; MCP `search_pages`. |
 | F-23, F-27 | N64, F-27 | `catalog.NamespaceState` gains `creating`/`restoring`; `catalog.ShardState` aligned with the catalog SQL and `adminv1.ShardState`; `engramctl shard` states. |
 
-**Review-2 follow-ups applied (REVIEW-2.md → register D21 → this section):**
+**Review-2 follow-ups applied (reviews/round-2.md → register D21 → this section):**
 
 | Finding | Register | What changed here |
 |---|---|---|

@@ -1,11 +1,20 @@
 ------------------------- MODULE Consolidation -------------------------
 (***************************************************************************)
-(* Engram D12: consolidation round with at-least-once activity execution.  *)
+(* Engram D12/N121 (D22): consolidation round with at-least-once activity  *)
+(* execution.                                                              *)
 (*                                                                         *)
-(* A round takes a set of facts, calls the LLM on a batch (8 facts in      *)
-(* production, 4 here), and applies the returned ops (create/update/delete *)
-(* of observations, each citing source facts).  A failed LLM call bisects  *)
-(* the batch (8 -> 4 -> 2 -> 1); a failed singleton is skipped.           *)
+(* A round takes a set of facts and processes a batch (8 facts in          *)
+(* production, 4 here).  Two-stage consolidation (N121): stage 1 routes    *)
+(* the batch and persists the decisions write-once under batch_key (the    *)
+(* `Op` list below: create / update(attach) / delete(merge, drop_source)); *)
+(* stage 2 writes one observation version per touched observation as the   *)
+(* effect of an op, citing the batch facts that are still visible when the *)
+(* version commits.  A failed routing call bisects the batch (8 -> 4 -> 2  *)
+(* -> 1); a failed singleton is skipped.  The text-writing LLM call is not *)
+(* modelled: only the idempotence of the persisted decision and of its     *)
+(* effect.  Visibility of the written versions under concurrent deletes    *)
+(* (markers, segments, the derivation lock) is Derivation.tla; here a     *)
+(* delete only removes the fact from the set of visible sources.           *)
 (*                                                                         *)
 (* Idempotency: batch_key = sha256(sorted fact ids || prompt || model) is  *)
 (* modelled as the fact set itself; op_key = (batch_key, op_index).        *)
@@ -123,7 +132,7 @@ ProposeFail(B) ==
 (* op_key.  Re-execution after a crash skips recorded keys.                 *)
 
 \* Effect of an op on the observation table.  Sources are the batch facts
-\* that are still live (checked FOR SHARE in the same transaction); an op
+\* that are still live (re-verified under the shared derivation lock, N120); an op
 \* whose sources vanished, or that does not apply (update of a retired
 \* observation, create of an existing one), is dropped but its key is still
 \* recorded so it is never retried.
@@ -189,18 +198,13 @@ Crash ==
   /\ pending' = {}
   /\ UNCHANGED <<live, queue, stored, applied, applyCount, effectOf, done, finalProp, failed, obs, deletes>>
 
-\* Concurrent document delete retires a fact; the DB trigger removes it from
-\* observation_sources and retires observations whose source count hits 0.
+\* Concurrent document delete (N115): a marker; the fact stops being a visible source.  Written
+\* versions are never touched (insert-only, N113); their visibility is a read-time predicate.
 DeleteFact(f) ==
   /\ f \in live /\ deletes < MaxDeletes
   /\ deletes' = deletes + 1
   /\ live' = live \ {f}
-  /\ obs' = [o \in Obs |->
-              IF obs[o].st = "live"
-                THEN IF obs[o].src \ {f} = {} THEN [st |-> "retired", src |-> {}]
-                                              ELSE [obs[o] EXCEPT !.src = @ \ {f}]
-                ELSE obs[o]]
-  /\ UNCHANGED <<queue, stored, mem, applied, applyCount, effectOf, pending, done, finalProp, failed, crashes>>
+  /\ UNCHANGED <<queue, stored, mem, applied, applyCount, effectOf, pending, done, finalProp, failed, obs, crashes>>
 
 -----------------------------------------------------------------------------
 
@@ -230,9 +234,10 @@ ExactlyOnceEffect ==
        /\ applyCount[<<B, i>>] = 1
        /\ effectOf[<<B, i>>] = finalProp[B][i]
 
-\* Observations never outlive their sources, and never cite a retired fact.
+\* Every written observation version cites at least one fact of the round (an op whose visible
+\* sources vanished before commit is dropped, never written with an empty segment).
 ObservationHasSources ==
-  \A o \in Obs : obs[o].st = "live" => obs[o].src /= {} /\ obs[o].src \subseteq live
+  \A o \in Obs : obs[o].st = "live" => obs[o].src /= {} /\ obs[o].src \subseteq Facts
 
 \* Every batch of the round is eventually done, bisected into done/failed children.
 RoundTerminates == <>(queue = {})

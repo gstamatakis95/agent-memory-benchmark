@@ -231,8 +231,9 @@ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
                           i);
 $$;
 
--- Mutable tables only (N113): stamps updated_at on every UPDATE. No replay bypass exists; the move
--- loader runs in session_replication_role = replica, where this trigger does not fire.
+-- Mutable tables only (N113): stamps updated_at on every UPDATE. The move loader runs in
+-- session_replication_role = replica, where this trigger does not fire, so copied rows keep the
+-- source's updated_at.
 CREATE FUNCTION engram_touch_updated_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -2127,9 +2128,8 @@ CREATE INDEX facts_bm25 ON facts
 -- pg_search:end
 
 -- vector side tables: exact-scan path (a namespace below 2,000 vectors reads <= 2,000 rows through
--- this btree and sorts by distance) and the document lookup of the expunge
+-- this btree and sorts by distance). The expunge deletes vectors through the FK cascade from facts.
 CREATE INDEX fact_vectors_model_idx  ON fact_vectors  (namespace_id, embedding_model, memory_id);
-CREATE INDEX fact_vectors_doc_idx    ON fact_vectors  (namespace_id, document_id);
 CREATE INDEX chunk_vectors_model_idx ON chunk_vectors (namespace_id, embedding_model, chunk_id);
 CREATE INDEX observation_version_vectors_model_idx
   ON observation_version_vectors (namespace_id, embedding_model, observation_id, version);
@@ -2372,11 +2372,8 @@ BEGIN
     RAISE EXCEPTION 'engram_app/engram_relay/engram_move must be NOBYPASSRLS';
   END IF;
 
-  -- 7. the move executor: no BYPASSRLS loader role, may set session_replication_role, holds no
+  -- 7. the move executor (NOBYPASSRLS, see 6): may set session_replication_role, holds no
   --    DELETE on content, and the ownership trigger is ENABLE ALWAYS so replica mode cannot switch it off
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'engram_move_load') THEN
-    RAISE EXCEPTION 'engram_move_load must not exist (N91)';
-  END IF;
   IF NOT has_parameter_privilege('engram_move', 'session_replication_role', 'SET') THEN
     RAISE EXCEPTION 'engram_move must be allowed to SET session_replication_role (N91)';
   END IF;

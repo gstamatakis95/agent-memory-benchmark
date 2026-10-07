@@ -156,7 +156,7 @@ formal/tla/*.tla    formal/lean/Engram/*.lean
 |---|---|---|
 | Embedding | `nomic-embed-text-v1.5`, 768-d, prefixes `search_document: ` / `search_query: `, L2-normalised | Matryoshka truncation to 512-d is a config knob, off by default. |
 | Rerank | `bge-reranker-base` (`bge-reranker-v2-m3` is a per-namespace upgrade; N53, superseded in D22) | Gateway rerank endpoint; batch of ≤ 150 pairs per call. |
-| Extract / Summarize / Consolidate | `models.extract`, `models.consolidate` — a fast structured-output model class | Per-namespace override. Prompt versions `extract/v1`, `summarize/v1`, `consolidate/v1`, `dedup_adjudicate/v1`; the benchmark judge is `judge/v1`. |
+| Extract / Summarize / Consolidate | `models.extract`, `models.consolidate` — a fast structured-output model class | Per-namespace override. Prompt versions `extract/v1`, `summarize/v1`, `consolidate_route/v1` (routing, decisions only), `consolidate_write/v1` (one call per touched observation; merges are root rebuilds), `dedup_adjudicate/v1`; the benchmark judge is `judge/v1`. |
 | Reflect / Page refresh | `models.reflect` — a stronger model class | Prompt versions `reflect/v1`, `reflect_structured/v1`, `page/v1` (delta edit), `page_full/v1` (rebuild fallback). |
 
 ## D16. Consistency model (stated once, referenced everywhere; superseded in D22)

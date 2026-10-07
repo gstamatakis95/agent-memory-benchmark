@@ -9,7 +9,8 @@
 --   catalog_app      engram-api (Resolver, NamespaceService, TenantService reads, usage rollups)
 --   catalog_admin    engramctl, MoveService, ShardService (full DML)
 -- The catalog has no RLS: it holds routing metadata only, is reached only by service roles,
--- and never by tenant credentials.
+-- and never by tenant credentials. It holds no delete log: delete intents (N122) are objects in blob
+-- storage, and the shard's deletion_log records what was applied.
 -- =============================================================================
 
 SET search_path = public;

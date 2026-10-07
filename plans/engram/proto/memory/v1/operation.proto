@@ -182,6 +182,10 @@ message OperationResult {
   int64 snapshot_version = 7;
   // CONSOLIDATE: observation operations applied.
   int32 observation_ops_applied = 8;
+  // RETAIN_DOCUMENT: items whose timestamp was earlier than an earlier item
+  // of the same document and was clamped up to the running maximum when its
+  // chunks were built (decision N86); 0 when timestamps were monotone.
+  int32 timestamps_clamped = 9;
 }
 
 // GetOperationRequest fetches one operation.

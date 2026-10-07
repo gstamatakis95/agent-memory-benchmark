@@ -12,9 +12,37 @@
 // the flags the events themselves carry. This keeps the outbox at a few
 // hundred bytes per event and makes replay idempotent by (namespace_id, seq).
 //
+// Bounded size (decisions N80, N81; review-2 G-2, G-3):
+//   * every id INSIDE a payload (memory, chunk, entity, observation, page and
+//     batch ids) is a 16-byte `bytes` value (batch_key and op_key: 32 bytes),
+//     ≈ 18 B encoded instead of ≈ 38 B as text. Client-chosen
+//     `document_id` and the envelope ids (namespace_id, tenant_id, event_id,
+//     operation_id) stay strings;
+//   * an event carries at most 256 ids in total across all its lists. A
+//     larger set is paged as consecutive events of the same type written in
+//     the SAME transaction, with `page` (0-based) and `page_count` plus the
+//     group key named on each message (document_id, deleted_at, batch_key,
+//     ...). A consumer treats a group as complete only when every page has
+//     been seen; the move replay treats each page independently;
+//   * above 4,096 ids (16 pages) the event is sent ONCE with
+//     `ids_elided = true`, empty id lists and the counts. Consumers and the
+//     move replay then read the ids from the store by `document_id` (or by
+//     observation_id for VersionsFlagged): the rows live until
+//     PurgeDocument plus its grace, so no blob write is needed inside the
+//     transaction;
+//   * every encoded event is ≤ 16 KiB by construction; the CHECK
+//     `octet_length(payload) <= 16384` on the outbox is only the backstop.
+//
+// Move replay (N81): every event type maps to the rows it names through the
+// single table in internal/move/replay_map.go, generated from the
+// `replay:` annotations in the message comments below; a CI check fails when
+// a store.Queries statement writes a table that no event type (or the
+// frozen re-copy class) covers.
+//
 // Versioning: `schema_version` in the envelope; consumers must skip unknown
 // payload variants (proto3 keeps unknown oneof members as unknown fields)
-// and count them in `events_unknown_payload_total`.
+// and count them in `events_unknown_payload_total`. Changes are additive;
+// removed field numbers are reserved.
 syntax = "proto3";
 
 package engram.internal.events.v1;
@@ -64,10 +92,20 @@ message Event {
     TokenUsageRecorded token_usage_recorded = 37;
     NamespacePurged namespace_purged = 38;
     RestoreMarker restore_marker = 39;
+    // Events for writes that had none before (N81).
+    ProposalStored proposal_stored = 40;
+    ProposalDiscarded proposal_discarded = 41;
+    BatchApplied batch_applied = 42;
+    IdempotencyKeyStored idempotency_key_stored = 43;
+    OperationTransitioned operation_transitioned = 44;
+    BlobTombstoned blob_tombstoned = 45;
+    VersionsFlagged versions_flagged = 46;
+    SnapshotsExpired snapshots_expired = 47;
   }
 }
 
 // DocumentVersionStarted: a new document version row exists (INGESTING).
+// replay: ingest_ledger, documents, document_versions.
 message DocumentVersionStarted {
   string document_id = 1;
   int64 version = 2;
@@ -78,29 +116,51 @@ message DocumentVersionStarted {
 
 // ChunkCommitted: CommitChunk committed a chunk with its facts, mentions and
 // links. The replayer copies rows by these ids.
+// replay: chunks, facts, fact_links, entity_mentions, entities,
+// document_version_chunks (parents first: ingest_ledger, documents,
+// document_versions).
+// Paging group key: (document_id, version, chunk_id).
 message ChunkCommitted {
   string document_id = 1;
   int64 version = 2;
-  string chunk_id = 3;
+  bytes chunk_id = 3;
   string content_hash = 4;
-  repeated string fact_ids = 5;
-  repeated string entity_ids = 6;
+  // ≤ 256 ids across fact_ids and entity_ids per event (N80).
+  repeated bytes fact_ids = 5;
+  repeated bytes entity_ids = 6;
   int32 links_written = 7;
   google.protobuf.Timestamp mentioned_at = 8;
+  // Paging (N80): 0-based page and the number of pages of the group.
+  uint32 page = 9;
+  uint32 page_count = 10;
+  // True above 4,096 ids: lists empty, counts below, read by document_id.
+  bool ids_elided = 11;
+  int32 fact_count = 12;
+  int32 entity_count = 13;
 }
 
-// ChunksRetired: chunks (and their facts) got retired_at set.
+// ChunksRetired: chunks (and their facts) got retired_at set (FinalizeVersion;
+// paged like every id-carrying event, N80).
+// replay: chunks, facts (retired_at, purge_after).
+// Paging group key: (document_id, version, retired_at).
 message ChunksRetired {
   string document_id = 1;
   // Version whose finalisation retired them (or 0 for a delete cascade).
   int64 version = 2;
-  repeated string chunk_ids = 3;
-  repeated string fact_ids = 4;
+  // ≤ 256 ids across chunk_ids and fact_ids per event.
+  repeated bytes chunk_ids = 3;
+  repeated bytes fact_ids = 4;
   google.protobuf.Timestamp retired_at = 5;
+  uint32 page = 6;
+  uint32 page_count = 7;
+  bool ids_elided = 8;
+  int32 chunk_count = 9;
+  int32 fact_count = 10;
 }
 
 // DocumentVersionActivated: FinalizeVersion made the version ACTIVE and the
 // previous one SUPERSEDED.
+// replay: documents, document_versions.
 message DocumentVersionActivated {
   string document_id = 1;
   int64 version = 2;
@@ -110,45 +170,80 @@ message DocumentVersionActivated {
 }
 
 // DocumentDeleted: the synchronous delete cascade committed (decision D8).
+// The cascade leaves facts.invalidated_at unchanged (N108). Versions flagged
+// derived_from_deleted (directly or through lineage, N79) travel in
+// VersionsFlagged events of the same transaction; expired export snapshots in
+// SnapshotsExpired (N81: the `snapshots_expired` list never existed in this
+// message and must not be added).
+// replay: documents, document_versions, facts, chunks (retired_at), operations.
+// Paging group key: (document_id, deleted_at).
 message DocumentDeleted {
   string document_id = 1;
-  repeated string fact_ids = 2;
-  repeated string chunk_ids = 3;
+  // ≤ 256 ids across all id lists of one event (N80).
+  repeated bytes fact_ids = 2;
+  repeated bytes chunk_ids = 3;
   // Observations that lost ≥ 1 source or prompt input (marked stale_delete,
   // hidden until reconsolidated — N41) and those retired because they lost
   // every source.
-  repeated string observations_marked_stale = 4;
-  repeated string observations_retired = 5;
-  repeated string pages_marked_stale = 6;
+  repeated bytes observations_marked_stale = 4;
+  repeated bytes observations_retired = 5;
+  repeated bytes pages_marked_stale = 6;
   google.protobuf.Timestamp deleted_at = 7;
+  uint32 page = 8;
+  uint32 page_count = 9;
+  // True above 4,096 ids in total: lists empty, counts below; consumers and
+  // the replay read the victims with `WHERE document_id = $1` (N80).
+  bool ids_elided = 10;
+  int64 fact_count = 11;
+  int64 chunk_count = 12;
+  int64 observations_marked_stale_count = 13;
+  int64 observations_retired_count = 14;
+  int64 pages_marked_stale_count = 15;
 }
 
-// FactInvalidated: soft curation.
+// FactInvalidated: soft curation. The per-version consequences travel in
+// VersionsFlagged{reason = INVALIDATED} of the same transaction (N84).
+// replay: facts (invalidated_at, invalidation_reason).
 message FactInvalidated {
-  string fact_id = 1;
+  bytes fact_id = 1;
   google.protobuf.Timestamp invalidated_at = 2;
   string reason = 3;
 }
 
-// FactRestored: soft curation undone.
+// FactRestored: soft curation undone (VersionsFlagged{reason = RESTORED}
+// carries the counter decrements, N84).
+// replay: facts (invalidated_at).
 message FactRestored {
-  string fact_id = 1;
+  bytes fact_id = 1;
 }
 
 // ObservationUpserted: a consolidation CREATE or UPDATE wrote a new
 // observation version.
+// replay: observations, observation_versions (including superseded_at of the
+// previous version), observation_sources, observation_inputs,
+// observation_version_lineage, observation_version_sources,
+// consolidation_applied.
+// Paging group key: (observation_id, version).
 message ObservationUpserted {
-  string observation_id = 1;
+  bytes observation_id = 1;
   int64 version = 2;
-  repeated string source_fact_ids = 3;
+  // ≤ 256 ids per event (N80).
+  repeated bytes source_fact_ids = 3;
   google.protobuf.Timestamp effective_at = 4;
   string op_key = 5;
   bool created = 6;
+  uint32 page = 7;
+  uint32 page_count = 8;
+  // Above 4,096 sources: list empty, read observation_sources by
+  // observation_id.
+  bool ids_elided = 9;
+  int32 source_count = 10;
 }
 
 // ObservationRetired: a consolidation DELETE, or the zero-sources trigger.
+// replay: observations, observation_versions (retired_at).
 message ObservationRetired {
-  string observation_id = 1;
+  bytes observation_id = 1;
   string op_key = 2;
   bool zero_sources = 3;
 }
@@ -156,43 +251,64 @@ message ObservationRetired {
 // ObservationsMarkedStale: evidence changed under these observations
 // (stale_write from a replace-retire or restore: still visible; stale_delete
 // from a delete, purge or invalidate: hidden until reconsolidated).
+// replay: observations (stale_write, stale_delete, stale_since).
+// Paging group key: (cause_fact_id, document_id of the cause when known).
 message ObservationsMarkedStale {
-  repeated string observation_ids = 1;
-  string cause_fact_id = 2;
+  repeated bytes observation_ids = 1;
+  bytes cause_fact_id = 2;
+  uint32 page = 3;
+  uint32 page_count = 4;
+  bool ids_elided = 5;
+  int32 observation_count = 6;
 }
 
 // EntityUpserted: entity created or canonical name changed.
+// replay: entities, entity_aliases.
 message EntityUpserted {
-  string entity_id = 1;
+  bytes entity_id = 1;
   string canonical_name = 2;
   string type = 3;
   bool created = 4;
 }
 
 // EntitiesMerged: resolution merged duplicates into `survivor_id`.
+// replay: entities, entity_aliases, entity_mentions.
+// Paging group key: survivor_id.
 message EntitiesMerged {
-  string survivor_id = 1;
-  repeated string merged_ids = 2;
+  bytes survivor_id = 1;
+  repeated bytes merged_ids = 2;
+  uint32 page = 3;
+  uint32 page_count = 4;
+  bool ids_elided = 5;
+  int32 merged_count = 6;
 }
 
 // PageVersionCreated: a refresh wrote a page version.
+// replay: pages, page_versions, page_sources.
 message PageVersionCreated {
-  string page_id = 1;
+  bytes page_id = 1;
   int64 version = 2;
   string markdown_blob_key = 3;
   google.protobuf.Timestamp effective_at = 4;
 }
 
 // PageDeleted: the page definition and versions were removed.
+// replay: DELETE of pages, page_versions, page_sources on the target.
 message PageDeleted {
-  string page_id = 1;
+  bytes page_id = 1;
 }
 
 // PagesMarkedStale: evidence changed under these pages.
+// replay: pages (stale flags, stale_seq).
+// Paging group key: (cause fact or document, stale flag pair).
 message PagesMarkedStale {
-  repeated string page_ids = 1;
+  repeated bytes page_ids = 1;
   bool stale_write = 2;
   bool stale_delete = 3;
+  uint32 page = 4;
+  uint32 page_count = 5;
+  bool ids_elided = 6;
+  int32 page_id_count = 7;
 }
 
 // SnapshotCreated: an export finished.
@@ -202,15 +318,31 @@ message SnapshotCreated {
   int64 base_version = 3;
 }
 
-// RowsPurged: a purge batch physically deleted rows (index consumers drop
-// the ids; the move replayer deletes them on target).
+// RowsPurged: a purge batch physically deleted rows. It carries NO id list
+// (N80): the key range and the count are enough because the move replayer
+// deletes by (table, document_id) on the target and an external index never
+// returns a retired row (read-time join on retired_at, N44). Purges of a
+// namespace are paused while a move is non-terminal (N88); a batch that
+// committed before StartMove is replayed by this event.
+// replay: DELETE FROM <table> WHERE namespace_id = $ns AND document_id = $d
+// AND the key lies in [min_key, max_key] on the target.
 message RowsPurged {
   string table = 1;
-  repeated string ids = 2;
+  // Removed in N80: `repeated string ids = 2`.
+  reserved 2;
+  reserved "ids";
   string document_id = 3;
+  // Rows deleted by this batch.
+  int64 count = 4;
+  // Smallest and largest primary-key value of the deleted rows, in the
+  // table's key encoding (16-byte uuid for single-id keys; the concatenated
+  // key columns, big-endian, otherwise). Empty when count = 0.
+  bytes min_key = 5;
+  bytes max_key = 6;
 }
 
 // TokenUsageRecorded: metering row written (moves with the namespace).
+// replay: token_usage_events, token_usage.
 message TokenUsageRecorded {
   string day = 1;
   string op = 2;
@@ -233,4 +365,123 @@ message RestoreMarker {
   int32 shard_id = 1;
   google.protobuf.Timestamp restored_to = 2;
   bool epoch_bump = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Events for writes that had none before (decision N81, review-2 G-3). Each is
+// emitted in the writing transaction; the move replay (N81) and the build-time
+// check on store.Queries need every writer of a namespace table to be covered
+// by one of them, by an existing event, or declared `frozen_recopy`/`derived`.
+// ---------------------------------------------------------------------------
+
+// ProposalStored: StoreProposal wrote consolidation_batches and
+// consolidation_proposals (N43).
+// replay: consolidation_batches, consolidation_proposals (immutable: ON
+// CONFLICT DO NOTHING).
+message ProposalStored {
+  // sha256(sorted fact ids ‖ prompt_version ‖ model), 32 bytes.
+  bytes batch_key = 1;
+}
+
+// ProposalDiscarded: ApplyBatch re-verification failed and the proposal was
+// deleted in its separate transaction (PD-24, N79).
+// replay: consolidation_batches (state = 'discarded'); DELETE of the
+// consolidation_proposals row on the target.
+message ProposalDiscarded {
+  bytes batch_key = 1;
+}
+
+// BatchApplied: ApplyBatch wrote fact_consolidation rows (N95).
+// replay: fact_consolidation, consolidation_batches (state = 'applied').
+// Paging group key: batch_key.
+message BatchApplied {
+  bytes batch_key = 1;
+  // ≤ 256 ids per event (N80); a batch has ≤ 8 facts, so one page in
+  // practice.
+  repeated bytes fact_ids = 2;
+  uint32 page = 3;
+  uint32 page_count = 4;
+  bool ids_elided = 5;
+  int32 fact_count = 6;
+}
+
+// IdempotencyKeyStored: the retain ack (or another unary write) stored an
+// idempotency_keys row. Without it a retry after cutover would not find its
+// key on the target (N81, W-8 `ShardMove_RetryAfterCutover`).
+// replay: idempotency_keys (immutable: ON CONFLICT DO NOTHING).
+message IdempotencyKeyStored {
+  // Full gRPC method name.
+  string method = 1;
+  string request_id = 2;
+}
+
+// OperationTransitioned: an operations row changed state or progress
+// (replaces the earlier "no outbox event for operations" rule, including
+// MarkProgress).
+// replay: operations (the full row).
+message OperationTransitioned {
+  bytes operation_id = 1;
+  // Operation state after the transition (PENDING, RUNNING, DEFERRED,
+  // SUCCEEDED, FAILED, CANCELLED); informational, the replay re-reads the row.
+  string state = 2;
+}
+
+// BlobTombstoned: blob_tombstones rows were inserted (delete cascade). A
+// concurrent move's blob copy skips these keys.
+// replay: blob_tombstones.
+// Paging group key: (document_id, deleted_at). ≤ 64 keys per event (these
+// keys do not count against the 256-id bound).
+message BlobTombstoned {
+  repeated string keys = 1;
+  string document_id = 2;
+  uint32 page = 3;
+  uint32 page_count = 4;
+}
+
+// VersionFlagReason says why VersionsFlagged was emitted.
+enum VersionFlagReason {
+  VERSION_FLAG_REASON_UNSPECIFIED = 0;
+  // observation_versions.derived_from_deleted = true: a delete victim was in
+  // the version's prompt, directly (observation_inputs) or through lineage
+  // (observation_version_lineage, N79).
+  VERSION_FLAG_REASON_DERIVED_FROM_DELETED = 1;
+  // hidden_by_invalidation incremented by Invalidate (N84).
+  VERSION_FLAG_REASON_INVALIDATED = 2;
+  // hidden_by_invalidation decremented by Restore (N84).
+  VERSION_FLAG_REASON_RESTORED = 3;
+  // The lineage cascade hit its depth bound (64) and failed closed by setting
+  // stale_delete on the frontier observations (N79).
+  VERSION_FLAG_REASON_LINEAGE_FRONTIER = 4;
+}
+
+// VersionsFlagged: derived_from_deleted or hidden_by_invalidation changed on
+// versions of one observation, superseded ones and lineage descendants
+// included (N79, N84).
+// replay: observation_versions of the named versions (flag columns only).
+// Paging group key: (observation_id, cause_fact_id, flagged_at).
+message VersionsFlagged {
+  bytes observation_id = 1;
+  // ≤ 256 versions per event (N80).
+  repeated int64 versions = 2;
+  VersionFlagReason reason = 3;
+  // The fact whose delete or invalidation caused the flagging (empty for
+  // LINEAGE_FRONTIER).
+  bytes cause_fact_id = 4;
+  google.protobuf.Timestamp flagged_at = 5;
+  uint32 page = 6;
+  uint32 page_count = 7;
+  // Above 4,096 versions: list empty, read observation_versions by
+  // observation_id.
+  bool ids_elided = 8;
+  int32 version_count = 9;
+}
+
+// SnapshotsExpired: the delete cascade set export_snapshots.state = 'expired'
+// (replaces the never-implemented DocumentDeleted.snapshots_expired list).
+// replay: export_snapshots.
+message SnapshotsExpired {
+  // export_snapshots.version values of the expired snapshots.
+  repeated int64 versions = 1;
+  string document_id = 2;
+  google.protobuf.Timestamp expired_at = 3;
 }

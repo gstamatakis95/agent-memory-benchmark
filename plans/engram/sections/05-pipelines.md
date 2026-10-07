@@ -23,31 +23,44 @@ query, §5.4–5.5).
 check, and in no idempotency key (D11): a restarted execution must recognise work committed
 under the previous epoch. Every *write* activity opens `store.WithNamespaceTx(write)`, which
 executes the D2 sequence as amended — the **fence prelude**: `SET LOCAL engram.namespace_id /
-tenant_id / epoch`, then `SELECT pg_advisory_xact_lock_shared(engram_ns_lock_key(namespace_id))`
-(the key is `hashtextextended(namespace_id::text, 0)`, one key per namespace for every party in the
-§3.3 lock-discipline table), then a plain `SELECT state, epoch FROM namespace_ownership WHERE
-namespace_id=$1` (no row lock;
-the row is the fence *value*, the advisory lock is the fence *lock*), aborting unless
-`state='active' AND epoch=$2`. The shared advisory lock is held to commit; the move's copy
-barrier and `Freeze` (§5.5), a restore and the export snapshot take the *exclusive* advisory
-lock on the same key, which queues fairly — it waits for the writers in flight when it was
-requested and blocks the ones that arrive after it — so a `Freeze` cannot flip the state under a
-committing writer and a continuous stream of writers cannot starve the freeze (the former
-`FOR SHARE` row lock had neither property: Postgres grants a compatible row lock past a waiting
-`FOR UPDATE`, and every extra share locker allocated a MultiXactId — review F-5). Wherever a
-step below says "fence prelude" or "shared advisory lock, `active` @ epoch" it means exactly
-this sequence. Every write transaction runs with `statement_timeout = idle_in_transaction_session_timeout
-= 30 s` and its outbox `INSERT` is the **last statement** before `COMMIT` (invariant A-F1, D6):
-a drawn `seq` is therefore committed or aborted within one timeout of being drawn, which is
-what the relay's 60 s gap watchlist (§5.6) and the move's copy barrier (§5.5 step 2) assume;
-`engramlint sql` fails a builder whose outbox append is followed by another statement. Outcomes: `active` at the caller's epoch → proceed; `frozen` → `errs.NamespaceFrozen`
-(retryable: the freeze lasts seconds); anything else (`incoming`, `moved_out`, missing row,
-epoch mismatch) → `errs.WrongShardOrEpoch` (**non-retryable**: the workflow is running against
-the wrong shard or a stale epoch and must not be allowed to succeed by retrying). *Read*
-activities use `WithNamespaceTx(read)`, which accepts `active` and `frozen`. Two activities
-run outside the fence by design and are marked so in their tables: the mover's target-side
-writes (fence `state='incoming' AND epoch=e+1`, §5.5) and the admin-role purge of a
-`moved_out` namespace (§5.5 Cleanup).
+tenant_id / epoch`, then `SELECT pg_try_advisory_xact_lock_shared(engram_ns_lock_keys(namespace_id))`
+(one lock-key form for every party in the §3.3 lock-discipline table, N103), then a plain
+`SELECT state, epoch FROM namespace_ownership WHERE namespace_id=$1` (no row lock; the row is
+the fence *value*, the advisory lock is the fence *lock*), aborting unless `state='active' AND
+epoch=$2`. **The fence never waits (N82, review-2 G-4).** If the try-lock is refused — a
+freeze, copy barrier, delete freeze, restore or cutover holds the exclusive form, or is queued
+for it (a shared request that conflicts with a queued exclusive request is refused under
+`dontWait`; documented lock-manager behaviour, confirmed by `TestFence_TryLockRefusedBehindWaiter`
+on PG 16, with `SET LOCAL lock_timeout = '50ms'` around a blocking acquisition as the fallback
+if that test fails) — the statement ends at once with the retryable
+`NamespaceFrozen{reason = FENCE_BUSY, retry_after = 200 ms}`, handled by the existing API and
+`P-frozen` retries with jitter, so no pooled connection is held while an exclusive taker is
+queued. The shared lock is held to commit. **Exclusive takers** — the mover's copy barrier and
+`Freeze` (§5.5), the delete freeze and a restore — use `pg_advisory_xact_lock` or the
+session-level variant under `lock_timeout = 5 s` per attempt and retry with jitter; they still
+queue fairly behind the writers in flight when they asked, so a `Freeze` cannot flip the state
+under a committing writer, and because writers no longer queue behind the exclusive request a
+continuous stream of writers cannot starve it (the former `FOR SHARE` row lock had neither
+property: Postgres grants a compatible row lock past a waiting `FOR UPDATE`, and every extra
+share locker allocated a MultiXactId — review F-5). **Exports take no exclusive fence** (§5.7).
+Role defaults: `ALTER ROLE engram_app, engram_worker SET lock_timeout = '2s'` (row and advisory
+waits; `statement_timeout = 30 s` stays as the outer bound), `engram_move` and `engram_admin`
+10 s. Wherever a step below says "fence prelude" or "shared advisory lock, `active` @ epoch" it
+means exactly this sequence. Every write transaction runs with `statement_timeout =
+idle_in_transaction_session_timeout = 30 s` and its outbox `INSERT` is the **last statement**
+before `COMMIT` — one multi-row statement when the transaction emits several events (invariant
+A-F1, D6): a drawn `seq` is therefore committed or aborted within one timeout of being drawn,
+which is what the relay's 60 s gap watchlist (§5.6) and the move's copy barrier (§5.5 step 2)
+assume; `engramlint sql` fails a builder whose outbox append is followed by another statement.
+Outcomes: `active` at the caller's epoch → proceed; `frozen` or a refused try-lock →
+`errs.NamespaceFrozen` (retryable: the freeze lasts seconds); anything else (`incoming`,
+`moved_out`, missing row, epoch mismatch) → `errs.WrongShardOrEpoch` (**non-retryable**: the
+workflow is running against the wrong shard or a stale epoch and must not be allowed to succeed
+by retrying; for `moved_out` the detail carries `target_shard_id` and `next_epoch`, N98).
+*Read* activities use `WithNamespaceTx(read)`, which accepts `active` and `frozen`. Two
+activities run outside the fence by design and are marked so in their tables: the mover's
+target-side writes (fence `state='incoming' AND epoch=e+1`, §5.5) and the admin-role purge of
+a `moved_out` namespace (§5.5 Cleanup, through the `SECURITY DEFINER` function of N93).
 
 **Retry-policy notation.** `initial / coefficient / max interval / max attempts / non-retryable
 error types`. Named policies used in the tables (`ScheduleToClose` bounds the whole retry
@@ -57,7 +70,7 @@ chain; `StartToClose` bounds one attempt):
 |---|---|---|---|
 | `P-pure` | — / — / — / 3 | everything (a pure function fails only on a bug) | `Chunk`, `GroupBatches`, `ApplyDeltaOps` |
 | `P-db` | 500 ms / 2.0 / 10 s / 10 | `WrongShardOrEpoch`, `Validation`, `IntegrityViolation` | every read/write tx activity |
-| `P-frozen` | 1 s / 1.5 / 5 s / unlimited within `ScheduleToClose` | `WrongShardOrEpoch`, `Validation` | write activities that may meet a freeze (`CommitChunk`, `FinalizeVersion`, `ApplyBatch`, `CommitPageVersion`, `PurgeBatch`) — same as `P-db` plus `NamespaceFrozen` treated as retryable with a 10 min `ScheduleToClose` |
+| `P-frozen` | 1 s / 1.5 / 5 s / unlimited within `ScheduleToClose` | `WrongShardOrEpoch`, `Validation`, `InputBlobMissing` (handled by the workflow, N100) | write activities that may meet a freeze (`CommitChunk`, `FinalizeVersion`, `ApplyBatch`, `CommitPageVersion`, `PurgeBatch`) — same as `P-db` plus `NamespaceFrozen` (including the N82 `FENCE_BUSY` refusal, 200 ms) and `DocumentBusy` (N83, 100 ms) treated as retryable with a 10 min `ScheduleToClose` |
 | `P-llm` | 2 s / 2.0 / 60 s / 8 | `PermanentLLMError`, `Validation`, `WrongShardOrEpoch` | gateway structured/chat calls |
 | `P-embed` | 1 s / 2.0 / 30 s / 8 | `PermanentLLMError`, `Validation` | gateway embed calls |
 | `P-blob` | 200 ms / 2.0 / 5 s / 10 | `Validation` | blob get/put/list/delete |
@@ -67,17 +80,25 @@ chain; `StartToClose` bounds one attempt):
 | `P-temporal` | 1 s / 2.0 / 10 s / 10 | `Validation` | activities that call the Temporal client (list/terminate/start) |
 
 **Transaction-boundary column values.** `none` (pure or blob/gateway only), `read tx` (RLS,
-`active|frozen`), `write tx` (fenced, `active`), `target tx (incoming)` (move only: the bulk
-load runs as `engram_move_load`, `BYPASSRLS` with `INSERT` only on the copied namespace tables
-plus `SELECT` on `namespace_ownership`/`shard_meta`, and every batch runs the fence prelude with
-the `incoming` predicate — `BEGIN; SELECT pg_advisory_xact_lock_shared(engram_ns_lock_key($1));
+`active|frozen`), `write tx` (fenced, `active`), `target tx (incoming)` (move only, N91: the
+mover runs as `engram_move` **without** `BYPASSRLS` and loads each key range through a session
+`TEMP` table — `COPY tmp FROM STDIN BINARY`, then `INSERT INTO t SELECT … FROM tmp ON CONFLICT …`
+under `ns_isolation`, so a stream carrying another `namespace_id` fails the RLS check. Each load
+transaction runs `BEGIN; SELECT pg_try_advisory_xact_lock_shared(engram_ns_lock_keys($1));
 SELECT state, epoch FROM namespace_ownership WHERE namespace_id = $1` → abort unless
-`('incoming', e + 1)`; `COPY … FROM STDIN BINARY; COMMIT` — because `COPY FROM` is refused on
-RLS tables, N51), `catalog tx`, `admin tx` (role `engram_admin`,
-`BYPASSRLS`, used only by the mover's cleanup, the namespace purge and per-shard sweepers that
-must enumerate namespaces).
+`('incoming', e + 1)`; `SET LOCAL session_replication_role = replica` (privilege granted with
+`GRANT SET ON PARAMETER session_replication_role TO engram_move`, PG 15 or later), so
+foreign-key, append-only and `*_touch` triggers do not fire during the load; the ownership
+trigger `engram_check_ownership` is `ENABLE ALWAYS TRIGGER` and RLS is unaffected by replica
+mode), `catalog tx`, `admin tx` (role `engram_admin`, `BYPASSRLS`, used only by the namespace
+purge and the per-shard sweepers that must enumerate namespaces; the mover's source cleanup
+goes through the `engram_migrate`-owned `SECURITY DEFINER` function
+`engram_cleanup_namespace`, N93).
 
-**Operation rows.** Activities update `operations` with absolute values (`state`,
+**Operation rows.** Every `operations` insert or transition — including `MarkProgress` — emits
+`OperationTransitioned{operation_id}` in the same transaction (N81; the earlier "no outbox event
+for operations" rule is withdrawn: an event-less row is invisible to the move replay).
+Activities update `operations` with absolute values (`state`,
 `progress.units_done = <count>`), never relative increments; `RetainDocument` writes progress
 **once per wave** from the workflow (`MarkProgress`), never from `CommitChunk`, so the 32
 parallel commits of a document do not serialise on the operation row (N69, review F-36).
@@ -86,8 +107,8 @@ sweeper** — `engram_admin`, every 60 s per namespace, one read per tick, which
 `large` flag at 20 k live facts with hysteresis at 10 k, N55), never written on the commit path
 by `CommitChunk`, `FinalizeVersion` or the delete cascade. `document_versions.chunks_done`
 follows the same rule — written once per wave by the workflow, never per chunk: a per-chunk
-`UPDATE` of the version row after the N40 `FOR SHARE` would deadlock two commits of the same
-version (§3.3.1). State transitions are monotone: `PENDING → RUNNING ⇄ DEFERRED → SUCCEEDED|FAILED|CANCELLED`; an
+`UPDATE` of the version row would serialise the 32 parallel commits of a document on one row
+(§3.3.1). State transitions are monotone: `PENDING → RUNNING ⇄ DEFERRED → SUCCEEDED|FAILED|CANCELLED`; an
 `UPDATE … WHERE state NOT IN (terminal)` guard makes a late activity from a terminated
 workflow harmless.
 
@@ -98,19 +119,26 @@ history, whichever first — ≈ 25–30 events per chunk, so 500 chunks was alr
 consolidate: every round; page refresh: every refresh; purge: every 200 batches; move: never —
 ≤ 200 events).
 
-**Payload size and confidentiality (N59, review F-13/F-18/F-25).** Every activity result larger
-than **4 KiB** travels by blob key under the namespace prefix: `ExtractChunk` returns the
-extraction-cache key (the cache entry *is* the result blob), `EmbedChunk` the staging key
-(`{prefix}/staging/{sha256(K)}.f32` — a single 768-d vector is 3 KiB, so any chunk with a fact
-spills), `ResolveEntities` and `BuildLinks` their own result keys, and `CommitChunkInput` is
-**keys-only**; `ChunkWork` carries no chunk text (activities read it from the manifest blob by
-ordinal). A Temporal history therefore holds ids, hashes and keys — never fact text or vectors
-— which keeps it under the 50 MB / 51 k-event limits (a 50-fact chunk otherwise put ≈ 400 KiB
-into the history: 150 KiB of vectors inline below the old 512 KiB threshold, 60 KiB of
-extraction, both repeated in `CommitChunkInput`) and lets a document delete erase every copy of
-the text by deleting blobs. Whatever still travels inline is encrypted by a Temporal
-`DataConverter` payload codec (AES-256-GCM, per-shard key from the secret store), so the shared
-Temporal namespace exposes no tenant cleartext to the UI or CLI.
+**Payload size and confidentiality (N59, N99, review F-13/F-18/F-25, review-2 G-20).** Every
+activity result larger than **4 KiB** travels by blob key under the namespace prefix:
+`ExtractChunk` returns the extraction-cache key (the cache entry *is* the result blob),
+`EmbedChunk` the staging key (`{prefix}/staging/{sha256(K)}.f32` — a single 768-d vector is 3
+KiB, so any chunk with a fact spills), `ResolveEntities` and `BuildLinks` their own result keys,
+and `CommitChunkInput` is **keys-only**; `ChunkWork` carries no chunk text (activities read it
+from the manifest blob by ordinal). A Temporal history therefore holds ids, hashes and keys
+plus the small inline residue — text appears in histories **only as ciphertext, at most 4 KiB
+per activity result, plus `ChunkWork.header/context/metadata_json/entity_hints`** — which keeps
+it under the 50 MB / 51 k-event limits (a 50-fact chunk otherwise put ≈ 400 KiB into the
+history: 150 KiB of vectors inline below the old 512 KiB threshold, 60 KiB of extraction, both
+repeated in `CommitChunkInput`) and lets a document delete erase the large copies by deleting
+blobs. Whatever travels inline is encrypted by a Temporal `DataConverter` payload codec
+(AES-256-GCM) under a **per-namespace data key** wrapped by the shard key (key id in the payload
+metadata, namespace id in the workflow header), so the shared Temporal namespace exposes no
+tenant cleartext to the UI or CLI. Deleting the wrapped data key is the shredding step of a
+namespace or tenant delete; a shard-key or data-key version is destroyed only after `rotation
+time + max workflow run timeout (7 d) + Temporal retention (7 d)`. The deletion SLA therefore
+reads: histories expire with retention 7 d; within that window they are unreadable after key
+destruction.
 
 **Token accounting (D13).** Every gateway call returns a `Usage`; the activity that owns the
 call carries it into the next fenced write transaction of the same pipeline, where it is
@@ -123,12 +151,22 @@ per retry, never double-counts (PD-1). Rationale: quotas are enforced from the r
 double counting would defer tenants spuriously; slight under-counting is harmless. Rejected:
 counting in the gateway `UsageHook` at call time (double counts on every activity retry).
 
-**Outbox events are thin (N12).** Every event named in the tables below carries ids,
-versions and flags — never text, vectors or row images. Every consumer (the `index` adapter
-in `Async` mode, the Kafka mirror's downstream consumers, the mover's catch-up, the export
-delta) reads the current rows by id at the recorded epoch. This is what makes replay
-idempotent by construction (§5.5, §5.6): applying "the current state of row X" twice is a
-no-op.
+**Outbox events are thin and bounded (N12, N80).** Every event named in the tables below
+carries ids, versions and flags — never text, vectors or row images. All ids inside events are
+16-byte `bytes` (≈ 18 B encoded); an event carries **≤ 256 ids in total across its lists**
+and encodes to ≤ 16 KiB by construction (the `octet_length(payload) <= 16384` CHECK is only the
+backstop; the T1 property test checks the maxima). A larger set is paged as consecutive events
+of the same type in the same transaction with `page` (0-based) and `page_count` plus the group
+key (`document_id`, `deleted_at` or `batch_key`); consumers treat a group as complete only when
+all pages are seen, and the move replay treats each page independently. Above 4,096 ids (16
+pages) one event is sent with `ids_elided = true` and counts only; consumers and the replay then
+read the ids from the store by `document_id` — the rows live until `PurgeDocument` plus its
+grace, so no blob write is needed inside the transaction. `RowsPurged` carries `(table,
+document_id, count, min_key, max_key)` and no id list. Every consumer (the `index` adapter in
+`Async` mode, the Kafka mirror's downstream consumers, the mover's catch-up, the export delta)
+reads the current rows by id at the recorded epoch. This is what makes replay idempotent by
+construction (§5.5, §5.6): applying "the current state of row X" twice is a no-op. The events'
+row coverage is the single table in §5.5.1 step 3 (N81).
 
 **Kafka, once for all pipelines.** No pipeline uses Kafka as a control channel, queue or
 hand-off. Temporal is the durable orchestrator and the per-shard outbox is the ordered log;

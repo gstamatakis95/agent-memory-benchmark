@@ -63,6 +63,26 @@ attempts so that an epoch can be reused after a rollback). Liveness configuratio
 smaller because TLC's symmetry reduction is unsound for liveness and the liveness check is
 roughly 10× slower per state.
 
+**What the table does not cover (second review, G-17, N96).** No D20 or D21 mechanism is in
+any `.tla` file today. `DocLifecycle.tla` has no lineage, no `hidden_by_invalidation` counter
+and defines `deriv` as `inputs`; `AsOf.tla` has no deletes, no versioned evidence and no
+chunk built from two items; `ShardMove.tla` models the pre-D20 protocol, so its PASS rows check
+the replay and copy of that protocol (one atomic `Copy`, `Resolved`-style replay, row-lock
+fence, cutover with the watchdog disarmed after (a)), not the anti-join replay, the event-driven
+N81 mapping, range snapshots, the try-lock fence or the (c) point of no return. The CI gate
+configurations `AsOf_Gate.cfg` and `ShardMove_Gate.cfg` have been written (copies of
+`AsOf.cfg` and `ShardMove_Mid.cfg` with shrunk constants) but are **unrun**: no log of either is
+in `formal/tla/results/`, and `DocLifecycle_Gate.cfg`/`_Gate1.cfg`/`_TxGate.cfg`/`_TxGate1.cfg`
+likewise have no committed log. `Consolidation_Gate.cfg` was deleted (strictly smaller than
+`Consolidation_Mid.cfg`, which already completed). The TLC queue was stopped on purpose: running
+the existing configurations again would only re-confirm the pre-D20 models, so no new run
+is made until the specs carry the D20/D21 mechanisms (W-1 to W-12 below); the result rows above
+are unchanged and are not evidence for D20/D21. Until W-7 to W-12 pass, the statement of what was model-checked is
+exactly: **the outbox; consolidation exactly-once at 3 facts; `as_of` without deletes; and the
+move protocol as it was before D20/D21.** Everything else in the plan about lineage hiding,
+reversible invalidation, replay coverage, the try-lock fence, range-snapshot copy and the
+cutover point of no return is argued in prose and covered by the Go tests of §8, not by TLC.
+
 ### 7.2 The specifications
 
 Each subsection gives the state variables, the actions, the invariants and the liveness
@@ -646,7 +666,7 @@ extraction function.
   `*.cfg` under `formal/tla/` with `-workers auto`, 8 GB heap and `timeout 900` per
   configuration; a design configuration must end with "No error has been found" and a
   counterexample configuration (`*_No*.cfg`, `*_CitedOnly.cfg`, `*_Watch1x.cfg`,
-  `*_VolatileProposal.cfg`, `*_NonAtomicKey.cfg`, `*_D5Order.cfg`, `*_UnfilteredIndex.cfg`)
+  `*_VolatileProposal.cfg`, `*_NonAtomicKey.cfg`, `*_D5Order.cfg`, `*_UnfilteredIndex.cfg`, and the N96 additions `DocLifecycle_NoLineage.cfg`, `AsOf_InvalidateSuperseded.cfg`, `AsOf_ChunkTwoItems.cfg`, `ShardMove_DeleteDuringCatchup.cfg`, `ShardMove_RetryAfterCutover.cfg`, `ShardMove_PerTableNewSnapshot.cfg`, none of which exists yet)
   must end with "Invariant … is violated" on the invariant named in the cfg's first comment
   line; anything else (parse error, a *different* invariant failing) fails the job. A
   **timeout is not a failure and not a pass**: a configuration that hits the cap is reported
@@ -664,7 +684,13 @@ extraction function.
   `_Live.cfg`, and for `DocLifecycle` a new `DocLifecycle_Gate.cfg` with bounds shrunk until
   it completes (`Docs = {d1, d2}, Hashes = {h1, h2}, Obs = {o1, o2}, MaxConsolidations = 2`
   is enough for every race 7.2.1 names). A design configuration is added to the gate only
-  when it has completed once; nothing larger is ever a merge gate.
+  when it has completed once; nothing larger is ever a merge gate. **N96 amendments:** every
+  `*_Gate*.cfg` is run and its log committed to `formal/tla/results/` (today none of them has
+  a log, so none counts as a gate); `Consolidation_Gate.cfg` is deleted because it is strictly
+  smaller than `Consolidation_Mid.cfg`; `DocLifecycle_Gate.cfg` must complete in the CI budget
+  with 2 documents and 2 hashes before M1.5, or its bounds shrink further; `AsOf_Gate.cfg` and
+  `ShardMove_Gate.cfg` are added (written from `AsOf.cfg` and `ShardMove_Mid.cfg`, to be run
+  when the specs are updated).
 - **PR job `formal-quick`**: parses every spec (`tlc2.TLC -parse` equivalent via SANY),
   runs the counterexample configurations and the gate set above (target < 5 minutes) so a
   spec edit that breaks parsing or silently weakens an invariant is caught before merge.
@@ -686,18 +712,26 @@ extraction function.
   The converter and the five harnesses are Track F.1/F.2 work (≈ 7 ew, §10), not a
   by-product of writing the specs.
 
-**Open spec work items (N77; review F-15, F-1, F-3, F-5).** Each is a change to a spec *and*
-to its mapped Go test (the manifest check enforces the pairing); the first three are M0.7's
-deliverable (week 1) because M1.3, M1.5 and M1.8 build on their outcome, the fourth is Track
-F.1. Until an item lands, the plan claims the property only for the Go test named next to it.
+**Open spec work items (N77, N96; reviews F-15, F-1, F-3, F-5, G-17).** Each is a change to a spec *and*
+to its mapped Go test (the manifest check enforces the pairing); W-1 to W-12 are M0.7's
+deliverable (3 to 4 ew split by spec owner, §10) and **W-6 to W-12 are preconditions of M1.5 and
+M2.1** (N105), because those milestones build on their outcome; the rest of W-4's queue model is
+superseded by W-11. Until an item lands, the plan claims the property only for the Go test named next to it.
 
 | # | Spec | Work item | Why | Go twin |
 |---|---|---|---|---|
 | W-1 | `AsOf.tla` | Add the **previous version's inputs** to `deriv` on an update (`Latest(o).deriv ∪ batch ∪ …`) and `eff ≥ eff(v−1)`, so the D9 monotone clamp is modelled and checked rather than cited; add a **`Delete(f)` action** with per-version `derivedFromDeleted` and a recall that skips flagged versions; add `AsOf_PerObservationUnhide.cfg` (observation-level un-hiding, must fail with the F-1 interleaving: v2 with `eff = t5` served at `as_of = t7` after v4) | §5.2.2 cites TLC for the clamp, but `cands ⊆ Obs \ {o}` never puts `o`'s own previous version into `deriv`; and no spec had deletes and versions together, which is where F-1 lived | `TestAsOf_DeletedDerivedVersionStaysHidden`, `TestAsOf_ObservationVersions` |
-| W-2 | `DocLifecycle.tla` | Add an apply variant `ApplyCheck = "inputs"` with **`cited ⊂ inputs`** (`src := cited`, `deriv := inputs`, inputs = batch ∪ rendered sources ≤ 5 per candidate) and the delete cascade driven by `deriv` per version, so the N41 mechanism as built is the one exercised; the current design configuration commits `src = snap = deriv`, which only shows that cited-only fails, not that the design passes; add the **`APPEND` chain** (N56) as a second version-allocation rule | the design run never exercised the input-only cascade; F-10 showed `APPEND` was unmodelled | `TestDocLifecycle_InputHidesObservation`, `TestRetain_ConcurrentAppendsChain`, `TestConsolidation_DisjointSourceUpdateKeepsObservation` (statement order, which `Effect` applies atomically and cannot see — a note in the spec, not a new action) |
-| W-3 | `ShardMove.tla` | Replace `Replay`'s `Resolved(s, n, k)` (which inspects every holding write of the shard) with the **anti-join replay** of N50: replay any committed seq `> p0` not yet in `applied`, independent of `Holding`; add `ShardMove_WatermarkOnly.cfg` (replay by `seq > applied`, must fail with the F-3 interleaving: 103 applied before 102 commits); model the **multi-snapshot copy** of §5.5.4 (per-table restart with the replay floor `min(p0_old, p0_new)`) instead of one atomic `Copy` | the spec assumed knowledge the RLS-confined mover cannot have, and the crash-recovery claim was unmodelled | `TestMove_AntiJoinReplay`, the `copying` row of the §8.4 crash table |
-| W-4 | `ShardMove.tla` | Model the **fence as a fair queue**: `Freeze`/`Copy` enqueue an exclusive request and later `BeginWrite`s block behind it (today `Freeze` is simply not enabled while `Holding ≠ {}`, and `MoveTerminates` passes only because `Writes` is a finite pool); add a configuration with an unbounded writer pool under fairness to show the row-lock discipline starves and the advisory-lock discipline terminates | review F-5: the model hid the starvation | `TestFence_AdvisoryLockFairness` |
-| W-5 | all | Shrink the DocLifecycle and Consolidation design bounds until they complete (`DocLifecycle_Gate.cfg`) and make that the CI gate; keep the full bounds nightly as INCOMPLETE until they finish or are reduced | N77 | `make formal-quick` |
+| W-2 (reworded by N96) | `DocLifecycle.tla`, `AsOf.tla` | `deriv` is defined **semantically**: `deriv(v) = batch ∪ deriv(previous version) ∪ UNION deriv(c) for every candidate version c`, never as `inputs`; the implementation rule (`inputs` plus lineage flagging, N79) is a separate action, and `NoDeletedContentRecalled` is evaluated on the semantic `deriv`. `AsOf.tla` imports the same `Deriv` definition from one shared module so the two specs cannot disagree. Add `DocLifecycle_NoLineage.cfg` (cascade driven by `inputs` only), which must **fail** with the G-1 trace. Keep from the first wording: the `APPEND` chain (N56) as a second version-allocation rule | the first wording (`cited ⊂ inputs`, cascade by `deriv` per version) still let the cascade read `inputs`, which hides a version only when the victim was rendered in its own prompt and misses versions derived from a flagged one (G-1) | `TestDocLifecycle_InputHidesObservation`, `TestDelete_LineageTransitive`, `TestRetain_ConcurrentAppendsChain`, `TestConsolidation_DisjointSourceUpdateKeepsObservation` (statement order, which `Effect` applies atomically and cannot see — a note in the spec, not a new action) |
+| W-3 | `ShardMove.tla` | Replace `Replay`'s `Resolved(s, n, k)` (which inspects every holding write of the shard) with the **anti-join replay** of N50: replay any committed seq `> p0` not yet in `applied`, independent of `Holding`; add `ShardMove_WatermarkOnly.cfg` (replay by `seq > applied`, must fail with the F-3 interleaving: 103 applied before 102 commits); model the **multi-snapshot copy** of §5.5.4 (per-table restart with the replay floor `min(p0_old, p0_new)`) instead of one atomic `Copy` | the spec assumed knowledge the RLS-confined mover cannot have, and the crash-recovery claim was unmodelled | `TestMove_AntiJoinReplay`, the `copying` row of the §8.4 crash table (amended by N88/W-9: the multi-snapshot per-table restart with floor `min(p0_old, p0_new)` is replaced by range snapshots with the single floor `p0`) |
+| W-4 | `ShardMove.tla` | Model the **fence as a fair queue**: `Freeze`/`Copy` enqueue an exclusive request and later `BeginWrite`s block behind it (today `Freeze` is simply not enabled while `Holding ≠ {}`, and `MoveTerminates` passes only because `Writes` is a finite pool); add a configuration with an unbounded writer pool under fairness to show the row-lock discipline starves and the advisory-lock discipline terminates | review F-5: the model hid the starvation. **Superseded by W-11** (N82): the fence is a try-lock, not a queue | `TestFence_AdvisoryLockFairness`, `TestFence_TryLockRefusedBehindWaiter` |
+| W-5 | all | Shrink the DocLifecycle and Consolidation design bounds until they complete (`DocLifecycle_Gate.cfg`; the `Consolidation_Gate.cfg` that was drafted is deleted, N96) and make that the CI gate; keep the full bounds nightly as INCOMPLETE until they finish or are reduced | N77 | `make formal-quick` |
+| W-6 | all | Record that D20/D21 mechanisms are in no spec today and restate the executive summary (§00) and §7.1 as "model-checked: the outbox; consolidation exactly-once at 3 facts; `as_of` without deletes; the move protocol before D20/D21" until W-7 to W-12 pass | G-17: the summary overstated what the specs cover | `formal/MANIFEST.md` row per spec |
+| W-7 | `AsOf.tla`, `DocLifecycle.tla` | Per-version `hidden_by_invalidation` counter and `Restore` (N84); `AsOf_InvalidateSuperseded.cfg` (no counter) must **fail** | G-6: Invalidate and Restore on superseded versions | `TestInvalidate_SupersededVersions`, `TestInvalidate_Twice` |
+| W-8 | `ShardMove.tla` | Event-driven replay as the **total N81 mapping**, including writes the old replay could not see (delete flagging, idempotency keys, operation transitions); `ShardMove_DeleteDuringCatchup.cfg` (a version flagged on the source during catch-up with no covering event) and `ShardMove_RetryAfterCutover.cfg` (an idempotency key not replayed) must **fail** | G-3 | `TestMove_ReplayCoversEveryEvent`, `TestMove_RetryAfterCutover` |
+| W-9 | `ShardMove.tla` | Range snapshots, the single floor `p0`, replica-mode load and `VerifyFK` (N88, N91); `ShardMove_PerTableNewSnapshot.cfg` (FK enforced, per-table restart with a new snapshot, floor `min(p0_old, p0_new)`) must **fail** | G-10 | `TestMove_ResumableCopy`, `TestMove_VerifyFK` |
+| W-10 | `AsOf.tla` | A chunk built from two items with non-monotone timestamps, versioned evidence (`observation_version_sources`) and `embedding_effective_at` (N85, N86); `AsOf_ChunkTwoItems.cfg` (the chunk takes the later item's timestamp only) must **fail** | G-7, G-8 | `TestAsOf_ChunkTwoItems`, `TestAsOf_VersionedEvidence` |
+| W-11 | `ShardMove.tla` | The fence as a **try-lock** (N82): property `OtherNamespaceProgress` (a freeze of namespace A never blocks writers of namespace B) and starvation-freedom of the mover; supersedes W-4's queue model | G-4 | `TestFence_PoolNotExhausted`, `TestFence_TryLockRefusedBehindWaiter` |
+| W-12 | `ShardMove.tla` | Cutover with the point of no return at (c), watchdog armed until (c), target routing from the `moved_out` row, schedulers acting only on `active` ownership (N97, N98); property `NoExecutionOnSourceAfterFreeze` | G-18, G-19 | `TestMove_CutoverBeforeCatalog`, `TestMove_DrainRestartReconcile` |
 
 ### New decisions (adopted in the register as D19: ND-1 → D6 (A-F1), ND-2 → N40, ND-3 → N41, ND-4 → D9, ND-5/ND-6/ND-7 → D5 and N45, ND-8 → N43, ND-9 → N44, ND-10 → N46, ND-11 → N42)
 

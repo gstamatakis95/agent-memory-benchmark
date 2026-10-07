@@ -18,11 +18,23 @@ sibling `v<N>.schema.json`, embedded with `embed.FS` and addressed by the string
 file without bumping `N` fails CI. A file, once released, is never edited.
 
 **Where the version is stored.** `facts.prompt_version` and `chunks.extraction_key`
-(`sha256(content_hash ‖ prompt_version ‖ model ‖ schema_version)`, N26), `observation_versions.prompt_version`,
+(`sha256(content_hash ‖ prompt_version ‖ model ‖ schema_version ‖ render_hash)`, N26 as amended by N87), `observation_versions.prompt_version`,
 the page markdown's front matter (`page_versions` holds the blob key), `documents.summary_blob_key`
 (the `docsum/` key embeds the prompt version), every
 `token_usage_events` row (`op` = prompt id), and every cache key (`xcache`:
-`sha256(chunk_hash ‖ prompt_version ‖ model ‖ schema_version)`, D11).
+`sha256(chunk_hash ‖ prompt_version ‖ model ‖ schema_version ‖ render_hash)`, D11 as amended by N87).
+
+**`render_hash` (N87; review-2 G-9).** The extraction key covers every input the prompt renders,
+not just the chunk text: `render_hash = sha256(day(mentioned_at) ‖ context ‖ canonical(metadata) ‖
+sorted(entity_hints) ‖ retain.mission ‖ header_hash)`, where `header_hash` hashes the summary-derived
+chunk header. A change to `retain.mission`, to the hints, to the timestamp day or to the summary is
+therefore a new key and re-extracts through the ordinary retain path (N26/N58 unchanged); without it
+the cache returned facts extracted under another mission or another "today" for relative dates
+(`item_timestamp` is the chunk's `mentioned_at`, N86). Cache hits occur only for identical text under
+identical rendered variables (a re-ingest of the same item, replays), **not** for forwarded or
+templated text under different timestamps; Table 6.8-B's cache-hit lines are read with that
+assumption. Moving relative-date resolution into Go after the cache is a recorded later
+optimisation, not part of N87.
 
 **How a bump takes effect — never in place.** Releasing `extract/v2` changes nothing until a
 namespace's config says `prompts.extract = "extract/v2"` (system → tenant → namespace
@@ -148,8 +160,8 @@ by more than 1 point and the mean does not drop.
 | Purpose | Turn one chunk into facts with text, type, who/what/when/where/why, `occurred_start/end`, `said_at`, typed entities and causal relations (task §Must-have 1). The `as_of` key `mentioned_at` is **not** an output of this prompt: the server sets it to the item's `timestamp` (D9 as amended, review F-2) |
 | Model class | `models.extract` |
 | Temperature | 0.0 (Hindsight uses 0.1; 0.0 makes retries reproducible for the cache) |
-| Inputs | `header` (summary > heading path), `chunk_index`, `chunk_count`, `item_timestamp` (ISO, the item's `timestamp`; the server stores it as `mentioned_at` on every fact of the chunk and it is the default `said_at`), `context` (item context, ≤ 500 chars), `metadata` (≤ 1 KiB, rendered as `key: value`), `entity_hints` (caller-supplied, with types), `retain_mission` (`retain.mission`, optional, ≤ 500 chars), `content` |
-| Cache | `xcache/{sha256(chunk_hash ‖ "extract/v1" ‖ model ‖ schema_version)}` |
+| Inputs | `header` (summary > heading path), `chunk_index`, `chunk_count`, `item_timestamp` (ISO, the chunk's `mentioned_at` = the maximum timestamp of every item the chunk covers, N86; a hard chunk boundary is forced between items more than 24 h apart, which bounds the relative-date error; the server stores it as `mentioned_at` on every fact of the chunk and it is the default `said_at`), `context` (item context, ≤ 500 chars), `metadata` (≤ 1 KiB, rendered as `key: value`), `entity_hints` (caller-supplied, with types), `retain_mission` (`retain.mission`, optional, ≤ 500 chars), `content` |
+| Cache | `xcache/{sha256(chunk_hash ‖ "extract/v1" ‖ model ‖ schema_version ‖ render_hash)}` (N87: `render_hash` covers the day of `item_timestamp`, `context`, `metadata`, `entity_hints`, `retain.mission` and the header) |
 | Max output tokens | 4 000 (≤ 40 facts) |
 
 Output schema (JSON Schema, `schema_version = 1`):
@@ -373,7 +385,7 @@ Evaluation:
 | Model class | `models.consolidate` |
 | Temperature | 0.0 |
 | Inputs | `observations_mission` (`consolidate.mission`, optional), `facts[]` `{id, text, mentioned_at, said_at (only when ≠ mentioned_at), occurred, tags}`, `observations[]` candidates `{id, text, sources[{fact_id, quote}]}` with **at most 5 quoted sources per candidate** (N47: the 5 most recent by `mentioned_at`, ties by `memory_id`), `capacity_note`, `stale_observations[]` (stale batches only) |
-| Inputs recorded (N41) | `observation_inputs(observation_id, version, fact_id)` = the batch facts ∪ the sources whose **quotes were rendered** in the prompt (≤ 8 + 10 × 5 = 58 per version), never every source of every candidate. Hiding on a lost input is per version and permanent (`derived_from_deleted`); the previous live version written without the victim stays servable at its `as_of` range. Review F-9: with every source rendered a version named ≈ 210 inputs and one 100-fact session delete hid ≈ 1 600 observations for 1–2 h; with rendered quotes only the blast radius is ≈ 3.6× smaller and bounded by `max_hidden_per_delete` (§8.6 metric, §9.4 SLO) |
+| Inputs recorded (N41) | `observation_inputs(observation_id, version, fact_id)` = the batch facts ∪ the sources whose **quotes were rendered** in the prompt (≤ 8 + 10 × 5 = 58 per version), never every source of every candidate. Every candidate **version** whose text was shown (including the observation's own previous version) is also recorded as a lineage edge in `observation_version_lineage` (N79), so that hiding a version hides its descendants; a rebuild of a flagged observation shows no text of any flagged version (root version, live sources only). Pending-fact selection uses `fact_consolidation` rows above the `consolidation_state` watermark, not a `facts.consolidated_at` column (N95). Hiding on a lost input is per version and permanent (`derived_from_deleted`); the previous live version written without the victim stays servable at its `as_of` range. Review F-9: with every source rendered a version named ≈ 210 inputs and one 100-fact session delete hid ≈ 1 600 observations for 1–2 h; with rendered quotes only the blast radius is ≈ 3.6× smaller and bounded by `max_hidden_per_delete` (§8.6 metric, §9.4 SLO) |
 | Not cached | the result depends on the candidate set |
 | Max output tokens | 3 000 |
 

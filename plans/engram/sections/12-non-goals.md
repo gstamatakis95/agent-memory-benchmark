@@ -38,6 +38,7 @@ items contradict a register decision.
 | NG30 | Guaranteed ordering or visibility across namespaces or shards | not ever | D16: no relationship whatsoever; anything that needs it must live in one namespace. |
 | NG31 | Backing up blob objects | not ever | The blob store is durable by contract (A-O12); tombstones make deletes durable (§9.3). |
 | NG32 | Running `engram-api` and `engram-worker` in one process for small deployments | not ever | D1 keeps them separate images; a single-shard dev cell is still two containers. |
+| NG33 | Per-namespace lexical statistics (BM25 IDF per namespace) to close the term-rarity channel of the partition-shared index | not scheduled (N102; R33) | per-query normalised scores (N67) leave a weak oracle on partition-wide term rarity; the remedy today is `isolation = dedicated`, and a per-namespace IDF would forfeit pg_search's Top-K pushdown. |
 
 **Reopening a non-goal.** A "not now" row is reopened by a register row in D18 naming the
 phase and the owning engineer, plus a §11.1 risk row for what it adds to the critical path;

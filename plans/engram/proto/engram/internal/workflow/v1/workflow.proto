@@ -20,8 +20,16 @@
 //     it by deleting the blobs;
 //   * RetainDocument continues-as-new every 100 chunks or 20 MB of history;
 //   * whatever still travels inline is encrypted at rest by a Temporal
-//     DataConverter payload codec (AES-GCM, per-shard key from the secret
-//     store), so the shared Temporal namespace holds no cleartext.
+//     DataConverter payload codec (AES-256-GCM). Decision N99 (review-2
+//     G-20): the codec uses a PER-NAMESPACE data key wrapped by the shard key
+//     (key id in the payload metadata, namespace id in the workflow header);
+//     deleting the wrapped data key is the shredding step of a namespace or
+//     tenant delete, and a key version is destroyed only after rotation time
+//     + max workflow run timeout (7 d) + Temporal retention (7 d). The
+//     accurate statement is therefore: text appears in histories only as
+//     ciphertext, at most 4 KiB per activity result, plus
+//     ChunkWork.header/context/metadata_json/entity_hints; histories expire
+//     with retention 7 d and are unreadable after key destruction.
 syntax = "proto3";
 
 package engram.internal.workflow.v1;
@@ -100,6 +108,9 @@ message RetainDocumentInput {
   // Set only on a continue-as-new run (every 100 chunks or 20 MB of history,
   // decision N59): where the previous run stopped.
   RetainResume resume = 13;
+  // `retain.mission` from the submit-time config_snapshot (N25), a prompt
+  // input of extract/v1. It is folded into every chunk's render_hash (N87).
+  string retain_mission = 14;
 }
 
 // RetainResume is the continue-as-new state of RetainDocument. Everything
@@ -117,6 +128,28 @@ message RetainResume {
   int32 chunks_failed = 5;
   int32 chunks_reused = 6;
   int32 facts_written = 7;
+  // Blob key of the full reconstructed body of the version being built
+  // (`{prefix}/ver/{sha256}`, decision N104), so a continued run never
+  // re-reads the ledger chain.
+  string body_blob_key = 8;
+}
+
+// LoadItemResult is the result of the LoadItem activity (decision N56, N104).
+message LoadItemResult {
+  // APPEND: the version this one extends (the highest existing version below
+  // `version`, even one still ingesting); 0 for REPLACE.
+  int64 append_base_version = 1;
+  // Content-addressed blob `{prefix}/ver/{sha256}` holding the FULL
+  // reconstructed body of this version, written by LoadItem before the
+  // version row is finalised (decision N104): the next APPEND reads this
+  // single object instead of walking the ledger chain. Mirrors
+  // document_versions.body_key / body_hash.
+  string body_blob_key = 2;
+  string body_hash = 3;
+  // Bytes of the reconstructed body.
+  int64 document_bytes = 4;
+  // Items whose timestamp was clamped up to the running maximum (N86).
+  int32 timestamps_clamped = 5;
 }
 
 // ChunkWork is one chunk to process (fan-out unit, ≤ 32 in flight). It
@@ -133,12 +166,16 @@ message ChunkWork {
   // vector and for extraction. Fact vectors are embedded without it
   // (decision N60), so a summary change re-embeds chunks only.
   string header = 6;
-  // Offsets into the concatenated item content and the originating item.
+  // Offsets into the concatenated item content.
   int32 char_start = 7;
   int32 char_end = 8;
-  int32 item_index = 9;
-  // Per-item values inherited by the chunk's facts. mentioned_at is the item
-  // `timestamp`, server-set, the only as_of key (decision D9).
+  // Per-item values inherited by the chunk's facts. mentioned_at is the
+  // maximum `timestamp` of every item whose bytes the chunk covers (for an
+  // APPEND re-chunk also the mentioned_at of every base chunk the new text
+  // overlaps), server-set, the only as_of key (decisions D9, N86). It is also
+  // the `item_timestamp` the extraction prompt sees; a hard chunk boundary is
+  // forced between consecutive items more than 24 h apart, which bounds the
+  // relative-date error.
   google.protobuf.Timestamp mentioned_at = 10;
   repeated string tags = 11;
   // Serialised google.protobuf.Struct (JSON) of the item metadata.
@@ -150,11 +187,23 @@ message ChunkWork {
   // sha256(content_hash ‖ heading path ‖ summary id) — decision N60: the
   // header hash compared at FinalizeVersion to decide chunk re-embedding.
   string header_hash = 16;
+  // Indexes of every item whose bytes the chunk covers, ascending (decision
+  // N86; replaces the singular item_index).
+  repeated int32 item_indexes = 17;
+  // sha256(day(mentioned_at) ‖ context ‖ canonical(metadata) ‖
+  // sorted(entity_hints) ‖ retain.mission ‖ header_hash) — decision N87. The
+  // extraction cache key and chunks.extraction_key are
+  // sha256(content_hash ‖ prompt_version ‖ model ‖ schema_version ‖
+  // render_hash), so a change to any prompt input is a new key.
+  string render_hash = 18;
 
   // Removed in v1.0.0-rc5 (decision N59): `string text = 5` (≤ 8 KiB of chunk
   // text inline in every activity input). Read from the manifest blob instead.
   reserved 5;
   reserved "text";
+  // Removed in N86: `int32 item_index = 9` (a chunk may cover several items).
+  reserved 9;
+  reserved "item_index";
 }
 
 // ChunkPlan is the result of the Chunk activity: the delta against the
@@ -232,7 +281,11 @@ message ExtractChunkResult {
   repeated CausalRelation causal = 3;
   TokenUsage usage = 4;
   // Blob key of the cache entry that answered or was written; the
-  // authoritative result when `facts` is empty.
+  // authoritative result when `facts` is empty. The key is
+  // `{prefix}/xcache/{sha256(content_hash ‖ prompt_version ‖ model ‖
+  // schema_version ‖ render_hash)}.json` (decision N87). A cache entry is
+  // deleted by PurgeDocument only when no live chunk references the hash AND
+  // it is older than xcache_grace (24 h, N100).
   string cache_key = 5;
   // Number of facts in the result (so the workflow can plan without reading
   // the blob).
@@ -308,7 +361,12 @@ message BuildLinksResult {
   int32 link_count = 4;
 }
 
-// CommitChunkInput is everything CommitChunk writes in ONE transaction:
+// CommitChunkInput is everything CommitChunk writes in ONE transaction. A
+// missing input blob (purged by a concurrent PurgeDocument) fails the
+// activity with the retryable InputBlobMissing error (memory.v1, decision
+// N100): the chunk sub-pipeline re-runs ExtractChunk and EmbedChunk, at most
+// twice, then records chunk_failed. A shared per-document advisory lock that
+// cannot be taken fails it with the retryable DocumentBusy (N83).
 // chunk row, facts, embeddings, mentions, links and the outbox event. It is
 // KEYS-ONLY (decision N59): the activity reads extraction, embeddings,
 // resolved entities and links from the blob keys below, so the history does
@@ -355,7 +413,10 @@ message CommitChunkResult {
   int64 outbox_seq = 5;
 }
 
-// FinalizeVersionInput retires missing chunks and activates the version.
+// FinalizeVersionInput retires missing chunks and activates the version. The
+// retire subquery is document-scoped (decision N107):
+// `content_hash NOT IN (SELECT content_hash FROM document_version_chunks
+// WHERE namespace_id = $1 AND document_id = $2 AND version = $3)`.
 message FinalizeVersionInput {
   WorkflowScope scope = 1;
   string operation_id = 2;
@@ -461,6 +522,71 @@ message ConsolidateBatchResult {
   repeated string failed_fact_ids = 7;
 }
 
+// ObservationVersionRef names one observation version shown to a consolidation
+// prompt (a candidate_versions entry, decision N79).
+message ObservationVersionRef {
+  string observation_id = 1;
+  int64 version = 2;
+}
+
+// StoreProposalInput persists the validated, deduplicated op list write-once
+// (decision N43). `candidate_versions` is every candidate version whose text
+// was shown, including the observation's own previous version; ApplyBatch
+// records one observation_version_lineage edge per entry and re-verifies each
+// one (decision N79).
+message StoreProposalInput {
+  WorkflowScope scope = 1;
+  // Hex sha256(sorted fact ids ‖ prompt_version ‖ model).
+  string batch_key = 2;
+  repeated ObservationOp ops = 3;
+  // The rendered evidence: batch facts ∪ the quoted sources shown (≤ 5 per
+  // candidate, N47).
+  repeated string input_fact_ids = 4;
+  repeated ObservationVersionRef candidate_versions = 5;
+  string prompt_version = 6;
+  string model = 7;
+}
+
+// StoreProposalResult returns the list that won (the stored one).
+message StoreProposalResult {
+  // False when an earlier attempt had already stored a proposal: `ops` is
+  // then that attempt's list and this attempt's ops were discarded.
+  bool stored_new = 1;
+  repeated ObservationOp ops = 2;
+}
+
+// ApplyBatchInput applies the STORED proposal of a batch.
+message ApplyBatchInput {
+  WorkflowScope scope = 1;
+  string batch_key = 2;
+}
+
+// ApplyOutcome is how ApplyBatch ended.
+enum ApplyOutcome {
+  APPLY_OUTCOME_UNSPECIFIED = 0;
+  APPLY_OUTCOME_APPLIED = 1;
+  // Every op_key already existed: an earlier attempt committed.
+  APPLY_OUTCOME_ALREADY = 2;
+  // Re-verification failed (N41, N79): a rendered input fact is not live, or
+  // a shown candidate version is derived_from_deleted, hidden_by_invalidation
+  // > 0 or retired. The proposal was deleted in its separate transaction.
+  APPLY_OUTCOME_DISCARDED = 3;
+  // The scope is at max_observations_per_scope.
+  APPLY_OUTCOME_CAPACITY_EXCEEDED = 4;
+}
+
+// ApplyBatchResult reports the outcome.
+message ApplyBatchResult {
+  ApplyOutcome outcome = 1;
+  int32 ops_applied = 2;
+  // DISCARDED: input facts that are no longer live (the workflow drops them
+  // from the batch and re-queues it with a new batch_key).
+  repeated string missing_fact_ids = 3;
+  // DISCARDED: shown candidate versions that failed re-verification (the
+  // workflow re-runs FindCandidates, which never returns a flagged version).
+  repeated ObservationVersionRef flagged_candidate_versions = 4;
+}
+
 // RefreshPageInput starts a page refresh workflow.
 message RefreshPageInput {
   uint32 schema_version = 1;
@@ -519,6 +645,10 @@ message PurgeInput {
   google.protobuf.Duration grace = 7;
   // Rows per delete batch (default 10 000).
   int32 batch_size = 8;
+  // xcache/ecache/staging blobs are deleted only when no live chunk
+  // references the hash AND the blob is older than this (default 24 h, longer
+  // than the maximum in-flight activity age; decision N100).
+  google.protobuf.Duration xcache_grace = 9;
 }
 
 // PurgeResult reports counts.
@@ -567,6 +697,27 @@ message MoveInput {
   string source_blob_prefix = 9;
   string target_blob_prefix = 10;
   bool pause_before_freeze = 11;
+  // Freeze watchdog: max(120 s, 60 s + 1 s per 10,000 live facts), capped at
+  // 15 min, computed by Plan from the stats row (decision N90). Armed until
+  // cutover sub-step (c) commits (N98).
+  google.protobuf.Duration freeze_watchdog = 12;
+}
+
+// CopyProgress is the Copy activity's heartbeat and resume payload (decision
+// N88): each table is copied in key ranges (≤ 100,000 rows or ≤ 60 s), each
+// range under its own short REPEATABLE READ snapshot (N89); ranges are
+// idempotent, so a crashed Copy resumes at the first range without a
+// completion mark.
+message CopyProgress {
+  string table = 1;
+  // Primary-key value of the last row of the last completed range, in the
+  // table's key encoding (empty before the first range).
+  bytes last_key = 2;
+  int64 rows_done = 3;
+  // Index of the table in the dependency-ordered copy list.
+  int32 table_index = 4;
+  // Opaque continuation token of the blob copy listing.
+  string blob_token = 5;
 }
 
 // MoveCheckpoint is persisted after every step so the executor is
@@ -581,6 +732,18 @@ message MoveCheckpoint {
   repeated string tables_done = 4;
   repeated string terminated_operation_ids = 5;
   google.protobuf.Timestamp frozen_at = 6;
+  // Workflow ids recorded by Drain from the source `operations` rows in
+  // RUNNING/PENDING/DEFERRED plus the namespace singletons (never from
+  // Temporal visibility, decision N97). Restart starts each on the target
+  // queue with a memo `epoch = e + 1` and WorkflowIDReusePolicy
+  // TERMINATE_IF_RUNNING.
+  repeated string drained_workflow_ids = 7;
+  // Watermark W of the pre-freeze deep verify: the stable cohort is
+  // created_at < W (decision N90).
+  google.protobuf.Timestamp verify_watermark = 8;
+  // Cutover sub-step last committed: "", "a", "b", "c" or "d". The point of
+  // no return is (c) (decision N98).
+  string cutover_step = 9;
 }
 
 // MoveResult is the terminal outcome.

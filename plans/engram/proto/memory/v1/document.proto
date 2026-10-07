@@ -43,7 +43,12 @@ service DocumentService {
   // synchronous cascade is committed before the call returns; the returned
   // Operation (kind DELETE_DOCUMENT) tracks blob and physical purge. Deleting
   // an unknown document returns NOT_FOUND; deleting a document whose purge
-  // is already running returns the existing operation (idempotent).
+  // is already running returns the existing operation (idempotent). The
+  // cascade commits with synchronous_commit = remote_apply against a
+  // synchronous standby, so an acknowledged delete survives a failover; with
+  // no standby available the call returns UNAVAILABLE (retryable) instead of
+  // acknowledging (decision N92). Cost: ≈ 50 ms p95 per 1,000 facts plus one
+  // outbox row per 256 ids (decision N80).
   rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
   // GetDocumentVersion returns one version's metadata (chunk/fact counts,
   // status, the operation that produced it).

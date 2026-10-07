@@ -138,9 +138,11 @@ enum NamespaceState {
 // to 5 s, exactly like NamespaceFrozen (decision N52) — so public clients see
 // it only when that also fails. FAILED_PRECONDITION returned during a move
 // counts against the availability SLI. Epochs are exposed because they are
-// the only actionable diagnostic; the shard id is never exposed. Client
-// action: retry the whole call with backoff (new resolve), do not persist
-// anything from this detail.
+// the only actionable diagnostic; the shard id is never exposed to public
+// callers: fields 5 and 6 are an API-internal routing hint (decision N98) and
+// the API strips them before the error leaves the process. Client action:
+// retry the whole call with backoff (new resolve), do not persist anything
+// from this detail.
 message WrongShardOrEpoch {
   string namespace_id = 1;
   // Epoch the caller (API or worker) believed to be current.
@@ -150,13 +152,27 @@ message WrongShardOrEpoch {
   int64 actual_epoch = 3;
   // Ownership state on the shard that rejected the call.
   NamespaceState namespace_state = 4;
+  // Set only with namespace_state = MOVED_OUT (decision N98): the shard and
+  // epoch recorded in the `moved_out` ownership row (target_shard_id,
+  // target_epoch). The API routes the read or write to that shard using only
+  // this detail, so cutover does not depend on the catalog being reachable
+  // (catalog failover takes ≥ 30 s), and still verifies ownership at the
+  // target's fence. Zero when not MOVED_OUT. Stripped before the error is
+  // returned to a caller outside the API.
+  int32 target_shard_id = 5;
+  // Epoch the namespace holds on `target_shard_id` (the move's e + 1).
+  int64 next_epoch = 6;
 }
 
 // NamespaceFrozen → FAILED_PRECONDITION. The namespace is in the freeze
-// window of a shard move (decision D5 step 4) or a restore. Writes are
-// rejected; reads continue at the source. The API already retried with
-// backoff for up to 30 s before surfacing this. Client action: retry after
-// `retry_after` (also emitted as google.rpc.RetryInfo).
+// window of a shard move (decision D5 step 4), a restore or a delete, or an
+// exclusive taker (freeze, barrier, restore, cutover) is queued on the
+// namespace fence and the writer's `pg_try_advisory_xact_lock_shared` was
+// refused (decision N82: the fence never waits, so no pooled connection is
+// held behind a queued exclusive request; `retry_after` = 200 ms then).
+// Writes are rejected; reads continue at the source. The API already retried
+// with backoff for up to 30 s before surfacing this. Client action: retry
+// after `retry_after` (also emitted as google.rpc.RetryInfo).
 message NamespaceFrozen {
   string namespace_id = 1;
   google.protobuf.Duration retry_after = 2;
@@ -169,6 +185,38 @@ enum FreezeReason {
   FREEZE_REASON_UNSPECIFIED = 0;
   FREEZE_REASON_MOVE = 1;
   FREEZE_REASON_RESTORE = 2;
+  // Delete freeze (freeze_reason = 'delete' in namespace_ownership).
+  FREEZE_REASON_DELETE = 3;
+  // No freeze yet: an exclusive taker is queued and the shared try-lock was
+  // refused (decision N82). Always retryable after 200 ms.
+  FREEZE_REASON_FENCE_BUSY = 4;
+}
+
+// DocumentBusy → ABORTED (retryable, internal to the write path). CommitChunk
+// could not take the shared per-document advisory lock because FinalizeVersion,
+// the delete cascade or PurgeDocument holds or is queued for the exclusive
+// form (decision N83). The activity retries with a 100 ms backoff under
+// P-frozen; it is never returned to public callers.
+message DocumentBusy {
+  string document_id = 1;
+  google.protobuf.Duration retry_after = 2;
+}
+
+// InputBlobMissing → retryable chunk-level activity error (decision N100),
+// Temporal ApplicationError type "InputBlobMissing"; never returned to public
+// callers. CommitChunk found an input blob (extraction cache entry, staging
+// vectors, entities or links result) purged by a concurrent PurgeDocument.
+// The RetainDocument chunk sub-pipeline re-runs ExtractChunk and EmbedChunk
+// for that chunk, at most twice; the third failure records `chunk_failed`.
+message InputBlobMissing {
+  // Full blob key that was not found.
+  string blob_key = 1;
+  // Which input: "extraction", "embeddings", "entities" or "links".
+  string input = 2;
+  // Hex SHA-256 of the chunk text the activity was committing.
+  string content_hash = 3;
+  // Re-runs of the extract/embed pair already spent (0, 1 or 2).
+  int32 attempt = 4;
 }
 
 // OperationConflict → ABORTED (concurrent conflict) or ALREADY_EXISTS
@@ -215,7 +263,10 @@ message Precondition {
   // cascade, decision N59: take a fresh full snapshot), "PAGE_NO_VERSION",
   // "MEMORY_NOT_A_FACT", "ALREADY_INVALIDATED", "NOT_INVALIDATED",
   // "TENANT_DELETING", "SCHEMA_VERSION_MISMATCH" (a move or migration refused
-  // because source and target shards run different schema versions).
+  // because source and target shards run different schema versions),
+  // "MOVE_STATE_TOO_LARGE" (a move refused because the frozen re-copy class —
+  // quota_counters, namespace_stats, batch_jobs, outbox_cursors — holds more
+  // than 10,000 rows of the namespace, decision N81).
   string type = 1;
   // Resource the precondition applies to (id).
   string subject = 2;

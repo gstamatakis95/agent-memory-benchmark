@@ -7,7 +7,13 @@
 // `shard-{shard_id}`, decision D11). OperationService is the read barrier of
 // the consistency model (decision D16): after WaitOperation returns SUCCEEDED
 // for a retain, Recall on the same namespace observes every fact of that
-// document version.
+// document version unless `result.superseded_by` is set (decision N127).
+//
+// Deletes are different: a delete is effective when its RPC is acknowledged
+// (soft-delete marker, decision N115); the Operation only tracks the
+// asynchronous expunge (N119), so SUCCEEDED means "physically gone", not
+// "hidden". A namespace move is not an Operation: it lives on the catalog
+// `namespace_moves` row and is visible only in memory.admin.v1 (N127).
 syntax = "proto3";
 
 package memory.v1;
@@ -58,10 +64,12 @@ enum OperationKind {
   OPERATION_KIND_UNSPECIFIED = 0;
   // MemoryService.Retain: one document version.
   OPERATION_KIND_RETAIN_DOCUMENT = 1;
-  // DocumentService.DeleteDocument: asynchronous blob/row purge after the
-  // synchronous cascade.
+  // DocumentService.DeleteDocument: the asynchronous Expunge (decision N119)
+  // that follows the acknowledged soft-delete marker. The delete is already
+  // effective for every read path when this operation is returned.
   OPERATION_KIND_DELETE_DOCUMENT = 2;
-  // NamespaceService.DeleteNamespace: per-shard purge.
+  // NamespaceService.DeleteNamespace: per-shard purge after the delete
+  // freeze and the intent object (N122).
   OPERATION_KIND_DELETE_NAMESPACE = 3;
   // Background consolidation round (never client-created; listed for
   // observability of consolidation_lag).
@@ -70,9 +78,26 @@ enum OperationKind {
   OPERATION_KIND_REFRESH_PAGE = 5;
   // ExportService.CreateSnapshot.
   OPERATION_KIND_CREATE_SNAPSHOT = 6;
-  // Admin-initiated namespace move (visible to the tenant as a kind only;
-  // shard ids are in the admin API).
-  OPERATION_KIND_MOVE_NAMESPACE = 7;
+  // Removed in v1.0.0-rc6 (decision N127): a move has no operations row; it
+  // is the catalog's `namespace_moves` row and lives in memory.admin.v1.
+  reserved 7;
+  reserved "OPERATION_KIND_MOVE_NAMESPACE";
+  // TenantService.DeleteTenant: the tenant-level umbrella over one
+  // DELETE_NAMESPACE operation per namespace (decision N127). It is stored in
+  // the catalog database, not on a shard, and is read through the
+  // tenant-scoped memory.admin.v1.TenantService.GetOperation.
+  OPERATION_KIND_DELETE_TENANT = 8;
+}
+
+// CancelReason says why an operation ended CANCELLED (decision N127).
+enum CancelReason {
+  CANCEL_REASON_UNSPECIFIED = 0;
+  // CancelOperation was called.
+  CANCEL_REASON_CLIENT_REQUEST = 1;
+  // A retain raced a delete of the same document; the delete won.
+  CANCEL_REASON_DOCUMENT_DELETED = 2;
+  // The namespace is being deleted.
+  CANCEL_REASON_NAMESPACE_DELETING = 3;
 }
 
 // OperationState is the lifecycle of an operation. Terminal states are
@@ -123,8 +148,23 @@ message Operation {
   // reflect the facts written by this operation (consolidation debounce +
   // current backlog). Absent when the kind produces no facts. Not a bound.
   google.protobuf.Duration consolidation_lag = 13;
+  // Set only when state == CANCELLED (decision N127).
+  CancelReason cancel_reason = 14;
 
   reserved 100 to 199;
+}
+
+// ExpungeSla states the bounds of the asynchronous expunge that follows an
+// acknowledged delete (decision N119). They are service-level targets, not
+// per-request guarantees: a delete is effective at ack regardless.
+message ExpungeSla {
+  // Derived versions that name the victim are materialised hidden and
+  // rebuilds are nudged: 15 minutes.
+  google.protobuf.Duration materialize_within = 1;
+  // Rows, vectors, links, evidence and blobs are physically deleted: 24 hours.
+  google.protobuf.Duration purge_within = 2;
+  // Touched vector indexes are rebuilt: 48 hours.
+  google.protobuf.Duration index_rebuilt_within = 3;
 }
 
 // OperationProgress counts work units. For RETAIN_DOCUMENT the unit is a
@@ -135,7 +175,8 @@ message OperationProgress {
   int32 units_done = 2;
   int32 units_failed = 3;
   // Current phase label, e.g. "chunk", "extract", "embed", "commit",
-  // "finalize", "purge-blobs".
+  // "finalize"; for DELETE_* the Expunge phases "materialize", "purge",
+  // "index", "finish" (decision N119).
   string phase = 4;
   // Retain only: chunks skipped by the content-hash delta (unchanged).
   int32 units_skipped = 5;
@@ -166,13 +207,15 @@ message DeferredInfo {
 // OperationResult is the kind-specific outcome of a SUCCEEDED operation.
 // Only the fields for the operation's kind are set.
 message OperationResult {
-  // RETAIN_DOCUMENT: the document version that became active.
+  // RETAIN_DOCUMENT: THIS operation's document version (decision N127). It is
+  // active unless `superseded_by` is set.
   int64 document_version = 1;
   // RETAIN_DOCUMENT: facts written by this version (new chunks only).
   int32 facts_written = 2;
   // RETAIN_DOCUMENT: chunks reused unchanged through the content-hash delta.
   int32 chunks_reused = 3;
-  // DELETE_DOCUMENT / DELETE_NAMESPACE: rows physically purged.
+  // DELETE_DOCUMENT / DELETE_NAMESPACE: rows physically purged by the
+  // expunge.
   int64 rows_purged = 4;
   // DELETE_DOCUMENT / DELETE_NAMESPACE: blobs deleted.
   int64 blobs_purged = 5;
@@ -186,6 +229,13 @@ message OperationResult {
   // of the same document and was clamped up to the running maximum when its
   // chunks were built (decision N86); 0 when timestamps were monotone.
   int32 timestamps_clamped = 9;
+  // RETAIN_DOCUMENT: set when a newer version of the document finalised first;
+  // this operation still ends SUCCEEDED but its version never became active
+  // and the facts of `document_version` are not guaranteed visible (decision
+  // N49, N127). The value is the newer version number.
+  int64 superseded_by = 10;
+  // DELETE_NAMESPACE / DELETE_TENANT: namespaces whose expunge finished.
+  int32 namespaces_done = 11;
 }
 
 // GetOperationRequest fetches one operation.

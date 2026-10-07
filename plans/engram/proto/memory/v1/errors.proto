@@ -15,6 +15,13 @@
 //
 // Each message comments the gRPC status code it is attached to. A response
 // carries at most one Engram detail plus (optionally) RetryInfo.
+//
+// Only details a public caller can see and act on live here. The details that
+// travel between the shard store, the workflows and the API (the moved-out
+// routing hint, DocumentBusy, InputBlobMissing, FenceBusy) are defined in
+// engram/internal/errors/v1/errors.proto and never cross the API boundary
+// (decision N128): a public message can never be removed once v1.0.0 ships,
+// and a stripped field is a runtime discipline, not a contract.
 syntax = "proto3";
 
 package memory.v1;
@@ -48,9 +55,10 @@ message FieldViolation {
 
 // QuotaExceeded → RESOURCE_EXHAUSTED. A per-tenant or per-namespace rate or
 // volume quota was hit at admission (decision D13: `recalls_per_min`,
-// `retains_per_min`). Volume quotas that are checked inside workflows
-// (`llm_tokens_per_day`, `max_facts`) do NOT produce this error: they defer
-// the operation (OperationState.DEFERRED). Client action: back off for
+// `retains_per_min`) or by a synchronous gateway call (Reflect). Volume
+// quotas that workflows hit (`llm_tokens_per_day`, `max_facts`) do NOT
+// produce this error: `quota.Reserve` defers the operation
+// (OperationState.DEFERRED, decision N130). Client action: back off for
 // `retry_after`, then retry the identical request.
 message QuotaExceeded {
   // Quota key as configured: "recalls_per_min", "retains_per_min",
@@ -103,16 +111,19 @@ message NotFound {
 }
 
 // NamespaceState mirrors the catalog state of a namespace as seen by the
-// shard's ownership row, for diagnostics in WrongShardOrEpoch.
+// shard's ownership row, for diagnostics in WrongShardOrEpoch and as the
+// public Namespace.state.
 enum NamespaceState {
   NAMESPACE_STATE_UNSPECIFIED = 0;
   // Being created; ownership row not yet active.
   NAMESPACE_STATE_PROVISIONING = 1;
   // Normal.
   NAMESPACE_STATE_ACTIVE = 2;
-  // A shard move is copying/catching up; writes still accepted at the source.
+  // A shard move is running its dirty copy; writes are still accepted at the
+  // source (decision N124).
   NAMESPACE_STATE_MOVING = 3;
-  // Move freeze window: writes rejected (NamespaceFrozen), reads served.
+  // Move freeze window (freeze, reconcile, drain): writes rejected
+  // (NamespaceFrozen), reads served.
   NAMESPACE_STATE_FROZEN = 4;
   // Delete in progress: reads and writes rejected (except
   // OperationService.GetOperation/WaitOperation, decision N70).
@@ -123,9 +134,9 @@ enum NamespaceState {
   // writes rejected as NamespaceFrozen{RESTORE}, reads served.
   NAMESPACE_STATE_RESTORING = 7;
   // The shard's ownership row says the namespace has moved out (move cutover
-  // sub-step (c) committed). Only ever seen in WrongShardOrEpoch; a read that
+  // sub-step (c) committed). Only ever seen in WrongShardOrEpoch; a call that
   // meets it re-resolves in a bounded loop (≤ 5 s) instead of once
-  // (decision N52).
+  // (decisions N52, N125).
   NAMESPACE_STATE_MOVED_OUT = 8;
 }
 
@@ -133,16 +144,17 @@ enum NamespaceState {
 // does not hold the namespace at the epoch the caller resolved (stale catalog
 // cache, a move cut over between resolve and execute, or a restore bumped the
 // epoch). The API invalidates its catalog entry, re-resolves and retries:
-// once for writes; for READS that observe namespace_state = MOVED_OUT (the
+// once for writes; for calls that observe namespace_state = MOVED_OUT (the
 // window between move cutover sub-steps (c) and (d)) in a bounded loop of up
 // to 5 s, exactly like NamespaceFrozen (decision N52) — so public clients see
 // it only when that also fails. FAILED_PRECONDITION returned during a move
-// counts against the availability SLI. Epochs are exposed because they are
-// the only actionable diagnostic; the shard id is never exposed to public
-// callers: fields 5 and 6 are an API-internal routing hint (decision N98) and
-// the API strips them before the error leaves the process. Client action:
-// retry the whole call with backoff (new resolve), do not persist anything
-// from this detail.
+// counts against the availability SLI. The shard id is never part of this
+// message: the routing hint a moved-out shard returns to the API is the
+// internal MovedOutHint (engram/internal/errors/v1). Client action: retry the
+// whole call with backoff (new resolve), do not persist anything from this
+// detail.
+// Removed in v1.0.0-rc6 (decision N128): `int32 target_shard_id = 5` and
+// `int64 next_epoch = 6` moved to the internal MovedOutHint.
 message WrongShardOrEpoch {
   string namespace_id = 1;
   // Epoch the caller (API or worker) believed to be current.
@@ -152,25 +164,19 @@ message WrongShardOrEpoch {
   int64 actual_epoch = 3;
   // Ownership state on the shard that rejected the call.
   NamespaceState namespace_state = 4;
-  // Set only with namespace_state = MOVED_OUT (decision N98): the shard and
-  // epoch recorded in the `moved_out` ownership row (target_shard_id,
-  // target_epoch). The API routes the read or write to that shard using only
-  // this detail, so cutover does not depend on the catalog being reachable
-  // (catalog failover takes ≥ 30 s), and still verifies ownership at the
-  // target's fence. Zero when not MOVED_OUT. Stripped before the error is
-  // returned to a caller outside the API.
-  int32 target_shard_id = 5;
-  // Epoch the namespace holds on `target_shard_id` (the move's e + 1).
-  int64 next_epoch = 6;
+
+  reserved 5, 6;
+  reserved "target_shard_id", "next_epoch";
 }
 
 // NamespaceFrozen → FAILED_PRECONDITION. The namespace is in the freeze
-// window of a shard move (decision D5 step 4), a restore or a delete, or an
-// exclusive taker (freeze, barrier, restore, cutover) is queued on the
-// namespace fence and the writer's `pg_try_advisory_xact_lock_shared` was
-// refused (decision N82: the fence never waits, so no pooled connection is
-// held behind a queued exclusive request; `retry_after` = 200 ms then).
-// Writes are rejected; reads continue at the source. The API already retried
+// window of a shard move (decision D5), a restore or a delete, or an
+// exclusive taker (freeze, restore) is queued on the namespace fence and the
+// writer's `pg_try_advisory_xact_lock_shared` was refused (decision N82: the
+// fence never waits, so no pooled connection is held behind a queued
+// exclusive request; `retry_after` = 200 ms then, reason UNSPECIFIED).
+// Writes are rejected; reads continue at the source for a move freeze only,
+// not for a delete or restore freeze (decision N122). The API already retried
 // with backoff for up to 30 s before surfacing this. Client action: retry
 // after `retry_after` (also emitted as google.rpc.RetryInfo).
 message NamespaceFrozen {
@@ -187,37 +193,29 @@ enum FreezeReason {
   FREEZE_REASON_RESTORE = 2;
   // Delete freeze (freeze_reason = 'delete' in namespace_ownership).
   FREEZE_REASON_DELETE = 3;
-  // No freeze yet: an exclusive taker is queued and the shared try-lock was
-  // refused (decision N82). Always retryable after 200 ms.
-  FREEZE_REASON_FENCE_BUSY = 4;
+
+  // Removed in v1.0.0-rc6 (decision N128): `FREEZE_REASON_FENCE_BUSY = 4`. A
+  // refused shared try-lock is reported as NamespaceFrozen with reason
+  // UNSPECIFIED; the distinction is the internal FenceBusy detail.
+  reserved 4;
+  reserved "FREEZE_REASON_FENCE_BUSY";
 }
 
-// DocumentBusy → ABORTED (retryable, internal to the write path). CommitChunk
-// could not take the shared per-document advisory lock because FinalizeVersion,
-// the delete cascade or PurgeDocument holds or is queued for the exclusive
-// form (decision N83). The activity retries with a 100 ms backoff under
-// P-frozen; it is never returned to public callers.
-message DocumentBusy {
-  string document_id = 1;
+// NamespaceNotReady → UNAVAILABLE (retryable). The namespace's target shard
+// is in the `ready` ownership state: the move passed its point of no return
+// on the source and the target is about to become `active` (cutover
+// sub-steps (c) to (b″), decision N125). Nothing routes to a `ready` shard,
+// so the window has no owner at all; it lasts well under a second and the
+// API retries it inside its bounded re-resolve loop. Client action: retry
+// after `retry_after`.
+message NamespaceNotReady {
+  string namespace_id = 1;
   google.protobuf.Duration retry_after = 2;
 }
 
-// InputBlobMissing → retryable chunk-level activity error (decision N100),
-// Temporal ApplicationError type "InputBlobMissing"; never returned to public
-// callers. CommitChunk found an input blob (extraction cache entry, staging
-// vectors, entities or links result) purged by a concurrent PurgeDocument.
-// The RetainDocument chunk sub-pipeline re-runs ExtractChunk and EmbedChunk
-// for that chunk, at most twice; the third failure records `chunk_failed`.
-message InputBlobMissing {
-  // Full blob key that was not found.
-  string blob_key = 1;
-  // Which input: "extraction", "embeddings", "entities" or "links".
-  string input = 2;
-  // Hex SHA-256 of the chunk text the activity was committing.
-  string content_hash = 3;
-  // Re-runs of the extract/embed pair already spent (0, 1 or 2).
-  int32 attempt = 4;
-}
+// Removed in v1.0.0-rc6 (decision N128): DocumentBusy (N83) and
+// InputBlobMissing (N100) are write-path details, now in
+// engram/internal/errors/v1/errors.proto.
 
 // OperationConflict → ABORTED (concurrent conflict) or ALREADY_EXISTS
 // (idempotency-key or operation_id reuse with a different payload). Client
@@ -239,7 +237,9 @@ enum OperationConflictReason {
   // The same request_id/operation_id was reused with a different request
   // hash within the retention window (ALREADY_EXISTS).
   OPERATION_CONFLICT_REASON_IDEMPOTENCY_KEY_REUSED = 1;
-  // A purge (DeleteDocument) is running on the document (ABORTED).
+  // The document is DELETING: its tombstone exists until the expunge has
+  // finished and the tombstone has been dropped (ABORTED; decision N115).
+  // `existing_operation_id` is the DELETE_DOCUMENT operation to wait on.
   OPERATION_CONFLICT_REASON_DOCUMENT_PURGING = 2;
   // The namespace has a delete or move cutover in progress (ABORTED).
   OPERATION_CONFLICT_REASON_NAMESPACE_BUSY = 3;
@@ -259,14 +259,13 @@ message PreconditionFailed {
 message Precondition {
   // Stable type: "OPERATION_TERMINAL", "ETAG_MISMATCH", "DOCUMENT_INGESTING",
   // "NAMESPACE_DELETING", "SNAPSHOT_BASE_UNAVAILABLE", "SNAPSHOT_EXPIRED" (the
-  // snapshot contained a since-deleted document and was expired by the delete
-  // cascade, decision N59: take a fresh full snapshot), "PAGE_NO_VERSION",
+  // snapshot contained, or was being built while, a document was deleted and
+  // was expired by the delete marker transaction, decision N126),
+  // "PAGE_NO_VERSION", "PAGE_HIDDEN" (the requested page version is hidden by
+  // a delete or invalidation until the refresh lands, decision N117),
   // "MEMORY_NOT_A_FACT", "ALREADY_INVALIDATED", "NOT_INVALIDATED",
   // "TENANT_DELETING", "SCHEMA_VERSION_MISMATCH" (a move or migration refused
-  // because source and target shards run different schema versions),
-  // "MOVE_STATE_TOO_LARGE" (a move refused because the frozen re-copy class —
-  // quota_counters, namespace_stats, batch_jobs, outbox_cursors — holds more
-  // than 10,000 rows of the namespace, decision N81).
+  // because source and target shards run different schema versions).
   string type = 1;
   // Resource the precondition applies to (id).
   string subject = 2;

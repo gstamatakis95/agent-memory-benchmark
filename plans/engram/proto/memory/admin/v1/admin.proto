@@ -5,7 +5,10 @@
 // that is not exposed to tenants). Three services fixed by decision D1:
 //   TenantService — tenants, quotas, config, isolation;
 //   ShardService  — shard registry and namespace → shard resolution;
-//   MoveService   — the per-namespace move protocol of decision D5.
+//   MoveService   — the per-namespace move protocol of decision D5 (dirty
+//                   copy, freeze, reconcile by set difference, cutover with a
+//                   `ready` state; decisions N124, N125).
+// The tenant-scoped GetTenantOperation also lives here (decision N127).
 // This is the ONLY place where shard ids and epochs appear in an API.
 syntax = "proto3";
 
@@ -38,9 +41,18 @@ service TenantService {
   // Changing isolation to DEDICATED does not move namespaces; it only
   // constrains future placement (use MoveService to relocate).
   rpc UpdateTenant(UpdateTenantRequest) returns (UpdateTenantResponse);
-  // DeleteTenant marks the tenant DELETING and starts a DELETE_NAMESPACE
-  // operation for every namespace.
+  // DeleteTenant writes the delete intent object (decision N122), marks the
+  // tenant DELETING, freezes every namespace (`freeze_delete`) and
+  // acknowledges: the delete is effective at the ack. It returns one
+  // DELETE_TENANT operation (stored in the catalog database) and one
+  // DELETE_NAMESPACE operation per namespace for the asynchronous expunge.
   rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
+  // GetTenantOperation reads a tenant-scoped operation (kind DELETE_TENANT),
+  // which no namespace-scoped OperationService.GetOperation can address
+  // (decision N127). Exempt from the TENANT_DELETING rejection.
+  rpc GetTenantOperation(GetTenantOperationRequest) returns (GetTenantOperationResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 // ShardService manages the shard registry.
@@ -67,8 +79,9 @@ service ShardService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
   // ReleaseNamespace records that a shard no longer holds a namespace: after
-  // the PurgeNamespace workflow removed the last rows it marks the catalog row
-  // DELETED (decision D8). Called by the purge workflow through engram-api
+  // the Expunge workflow removed the last rows of a deleted namespace it marks
+  // the catalog row DELETED (decisions D8, N119). Called by the workflow
+  // through engram-api
   // because workers never write the catalog directly (decision D4).
   // Idempotent.
   rpc ReleaseNamespace(ReleaseNamespaceRequest) returns (ReleaseNamespaceResponse);
@@ -87,15 +100,20 @@ service MoveService {
   rpc ListMoves(ListMovesRequest) returns (ListMovesResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // RollbackMove aborts a move that has not reached CUTOVER: the target's
-  // incoming ownership row is dropped, copied rows are purged, source is
-  // un-frozen if needed. After CUTOVER a rollback is a new move back.
+  // RollbackMove aborts a move that has not passed its point of no return
+  // (cutover sub-step (c), decision N125): before Freeze the source is
+  // `abort_move`d; after Freeze it is thawed first; after the target reached
+  // `ready` it goes back to `incoming` first; then the target's copied rows
+  // and ownership row are deleted. Onto a shard that had a `moved_out` row the
+  // permanent fence value is restored. After (c) a rollback is a new move
+  // back (FAILED_PRECONDITION).
   rpc RollbackMove(RollbackMoveRequest) returns (RollbackMoveResponse);
-  // CleanupMove runs decision D5 step 7 after the 24 h grace: deletes the
-  // namespace's rows and blob prefix on the source shard, drops its move
-  // cursor and the target's move_applied rows, and sets the move DONE. Called
-  // by the Move workflow (the worker never writes the catalog outside
-  // Plan/Freeze/Cutover) or earlier by `engramctl move cleanup`. Idempotent.
+  // CleanupMove runs decision D5 step 7 after the 24 h grace: drops the
+  // namespace's partial indexes on the source shard, deletes its rows
+  // (`engram_cleanup_namespace`, batched) and blob prefix, and sets the move
+  // DONE. The `moved_out` ownership row stays forever. Called by the Move
+  // workflow (the worker never writes the catalog outside Plan/Freeze/
+  // Cutover) or earlier by `engramctl move cleanup`. Idempotent.
   rpc CleanupMove(CleanupMoveRequest) returns (CleanupMoveResponse);
 }
 
@@ -125,7 +143,8 @@ message Quotas {
   // Admission-time rate limits (RESOURCE_EXHAUSTED + QuotaExceeded).
   int64 recalls_per_min = 1;
   int64 retains_per_min = 2;
-  // Workflow-time volume limits (operation DEFERRED until window reset).
+  // Workflow-time volume limits (operation DEFERRED until window reset; every
+  // gateway call class passes quota.Reserve first, decision N130).
   int64 llm_tokens_per_day = 3;
   int64 max_facts = 4;
   // Control-plane limit.
@@ -229,11 +248,31 @@ message DeleteTenantRequest {
   reserved 100 to 199;
 }
 
-// DeleteTenantResponse returns the tenant (DELETING) and the per-namespace
-// purge operations.
+// DeleteTenantResponse returns the tenant (DELETING), the tenant-level
+// operation and the per-namespace expunge operations.
 message DeleteTenantResponse {
   Tenant tenant = 1;
   repeated memory.v1.Operation namespace_operations = 2;
+  // Kind DELETE_TENANT; read it with TenantService.GetTenantOperation.
+  memory.v1.Operation operation = 3;
+  // Commit time of the last delete freeze: from here nothing of the tenant is
+  // readable.
+  google.protobuf.Timestamp deleted_at = 4;
+
+  reserved 100 to 199;
+}
+
+// GetTenantOperationRequest fetches a tenant-scoped operation.
+message GetTenantOperationRequest {
+  string tenant_id = 1;
+  string operation_id = 2;
+
+  reserved 100 to 199;
+}
+
+// GetTenantOperationResponse wraps the operation.
+message GetTenantOperationResponse {
+  memory.v1.Operation operation = 1;
 
   reserved 100 to 199;
 }
@@ -400,7 +439,6 @@ message ResolveNamespaceResponse {
   reserved 100 to 199;
 }
 
-// MoveState follows decision D5.
 // ReleaseNamespaceRequest finalises a namespace delete (ShardService).
 message ReleaseNamespaceRequest {
   memory.v1.RequestMeta meta = 1;
@@ -421,37 +459,67 @@ message ReleaseNamespaceResponse {
   reserved 100 to 199;
 }
 
+// MoveState follows decision D5: planned → copying → frozen → reconciling →
+// cutover → cleaning → done, or rolled_back before the point of no return.
 enum MoveState {
   MOVE_STATE_UNSPECIFIED = 0;
   MOVE_STATE_PLANNED = 1;
+  // Dirty bulk copy; the source stays writable (decision N124).
   MOVE_STATE_COPYING = 2;
-  MOVE_STATE_CATCHING_UP = 3;
+  // Removed in v1.0.0-rc6 (decision N124): `MOVE_STATE_CATCHING_UP = 3`.
+  // There are no catch-up rounds; the freeze is followed by a reconcile.
+  reserved 3;
+  reserved "MOVE_STATE_CATCHING_UP";
+  // Source frozen (`frozen/move`, reads continue).
   MOVE_STATE_FROZEN = 4;
+  // Cutover sub-steps (b′), (c), (b″), (d); see Move.cutover_step.
   MOVE_STATE_CUTOVER = 5;
   MOVE_STATE_CLEANING = 6;
   MOVE_STATE_DONE = 7;
   MOVE_STATE_ROLLED_BACK = 8;
+  // Under freeze: re-copy of rows newer than T_copy − 10 min, mutable-table
+  // diff, blob check, relay drain, VerifyFK (decision N124).
+  MOVE_STATE_RECONCILING = 9;
 }
 
-// MoveProgress reports copy and catch-up progress.
+// CutoverStep names the sub-step of MOVE_STATE_CUTOVER (decision N125).
+enum CutoverStep {
+  CUTOVER_STEP_UNSPECIFIED = 0;
+  // (b′) target `incoming → ready`; rollback is still possible.
+  CUTOVER_STEP_READY_TARGET = 1;
+  // (c) source `frozen/move → moved_out`: the point of no return.
+  CUTOVER_STEP_MOVED_OUT_SOURCE = 2;
+  // (b″) target `ready → active`, retried indefinitely.
+  CUTOVER_STEP_ACTIVE_TARGET = 3;
+  // (d) catalog flip, retried forever.
+  CUTOVER_STEP_CATALOG_FLIP = 4;
+}
+
+// MoveProgress reports copy and reconcile progress.
 message MoveProgress {
   int64 rows_copied = 1;
   int64 bytes_copied = 2;
   int64 blobs_copied = 3;
-  // Outbox position captured at copy start (p0) and the target's
-  // `namespace_ownership.move_applied_seq`, a LAG INDICATOR only: the replay
-  // is an anti-join of the source outbox against the source's lagging copy of
-  // `move_applied` (the target copy is authoritative, decision N50), never a
-  // `seq > applied_seq` read, so an out-of-order commit cannot be skipped.
-  int64 copy_start_seq = 4;
-  int64 applied_seq = 5;
-  // Outbox events not yet replayed and their age.
-  int64 replay_lag_events = 6;
-  google.protobuf.Duration replay_lag = 7;
+  // Removed in v1.0.0-rc6 (decision N124): the outbox replay machinery
+  // (`copy_start_seq = 4`, `applied_seq = 5`, `replay_lag_events = 6`,
+  // `replay_lag = 7`).
+  reserved 4 to 7;
+  reserved "copy_start_seq", "applied_seq", "replay_lag_events", "replay_lag";
   // Operation ids terminated during drain and restarted after cutover.
   repeated string restarted_operation_ids = 8;
   // Tables fully copied so far.
   repeated string tables_done = 9;
+  // When the dirty copy began (T_copy): the reconcile re-copies immutable
+  // rows created at or after T_copy − 10 min.
+  google.protobuf.Timestamp copy_started_at = 10;
+  // Immutable rows re-copied under freeze.
+  int64 rows_recopied = 11;
+  // Mutable-table rows upserted or deleted by the merge-diff.
+  int64 mutable_rows_reconciled = 12;
+  // Referenced blobs missing on the target that the reconcile copied.
+  int64 blobs_reconciled = 13;
+  // Freeze watchdog: max(120 s, 60 s + 1 s per 10 k facts), at most 15 min.
+  google.protobuf.Duration freeze_watchdog = 14;
 }
 
 // Move is one namespace relocation.
@@ -471,8 +539,15 @@ message Move {
   google.protobuf.Timestamp cutover_at = 11;
   // Set when state is ROLLED_BACK or the executor is retrying after an error.
   string error = 12;
-  // Operation exposed to the tenant (kind MOVE_NAMESPACE).
-  string operation_id = 13;
+  // Removed in v1.0.0-rc6 (decision N127): `string operation_id = 13`. A move
+  // is not an Operation and is not visible to tenants.
+  reserved 13;
+  reserved "operation_id";
+  // Set while state is CUTOVER.
+  CutoverStep cutover_step = 14;
+  // True once cutover sub-step (c) committed; RollbackMove is refused from
+  // then on.
+  bool past_point_of_no_return = 15;
 
   reserved 100 to 199;
 }
@@ -532,7 +607,7 @@ message ListMovesResponse {
   reserved 100 to 199;
 }
 
-// RollbackMoveRequest aborts a move before cutover.
+// RollbackMoveRequest aborts a move before its point of no return.
 message RollbackMoveRequest {
   memory.v1.RequestMeta meta = 1;
   string move_id = 2;
@@ -549,6 +624,7 @@ message RollbackMoveResponse {
 }
 
 // CleanupMoveRequest purges the source side of a move in state CLEANING.
+// The source's `moved_out` ownership row is never deleted (decision N93).
 message CleanupMoveRequest {
   memory.v1.RequestMeta meta = 1;
   string move_id = 2;

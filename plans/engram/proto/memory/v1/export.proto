@@ -6,10 +6,15 @@
 // grep-style local search.
 //
 // Versions are dense integers per namespace. Snapshot v{n} always contains a
-// full set of files; when v{n-1} still exists and its outbox range has not
-// been pruned, it also contains `delta-v{n-1}-v{n}.jsonl.zst`, derived from
-// the outbox, so a client at v{n-1} downloads only the delta. A client
-// further behind applies consecutive deltas or falls back to the full files.
+// full set of files and, for n > 1, ALWAYS contains
+// `delta-v{n-1}-v{n}.jsonl.zst`, computed by diffing the two snapshots by
+// (id, version) with delete records, and lists `deleted_ids` in its manifest,
+// even when v{n-1} has expired or been garbage-collected (decision N126). A
+// client at v{n-1} downloads only the delta and applies the deletes before
+// serving anything; a client further behind applies consecutive deltas or
+// falls back to the full files. A local copy whose version is `expired` is
+// refused by the sync client until it has applied the next delta (the delta
+// carries the delete records).
 //
 // StreamSnapshot is SERVER-STREAMING: parts of ≤ 1 MiB, resumable by
 // (path, offset). Unary "download a file" was rejected because gRPC messages
@@ -28,9 +33,12 @@ option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
 // memory.write (it consumes worker capacity and storage); the reads need
 // memory.read.
 service ExportService {
-  // CreateSnapshot starts a snapshot (kind CREATE_SNAPSHOT) at the current
-  // outbox position and returns the Operation. At most one snapshot per
-  // namespace runs at a time (ABORTED + OperationConflict otherwise).
+  // CreateSnapshot starts a snapshot (kind CREATE_SNAPSHOT) and returns the
+  // Operation. BeginSnapshot inserts the snapshot as `building`; the files
+  // are written from one REPEATABLE READ snapshot; RecordSnapshot refuses to
+  // promote a row that a delete expired in between (decision N126). At most
+  // one snapshot per namespace runs at a time (ABORTED + OperationConflict
+  // otherwise).
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
   // GetSnapshotManifest returns the manifest of one version (0 = latest).
   rpc GetSnapshotManifest(GetSnapshotManifestRequest) returns (GetSnapshotManifestResponse) {
@@ -42,9 +50,11 @@ service ExportService {
   }
   // StreamSnapshot streams one file of a snapshot in parts of ≤ 1 MiB from a
   // byte offset. The last part carries the file's SHA-256. A version marked
-  // `expired` (it contained a document deleted since, decision N59) is
-  // refused with FAILED_PRECONDITION + PreconditionFailed{SNAPSHOT_EXPIRED}:
-  // the client re-syncs from a new full snapshot.
+  // `expired` (a document in it, or in it while it was `building`, was
+  // deleted since, decision N126) is refused with FAILED_PRECONDITION +
+  // PreconditionFailed{SNAPSHOT_EXPIRED}: the client takes the next
+  // snapshot's delta or a new full snapshot. Every part applies the read-time
+  // visibility predicate (decision N116).
   rpc StreamSnapshot(StreamSnapshotRequest) returns (stream StreamSnapshotResponse);
 }
 
@@ -53,16 +63,17 @@ enum SnapshotFileKind {
   SNAPSHOT_FILE_KIND_UNSPECIFIED = 0;
   // manifest.json (also returned inline as SnapshotManifest).
   SNAPSHOT_FILE_KIND_MANIFEST = 1;
-  // facts.jsonl.zst: one Memory (kind FACT) per line, invalidated excluded.
+  // facts.jsonl.zst: one Memory (kind FACT) per line, invisible facts
+  // (tombstoned documents, fact_hidden) excluded.
   SNAPSHOT_FILE_KIND_FACTS = 2;
-  // observations.jsonl.zst: latest version of each live observation.
+  // observations.jsonl.zst: latest visible version of each observation.
   SNAPSHOT_FILE_KIND_OBSERVATIONS = 3;
-  // chunks.jsonl.zst: live chunks with header and provenance.
+  // chunks.jsonl.zst: visible chunks with header and provenance.
   SNAPSHOT_FILE_KIND_CHUNKS = 4;
   // pages/<name>.md: current version of each page.
   SNAPSHOT_FILE_KIND_PAGE = 5;
-  // delta-v{n-1}-v{n}.jsonl.zst: ordered upsert/delete records since the
-  // previous version.
+  // delta-v{n-1}-v{n}.jsonl.zst: upsert and delete records between the
+  // previous version and this one, from a diff of the two snapshots.
   SNAPSHOT_FILE_KIND_DELTA = 6;
 }
 
@@ -85,12 +96,14 @@ message SnapshotFile {
 message SnapshotManifest {
   NamespaceRef namespace = 1;
   int64 version = 2;
-  // Version the delta file is relative to; 0 when no delta is included.
+  // Version the delta file is relative to; 0 for version 1.
   int64 base_version = 3;
-  // True when a DELTA file is present.
+  // True for every version above 1: the delta is always emitted (decision
+  // N126).
   bool delta_available = 4;
-  // Consistent point of the snapshot: every fact with mentioned_at ≤ this
-  // and committed before the outbox position is included.
+  // Consistent point of the snapshot: the start of the REPEATABLE READ
+  // transaction that wrote the files; everything committed before it and
+  // visible then is included.
   google.protobuf.Timestamp as_of = 5;
   repeated SnapshotFile files = 6;
   int64 total_bytes = 7;
@@ -104,13 +117,18 @@ message SnapshotManifest {
   int64 chunk_count = 13;
   int32 page_count = 14;
   // True when a document contained in this snapshot was deleted after it was
-  // taken (decision N59): the delete cascade marks every such snapshot
-  // expired so an acknowledged delete cannot be served through an old
-  // export. Expired versions stay listed (so a client learns why its chain is
-  // broken) but StreamSnapshot refuses them; the next CreateSnapshot must be
-  // a full one.
+  // taken or while it was being built (decision N126): the delete marker
+  // transaction expires `building` and `ready` snapshots alike, so an
+  // acknowledged delete cannot be served through an old export. Expired
+  // versions stay listed (so a client learns why its chain is broken) but
+  // StreamSnapshot refuses them.
   bool expired = 15;
   google.protobuf.Timestamp expired_at = 16;
+  // Ids (facts, chunks, observations) deleted between base_version and this
+  // version, also when the base snapshot has expired (decision N126). The
+  // sync client applies them before serving. Long lists are paged into the
+  // delta file's delete records; this field holds at most the first 10,000.
+  repeated string deleted_ids = 17;
 
   reserved 100 to 199;
 }

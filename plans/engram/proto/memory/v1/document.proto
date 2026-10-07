@@ -5,16 +5,20 @@
 // MemoryService.Retain; this service never writes content.
 //
 // DeleteDocument is UNARY and returns an Operation because the delete has two
-// halves (decision D8): everything Recall/Reflect/GetMemory/Export can see is
-// removed SYNCHRONOUSLY inside one shard transaction (facts retired, links
-// and mentions deleted, observation sources and inputs removed, observations
-// derived from the deleted content hidden as stale_delete until
-// reconsolidated, pages marked stale) and the call returns only after that
-// commits; the
-// blob deletion and the physical row purge run ASYNCHRONOUSLY in a Temporal
-// PurgeWorkflow that the returned Operation tracks. A client that needs
-// "storage reclaimed" waits on the Operation; a client that needs "no longer
-// returned" needs nothing beyond the ack.
+// halves (decisions D8, N115, N119). The synchronous half is an O(1)
+// soft-delete marker: the delete intent object is written to blob storage
+// (N122), then one shard transaction inserts a document tombstone, flips the
+// document to DELETING and writes the outbox event, and the call returns. From
+// that ack on, every read path (Recall, Reflect, GetMemory, ListMemories,
+// GetPage, SearchPages, StreamSnapshot) hides everything derived from the
+// document, evaluated at read time against the tombstone set (N116, N117);
+// nothing is walked or stamped at delete time. The asynchronous half is the
+// throttled per-namespace Expunge workflow (N119) that the returned
+// Operation tracks: materialize (<= 15 min), purge rows and blobs (<= 24 h),
+// index rebuild (<= 48 h). Recall SLOs may degrade for the namespace while
+// the tombstone is pending. A client that needs "no longer returned" needs
+// nothing beyond the ack; one that needs "storage reclaimed" waits on the
+// Operation.
 syntax = "proto3";
 
 package memory.v1;
@@ -39,16 +43,15 @@ service DocumentService {
   rpc ListDocuments(ListDocumentsRequest) returns (ListDocumentsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // DeleteDocument removes a document and everything derived from it. The
-  // synchronous cascade is committed before the call returns; the returned
-  // Operation (kind DELETE_DOCUMENT) tracks blob and physical purge. Deleting
-  // an unknown document returns NOT_FOUND; deleting a document whose purge
-  // is already running returns the existing operation (idempotent). The
-  // cascade commits with synchronous_commit = remote_apply against a
-  // synchronous standby, so an acknowledged delete survives a failover; with
-  // no standby available the call returns UNAVAILABLE (retryable) instead of
-  // acknowledging (decision N92). Cost: ≈ 50 ms p95 per 1,000 facts plus one
-  // outbox row per 256 ids (decision N80).
+  // DeleteDocument soft-deletes a document and everything derived from it.
+  // The ack means: the intent object is durable (N122) and the tombstone
+  // marker is committed (N115), so the delete is effective for every read
+  // path and survives restore and failover (acknowledged deletes have RPO 0).
+  // Cost: one blob put (10-50 ms) plus one small transaction, independent of
+  // document size. The returned Operation (kind DELETE_DOCUMENT) tracks the
+  // asynchronous Expunge. Deleting an unknown document returns NOT_FOUND;
+  // deleting a document that is already DELETING returns the existing
+  // operation (idempotent).
   rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
   // GetDocumentVersion returns one version's metadata (chunk/fact counts,
   // status, the operation that produced it).
@@ -64,8 +67,8 @@ enum DocumentState {
   DOCUMENT_STATE_ACTIVE = 1;
   // First version still ingesting; nothing visible yet.
   DOCUMENT_STATE_INGESTING = 2;
-  // Synchronous cascade done; purge in progress. Not returned by List unless
-  // `include_deleting`.
+  // Tombstone committed (the delete is effective); expunge in progress. Not
+  // returned by List unless `include_deleting`.
   DOCUMENT_STATE_DELETING = 3;
 }
 
@@ -75,7 +78,7 @@ enum DocumentVersionStatus {
   DOCUMENT_VERSION_STATUS_INGESTING = 1;
   DOCUMENT_VERSION_STATUS_ACTIVE = 2;
   // Replaced by a newer version; its unchanged chunks live on in the newer
-  // version, its removed chunks are retired.
+  // version, its removed chunks are hidden by chunk tombstones.
   DOCUMENT_VERSION_STATUS_SUPERSEDED = 3;
   DOCUMENT_VERSION_STATUS_DELETED = 4;
 }
@@ -90,7 +93,7 @@ message Document {
   // Content hash of the current version (hex SHA-256 over the concatenated
   // item content).
   string content_hash = 5;
-  // Live (non-retired) chunk and fact counts.
+  // Visible chunk and fact counts.
   int32 chunk_count = 6;
   int32 fact_count = 7;
   // Union of item tags of the current version.
@@ -183,15 +186,20 @@ message DeleteDocumentRequest {
   reserved 100 to 199;
 }
 
-// DeleteDocumentResponse acknowledges the synchronous cascade and returns the
-// purge operation.
+// DeleteDocumentResponse acknowledges the tombstone (decision N115) and
+// returns the expunge operation.
 message DeleteDocumentResponse {
   Operation operation = 1;
-  // Facts retired by the synchronous cascade.
-  int32 facts_retired = 2;
-  // Observations hidden (stale_delete) and pages marked stale by the cascade.
-  int32 observations_marked_stale = 3;
-  int32 pages_marked_stale = 4;
+  // Removed in v1.0.0-rc6 (decisions N115, N117): `int32 facts_retired = 2`,
+  // `int32 observations_marked_stale = 3`, `int32 pages_marked_stale = 4`.
+  // Nothing is counted at delete time any more; the expunge reports progress.
+  reserved 2 to 4;
+  reserved "facts_retired", "observations_marked_stale", "pages_marked_stale";
+  // Commit time of the tombstone: the instant from which no read path returns
+  // anything derived from the document.
+  google.protobuf.Timestamp deleted_at = 5;
+  // Stated bounds of the asynchronous expunge.
+  ExpungeSla expunge_sla = 6;
 
   reserved 100 to 199;
 }

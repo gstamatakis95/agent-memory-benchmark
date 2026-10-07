@@ -12,6 +12,20 @@
 // re-interpreting a field requires a `workflow.GetVersion` patch in the
 // workflow code and a drain window for running histories (section 4.5).
 //
+// Pre-1.0 breaking-change exception (decision N128, review A-11). This
+// package has not shipped v1.0.0, so the round-3 redesign (D22) changed it
+// incompatibly and `buf breaking` is baselined against the `proto/v1.0.0`
+// tag, not `main`. The breaks, all intended: N86 `ChunkWork.item_index = 9`
+// became `item_indexes = 17` (old number reserved); the lineage-based
+// consolidation messages (`ObservationVersionRef`, `candidate_versions`,
+// `flagged_candidate_versions`, N79) were replaced by the two-stage shapes of
+// N121; `PurgeTarget`/`PurgeInput`/`PurgeResult` were replaced by the
+// Expunge messages of N119; `ExportInput` lost its outbox cut (N126); and the
+// move messages lost the replay floor, `applied_seq` and the verify watermark
+// (N124). Every top-level input written by the D22 build carries
+// `schema_version = 2`; the worker branches on it for in-flight histories
+// started at 1 and keeps that branch until they have drained (30 days).
+//
 // Payload size and confidentiality (decision N59, review F-13/F-18/F-25):
 //   * every activity result larger than 4 KiB travels by blob key under the
 //     namespace prefix (extraction, embeddings, entity resolution, links);
@@ -48,6 +62,8 @@ message WorkflowScope {
   // Ownership epoch the operation was submitted under. Activities abort with
   // FAILED_PRECONDITION + WrongShardOrEpoch when the shard disagrees; the
   // move executor restarts the operation with the new epoch after cutover.
+  // Every activity is fenced `active` at this epoch, and the expunge and the
+  // schedulers skip a namespace while a move is open (decisions N119, N125).
   int64 epoch = 4;
   // Blob key prefix of the shard (= shard_id as text, "7"), so activities
   // build keys without the catalog.
@@ -87,6 +103,7 @@ message TokenUsage {
 // RetainDocumentInput starts workflow `ns/{namespace_id}/op/{operation_id}`
 // on task queue `shard-{shard_id}` (decision D11).
 message RetainDocumentInput {
+  // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
   WorkflowScope scope = 2;
   string operation_id = 3;
@@ -213,10 +230,12 @@ message ChunkPlan {
   repeated ChunkWork new_chunks = 1;
   // Hashes kept from the previous version without work.
   repeated string unchanged_hashes = 2;
-  // Retired-but-not-purged hashes to un-retire.
+  // Tombstoned-but-not-purged hashes to un-retire: `DELETE FROM
+  // chunk_tombstones` (decision N115); their facts become visible again.
   repeated string unretired_hashes = 3;
   // Hashes of the previous version absent from the new one (REPLACE only):
-  // retired by FinalizeVersion.
+  // FinalizeVersion inserts `chunk_tombstones(reason = 'replace')` for them.
+  // Nothing on a content row changes (decision N113).
   repeated string retired_hashes = 4;
   // Content hash of the whole version.
   string version_hash = 5;
@@ -284,7 +303,7 @@ message ExtractChunkResult {
   // authoritative result when `facts` is empty. The key is
   // `{prefix}/xcache/{sha256(content_hash ‖ prompt_version ‖ model ‖
   // schema_version ‖ render_hash)}.json` (decision N87). A cache entry is
-  // deleted by PurgeDocument only when no live chunk references the hash AND
+  // deleted by the expunge only when no visible chunk references the hash AND
   // it is older than xcache_grace (24 h, N100).
   string cache_key = 5;
   // Number of facts in the result (so the workflow can plan without reading
@@ -307,7 +326,10 @@ message Embedding {
   bytes vector = 2;
 }
 
-// EmbedChunkResult holds embeddings for the chunk and its facts.
+// EmbedChunkResult holds embeddings for the chunk and its facts. CommitChunk
+// inserts them into the insert-only vector side tables `fact_vectors` and
+// `chunk_vectors`, keyed by `model` (decision N111); a model change or a
+// header change inserts new rows and never updates one.
 message EmbedChunkResult {
   string content_hash = 1;
   repeated Embedding embeddings = 2;
@@ -361,17 +383,18 @@ message BuildLinksResult {
   int32 link_count = 4;
 }
 
-// CommitChunkInput is everything CommitChunk writes in ONE transaction. A
-// missing input blob (purged by a concurrent PurgeDocument) fails the
-// activity with the retryable InputBlobMissing error (memory.v1, decision
-// N100): the chunk sub-pipeline re-runs ExtractChunk and EmbedChunk, at most
-// twice, then records chunk_failed. A shared per-document advisory lock that
-// cannot be taken fails it with the retryable DocumentBusy (N83).
-// chunk row, facts, embeddings, mentions, links and the outbox event. It is
-// KEYS-ONLY (decision N59): the activity reads extraction, embeddings,
-// resolved entities and links from the blob keys below, so the history does
-// not repeat ≈ 400 KiB per chunk and a document delete can erase every copy
-// of the text by deleting blobs.
+// CommitChunkInput is everything CommitChunk writes in ONE transaction: the
+// chunk row, facts, vectors (side tables, N111), mentions, links, the
+// `curation_log` re-application for facts of a known content hash (N115) and
+// the outbox event, as inserts only. A missing input blob (purged by a
+// concurrent expunge) fails the activity with the retryable InputBlobMissing
+// error (engram.internal.errors.v1, decision N100): the chunk sub-pipeline
+// re-runs ExtractChunk and EmbedChunk, at most twice, then records
+// chunk_failed. A shared per-document advisory lock that cannot be taken fails
+// it with the retryable DocumentBusy (N83). The input is KEYS-ONLY (decision
+// N59): the activity reads extraction, embeddings, resolved entities and
+// links from the blob keys below, so the history does not repeat ≈ 400 KiB
+// per chunk and a delete can erase every copy of the text by deleting blobs.
 message CommitChunkInput {
   WorkflowScope scope = 1;
   string operation_id = 2;
@@ -413,10 +436,13 @@ message CommitChunkResult {
   int64 outbox_seq = 5;
 }
 
-// FinalizeVersionInput retires missing chunks and activates the version. The
-// retire subquery is document-scoped (decision N107):
+// FinalizeVersionInput tombstones missing chunks and activates the version.
+// The tombstone subquery is document-scoped (decision N107):
 // `content_hash NOT IN (SELECT content_hash FROM document_version_chunks
-// WHERE namespace_id = $1 AND document_id = $2 AND version = $3)`.
+// WHERE namespace_id = $1 AND document_id = $2 AND version = $3)`; it inserts
+// `chunk_tombstones(reason = 'replace')` and, for kept chunks whose
+// extraction_key differs from the current key, `fact_hidden(reason =
+// 'reextract')` (decisions N58, N115). Both are inserts.
 message FinalizeVersionInput {
   WorkflowScope scope = 1;
   string operation_id = 2;
@@ -429,25 +455,31 @@ message FinalizeVersionInput {
 
 // FinalizeVersionResult reports what FinalizeVersion did.
 message FinalizeVersionResult {
+  // Chunk tombstones inserted by this finalize.
   int32 chunks_retired = 1;
+  // Facts hidden through those chunk tombstones (counted, not written).
   int32 facts_retired = 2;
+  // Chunk tombstones deleted again because the chunk is back in the version.
   int32 chunks_unretired = 3;
   int64 outbox_seq = 4;
-  // Live facts of kept chunks whose extraction_key differed from the chunk's
-  // current key, retired by this finalize (decision N58: a prompt or model
-  // bump never leaves two live fact sets on a chunk).
+  // Visible facts of kept chunks whose extraction_key differed from the
+  // chunk's current key, hidden by `fact_hidden(reason = 'reextract')`
+  // (decision N58: a prompt or model bump never leaves two visible fact sets
+  // on a chunk).
   int32 stale_extraction_facts_retired = 5;
   // Content hashes whose header_hash changed and need chunk re-embedding
   // (N60: chunk vectors only).
   repeated string reembed_hashes = 6;
   // Set when a newer version had already started (N40): this version was
-  // marked superseded and retired nothing.
+  // marked superseded and tombstoned nothing. The operation ends SUCCEEDED
+  // with OperationResult.superseded_by set (decisions N49, N127).
   int64 superseded_by = 7;
 }
 
 // ConsolidateTrigger is the SignalWithStart payload of the per-namespace
 // Consolidate workflow (id `ns/{namespace_id}/consolidate`, debounced 30 s).
 message ConsolidateTrigger {
+  // 2 for payloads written by the D22 build.
   uint32 schema_version = 1;
   WorkflowScope scope = 2;
   ConsolidateReason reason = 3;
@@ -460,6 +492,8 @@ message ConsolidateTrigger {
 enum ConsolidateReason {
   CONSOLIDATE_REASON_UNSPECIFIED = 0;
   CONSOLIDATE_REASON_RETAIN = 1;
+  // The expunge materialized a delete: observations whose segment named the
+  // victim need a root rebuild (decision N119).
   CONSOLIDATE_REASON_DELETE = 2;
   CONSOLIDATE_REASON_INVALIDATE = 3;
   CONSOLIDATE_REASON_MANUAL = 4;
@@ -467,18 +501,25 @@ enum ConsolidateReason {
 }
 
 // ConsolidateInput is the Consolidate workflow's own input (first start).
+// Consolidation is two-stage (decision N121): stage 1 routes batches of facts
+// against candidate observations (decisions only), stage 2 writes one new
+// version per touched observation.
 message ConsolidateInput {
+  // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
   WorkflowScope scope = 2;
   ResolvedModels models = 3;
-  // ≤ 100 facts per round, 8 per LLM call (decision D12).
+  // ≤ 100 facts per round, 8 per routing call (decision N121).
   int32 max_facts_per_round = 4;
   int32 facts_per_call = 5;
+  // `consolidate.max_rebuilds_per_round` (decision N66): root rebuilds started
+  // per round, so a large delete cannot starve ordinary consolidation.
+  int32 max_rebuilds_per_round = 6;
 }
 
-// ConsolidateBatchInput is one LLM call's worth of facts plus candidate
+// RouteBatchInput is stage 1: one routing call's worth of facts plus candidate
 // observations (top-10 by similarity).
-message ConsolidateBatchInput {
+message RouteBatchInput {
   WorkflowScope scope = 1;
   // sha256(sorted fact ids ‖ prompt_version ‖ model).
   string batch_key = 2;
@@ -489,73 +530,124 @@ message ConsolidateBatchInput {
   int32 bisect_level = 6;
 }
 
-// ObservationOpKind is the consolidation operation type.
-enum ObservationOpKind {
-  OBSERVATION_OP_KIND_UNSPECIFIED = 0;
-  OBSERVATION_OP_KIND_CREATE = 1;
-  OBSERVATION_OP_KIND_UPDATE = 2;
-  OBSERVATION_OP_KIND_DELETE = 3;
+// RoutingKind is one stage-1 decision type (decision N121).
+enum RoutingKind {
+  ROUTING_KIND_UNSPECIFIED = 0;
+  // Attach `fact_ids` to the existing observation `observation_id`.
+  ROUTING_KIND_ATTACH = 1;
+  // Create a new observation from `fact_ids`.
+  ROUTING_KIND_CREATE = 2;
+  // Merge `merged_observation_id` into `observation_id` (the survivor): stage
+  // 2 writes the survivor as a root rebuild from the union of live sources.
+  ROUTING_KIND_MERGE = 3;
+  // Remove `fact_ids` as sources of `observation_id`.
+  ROUTING_KIND_DROP_SOURCE = 4;
 }
 
-// ObservationOp is one consolidation edit, idempotent by op_key.
-message ObservationOp {
+// RoutingDecision is one stage-1 outcome. Nothing textual is persisted from
+// stage 1, so candidate text cannot flow into stored content.
+message RoutingDecision {
+  RoutingKind kind = 1;
+  repeated string fact_ids = 2;
+  // ATTACH target, MERGE survivor, DROP_SOURCE owner; empty for CREATE.
+  string observation_id = 3;
+  // MERGE only: the observation folded into the survivor.
+  string merged_observation_id = 4;
+}
+
+// RouteBatchResult is the stage-1 outcome of one batch.
+message RouteBatchResult {
+  string batch_key = 1;
+  repeated RoutingDecision decisions = 2;
+  TokenUsage usage = 3;
+  // True when the batch failed and was split.
+  bool bisected = 4;
+  // Facts that could not be routed even at bisect level 3.
+  repeated string failed_fact_ids = 5;
+}
+
+// ObservationWriteKind is the stage-2 write type.
+enum ObservationWriteKind {
+  OBSERVATION_WRITE_KIND_UNSPECIFIED = 0;
+  OBSERVATION_WRITE_KIND_CREATE = 1;
+  // Next version: previous text, live source quotes and the newly attached
+  // facts are shown; root_version is inherited.
+  OBSERVATION_WRITE_KIND_UPDATE = 2;
+  // Root rebuild (a MERGE survivor, or a rebuild after an expunge or an
+  // Invalidate): written from live visible sources only, no previous text
+  // shown; root_version = version.
+  OBSERVATION_WRITE_KIND_ROOT_REBUILD = 3;
+  // The observation lost its last visible source and is retired.
+  OBSERVATION_WRITE_KIND_RETIRE = 4;
+}
+
+// WriteObservationInput is stage 2: one call per touched observation.
+message WriteObservationInput {
+  WorkflowScope scope = 1;
+  string batch_key = 2;
+  // Empty for CREATE.
+  string observation_id = 3;
+  ObservationWriteKind kind = 4;
+  // Facts newly attached by stage 1 (UPDATE/CREATE).
+  repeated string attach_fact_ids = 5;
+  // Observations folded in by a MERGE (ROOT_REBUILD).
+  repeated string merged_observation_ids = 6;
+  ResolvedModels models = 7;
+}
+
+// ObservationWrite is one persisted stage-2 result, idempotent by op_key.
+message ObservationWrite {
   // sha256(batch_key ‖ op_index); recorded in consolidation_applied.
   string op_key = 1;
-  ObservationOpKind kind = 2;
+  ObservationWriteKind kind = 2;
   // Empty for CREATE.
   string observation_id = 3;
   string text = 4;
   repeated string source_fact_ids = 5;
   repeated string quotes = 6;
+  // The facts shown to the writer: these become observation_inputs(O, v)
+  // (decision N117), all of them O's own sources (only visible sources are
+  // rendered). A strict superset of source_fact_ids.
+  repeated string input_fact_ids = 7;
 }
 
-// ConsolidateBatchResult is the applied outcome of one batch.
-message ConsolidateBatchResult {
-  string batch_key = 1;
-  repeated ObservationOp ops = 2;
-  int32 ops_applied = 3;
-  int32 ops_skipped_already_applied = 4;
-  TokenUsage usage = 5;
-  // True when the batch failed and was split.
-  bool bisected = 6;
-  // Facts that could not be consolidated even at bisect level 3.
-  repeated string failed_fact_ids = 7;
+// WriteObservationResult returns the validated write.
+message WriteObservationResult {
+  ObservationWrite write = 1;
+  TokenUsage usage = 2;
 }
 
-// ObservationVersionRef names one observation version shown to a consolidation
-// prompt (a candidate_versions entry, decision N79).
-message ObservationVersionRef {
-  string observation_id = 1;
-  int64 version = 2;
-}
-
-// StoreProposalInput persists the validated, deduplicated op list write-once
-// (decision N43). `candidate_versions` is every candidate version whose text
-// was shown, including the observation's own previous version; ApplyBatch
-// records one observation_version_lineage edge per entry and re-verifies each
-// one (decision N79).
+// StoreProposalInput persists the validated stage-2 writes of a batch
+// write-once (decision N43), before apply.
 message StoreProposalInput {
   WorkflowScope scope = 1;
   // Hex sha256(sorted fact ids ‖ prompt_version ‖ model).
   string batch_key = 2;
-  repeated ObservationOp ops = 3;
-  // The rendered evidence: batch facts ∪ the quoted sources shown (≤ 5 per
-  // candidate, N47).
-  repeated string input_fact_ids = 4;
-  repeated ObservationVersionRef candidate_versions = 5;
   string prompt_version = 6;
   string model = 7;
+  repeated ObservationWrite writes = 8;
+
+  // Removed in the D22 redesign (decisions N117, N121, N128): lineage and the
+  // stage-1 candidate text are no longer recorded. `repeated ObservationOp ops
+  // = 3`, `repeated string input_fact_ids = 4` (now per write) and `repeated
+  // ObservationVersionRef candidate_versions = 5`.
+  reserved 3 to 5;
+  reserved "ops", "input_fact_ids", "candidate_versions";
 }
 
 // StoreProposalResult returns the list that won (the stored one).
 message StoreProposalResult {
-  // False when an earlier attempt had already stored a proposal: `ops` is
-  // then that attempt's list and this attempt's ops were discarded.
+  // False when an earlier attempt had already stored a proposal: `writes` is
+  // then that attempt's list and this attempt's writes were discarded.
   bool stored_new = 1;
-  repeated ObservationOp ops = 2;
+  repeated ObservationWrite writes = 3;
+
+  reserved 2;
+  reserved "ops";
 }
 
-// ApplyBatchInput applies the STORED proposal of a batch.
+// ApplyBatchInput applies the STORED proposal of a batch under the derivation
+// lock (decision N120): writers take the shared form, refused → retry.
 message ApplyBatchInput {
   WorkflowScope scope = 1;
   string batch_key = 2;
@@ -567,9 +659,10 @@ enum ApplyOutcome {
   APPLY_OUTCOME_APPLIED = 1;
   // Every op_key already existed: an earlier attempt committed.
   APPLY_OUTCOME_ALREADY = 2;
-  // Re-verification failed (N41, N79): a rendered input fact is not live, or
-  // a shown candidate version is derived_from_deleted, hidden_by_invalidation
-  // > 0 or retired. The proposal was deleted in its separate transaction.
+  // Re-verification failed (decision N116): an input fact is no longer
+  // visible under the read predicate, evaluated in a fresh statement (facts
+  // are immutable, no FOR SHARE). The proposal was deleted in its separate
+  // transaction.
   APPLY_OUTCOME_DISCARDED = 3;
   // The scope is at max_observations_per_scope.
   APPLY_OUTCOME_CAPACITY_EXCEEDED = 4;
@@ -579,16 +672,20 @@ enum ApplyOutcome {
 message ApplyBatchResult {
   ApplyOutcome outcome = 1;
   int32 ops_applied = 2;
-  // DISCARDED: input facts that are no longer live (the workflow drops them
-  // from the batch and re-queues it with a new batch_key).
+  // DISCARDED: input facts that are no longer visible (the workflow drops
+  // them from the batch and re-queues it with a new batch_key; a batch is
+  // re-queued at most 3 times before `failed`).
   repeated string missing_fact_ids = 3;
-  // DISCARDED: shown candidate versions that failed re-verification (the
-  // workflow re-runs FindCandidates, which never returns a flagged version).
-  repeated ObservationVersionRef flagged_candidate_versions = 4;
+
+  // Removed in the D22 redesign (decision N79 is withdrawn): `repeated
+  // ObservationVersionRef flagged_candidate_versions = 4`.
+  reserved 4;
+  reserved "flagged_candidate_versions";
 }
 
 // RefreshPageInput starts a page refresh workflow.
 message RefreshPageInput {
+  // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
   WorkflowScope scope = 2;
   string operation_id = 3;
@@ -604,6 +701,9 @@ message RefreshPageInput {
 enum RefreshReason {
   REFRESH_REASON_UNSPECIFIED = 0;
   REFRESH_REASON_WRITE = 1;
+  // Nudged by the expunge or an Invalidate: the current version was hidden or
+  // is stale_delete (decision N119); the refresh is always a delta edit from
+  // a visible base or a full rewrite when none is visible.
   REFRESH_REASON_DELETE = 2;
   REFRESH_REASON_SCHEDULE = 3;
   REFRESH_REASON_MANUAL = 4;

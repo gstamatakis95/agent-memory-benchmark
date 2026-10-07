@@ -34,7 +34,11 @@ CREATE TYPE namespace_state AS ENUM ('creating', 'active', 'moving', 'frozen', '
 -- 'restoring' (N64, review F-23): the shard is being restored from backup; the shard-side
 -- ownership rows are frozen with freeze_reason = 'restore' and surface as NamespaceFrozen.
 -- A client can therefore tell a restore from a move ('frozen').
-CREATE TYPE move_state      AS ENUM ('planned', 'copying', 'catching_up', 'frozen', 'cutover',
+-- move_state (D5, N124, N125): planned -> copying (dirty bulk copy, no snapshot) -> frozen -> reconciling
+-- (set difference under the freeze) -> cutover ((b') ready, (c) moved_out = point of no return,
+-- (b'') active, (d) catalog flip) -> cleaning -> done; rolled_back is reachable from every state
+-- before (c). There is no catch-up state: moves do not replay the outbox.
+CREATE TYPE move_state      AS ENUM ('planned', 'copying', 'frozen', 'reconciling', 'cutover',
                                      'cleaning', 'done', 'rolled_back');
 
 -- -----------------------------------------------------------------------------
@@ -91,6 +95,8 @@ CREATE TABLE shards (
   blob_cred_secret_ref  text NOT NULL,             -- secret holding the credential scoped to blob_prefix/*
   task_queue            text NOT NULL,             -- 'shard-{shard_id}' (Temporal)
   kafka_topic           text NOT NULL,             -- 'engram.events.shard-{shard_id}' (used only if Kafka is on)
+  system_identifier     bigint,                    -- N123: pg_control_system().system_identifier of the current primary; written on PROMOTION before the virtual endpoint flips
+  timeline_id           integer,                   -- N123: pg_control_checkpoint().timeline_id; the mover compares its session's value at Freeze and (c), the relay every 10 s
   dedicated_tenant_id   text REFERENCES tenants (tenant_id),   -- NULL = shared pool
   max_namespaces        integer NOT NULL DEFAULT 150 CHECK (max_namespaces > 0),
   soft_cap_facts        bigint  NOT NULL DEFAULT 10000000,
@@ -103,6 +109,7 @@ CREATE TABLE shards (
   created_at            timestamptz NOT NULL DEFAULT now(),
   updated_at            timestamptz NOT NULL DEFAULT now(),
   CHECK (soft_cap_facts <= hard_cap_facts),
+  CHECK ((system_identifier IS NULL) = (timeline_id IS NULL)),
   CHECK (blob_prefix = shard_id::text),
   CHECK (task_queue = 'shard-' || shard_id::text),
   CHECK (kafka_topic = 'engram.events.shard-' || shard_id::text)
@@ -117,8 +124,12 @@ CREATE TRIGGER shards_touch BEFORE UPDATE ON shards
 -- -----------------------------------------------------------------------------
 -- namespaces: the routing table. shard_id + epoch + state are what the resolver caches.
 -- profile: reflect mission/directives/disposition (namespace identity, NOT inherited).
--- large: mirror of the shard's namespace_stats.large (N55, review F-8) — the namespace has a
--- per-namespace partial HNSW index on its shard; a stats-only column, no cache invalidation.
+-- embedding_model / embedding_dims (N111): fixed at namespace creation and mirrored by the shard's
+-- namespace_models row; a change is the ReembedNamespace workflow (new vectors, new index, flip,
+-- expunge of the old), never a config flip.
+-- large: mirror of the shard's namespace_stats.large (N112) — the namespace has crossed 2,000
+-- vectors and owns per-namespace partial HNSW indexes on its shard; a stats-only column, no cache
+-- invalidation.
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespaces (
   namespace_id      uuid PRIMARY KEY,               -- UUIDv7 minted by engram-api
@@ -127,6 +138,8 @@ CREATE TABLE namespaces (
   shard_id          integer NOT NULL REFERENCES shards (shard_id),
   epoch             bigint NOT NULL DEFAULT 1 CHECK (epoch >= 1),
   state             namespace_state NOT NULL DEFAULT 'creating',   -- creating|active|moving|frozen|restoring|deleting|deleted
+  embedding_model   text NOT NULL DEFAULT 'nomic-embed-text-v1.5' CHECK (octet_length(embedding_model) BETWEEN 1 AND 128),
+  embedding_dims    integer NOT NULL DEFAULT 768 CHECK (embedding_dims BETWEEN 8 AND 4000),
   config            jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(config) = 'object'),
   profile           jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(profile) = 'object'),
   large             boolean NOT NULL DEFAULT false,
@@ -151,13 +164,14 @@ CREATE TRIGGER namespaces_touch BEFORE UPDATE ON namespaces
   FOR EACH ROW EXECUTE FUNCTION catalog_touch_updated_at();
 
 -- -----------------------------------------------------------------------------
--- namespace_moves: one row per move attempt (D5). At most one live move per namespace.
--- Cutover order (N98): (a) CutoverBegin records intent (cutover_at), not a point of no return;
--- (b) the target ownership row goes incoming -> active at epoch e + 1; (c) the source row goes
--- frozen -> moved_out carrying target_shard_id and target_epoch (moved_out_at, the point of no
--- return); (d) the catalog flip, retried indefinitely and idempotently. The API routes from the
--- moved_out row's WrongShardOrEpoch detail, so (d) is on no read path and a catalog failover
--- causes no read outage beyond the bounded re-resolve loop (N52).
+-- namespace_moves: one row per move attempt (D5, N124, N125). At most one live move per namespace.
+-- It is also the ARBITER of restore and failover (N123): a restored or promoted shard completes or
+-- aborts every open move that names it from this row. Cutover order: (b') the target row goes
+-- incoming -> ready (ready_at); (c) the source row goes frozen/move -> moved_out carrying
+-- target_shard_id / target_epoch (moved_out_at, the point of no return); (b'') the target row goes
+-- ready -> active (activated_at); (d) the catalog flip, retried indefinitely and idempotently. The
+-- API routes from the moved_out row's WrongShardOrEpoch detail, so (d) is on no read path.
+-- There is no outbox position here: the move never reads or replays the outbox (N124).
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespace_moves (
   move_id                uuid PRIMARY KEY,
@@ -168,20 +182,24 @@ CREATE TABLE namespace_moves (
   from_epoch             bigint NOT NULL CHECK (from_epoch >= 1),
   to_epoch               bigint NOT NULL,
   state                  move_state NOT NULL DEFAULT 'planned',
-  p0_seq                 bigint,                    -- source outbox high-water mark at the copy snapshot
-  applied_seq            bigint,                    -- last replayed source seq (mirror of target namespace_ownership.move_applied_seq)
-  lag_events             bigint,                    -- max(seq) - applied_seq at the last catch-up iteration
-  terminated_workflows   text[] NOT NULL DEFAULT '{}',  -- workflow ids terminated at drain, restarted at cutover (D5 step 5)
+  source_system_id       bigint,                    -- N123: recorded at Plan; every later source activity fails MoveFenced on mismatch
+  source_timeline_id     integer,
+  t_copy                 timestamptz,               -- N124: source now() when the dirty copy began; reconcile re-copies rows with created_at >= t_copy - 10 min
+  terminated_workflows   text[] NOT NULL DEFAULT '{}',  -- workflow ids terminated at drain, restarted on the target (N97)
   error                  text,
   created_by             text NOT NULL,             -- operator principal (engramctl) or 'rebalancer'
   created_at             timestamptz NOT NULL DEFAULT now(),
   updated_at             timestamptz NOT NULL DEFAULT now(),
   frozen_at              timestamptz,
-  cutover_at             timestamptz,               -- CutoverBegin recorded intent (a): NOT the point of no return (N98)
-  moved_out_at           timestamptz,               -- cutover (c) committed on the source: the point of no return (N98); the catalog flip (d) follows, retried indefinitely
+  ready_at               timestamptz,               -- (b') target incoming -> ready; rollback still possible (unready_target)
+  moved_out_at           timestamptz,               -- (c) committed on the source: the point of no return
+  activated_at           timestamptz,               -- (b'') target ready -> active
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
-  CHECK (to_epoch = from_epoch + 1)
+  CHECK (to_epoch = from_epoch + 1),
+  CHECK ((source_system_id IS NULL) = (source_timeline_id IS NULL)),
+  CHECK (state NOT IN ('reconciling', 'cutover', 'cleaning', 'done') OR frozen_at IS NOT NULL),
+  CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)
@@ -221,26 +239,6 @@ CREATE TABLE tenant_usage_daily (
   updated_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, day, quota_key)
 ) WITH (fillfactor = 70);
-
--- -----------------------------------------------------------------------------
--- deletion_log: replicated from every shard's deletion_log by the deletion-log outbox
--- consumer (section 9 ND-8) so a restore-from-backup re-applies deletes made after the
--- backup point. Idempotent on (namespace_id, kind, subject_id, deleted_at).
--- -----------------------------------------------------------------------------
-CREATE TABLE deletion_log (
-  namespace_id  uuid NOT NULL,
-  tenant_id     text NOT NULL,
-  shard_id      integer NOT NULL,
-  kind          text NOT NULL CHECK (kind IN ('document', 'memory', 'namespace', 'tenant')),
-  subject_id    text NOT NULL,
-  epoch         bigint NOT NULL,
-  deleted_at    timestamptz NOT NULL,
-  details       jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(details) = 'object'),   -- N79: mirrors the shard row, e.g. {"lineage_flagged": n, "lineage_frontier": m}
-  received_at   timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (namespace_id, kind, subject_id, deleted_at)
-);
-
-CREATE INDEX deletion_log_shard_idx ON deletion_log (shard_id, deleted_at);
 
 -- -----------------------------------------------------------------------------
 -- catalog_events: append-only change log + LISTEN/NOTIFY source (D4).
@@ -352,24 +350,30 @@ BEGIN
     RAISE EXCEPTION 'tenant % is not active', p_tenant_id USING ERRCODE = 'P0002';
   END IF;
 
-  SELECT shard_id INTO v_shard
-    FROM shards
-   WHERE state = 'active'
-     AND namespaces_count < max_namespaces
-     AND facts_estimate < soft_cap_facts
+  -- N131 (P-16): namespaces_count is DERIVED here from the namespaces table (a counter that is only
+  -- incremented drifts after deletes and moves); the stored column is refreshed from the same count.
+  SELECT s.shard_id INTO v_shard
+    FROM shards s
+   CROSS JOIN LATERAL (SELECT count(*)::integer AS n FROM namespaces x
+                        WHERE x.shard_id = s.shard_id AND x.state <> 'deleted') AS c
+   WHERE s.state = 'active'
+     AND c.n < s.max_namespaces
+     AND s.facts_estimate < s.soft_cap_facts
      AND CASE WHEN v_isolation = 'dedicated'
-              THEN dedicated_tenant_id = p_tenant_id
-              ELSE dedicated_tenant_id IS NULL END
-   ORDER BY facts_estimate::numeric / soft_cap_facts::numeric, namespaces_count, shard_id
+              THEN s.dedicated_tenant_id = p_tenant_id
+              ELSE s.dedicated_tenant_id IS NULL END
+   ORDER BY s.facts_estimate::numeric / s.soft_cap_facts::numeric, c.n, s.shard_id
    LIMIT 1
-   FOR UPDATE SKIP LOCKED;
+   FOR UPDATE OF s SKIP LOCKED;
 
   IF v_shard IS NULL THEN
     RAISE EXCEPTION 'no shard with capacity for tenant % (isolation=%)', p_tenant_id, v_isolation
       USING ERRCODE = '53400';   -- configuration_limit_exceeded -> RESOURCE_EXHAUSTED at the API
   END IF;
 
-  UPDATE shards SET namespaces_count = namespaces_count + 1 WHERE shard_id = v_shard;
+  UPDATE shards SET namespaces_count = (SELECT count(*) FROM namespaces x
+                                         WHERE x.shard_id = v_shard AND x.state <> 'deleted') + 1
+   WHERE shard_id = v_shard;
   RETURN v_shard;
 END $$;
 
@@ -377,7 +381,7 @@ END $$;
 --   SELECT pick_shard($tenant);
 --   INSERT INTO namespaces (namespace_id, tenant_id, name, shard_id, epoch, state) VALUES (..., 1, 'creating');
 -- then on the shard, as engram_app with the new namespace in scope:
---   INSERT namespace_ownership (ns, tenant, shard, 1, 'active') + namespace_stats
+--   INSERT namespace_ownership (ns, tenant, shard, 1, 'active') + namespace_stats + namespace_models
 --   (the shard's ownership trigger admits nothing but this active/epoch-1 insert from engram_app);
 -- then: UPDATE namespaces SET state = 'active' (which logs + NOTIFYs).
 -- A crash between the phases leaves a 'creating' row: the per-shard op-sweeper (N72) completes
@@ -394,7 +398,6 @@ GRANT INSERT, UPDATE ON namespaces TO catalog_app;
 GRANT INSERT ON catalog_events TO catalog_app;                 -- via triggers
 GRANT INSERT, UPDATE, DELETE ON idempotency_keys TO catalog_app;
 GRANT INSERT, UPDATE ON tenant_usage_daily TO catalog_app;
-GRANT INSERT ON deletion_log TO catalog_app;                   -- deletion-log consumer reports through the API
 GRANT UPDATE (namespaces_count, facts_estimate, bytes_estimate, stats_updated_at, updated_at)
   ON shards TO catalog_app;                                    -- pick_shard + stats reporter (namespaces.large is set by the same reporter)
 GRANT EXECUTE ON FUNCTION pick_shard(text) TO catalog_app;

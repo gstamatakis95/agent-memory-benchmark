@@ -9,7 +9,13 @@
 // incomplete.
 //
 // Pages are versioned like observations: GetPage with as_of returns the
-// latest version with effective_at ≤ T (decision D9).
+// latest version with effective_at ≤ T (decision D9). A page version is
+// visible iff no fact input in its evidence segment is tombstoned or hidden
+// and no observation-version input in its segment is hidden (decision N117);
+// depth is fixed at two (fact, observation, page) and pages never feed
+// observations. A page whose CURRENT version is hidden answers GetPage with
+// FAILED_PRECONDITION + PreconditionFailed{PAGE_HIDDEN} until the refresh
+// that the expunge always schedules lands.
 //
 // Before phase 3 the service is registered and every method returns
 // UNIMPLEMENTED.
@@ -32,7 +38,8 @@ service PageService {
   // refresh. `name` is unique per namespace (ALREADY_EXISTS otherwise).
   rpc CreatePage(CreatePageRequest) returns (CreatePageResponse);
   // GetPage returns a page and (optionally) its markdown at a version or as
-  // of a time.
+  // of a time. FAILED_PRECONDITION + PreconditionFailed{PAGE_HIDDEN} when the
+  // requested content version is hidden by a delete or invalidation.
   rpc GetPage(GetPageRequest) returns (GetPageResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -72,7 +79,11 @@ enum RefreshTrigger {
   REFRESH_TRIGGER_MANUAL = 3;
 }
 
-// RefreshPolicy controls automatic refreshes.
+// RefreshPolicy controls automatic refreshes. It is the only refresh policy
+// in the system (decision N128): the plan's pipelines and the generated Go
+// `Page` follow this message. There is no `on_delete` knob: the expunge
+// always refreshes the pages that a delete or invalidation touched, whatever
+// the trigger says.
 message RefreshPolicy {
   RefreshTrigger trigger = 1;
   // For SCHEDULED: 1 h .. 30 d.
@@ -115,7 +126,9 @@ message Page {
   int64 current_version = 8;
   // New evidence matching source_query arrived since current_version.
   bool stale_write = 9;
-  // Evidence cited by current_version was deleted or invalidated since.
+  // Evidence cited by current_version was deleted or invalidated since (the
+  // current version may be hidden by the read predicate, decision N117, until
+  // the refresh lands).
   bool stale_delete = 10;
   google.protobuf.Timestamp stale_since = 11;
   google.protobuf.Timestamp last_refreshed_at = 12;

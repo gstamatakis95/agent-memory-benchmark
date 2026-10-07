@@ -48,9 +48,19 @@ service NamespaceService {
   // (display_name, mission, directives, disposition, config_overrides).
   // Optimistic concurrency through `etag`.
   rpc UpdateNamespace(UpdateNamespaceRequest) returns (UpdateNamespaceResponse);
-  // DeleteNamespace moves the namespace to DELETING (reads and writes are
-  // rejected from then on) and returns the purge Operation (kind
-  // DELETE_NAMESPACE). Running operations of the namespace are cancelled.
+  // GetEffectiveConfig returns the resolved configuration of a namespace
+  // (system, tenant and namespace layers merged) and the namespace's own
+  // overrides, so a tenant can see which model a namespace will use
+  // (decision N129).
+  rpc GetEffectiveConfig(GetEffectiveConfigRequest) returns (GetEffectiveConfigResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // DeleteNamespace writes the delete intent object (decision N122), freezes
+  // the namespace on its shard (`freeze_delete`, reads and writes are
+  // rejected from then on) and acknowledges: the delete is effective at the
+  // ack. The returned Operation (kind DELETE_NAMESPACE) tracks the purge
+  // (DROP INDEX, batched DELETE, blob prefix; no graph repair). Running
+  // operations of the namespace are cancelled (CANCEL_REASON_NAMESPACE_DELETING).
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
 }
 
@@ -63,6 +73,21 @@ message Disposition {
   int32 literalism = 2;
   // 1 = neutral tone … 5 = strongly considers the user's feelings/goals.
   int32 empathy = 3;
+}
+
+// Directive is one standing instruction for Reflect (decision N129). A
+// directive with tags applies only when the Reflect request carries matching
+// tags (Hindsight-compatible).
+message Directive {
+  // The instruction, 1 byte to 1 KiB.
+  string text = 1;
+  // Higher first when the prompt budget forces a choice; 0-100, default 50.
+  int32 priority = 2;
+  // Unset = true.
+  optional bool active = 3;
+  // Applies only to Reflect calls whose tag_filter intersects these tags;
+  // empty = always.
+  repeated string tags = 4;
 }
 
 // NamespaceStats are approximate counters maintained on the shard.
@@ -96,13 +121,21 @@ message Namespace {
   // What the agent using this namespace is for; injected into Reflect
   // prompts. ≤ 4 KiB.
   string mission = 5;
-  // Standing instructions for Reflect, each ≤ 1 KiB, ≤ 32 entries.
-  repeated string directives = 6;
+  // Removed in v1.0.0-rc6 (decision N129): `repeated string directives = 6`,
+  // replaced by the typed `reflect_directives = 13`.
+  reserved 6;
+  reserved "directives";
   Disposition disposition = 7;
-  // Config overrides layered over tenant and system config (decision D12):
-  // keys `models.{extract,consolidate,reflect,embed,rerank}`,
-  // `chunk.target_chars`, `recall.default_budget`, `quota.*`. Unknown keys
-  // are rejected with INVALID_ARGUMENT.
+  // Config overrides layered over tenant and system config (decision D12).
+  // Keys: `models.{extract,consolidate,reflect,rerank}`, `chunk.target_chars`,
+  // `recall.default_budget`, `quota.*`, `prompts.*`, `retain.mission`,
+  // `consolidate.{mission,observation_scope,max_observations_per_scope,
+  // max_rebuilds_per_round}`, `reflect.keep_transcripts` (decision N66; this
+  // list and the server's allow-list are generated from one Go table and
+  // checked in CI). `models.embed` and the embedding dimension are fixed at
+  // namespace creation (decision N111): they may be set in CreateNamespace
+  // only; a later change is the ReembedNamespace workflow, never an override.
+  // Unknown keys are rejected with INVALID_ARGUMENT.
   google.protobuf.Struct config_overrides = 8;
   // Catalog state (see errors.proto NamespaceState).
   NamespaceState state = 9;
@@ -111,6 +144,8 @@ message Namespace {
   NamespaceStats stats = 11;
   // Opaque version for optimistic concurrency in UpdateNamespace.
   string etag = 12;
+  // Standing instructions for Reflect, ≤ 32 entries (decision N129).
+  repeated Directive reflect_directives = 13;
 
   reserved 100 to 199;
 }
@@ -120,7 +155,7 @@ message CreateNamespaceRequest {
   // Must equal the JWT tenant_id claim.
   string tenant_id = 1;
   RequestMeta meta = 2;
-  // Only name, display_name, mission, directives, disposition and
+  // Only name, display_name, mission, reflect_directives, disposition and
   // config_overrides are read; other fields must be unset.
   Namespace namespace = 3;
 
@@ -130,6 +165,24 @@ message CreateNamespaceRequest {
 // CreateNamespaceResponse returns the created namespace.
 message CreateNamespaceResponse {
   Namespace namespace = 1;
+
+  reserved 100 to 199;
+}
+
+// GetEffectiveConfigRequest asks for the resolved configuration.
+message GetEffectiveConfigRequest {
+  NamespaceRef namespace = 1;
+
+  reserved 100 to 199;
+}
+
+// GetEffectiveConfigResponse returns the merged and the raw configuration.
+message GetEffectiveConfigResponse {
+  // System, tenant and namespace layers merged; every allow-listed key is
+  // present.
+  google.protobuf.Struct effective = 1;
+  // Only the namespace's own overrides (Namespace.config_overrides).
+  google.protobuf.Struct namespace_overrides = 2;
 
   reserved 100 to 199;
 }
@@ -178,8 +231,8 @@ message UpdateNamespaceRequest {
   RequestMeta meta = 2;
   // Carries the new values for the paths in update_mask.
   Namespace patch = 3;
-  // Required, non-empty. Allowed paths: display_name, mission, directives,
-  // disposition, disposition.*, config_overrides. Any other path fails with
+  // Required, non-empty. Allowed paths: display_name, mission,
+  // reflect_directives, disposition, disposition.*, config_overrides. Any other path fails with
   // INVALID_ARGUMENT (OUTPUT_ONLY / UNKNOWN_FIELD_MASK_PATH).
   google.protobuf.FieldMask update_mask = 4;
   // When set, the update only applies if it equals the current etag
@@ -211,6 +264,11 @@ message DeleteNamespaceRequest {
 // DeleteNamespaceResponse returns the purge operation.
 message DeleteNamespaceResponse {
   Operation operation = 1;
+  // Commit time of the delete freeze: from here nothing of the namespace is
+  // readable.
+  google.protobuf.Timestamp deleted_at = 2;
+  // Stated bounds of the asynchronous purge.
+  ExpungeSla expunge_sla = 3;
 
   reserved 100 to 199;
 }

@@ -730,3 +730,42 @@ Rerank, pack and stream need only 98 ms, so the 150 ms reserve is 52 ms too cons
 - **Gateway behaviour**, rerank latency distributions and their tails (G-28) are assumptions inherited from A-2 and A-R1.
 - **Lean files** were not type-checked, and I did not review them beyond the RRF comment fix.
 - **Spec reading.** I read the TLA+ modules and every `.cfg`, but not every line of `ShardMove.tla`'s cutover and restart actions. Statements about it are limited to the replay, copy and freeze actions cited.
+
+---
+
+## Disposition
+
+Decisions are in `00-decision-register.md` D21 (N79 to N108). Counts: 21 accepted, 7 accepted with change, 1 work item (G-17), 1 rejected as a decision to keep (G-24, risk accepted).
+
+| Finding | Disposition | Register id | Note |
+|---|---|---|---|
+| G-1 | Accepted | N79 | Lineage table, bounded transitive flagging (depth 64, fail closed), apply re-verifies candidate versions, rebuild-from-sources with a rate limit; blast radius stated. |
+| G-2 | Accepted | N80 | Bytes ids, 256 ids per event, paging, `ids_elided` above 4,096 instead of a blob (no blob write inside a transaction); delete SLO restated. |
+| G-3 | Accepted with change | N81 | Design (a): total event-to-row table plus new events; small mutable tables (quotas, stats, batch_jobs, cursors) are re-copied after freeze instead of getting chatty events. |
+| G-4 | Accepted | N82 | Try-lock fence, `lock_timeout` role defaults, exports take no exclusive fence; behaviour to be confirmed by a PG 16 test. |
+| G-5 | Accepted with change | N83 | Per-document advisory lock; the ack keeps only the `documents` row lock so ack latency never waits on commits. |
+| G-6 | Accepted | N84 | Reversible `hidden_by_invalidation` counter, propagated along lineage. |
+| G-7 | Accepted with change | N85 | Versioned evidence table; chunk arm filtered by `embedding_effective_at` rather than keeping a second vector (storage). |
+| G-8 | Accepted with change | N86 | Max rule as recommended; clamp instead of reject; added a 24 h hard chunk boundary to bound relative-date error. |
+| G-9 | Accepted | N87 | Key includes `render_hash` of all prompt variables; Go-side relative dates recorded as a later optimisation. |
+| G-10 | Accepted with change | N88 | Chose resumable idempotent range copy with replica-mode load, one floor `p0`, `VerifyFK` and purge pause, rather than restart-all; W-9 models it. |
+| G-11 | Accepted with change | N89 | Short per-range snapshots (not logical replication); copy rate A-O17' to be measured; target partial HNSW built after copy. Shared indexes cannot be dropped (shared partitions). |
+| G-12 | Accepted | N90 | Pre-freeze deep verify, freeze verify on counts, PK hash and delta cohort; watchdog scales with namespace size. |
+| G-13 | Accepted | N92 | Failover restarts workflows like restore; `remote_apply` for delete-class transactions (option a); RPO for deletes is 0. |
+| G-14 | Accepted | N93 | `moved_out` rows kept; new `moved_out -> incoming` edge for moves back; SQL generated from §3.3.1. |
+| G-15 | Accepted | N94 | `observation_versions` hash-partitioned; `STORAGE MAIN`; partial HNSW only in the band 20 k to 2 % of partition; M0.6 measures all arms. |
+| G-16 | Accepted | N95 | `fact_consolidation` table plus watermark; `facts.consolidated_at` dropped. |
+| G-17 | Work item | N96 | W-6 to W-12; W-2 reworded to a semantic `deriv` plus `DocLifecycle_NoLineage.cfg`; gates must be run and logged. |
+| G-18 | Accepted | N97 | Reconcile from `operations` and `DescribeWorkflowExecution`; schedulers join `active` ownership. |
+| G-19 | Accepted | N98 | Target hint in `moved_out` row and error detail; point of no return at (c); watchdog armed until (c). |
+| G-20 | Accepted with change | N99 | Per-namespace data keys adopted now (not deferred); key destruction after rotation + 7 d + 7 d. |
+| G-21 | Accepted | N100 | `InputBlobMissing` retry and a 24 h `xcache` grace. |
+| G-22 | Accepted | N91 | Temp-table load under RLS, `BYPASSRLS` role removed; replica-mode needs the `ENABLE ALWAYS` ownership trigger. |
+| G-23 | Accepted | N101 | Explicit transition-by-role list and one negative test per forbidden edge. |
+| G-24 | Rejected (risk accepted, keep as is) | N102 | N67 stays; the relative-order channel is documented, remedy `isolation = dedicated`. |
+| G-25 | Accepted | N103 | Nine drifts resolved one by one; fold D20/D21 into D2, D3, D5, D15; generate §5.5 SQL and events table. |
+| G-26 | Accepted | N104 | Per-version body blob; ledger rows deleted only by explicit deletes (they hold deltas only). |
+| G-27 | Accepted | N105 | M0.7 at 3 to 4 ew split by owner, Phase 0'' of 3.5 ew, `RetainBackfill` out of committed scope. |
+| G-28 | Accepted | N106 | Reserve 106 ms; SLO assumes a 300 ms client deadline; skip rate as a p99 property of the pre-rerank path. |
+| G-29 | Accepted | N107 | Add `document_id` (and namespace) to the subquery. |
+| G-30 | Accepted | N108 | Leave `invalidated_at` unchanged. |

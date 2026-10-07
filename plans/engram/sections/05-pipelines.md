@@ -284,7 +284,7 @@ manifest_key, counters}` is workflow-local.
    resume_at, scope})` and `workflow.Sleep(until resume_at)`. Per chunk with hash `h` (the activity
    idempotency key is `K = (namespace_id, document_id, v, h)` throughout, D11: the epoch is a
    fence, never part of a key):
-   1. **`ExtractChunk`** (blob + gateway): key `{prefix}/xcache/{sha256(h ‖ prompt_version ‖ model
+   a. **`ExtractChunk`** (blob + gateway): key `{prefix}/xcache/{sha256(h ‖ prompt_version ‖ model
       ‖ schema_version ‖ render_hash)}.json` (N87). Hit → return the cache key. Miss →
       `quota.Reserve`, `ChatStructured(extract/v1)` with the chunk header prepended → validate (≤ 40
       facts, causal indices point to earlier facts, timestamps parse, `said_at ≤ item_timestamp + 5
@@ -293,24 +293,24 @@ manifest_key, counters}` is workflow-local.
       `PermanentLLMError` or validation failure after one repair attempt → a `chunk_failed{reason}`
       *result*; the workflow records it in `operations.error` and continues; the operation ends
       `SUCCEEDED` with `progress.units_failed > 0` (N35).
-   2. **`EmbedChunk`** (blob + gateway; **unary embedder, one text per call, concurrency bounded at
+   b. **`EmbedChunk`** (blob + gateway; **unary embedder, one text per call, concurrency bounded at
       the gateway**): `search_document: {fact.text}` for each fact (**no header**, N60) and
       `search_document: {header}\n{chunk text}` for the chunk, L2-normalised, `halfvec(768)`.
       Per-namespace embedding cache `{prefix}/ecache/{sha256(prefixed text ‖ model ‖ dims)}.f16`.
       Vectors go to the staging blob `{prefix}/staging/{sha256(K)}.f32`; the result carries the key
       plus `header_hash` and the model id.
-   3. **`ResolveEntities`** (read tx): per extracted entity: normalise (NFKC, trim), exact hit in
+   c. **`ResolveEntities`** (read tx): per extracted entity: normalise (NFKC, trim), exact hit in
       `entity_aliases`, else trigram lookup through the `SECURITY DEFINER` function (N131) at
       similarity ≥ 0.6 for a matching type (≥ 0.85 when a type is `unknown`), else plan a create;
       **type match is mandatory**; caller hints are force-resolved. The create-or-merge happens in
       `CommitChunk` as **one statement with rows in `canonical_norm` order** (N69). Entity
       resolution is not `as_of`-aware at write time; `as_of` reads suppress names (N118).
-   4. **`BuildLinks`** (read tx, then in memory), per new fact, ≤ 60 links: *temporal* ≤ 20 visible
+   d. **`BuildLinks`** (read tx, then in memory), per new fact, ≤ 60 links: *temporal* ≤ 20 visible
       facts within ±24 h; *semantic* k = 10 over `fact_vectors` of the namespace's current model
       (the per-namespace partial HNSW when it exists, an exact scan below 2,000 vectors, N112),
       cosine ≥ 0.75; *entity* ≤ 20; *causal* from the extraction. Links to invisible facts are never
       built. The result is returned by blob key.
-   5. **`CommitChunk`** (fenced write tx; **keys-only** input; a missing blob is the retryable
+   e. **`CommitChunk`** (fenced write tx; **keys-only** input; a missing blob is the retryable
       `InputBlobMissing`, N100 — the chunk sub-pipeline re-runs `ExtractChunk` and `EmbedChunk` at
       most twice, then `chunk_failed`). Statement order:
       1. fence prelude at the caller's epoch.
@@ -530,10 +530,11 @@ it would add a second durable store to the write path (D6).
 ### 5.2 Consolidation
 
 Consolidation is **two-stage** (D12, N121). Stage 1 *routes* a batch of 8 facts against candidate
-observations and returns decisions only (`attach`, `create`, `merge`, `drop_source`); nothing
-textual from stage 1 is persisted, so candidate text cannot flow into stored content. Stage 2
-*writes* one new version per touched observation from that observation's own previous text, its
-own visible source quotes and the newly attached facts. The evidence segment of a version
+observations and returns decisions only (`attach`, `create`, `skip`, `merge`, `drop_source`;
+prompt `consolidate_route/v1`); nothing textual from stage 1 is persisted, so candidate text cannot flow into stored content. Stage 2
+*writes* one new version per touched observation (prompt `consolidate_write/v1`) from that
+observation's own previous text, its own visible source quotes and the newly attached facts; a
+`merge` survivor is a root rebuild. The evidence segment of a version
 (`inputs(O, w)` for `root_version(v) ≤ w ≤ v`, N117) therefore contains only facts that are O's own
 sources, which keeps the set a delete can touch small and exact.
 
@@ -582,38 +583,48 @@ with no facts never starts one.
       namespace's current model: the per-namespace HNSW or an exact scan, N112); union, ranked by
       max cosine, top-10. Returns `{observation_id, current text, visible source ids, proof_count}`
       plus the scope's observation count against `max_observations_per_scope` (default 2,000).
-   2. **`RouteBatch`** — stage 1 (gateway, `consolidate/v1` routing, temperature 0,
+   2. **`RouteBatch`** — stage 1 (gateway, `consolidate_route/v1`, temperature 0,
       `models.consolidate`, `quota.Reserve` first): input = the batch facts (id, text,
-      mentioned_at, occurred window, tags) and the candidates' texts and quotes; output = decisions
-      only: `attach(fact → O)`, `create(O_new ← {facts})`, `merge(O_a ← O_b)`, `drop_source(O,
-      fact)`. **Validation:** every id was shown; every batch fact is assigned exactly once;
-      `attach`, `merge` and `drop_source` target shown candidates; a `merge` names two shown
-      candidates of the same scope. Violations reject the decision, not the batch; a response in
-      which every decision was rejected, or a schema failure, is a batch failure.
+      mentioned_at, occurred window, tags) and the candidates' texts with **at most 5 quoted
+      visible sources each**; output = **decisions only**, no text: `placements` (`attach` to a
+      shown candidate, `create` with a `new_group` number shared by the facts of one new facet, or
+      `skip` for a trivial, already-covered or transient fact), `merges` `(survivor, absorbed)` and
+      `drop_sources` `(observation, fact)`. **Validation (Go, §6.3.1):** every batch fact appears
+      exactly once; `attach` names a shown candidate; `create` carries a `new_group` and `attach`
+      does not; `merges` and `drop_sources` name shown candidates and shown sources; a candidate is
+      absorbed at most once and is never also a survivor; the touched set (attach targets ∪ new
+      groups ∪ survivors) has ≤ 16 members. A violating decision is rejected, not the batch; a
+      response in which every decision was rejected, or a schema failure, is a batch failure. A
+      `skip` stamps the fact `done` without an observation.
    3. **Bisect** (workflow logic): batch failure with `len > 1` → split at `len/2`, both halves
       pushed to the front of the group's queue (8 → 4 → 2 → 1); `len = 1` and still failing →
       **`StampFailed`** (write tx: `INSERT fact_consolidation(…, note = 'failed')`; stamps are
       inserts, never updates, N95). A fact whose latest stamp is `failed` and older than 7 days is
       pending again by the anti-join; a batch is re-queued at most 3 times before `failed`.
-   4. **`WriteObservation`** — stage 2 (gateway, `models.consolidate`, `quota.Reserve` first), one
-      call per touched observation, ≤ 4 in parallel per group: for `attach`/`drop_source` the
-      previous text, the observation's **visible** source quotes (≤ 5) and the newly attached
-      facts; for `create` the facts; for `merge` and for a stale rebuild a **root rebuild** of the
-      survivor from the union of the live visible sources, with no previous text shown. Only
-      visible sources are rendered (H-24), so a hidden fact can never re-enter through a prompt.
-      `input_fact_ids` = the facts shown, all of them O's own sources. **Validation:** every cited
-      `source_fact_id` ∈ the shown facts; a quote must be a substring (whitespace-normalised) of
-      the cited fact's text, else the quote is dropped; text ≤ 1,000 chars; an empty valid source
-      list rejects a `create`/`update`; a write whose text equals a shown observation's is dropped.
-   5. **`Dedup`** (blob + gateway + read tx): embed each written `create`/`update` text
-      (`search_document:`, ecache); kNN over visible current versions in the scope, excluding its
-      own target; a twin at cosine ≥ 0.97 → `dedup_adjudicate/v1` (§6.4). `merge` re-routes the
-      batch: the create's facts become an `attach` to the twin and stage 2 runs once more for the
-      twin, so the writer of the merged text has seen exactly those facts; the discarded write is
-      never stored. An LLM failure, a schema error or `keep` leaves the batch unchanged — never
-      merge silently; if two observations are each other's twins, the lexicographically smaller
-      `observation_id` survives.
-   6. **`StoreProposal`** (fenced write tx, N43): the validated writes are persisted **before**
+   4. **`WriteObservation`** (stage 2) **and `Dedup`.** *Write* (gateway, `consolidate_write/v1`,
+      `models.consolidate`, `quota.Reserve` first): one call per touched observation, ≤ 4 in
+      parallel per group, with `mode ∈ {update, create, rebuild}`. `update`: the previous text, the
+      observation's own **visible** sources (≤ 10 most recent quotes) and the facts newly attached.
+      `create`: the facts of the new group. `rebuild` — a **root rebuild**, **no previous text
+      shown**, visible sources only (≤ 30) — is used for a `merge` survivor (from the union of both
+      source sets), after a `drop_source`, for an observation whose evidence segment holds a
+      tombstoned or hidden input, and for a capacity rewrite. A rebuild with zero visible sources
+      is not sent to the model: Go retires the observation. Only visible sources are rendered
+      (N116), so a hidden fact can never re-enter through a prompt. The output is `write` (text ≤
+      1,000 chars, sources with verbatim quotes) or `retire`. `input_fact_ids` = the `attached`
+      facts ∪ the sources rendered, every one of them a source of this observation. **Validation
+      (Go):** cited ids ∈ the rendered set and ⊆ the observation's own sources ∪ attached; a quote
+      must be a substring (whitespace-normalised) of the cited fact; `write` has non-empty `text`
+      and `sources`; no id-like token in the text; a `retire` in mode `create` is rejected; a text
+      equal to a shown observation's is dropped. *Dedup* (blob + gateway + read tx): embed each
+      written `create`/`update` text (`search_document:`, ecache) and run kNN over the visible
+      current versions in the scope, excluding its own target; a twin at cosine ≥ 0.97 →
+      `dedup_adjudicate/v1` (§6.4), which returns **a decision only**, `merge` or `keep`, never
+      text. `merge`: the **older** observation survives and is **root-rebuilt by
+      `consolidate_write/v1` (mode `rebuild`) from the union of both source sets**; the discarded
+      write is never stored, a `create` is never made and the other observation is retired. An LLM
+      failure, a schema error or `keep` leaves the batch unchanged: never merge silently.
+   5. **`StoreProposal`** (fenced write tx, N43): the validated writes are persisted **before**
       anything is applied — `INSERT consolidation_proposals(namespace_id, batch_key, writes,
       prompt_version, model) ON CONFLICT (namespace_id, batch_key) DO NOTHING`, `batch_key =
       sha256(sorted fact ids ‖ prompt_version ‖ model)`, `writes` in `op_index` order with a
@@ -621,8 +632,8 @@ with no facts never starts one.
       an earlier attempt already stored a proposal; **the stored list wins** and this attempt's
       writes are discarded. `op_key = sha256(batch_key ‖ op_index)` is computed over the stored
       list, never over a live LLM answer (TLC `Consolidation_VolatileProposal`). The row is
-      immutable; the only delete is the discard path of step 7.
-   7. **`ApplyBatch`** (fenced **derivation** tx), statement order:
+      immutable; the only delete is the discard path of step 6.
+   6. **`ApplyBatch`** (fenced **derivation** tx), statement order:
       1. fence prelude, then `engram_try_derivation_lock(ns)` — the **shared** derivation lock
          (N120); refused → retryable. This is the only lock writers of derived versions share with
          `Expunge.Materialize`: a writer whose re-verification predates a delete marker holds it
@@ -673,7 +684,7 @@ with no facts never starts one.
          `COMMIT`.
       **Capacity**: if the scope's observation count would exceed `max_observations_per_scope`, the
       transaction is rolled back and the activity returns `capacity_exceeded`; the workflow re-runs
-      stage 1 once with the capacity note ("only attach, merge and drop_source are allowed"); a
+      stage 1 once with the capacity note ("do not use create; attach or merge instead"); a
       second overflow stamps the facts `note = 'capacity'` (no observation is created; the facts
       remain recallable).
 4. **Round end**: `MarkRound` (write tx: the `operations` row of kind `CONSOLIDATE` is marked
@@ -712,10 +723,10 @@ per touched observation, ≈ 3.5 calls per chunk overall (D3); ≤ 4 groups in p
 | `SelectRound` | activity | `(ns, round_no)` — re-selection returns the same facts until a `done` stamp exists | `P-db` | read fence | read tx | — |
 | `GroupBatches` | workflow (pure) | deterministic from selection | `P-pure` | — | none | — |
 | `FindCandidates` | activity | `batch_key` | `P-db` | read fence | read tx | — |
-| `RouteBatch` (stage 1) | activity | `batch_key` (not cached) | `P-llm` after `quota.Reserve`; failure → bisect | none | none | — |
+| `RouteBatch` (stage 1, `consolidate_route/v1`) | activity | `batch_key` (not cached) | `P-llm` after `quota.Reserve`; failure → bisect | none | none | — |
 | `StampFailed` | activity | `(ns, memory_id)` insert, `ON CONFLICT DO NOTHING` | `P-db` | shared try-lock, `active` @ epoch | write tx | — |
-| `WriteObservation` (stage 2) | activity | `batch_key` + observation | `P-llm` after `quota.Reserve` | none | none | — |
-| `Dedup` | activity | `batch_key` + write index | `P-embed`/`P-llm`; failure → `keep` | read fence | read tx | — |
+| `WriteObservation` (stage 2, `consolidate_write/v1`) | activity | `batch_key` + observation | `P-llm` after `quota.Reserve` | none | none | — |
+| `Dedup` (`dedup_adjudicate/v1`, decision only; `merge` → root rebuild of the older observation) | activity | `batch_key` + write index | `P-embed`/`P-llm`; failure → `keep` | read fence | read tx | — |
 | `StoreProposal` (N43) | activity | `batch_key` via `consolidation_proposals` (write-once; the stored list wins) | `P-frozen` | shared try-lock, `active` @ epoch | write tx | — |
 | `ApplyBatch` | activity | `op_key = sha256(batch_key ‖ op_index)` over the **stored** list, via `consolidation_applied`; keys and effects in one tx | `P-frozen`; `discarded` → re-queue | shared try-lock, `active` @ epoch + shared derivation lock (N120); inputs re-verified by the visibility predicate; `observation_sources` rewritten only here | derivation tx (+ a separate tx for the discard) | `ObservationUpserted`, `ObservationRetired`, `PagesMarkedStale` |
 | `MarkRound` | activity | `(ns, round_no)` | `P-db` | shared try-lock, `active` @ epoch | write tx | — |
@@ -755,7 +766,7 @@ stateDiagram-v2
 | Worker dies after `ApplyBatch` committed, before the activity result is recorded | Retry re-runs `ApplyBatch`; it reads the same stored proposal and every `op_key` conflicts → `already` | exactly-once effect (`Consolidation.tla`) |
 | Worker dies during an LLM call, or between the call and `StoreProposal` | Retry repeats the call (not cached); nothing was stored, so the new answer is the one stored and applied | at most one list per `batch_key` |
 | Worker dies between `StoreProposal` and `ApplyBatch` | `StoreProposal`'s `ON CONFLICT DO NOTHING` returns zero rows; the retried attempt's writes are discarded and `ApplyBatch` applies the stored list (N43) | the keys name a list that cannot change |
-| A fact is deleted or invalidated between `SelectRound` and `ApplyBatch` | The marker is already committed, so step 7.4's visibility predicate finds it invisible → the proposal is discarded and the batch re-queued without it. If the marker commits *after* the apply, the version is hidden by the read predicate and Materialize (which waited for the shared derivation lock the apply held) records it in `derived_hidden` | no observation is ever served that was written with a victim in view (`Derivation.tla` `NoDeletedDerivationServed`, `MaterializeComplete`) |
+| A fact is deleted or invalidated between `SelectRound` and `ApplyBatch` | The marker is already committed, so step 3.6.4's visibility predicate finds it invisible → the proposal is discarded and the batch re-queued without it. If the marker commits *after* the apply, the version is hidden by the read predicate and Materialize (which waited for the shared derivation lock the apply held) records it in `derived_hidden` | no observation is ever served that was written with a victim in view (`Derivation.tla` `NoDeletedDerivationServed`, `MaterializeComplete`) |
 | A candidate observation shown in stage 1 is hidden between `FindCandidates` and `ApplyBatch` | Stage 1 output is decisions only and no candidate text enters a stored version: an `attach` to a now-hidden target is skipped, and stage 2 only ever shows the target's own visible sources | no lineage exists to taint (N117) |
 | `update` of an observation whose source set is larger than the ≤ 5 quotes shown | Only sources the writer was shown and dropped are deleted; unshown sources stay | `proof_count` does not erode |
 | Model returns ids not shown | The decision or write is rejected in validation; if every one is rejected the batch bisects; a persistent single-fact failure is stamped `failed` | bounded LLM spend |

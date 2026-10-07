@@ -319,7 +319,7 @@ sequenceDiagram
     W->>G: SummarizeDocument on cache miss
   end
   loop per chunk, ≤ 32 in flight, results gt 4 KiB by blob key (N59)
-    W->>DB: chunk already a member or live by (ns, doc, content_hash)? → skip; tombstoned? → un-retire (delta retain, D8)
+    W->>DB: chunk already a member or live by (ns, doc, content_hash)? → skip, tombstoned? → un-retire (delta retain, D8)
     W->>B: xcache/{sha256(chunk_hash‖prompt‖model‖schema‖render_hash)}.json (N87)
     alt cache miss
       W->>G: ExtractChunk (structured JSON, prompt extract/v1, mentioned_at = item timestamp, D9)

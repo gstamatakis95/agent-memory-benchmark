@@ -299,13 +299,15 @@ NoLossNoDup ==
   mp \in {"tactive", "done", "early", "early_flipped"} =>
     /\ actSet = frozenSet /\ actMut = frozenMut
 
-\* Before (c) the source still holds every committed row (bar restore RPO loss), nothing routes to the
-\* target, and the target is not writable (so Rollback loses nothing).
+\* Before (c) the source is still the owner and holds every committed row (bar restore RPO loss),
+\* so Rollback loses nothing.
 RollbackPossibleBeforeC ==
   mp \in PreC =>
     /\ own[Src].st \in {"active", "frozen", "restoring", "replaying"}
-    /\ own[Tgt].st # "active"
     /\ (committed \ lost) \subseteq store[Src]
+
+\* `incoming` and `ready` accept nothing: the target is never writable before (c).
+NoWriteToTargetBeforeC == mp \in PreC => own[Tgt].st # "active"
 
 NoRouteToTargetBeforeC == cat.sh = Tgt => mp \in {"done", "tactive", "moved"}
 

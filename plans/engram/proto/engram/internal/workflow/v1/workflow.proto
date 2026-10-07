@@ -720,63 +720,217 @@ message RefreshPageResult {
   TokenUsage usage = 6;
 }
 
-// PurgeTarget selects what a purge removes.
-enum PurgeTarget {
-  PURGE_TARGET_UNSPECIFIED = 0;
-  // Everything of one document (explicit delete; grace 0).
-  PURGE_TARGET_DOCUMENT = 1;
-  // Everything of the namespace on this shard.
-  PURGE_TARGET_NAMESPACE = 2;
-  // Retired rows older than `grace` across the namespace (grace 1 h).
-  PURGE_TARGET_RETIRED_SWEEP = 3;
-  // Rows left on a move source after the 24 h grace.
-  PURGE_TARGET_MOVED_OUT = 4;
+// ExpungeTarget selects what an Expunge run removes (decision N119).
+enum ExpungeTarget {
+  EXPUNGE_TARGET_UNSPECIFIED = 0;
+  // Every pending document tombstone and `fact_hidden` marker of the
+  // namespace (or those named in ExpungeInput.document_ids).
+  EXPUNGE_TARGET_MARKERS = 1;
+  // The whole namespace on this shard after a DeleteNamespace ack: DROP INDEX,
+  // batched DELETE, blob prefix; no graph repair (decision N112).
+  EXPUNGE_TARGET_NAMESPACE = 2;
+  // Chunk tombstones (`replace`, `reextract`) older than the grace of 1 h:
+  // rows are purged and the tombstone deleted.
+  EXPUNGE_TARGET_CHUNK_TOMBSTONES = 3;
+  // Vectors of the previous embedding model after a ReembedNamespace flip.
+  EXPUNGE_TARGET_OLD_EMBEDDING_MODEL = 4;
 }
 
-// PurgeInput starts the PurgeWorkflow.
-message PurgeInput {
+// ExpungePhase is the four-phase shape of the workflow (decision N119).
+enum ExpungePhase {
+  EXPUNGE_PHASE_UNSPECIFIED = 0;
+  // Under the exclusive derivation lock: insert `derived_hidden`, mark
+  // observations and pages `stale_delete`, nudge root rebuilds and refreshes,
+  // set `expunge_state = 'materialized'`. SLA ≤ 15 min.
+  EXPUNGE_PHASE_MATERIALIZE = 1;
+  // Batches of 1,000 with 50 ms pauses: facts, vectors, links, mentions,
+  // evidence, chunks, versions, explicit-delete ledger rows, then blob
+  // tombstones. Starts only after every registered index/Kafka cursor passed
+  // the delete's `seq`. SLA ≤ 24 h.
+  EXPUNGE_PHASE_PURGE = 2;
+  // REINDEX INDEX CONCURRENTLY on touched partition indexes above 5 % dead
+  // fraction. SLA ≤ 48 h.
+  EXPUNGE_PHASE_INDEX = 3;
+  // `expunge_state = 'purged'`, tombstone dropped 24 h later, operation
+  // SUCCEEDED.
+  EXPUNGE_PHASE_FINISH = 4;
+}
+
+// ExpungeInput starts or signals the per-namespace Expunge workflow (id
+// `ns/{namespace_id}/expunge`, SignalWithStart, one at a time per namespace).
+// Every activity is fenced `active` at the epoch and skipped while a move is
+// open.
+message ExpungeInput {
+  // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
   WorkflowScope scope = 2;
+  // The DELETE_DOCUMENT / DELETE_NAMESPACE operation this run completes.
   string operation_id = 3;
-  PurgeTarget target = 4;
-  string document_id = 5;
-  // Versions to purge (empty = all versions of the document).
-  repeated int64 versions = 6;
-  google.protobuf.Duration grace = 7;
-  // Rows per delete batch (default 10 000).
-  int32 batch_size = 8;
-  // xcache/ecache/staging blobs are deleted only when no live chunk
+  ExpungeTarget target = 4;
+  // MARKERS only: restrict to these documents; empty = every pending marker.
+  repeated string document_ids = 5;
+  // Rows per delete batch (default 1,000).
+  int32 batch_size = 6;
+  // Pause between batches (default 50 ms).
+  google.protobuf.Duration batch_pause = 7;
+  // xcache/ecache/staging blobs are deleted only when no visible chunk
   // references the hash AND the blob is older than this (default 24 h, longer
   // than the maximum in-flight activity age; decision N100).
-  google.protobuf.Duration xcache_grace = 9;
+  google.protobuf.Duration xcache_grace = 8;
+  // OLD_EMBEDDING_MODEL only.
+  string old_embedding_model = 9;
 }
 
-// PurgeResult reports counts.
-message PurgeResult {
+// MaterializeInput is the Materialize activity input.
+message MaterializeInput {
+  WorkflowScope scope = 1;
+  // Pending tombstones to materialize (empty = all pending).
+  repeated string document_ids = 2;
+  // Invalidated facts to materialize (an Invalidate nudges a rebuild too).
+  repeated string fact_ids = 3;
+}
+
+// MaterializeResult counts what Materialize hid and nudged.
+message MaterializeResult {
+  int32 tombstones_materialized = 1;
+  int32 observations_hidden = 2;
+  int32 pages_hidden = 3;
+  int32 rebuilds_nudged = 4;
+  int32 refreshes_nudged = 5;
+  int64 outbox_seq = 6;
+}
+
+// PurgeBatchInput is one purge activity: delete up to batch_size rows of one
+// table for one victim.
+message PurgeBatchInput {
+  WorkflowScope scope = 1;
+  string table = 2;
+  // Victim document; empty for NAMESPACE and CHUNK_TOMBSTONES runs.
+  string document_id = 3;
+  // Resume key of the previous batch (empty before the first).
+  bytes last_key = 4;
+  int32 batch_size = 5;
+  // Lowest outbox cursor among the registered index/Kafka consumers; the
+  // purge refuses to start while it is below the delete's `seq`.
+  int64 min_consumer_cursor = 6;
+}
+
+// PurgeBatchResult reports one batch.
+message PurgeBatchResult {
+  int64 rows_deleted = 1;
+  bytes last_key = 2;
+  bool table_done = 3;
+  int64 blobs_tombstoned = 4;
+}
+
+// ExpungeResult reports the whole run.
+message ExpungeResult {
   int64 rows_purged = 1;
   int64 blobs_purged = 2;
   int32 batches = 3;
+  int32 observations_hidden = 4;
+  int32 pages_hidden = 5;
+  int32 indexes_rebuilt = 6;
+  // Time from the tombstone to the end of Materialize / Purge / Index, for the
+  // SLA metrics.
+  google.protobuf.Duration materialized_after = 7;
+  google.protobuf.Duration purged_after = 8;
+  google.protobuf.Duration indexed_after = 9;
 }
 
-// ExportInput starts a snapshot workflow.
+// TenantDeleteInput starts the TenantDelete workflow on the cell-wide
+// `control` task queue (register N36). The intent object was written and
+// every namespace frozen (`freeze_delete`) before the ack.
+message TenantDeleteInput {
+  uint32 schema_version = 1;
+  string tenant_id = 2;
+  string operation_id = 3;
+  // `_control/deletes/{tenant}/…` key of the intent object (decision N122).
+  string intent_object_key = 4;
+  // Namespaces to expunge, with their shard and epoch at freeze time.
+  repeated NamespaceTarget namespaces = 5;
+}
+
+// NamespaceTarget addresses one namespace on one shard at one epoch.
+message NamespaceTarget {
+  string namespace_id = 1;
+  int32 shard_id = 2;
+  int64 epoch = 3;
+  string operation_id = 4;
+}
+
+// RetainBackfillInput starts the RetainBackfill workflow (register N31, a
+// launch prerequisite in the committed scope, decision N130): it pre-warms the
+// extraction cache through the gateway batch API (`batch_jobs`) and then runs
+// ordinary RetainDocument children.
+message RetainBackfillInput {
+  uint32 schema_version = 1;
+  WorkflowScope scope = 2;
+  string operation_id = 3;
+  // ingest_ledger row ids of the documents to backfill.
+  repeated string ledger_ids = 4;
+  ResolvedModels models = 5;
+  // Children started in parallel.
+  int32 max_children = 6;
+}
+
+// ReembedNamespaceInput starts the ReembedNamespace workflow (decision N111):
+// insert new vectors, build the new index, flip the namespace's current model,
+// expunge the old.
+message ReembedNamespaceInput {
+  uint32 schema_version = 1;
+  WorkflowScope scope = 2;
+  string operation_id = 3;
+  string from_model = 4;
+  string to_model = 5;
+}
+
+// SweeperKind names a per-shard Temporal schedule (register N3, N28).
+enum SweeperKind {
+  SWEEPER_KIND_UNSPECIFIED = 0;
+  // `shard/{id}/op-sweeper`: starts workflows for PENDING operations older
+  // than 2 min that have none; completes or deletes `creating` namespaces.
+  SWEEPER_KIND_OP = 1;
+  SWEEPER_KIND_CONSOLIDATE = 2;
+  SWEEPER_KIND_PAGE_CRON = 3;
+  // Starts Expunge for namespaces with pending markers or old chunk
+  // tombstones.
+  SWEEPER_KIND_EXPUNGE = 4;
+  SWEEPER_KIND_OUTBOX_TRIM = 5;
+  // Creates and drops per-namespace partial HNSW indexes (decision N112).
+  SWEEPER_KIND_INDEX = 6;
+  // Trims delete intents older than 35 days.
+  SWEEPER_KIND_INTENT_TRIM = 7;
+}
+
+// SweeperInput is the payload of a sweeper schedule. Writes to `operations`
+// and the outbox go through `WithNamespaceTx(write)` (decision N131).
+message SweeperInput {
+  uint32 schema_version = 1;
+  int32 shard_id = 2;
+  SweeperKind kind = 3;
+}
+
+// ExportInput starts a snapshot workflow. BeginSnapshot inserted the
+// `export_snapshots` row as `building`; WriteFiles uses one REPEATABLE READ
+// snapshot; RecordSnapshot refuses to promote an expired row (decision N126).
 message ExportInput {
+  // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
   WorkflowScope scope = 2;
   string operation_id = 3;
   int64 version = 4;
-  // Previous version for the delta file (0 = none).
+  // Previous version for the delta file (0 = none). The delta is a diff of
+  // the two snapshots, emitted even when the base expired.
   int64 base_version = 5;
   bool include_chunks = 6;
   bool include_pages = 7;
-  // Outbox positions bounding the delta.
-  int64 base_outbox_seq = 8;
-  int64 outbox_seq = 9;
-  // Outbox seqs below base_outbox_seq that were not visible in the base
-  // snapshot (writers in flight when it was taken). The delta reads
-  // `seq > base_outbox_seq OR seq = ANY(base_open_gaps)`: exports take no
-  // exclusive fence (decision N82), so the cut is a strict prefix plus
-  // explicit gaps resolved with the N50 anti-join.
-  repeated int64 base_open_gaps = 10;
+
+  // Removed in the D22 redesign (decision N126): the outbox cut `int64
+  // base_outbox_seq = 8`, `int64 outbox_seq = 9` and `repeated int64
+  // base_open_gaps = 10`.
+  reserved 8 to 10;
+  reserved "base_outbox_seq", "outbox_seq", "base_open_gaps";
 }
 
 // ExportResult reports the written files.
@@ -785,13 +939,18 @@ message ExportResult {
   string manifest_blob_key = 2;
   int64 total_bytes = 3;
   bool delta_written = 4;
+  // Ids deleted since the base snapshot (also in the manifest).
+  int64 deleted_id_count = 5;
 }
 
 // MoveInput starts the move executor workflow (`move/{namespace_id}/{epoch}`)
 // on the TARGET shard's task queue (`shard-{target_shard_id}`, register N2).
 // The executing worker opens a second, move-scoped pool to the source shard
 // (role `engram_move`); it is the only code path that holds two shard handles.
+// Protocol: plan, dirty copy, freeze, reconcile by set difference, drain,
+// cutover with a `ready` state, restart, cleanup (decisions N124, N125).
 message MoveInput {
+  // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
   string move_id = 2;
   string namespace_id = 3;
@@ -804,16 +963,15 @@ message MoveInput {
   string target_blob_prefix = 10;
   bool pause_before_freeze = 11;
   // Freeze watchdog: max(120 s, 60 s + 1 s per 10,000 live facts), capped at
-  // 15 min, computed by Plan from the stats row (decision N90). Armed until
-  // cutover sub-step (c) commits (N98).
+  // 15 min, computed by Plan from the stats row. Armed until cutover
+  // sub-step (c) commits.
   google.protobuf.Duration freeze_watchdog = 12;
 }
 
-// CopyProgress is the Copy activity's heartbeat and resume payload (decision
-// N88): each table is copied in key ranges (≤ 100,000 rows or ≤ 60 s), each
-// range under its own short REPEATABLE READ snapshot (N89); ranges are
-// idempotent, so a crashed Copy resumes at the first range without a
-// completion mark.
+// CopyProgress is the BulkCopy activity's heartbeat and resume payload
+// (decision N124): each table is copied in key ranges of ≤ 100,000 rows,
+// READ COMMITTED, ordered by primary key, no snapshot and no barrier; ranges
+// are idempotent, so a crashed copy resumes at `(table, last_key)`.
 message CopyProgress {
   string table = 1;
   // Primary-key value of the last row of the last completed range, in the
@@ -826,17 +984,44 @@ message CopyProgress {
   string blob_token = 5;
 }
 
+// CutoverStep names the cutover sub-step last committed (decision N125).
+enum CutoverStep {
+  CUTOVER_STEP_UNSPECIFIED = 0;
+  // (b′) target `incoming → ready`; rollback still possible.
+  CUTOVER_STEP_READY_TARGET = 1;
+  // (c) source `frozen/move → moved_out`: the point of no return.
+  CUTOVER_STEP_MOVED_OUT_SOURCE = 2;
+  // (b″) target `ready → active`.
+  CUTOVER_STEP_ACTIVE_TARGET = 3;
+  // (d) catalog flip.
+  CUTOVER_STEP_CATALOG_FLIP = 4;
+}
+
+// ReconcileReport is the Reconcile activity's result (decision N124). Any
+// residual mismatch ends in Rollback.
+message ReconcileReport {
+  // Immutable rows re-copied: `created_at ≥ T_copy − 10 min`.
+  int64 rows_recopied = 1;
+  // Mutable-table rows upserted, and target rows absent on the source deleted.
+  int64 mutable_rows_upserted = 2;
+  int64 mutable_rows_deleted = 3;
+  // Referenced blobs missing on the target that were copied; the cutover is
+  // refused while any is still missing.
+  int64 blobs_copied = 4;
+  int64 blobs_still_missing = 5;
+  // Tables whose count(*) or bit_xor(hashtextextended(pk::text, 0)) differ
+  // after the re-copy (empty = match).
+  repeated string mismatched_tables = 6;
+  // True once every source consumer cursor passed the namespace's final
+  // max(seq) (≤ 60 s, else rollback).
+  bool consumers_drained = 7;
+  bool verify_fk_ok = 8;
+}
+
 // MoveCheckpoint is persisted after every step so the executor is
 // restartable (decision D5 states).
 message MoveCheckpoint {
   string state = 1;
-  // p0: max(outbox.seq) read inside the copy snapshot taken behind the barrier,
-  // recorded once before the first range and the single replay floor for the
-  // whole move (decision N88). Replay is the anti-join
-  // `seq > p0 AND NOT EXISTS (move_applied)` (decision N50); applied_seq is
-  // informational, never a read cursor.
-  int64 copy_start_seq = 2;
-  int64 applied_seq = 3;
   repeated string tables_done = 4;
   repeated string terminated_operation_ids = 5;
   google.protobuf.Timestamp frozen_at = 6;
@@ -846,19 +1031,34 @@ message MoveCheckpoint {
   // queue with a memo `epoch = e + 1` and WorkflowIDReusePolicy
   // TERMINATE_IF_RUNNING.
   repeated string drained_workflow_ids = 7;
-  // Watermark W of the pre-freeze deep verify: the stable cohort is
-  // created_at < W (decision N90).
-  google.protobuf.Timestamp verify_watermark = 8;
-  // Cutover sub-step last committed: "", "a", "b", "c" or "d". The point of
-  // no return is (c) (decision N98).
-  string cutover_step = 9;
+  // T_copy: `now()` on the source when the dirty copy began.
+  google.protobuf.Timestamp copy_started_at = 10;
+  // Source `pg_control_system().system_identifier` and
+  // `pg_control_checkpoint().timeline_id`, recorded by Plan; every later
+  // activity on the source re-reads them and fails MoveFenced on mismatch
+  // (decision N123).
+  uint64 source_system_identifier = 11;
+  int32 source_timeline_id = 12;
+  CutoverStep cutover_step = 13;
+  ReconcileReport reconcile = 14;
+
+  // Removed in the D22 redesign (decision N124): the replay floor
+  // `int64 copy_start_seq = 2` (p0), `int64 applied_seq = 3`, the pre-freeze
+  // verify watermark `Timestamp verify_watermark = 8` and the string
+  // `cutover_step = 9` ("a" to "d"; replaced by the enum in 13).
+  reserved 2, 3, 8, 9;
+  reserved "copy_start_seq", "applied_seq", "verify_watermark";
 }
 
 // MoveResult is the terminal outcome.
 message MoveResult {
   string final_state = 1;
   int64 rows_copied = 2;
-  int64 events_replayed = 3;
   repeated string restarted_operation_ids = 4;
   string error = 5;
+  int64 rows_recopied = 6;
+
+  // Removed in the D22 redesign (decision N124): `int64 events_replayed = 3`.
+  reserved 3;
+  reserved "events_replayed";
 }

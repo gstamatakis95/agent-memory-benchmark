@@ -36,9 +36,18 @@ items contradict a register decision.
 | NG28 | Caching recall results (a "semantic cache" keyed by query) | not ever | Recall is ≈ 216 ms on the critical path (N54) and its inputs change per chunk commit (D16); a result cache would reintroduce the staleness the read barrier removes. |
 | NG29 | Streaming ingestion of live transcripts (token-by-token `Retain`) | not now | Items are whole documents or appends (D8 `APPEND`); a streaming front end would buffer into those. |
 | NG30 | Guaranteed ordering or visibility across namespaces or shards | not ever | D16: no relationship whatsoever; anything that needs it must live in one namespace. |
-| NG31 | Backing up blob objects | not ever | The blob store is durable by contract (A-O12); tombstones make deletes durable (§9.3). |
+| NG31 | Backing up blob objects | not ever | The blob store is durable by contract (A-O12); delete intents (N122) and the expunge's blob tombstones make deletes durable (§9.3). |
 | NG32 | Running `engram-api` and `engram-worker` in one process for small deployments | not ever | D1 keeps them separate images; a single-shard dev cell is still two containers. |
 | NG33 | Per-namespace lexical statistics (BM25 IDF per namespace) to close the term-rarity channel of the partition-shared index | not scheduled (N102; R33) | per-query normalised scores (N67) leave a weak oracle on partition-wide term rarity; the remedy today is `isolation = dedicated`, and a per-namespace IDF would forfeit pg_search's Top-K pushdown. |
+| NG34 | Synchronous replication (`synchronous_commit = on`, `remote_apply`, a synchronous standby) | not ever | Every role runs `synchronous_commit = local` (N122): a standby outage must not hang commits or break the relay's gap horizon. Acknowledged deletes reach RPO 0 through intent objects in blob storage, retains accept RPO ≤ 60 s. |
+| NG35 | A synchronous physical delete, or a bounded-latency guarantee for recall while a delete is expunged | not ever | A delete is an O(1) soft marker honoured at ack; rows, vectors and blobs go asynchronously (materialize ≤ 15 min, purge ≤ 24 h, index ≤ 48 h, N119). Deletes are rare, and the namespace's SLOs (rerank-skip, recall latency) may degrade while markers are pending. |
+| NG36 | Memory history and in-place edit of a fact (Hindsight's memory history/edit) | not now | Facts are immutable (N113); correction is `Invalidate` plus a new retain. A history API would need a version table with the N116 predicate. |
+| NG37 | Bank import/clone | not now | A clone is a move whose source stays live; it would need the N124 reconcile without the freeze. Export plus a fresh retain covers it. |
+| NG38 | `retry_operation` (re-run a failed operation by id) | not now | Clients resubmit with the same `operation_id`; the workflow id makes that idempotent (N127). |
+| NG39 | Entity-level results (returning entities as recall hits) and the document body in recall results | not now | Entities are `EntityRef`s on facts (N118); recall returns facts, observations and chunks. The ledger body is fetched by `GetDocument` only. |
+| NG40 | `ListObservationVersions` (observation history) | not now | It needs the N117 evidence-segment predicate on a new read path; version history is internal until a product need names it. |
+| NG41 | A unary `Recall` alias next to the streaming RPC | not ever | A second contract test matrix for no capability; the stream carries the stats trailer and future progressive arms (N129). |
+| NG42 | Re-enqueueing facts for re-enrichment with a bulk `UPDATE` | not ever | Content rows are insert-only (N113). A prompt or model bump changes the cache and extraction keys; re-extraction goes through the ordinary retain path (§6.0). |
 
 **Reopening a non-goal.** A "not now" row is reopened by a register row in D18 naming the
 phase and the owning engineer, plus a §11.1 risk row for what it adds to the critical path;

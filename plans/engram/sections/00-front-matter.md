@@ -1,6 +1,6 @@
 # Engram: implementation plan for a Go + Postgres agent-memory service
 
-**Status:** design plan, v1.2 (2026-10-07, after two adversarial reviews — `reviews/round-1.md` / register D20 and `reviews/round-2.md` / register D21). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
+**Status:** design plan, v1.3 (2026-10-07, after three adversarial reviews: `reviews/round-1.md` / register D20, `reviews/round-2.md` / D21, `reviews/round-3.md` / D22). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
 **Scope:** everything needed to build, verify and operate a Hindsight-class long-term memory service in Go,
 exposed as gRPC (`memory.v1`), with PostgreSQL 16 as the per-shard system of record, Temporal for
 asynchronous work, an AI gateway for every model call and blob storage for large or immutable data.
@@ -8,22 +8,21 @@ asynchronous work, an AI gateway for every model call and blob storage for large
 This document is standalone. It shares a repository with an unrelated benchmark project and does not
 change that project's constraints.
 
-**Second review (2026-10-07).** A second adversarial review (`reviews/round-2.md`, findings G-1 to G-30)
-tested the plan as amended by the first. Register block D21 (N79 to N108) is binding and has been
-applied to every section: transitive observation hiding through version lineage (N79), bounded
-paged outbox events (N80), a total event-driven replay mapping for moves (N81), a try-lock
-namespace fence that never holds a pooled connection (N82, N83), reversible per-version
-invalidation (N84), versioned evidence and time-safe chunks under `as_of` (N85, N86), a render-aware
-extraction cache key (N87), restartable range-snapshot copy without a `BYPASSRLS` loader
-(N88 to N91), RPO 0 for acknowledged deletes through a synchronous standby (N92), permanent
-`moved_out` fence values (N93) and a cutover whose point of no return is step (c) (N98). **The TLA+
-specifications lag the design:** no D20 or D21 mechanism is in any `.tla` file, the `ShardMove`
-PASS checks the pre-D20 protocol, and the gate configurations are unrun; the model-checked set
-today is the outbox, consolidation exactly-once at 3 facts, `as_of` without deletes and the move
-protocol as it was before D20/D21, until work items W-1 to W-12 land (§7.6; W-6 to W-12 are
-preconditions of M1.5 and M2.1). The schedule absorbed the review: Phase 0 grows to ≈ 15 ew with a
-3.5-ew Phase 0″, `RetainBackfill` leaves the committed scope, and the committed total is ≈ 77 ew
-with about 1 ew of slack (§10).
+**Third review (2026-10-07) and the redesign.** Rounds 1 and 2 were patched; round 3 found the same
+areas regressing twice (storage updates, delete visibility, delete durability, shard moves), so it
+produced a redesign (`reviews/round-3.md`, advice R1 to R5; register D22, N111 to N132) applied to
+every section. One principle and one product guidance drive it: **rows that carry vectors or BM25 text
+are immutable, mutable state lives in narrow side tables, and visibility is a read-time predicate over
+small marker sets; deletes are rare, so a delete is an O(1) soft marker honoured by every read path at
+ack and all physical work is an asynchronous, throttled expunge during which SLOs may degrade.** The
+lineage walk, the synchronous delete cascade, the outbox-replay move, `remote_apply` and the shared HNSW
+are gone. **The TLA+ specifications lag the design:** `Storage`, `Derivation`, `Durability` and a
+rewritten `ShardMove` are specified in the review but not yet written, and the checked set is the one §7.1
+lists (the outbox, consolidation exactly-once at 3 facts, `as_of` without deletes, and the pre-D20 move
+protocol); the Phase 0 spec work closes the gap (§7.6, M0.7). The schedule absorbed the redesign: the
+move simplification pays for the expunge and the delete-intent log, and `RetainBackfill` returned to the
+committed scope, so the committed total is **≈ 80 ew against 78 ew of capacity** (a two-engineer-week
+overrun, stated in §10).
 
 ## How to read this plan
 
@@ -45,54 +44,67 @@ with about 1 ew of slack (§10).
 ## Executive summary
 
 - **Tenancy is physical.** A namespace lives on exactly one shard, and a shard is a dedicated PostgreSQL
-  instance with its own pgbouncer, blob prefix, Temporal task queue and metrics label. Nothing spans shards.
-  Inside a shard, `namespace_id` leads every key and every index, row-level security is on for every
-  namespace-scoped table, and every write transaction tries a **shared advisory lock** on the namespace
-  (`pg_try_advisory_xact_lock_shared`: a refusal is a retryable `NamespaceFrozen`, so a writer never
-  holds a pooled connection while a freeze waits, N82) and reads the ownership row at the caller's epoch
-  (the row is the fence *value*, the advisory lock the fence *lock*). That row is the
-  fencing token that makes shard moves safe even when the catalog cache is stale.
+  instance (128 GB RAM, 4 per 512 GB host) with its own pgbouncer, blob prefix, Temporal task queue and
+  metrics label. Nothing spans shards. Inside a shard, `namespace_id` leads every key and every index,
+  row-level security is on for every namespace-scoped table, and every write transaction tries a
+  **shared advisory lock** on the namespace (a refusal is a retryable `NamespaceFrozen`) and reads the
+  ownership row at the caller's epoch. That row is the fencing token that makes shard moves safe even when
+  the catalog cache is stale.
+- **Content is immutable; state is narrow.** Facts, chunks, observation and page versions, links, mentions
+  and evidence rows are insert-only and purge-only (`fillfactor 100`, no `UPDATE`, no `live` or
+  `retired_at` column). Vectors live in insert-only side tables keyed by embedding model, and the
+  semantic arm uses an exact scan below 2,000 vectors and **one small partial HNSW per namespace and
+  partition** above, so a query visits only its own graph and a namespace delete or move cleanup is a
+  `DROP INDEX` plus batched `DELETE` with no graph repair. Mutable state (`documents`, `observations`,
+  `pages`, version meta, markers) sits in narrow HOT tables.
 - **Routing is by catalog.** Clients send `tenant_id` + `namespace_id` and a JWT; one interceptor verifies
-  the token, resolves the namespace through a cached catalog (LISTEN/NOTIFY invalidation; existing
-  namespaces are served from cache for as long as a catalog outage lasts, because the shard-side fence,
-  not the cache, decides writability; catalog failover is automatic), checks ownership, and binds the
-  request to a shard.
+  the token, resolves the namespace through a cached catalog (existing namespaces are served from cache for
+  as long as a catalog outage lasts, because the shard-side fence, not the cache, decides writability),
+  checks ownership, and binds the request to a shard.
 - **Retain is asynchronous and cheap to repeat.** Chunks are content-addressed, extraction results are cached
-  in blob storage per (chunk hash, prompt version, model), and unchanged chunks cost nothing. Every activity is
-  idempotent; commits are per chunk; visibility is per chunk; `WaitOperation` is the read barrier.
+  in blob storage per (chunk hash, prompt version, model, render), and unchanged chunks cost nothing. Every
+  activity is idempotent; commits are per chunk; visibility is per chunk; `WaitOperation` is the read barrier.
 - **Recall makes no LLM calls.** Five arms (semantic, BM25, graph, temporal, raw chunks) run with `as_of`,
-  tag and type filters applied inside each arm (the semantic arm is an exact scan for small namespaces and
-  a partial HNSW for large ones); RRF (k = 60, exact rational arithmetic), a cross-encoder rerank on 50
-  pairs at the default budget, bounded boosts and token-budget packing follow; results stream as soon as
-  the last stage that fits the deadline completes. The budget is a critical-path sum, 216 ms p95 at MID,
-  and a skipped rerank is an SLO breach, not a degradation.
-- **Time travel is exact for facts, observations and their evidence, and for chunks subject to a stated rule (N85).** Every fact and chunk carries `mentioned_at` **= the item timestamp, set by the
-  server** (the time the system learned the content; the extractor's own date is `said_at`, informational);
-  observations are versioned with `effective_at = max(mentioned_at over every fact rendered to the
-  consolidation prompt, effective_at of the observations shown, effective_at of the previous version)`
-  (D9); recall at `as_of = T` never returns anything derived from content the system learned after T.
-  Deletion hides derived text **per version and permanently, and transitively through lineage**
-  (N79): a version written with deleted content in the prompt, or derived from such a version, is never
-  served again at any `as_of`, while a version written without it stays servable. A chunk is
-  visible under `as_of = T` only if its embedded header was effective by T (`embedding_effective_at`), and
-  chunk headers are not returned.
-- **Derived state is rebuildable and propagated through a transactional outbox** that doubles as the
-  change log for shard moves. Kafka is optional and off by default.
-- **Correctness is checked, not asserted — and the plan says exactly what was checked (and, since the
-  second review, what was not).** Five TLA+
-  specifications (document lifecycle, consolidation idempotency, outbox propagation, `as_of` isolation,
-  shard moves) and four Lean 4 developments (tag modes, RRF, packing, temporal windows) are tied to Go
-  property tests and trace validation. The design configurations that completed are listed in §7.1:
-  **model-checked today: the outbox; consolidation exactly-once at 3 facts; `as_of` without deletes; and
-  the move protocol before D20/D21.** The `ShardMove` full-bound PASS checks that pre-D20 protocol; the
-  `DocLifecycle` and `Consolidation` full-bound configurations remain incomplete and are reported as
-  INCOMPLETE; no D20/D21 mechanism (lineage hiding, reversible invalidation, total replay, range-snapshot
-  copy, try-lock fence, point of no return at (c)) is in any spec yet, the gate configurations are unrun,
-  and the work items W-1 to W-12 of §7.6 close the gap.
+  tag and type filters and the **visibility predicate** applied inside each arm; RRF (k = 60, exact
+  rational arithmetic), a cross-encoder rerank on 50 pairs at the default budget, bounded boosts and
+  token-budget packing follow. The budget is a critical-path sum, 216 ms p95 at MID, and a skipped rerank
+  is an SLO breach, not a degradation.
+- **Delete is an O(1) soft marker; physical work is asynchronous.** `DeleteDocument` writes an intent
+  object to blob storage (strongly consistent, shard-independent key), then one tombstone row in the
+  shard, and acks. From the ack, every surface (Recall, Reflect, GetMemory, GetPage, ListMemories, export)
+  hides the document, its chunks, and every observation or page version whose **evidence segment** names
+  it: visibility is `NOT IN` three small marker sets plus two `EXISTS` over evidence rows, evaluated at
+  read time, so there is nothing to walk, stamp or race at delete time. A throttled per-namespace
+  **Expunge** workflow then materializes derived hiding (≤ 15 min), purges rows and blobs (≤ 24 h) and
+  rebuilds touched indexes (≤ 48 h); while markers are pending the namespace runs in a documented degraded
+  mode (extra per-candidate lookups, root rebuilds only, rerank-skip SLO suspended). `Invalidate`/`Restore`
+  insert and delete one marker, so `Restore` is exact.
+- **Durability without synchronous replication.** Every role commits with `synchronous_commit = local`, so a
+  commit cannot hang on a standby. Acknowledged deletes and invalidations have RPO 0 because their intent
+  object exists before the ack and a restore or failover replays the intents (`frozen/restore` until the
+  replay finishes); retains have RPO ≤ 60 s.
+- **Shard moves copy dirty, freeze, and reconcile by set difference.** Because large tables are immutable
+  and the expunge is paused for the move, the difference after a dirty copy is exactly the rows inserted
+  since the copy began (time-margin re-copy, counts and hashes); small mutable tables are diffed in full
+  inside the freeze. There is no replay, no copy barrier and no catch-up loop. Cutover goes through a
+  `ready` state with a single point of no return at the source's `moved_out`, and rollback exists at every
+  step before it. Restore and failover first reconcile open moves against the catalog.
+- **Time travel is exact for facts, observations and their evidence, and for chunks subject to a stated rule (N85).**
+  Every fact and chunk carries `mentioned_at` = the item timestamp, set by the server; observations are
+  versioned with `effective_at = max(mentioned_at over every fact rendered to the writer, effective_at of
+  the previous version)` (D9); recall at `as_of = T` never returns anything derived from content the system
+  learned after T. Consolidation is two-stage (a routing call returning decisions only, one write call per
+  touched observation) so a version's evidence segment contains only its own sources.
+- **Derived state is rebuildable and propagated through a transactional outbox** (index and optional Kafka
+  consumers; moves no longer read it). Kafka is optional and off by default.
+- **Correctness is checked, not asserted, and the plan says exactly what was checked.** Five TLA+
+  specifications and four Lean 4 developments exist (§7); the D22 mechanisms (`Storage`, `Derivation`,
+  `Durability`, the rewritten `ShardMove`) are the Phase 0 spec work and are not yet model-checked.
 - **Size:** about **118 engineer-weeks** in total; the committed six-month scope for three engineers is
-  Phases 0–2, **≈ 77 ew** (foundations, a 3-week Phase 0′ of measurements and a 3.5-ew Phase 0″ that
-  lands the second review's decisions, the MVP with shard moves behind an admin flag, consolidation and
-  Reflect) against 78 ew of capacity, i.e. about 1 ew of slack; pages, export, multi-cell, `RetainBackfill`
-  and most of the formal tooling are a separate 41-ew track. One shard holds ~10 M facts, one API + worker
-  stack serves up to 32 shards, and 1 B facts is 100 shards in 4 cells — ≈ 29 days and ≈ $160 k to fill
-  at list prices.
+  Phases 0 to 2, **≈ 80 ew** against 78 ew of capacity (foundations and measurements, the MVP with moves
+  behind an admin flag, the expunge and delete-intent log, consolidation, Reflect and `RetainBackfill`),
+  so the Phase 2 exit lands in week 27; pages, export, multi-cell and most of the formal tooling are a
+  separate 38-ew track. One shard holds ~10 M facts, one API + worker stack serves up to 32 shards, and
+  1 B facts is 100 shards in 4 cells: **≈ 100 days to fill online** at 3.5 gateway calls per chunk and
+  600 RPM per cell, ≈ $160 k at list prices (Table 6.8-B); `RetainBackfill` through the batch API is a
+  launch prerequisite.

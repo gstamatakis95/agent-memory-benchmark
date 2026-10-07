@@ -2,19 +2,17 @@
 
 A decision-oriented implementation plan for a Go + PostgreSQL long-term memory service for AI agents,
 modelled on Hindsight (MIT). The plan is standalone and unrelated to the benchmark project in this repository.
-It has been through two adversarial design reviews (`reviews/round-1.md`, then `reviews/round-2.md`); the plan text is the
-post-second-review version. The second review (findings G-1 to G-30) is applied through register block D21
-(N79 to N108). **The TLA+ specifications lag the design until work items W-1 to W-12 of section 7.6 land:**
-no D20 or D21 mechanism is in any `.tla` file, the `ShardMove` PASS checks the pre-D20 move protocol, the
-`*_Gate*.cfg` configurations are written but unrun, and the TLC queue was stopped on purpose until the specs
-are updated.
+It has been through three adversarial design reviews (`reviews/round-1.md` to `reviews/round-3.md`); the plan text is
+the post-third-review version. Round 3 produced a redesign of storage, deletion visibility, delete durability and
+shard moves (advice R1 to R5), applied through register block D22 (N111 to N132). **The TLA+ specifications lag the
+design:** `Storage`, `Derivation`, `Durability` and a rewritten `ShardMove` are specified in round 3 but not yet
+written, and the `*_Gate*.cfg` configurations are written but unrun (section 7.1 states what was checked).
 
 | Path | What it is |
 |---|---|
-| `PLAN.md` | The assembled plan (sections 1–12 plus the decision register as Appendix A). |
-| `00-decision-register.md` | The binding cross-cutting decisions every section follows; D20 holds the corrections adopted from the first adversarial review (N50–N77); D21 holds those of the second (N79–N108). |
-| `reviews/round-2.md` | The second adversarial review (findings G-1…G-30) of the plan as amended by the first, with its Disposition table mapping every finding to a D21 row (N79–N108) and the section where it was applied. |
-| `reviews/round-1.md` | The adversarial design review (45 findings, F-1…F-45, ranked by severity) and, at its end, the **Disposition** table that maps every finding to the register row and the section where it was applied. Read it to understand *why* D2, D4, D9, D17 and N41 read the way they do. |
+| `PLAN.md` | The assembled plan (sections 1-12 plus the decision register as Appendix A). |
+| `00-decision-register.md` | The binding cross-cutting decisions every section follows; D20 holds the corrections adopted from round 1 (N50-N77), D21 those of round 2 (N79-N108), D22 the round-3 redesign (N111-N132). Rows the redesign superseded were rewritten in place and keep their ids. |
+| `reviews/` | The three adversarial reviews, one file per round: `round-1.md` (45 findings F-1...F-45), `round-2.md` (G-1...G-30), `round-3.md` (the correctness, Postgres and API/numbers reviews H-*, P-*, A-*, and the redesign advice R1 to R5). Each ends with a Disposition table that maps every finding to a register row and the section where it was applied. Read them to understand *why* D2, D5, D8, D9 and D22 read the way they do. |
 | `sections/` | The individual sections that `PLAN.md` is assembled from. |
 | `proto/` | The protobuf contracts (`memory.v1`, `memory.admin.v1`, internal workflow and event schemas) with `buf.yaml`. |
 | `sql/` | DDL for the control-plane catalog and for one shard. |

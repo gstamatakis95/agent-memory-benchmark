@@ -15,8 +15,10 @@
 // Pre-1.0 breaking-change exception (decisions N128, N139, review A-9, A-11).
 // This package has not shipped v1.0.0, so the round-3 redesign (D22) and the
 // round-4 changes (D23) changed it incompatibly. Until v1.0.0, `buf breaking`
-// is baselined on `main@HEAD~1` and every intended break carries a labelled
-// exception and a changelog entry (plan section 4.5). The breaks, all
+// is baselined on the merge target (`main`) for pull requests and on
+// `main@HEAD~1` only in the push-to-main job, and every intended break
+// carries a labelled exception and a changelog entry (plan section 4.5,
+// decision N157). Round 5 (N144 to N157) only added fields and messages. The breaks, all
 // intended: N86 `ChunkWork.item_index = 9`
 // became `item_indexes = 17` (old number reserved); the lineage-based
 // consolidation messages (`ObservationVersionRef`, `candidate_versions`,
@@ -732,6 +734,8 @@ message RefreshPageInput {
   // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
   WorkflowScope scope = 2;
+  // Manual refresh: the operation id carried in the nudge to the per-page
+  // singleton (REFRESH_PAGE is singleton-backed, decision N157).
   string operation_id = 3;
   string page_id = 4;
   RefreshReason reason = 5;
@@ -757,6 +761,9 @@ enum RefreshReason {
 // RefreshPageResult reports the new version.
 message RefreshPageResult {
   int64 version = 1;
+  // Attempt-unique key `pages/{page_id}/v{n}-{sha256(markdown)[:16]}.md`: the
+  // rollback branch deletes only the key this execution minted, and only when
+  // no page_versions row names it (decision N144).
   string markdown_blob_key = 2;
   google.protobuf.Timestamp effective_at = 3;
   int32 sources_added = 4;
@@ -847,9 +854,14 @@ message ExpungeInput {
 // a set computed once fails RestoreExact (decision N120).
 message MaterializeInput {
   WorkflowScope scope = 1;
-  // Pending tombstones to materialize (empty = all pending).
+  // Hint only: pending tombstones to materialize (empty = all pending). The
+  // work is discovered from the open tombstones and from the partial index
+  // `fact_hidden WHERE cause = 'invalidate' AND materialized_at IS NULL`,
+  // never from this payload, so a lost signal costs at most one purge-sweep
+  // tick (decision N145).
   repeated string document_ids = 2;
-  // Invalidated facts to materialize (an Invalidate nudges a rebuild too).
+  // Hint only: invalidated facts to materialize (an Invalidate nudges a
+  // rebuild too). Same rule: the unstamped marker set is the source of truth.
   repeated string fact_ids = 3;
 }
 
@@ -861,6 +873,9 @@ message MaterializeResult {
   int32 rebuilds_nudged = 4;
   int32 refreshes_nudged = 5;
   int64 outbox_seq = 6;
+  // Invalidation markers stamped `materialized_at` in the batch that wrote
+  // their derived_hidden(invalidation) rows (decision N145).
+  int32 invalidations_stamped = 7;
 }
 
 // PurgeBatchInput is one purge activity: delete up to batch_size rows of one
@@ -1118,16 +1133,55 @@ message PreVerifyReport {
   // engram_seq_floor(T_copy).
   int64 catchup_rows_copied = 3;
   // Tables whose count(*) or bit_xor(hashtextextended(pk::text, 0)) differ
-  // for ins_seq below engram_seq_floor(now()) (empty = match).
+  // for ins_seq below `f_c` on both sides (empty = match).
   repeated string mismatched_tables = 4;
   bool verify_fk_ok = 5;
   int64 blobs_missing = 6;
+  // Order inside the activity (decision N148): take t_c and f_c =
+  // engram_seq_floor(t_c) on the source, copy first (catch-up of
+  // ins_seq >= f_copy), and only then check the range below f_c on BOTH sides.
+  // Both floors are source values passed to the target as numbers (N147).
+  int64 f_c = 7;
+  int64 f_copy = 8;
+  // Catch-up and check rounds run (1, or 2 after one mismatch; a second
+  // mismatch fails the activity and rolls the move back).
+  int32 rounds = 9;
+}
+
+// AwaitIndexesReport is the AwaitIndexes activity's result (decision N153):
+// after PreVerify and before Freeze the mover requests the namespace's partial
+// indexes on the target and waits until every one is ready with rows_at_build
+// at least 0.99 times the verified count. A failed build is retried once, then
+// the move rolls back.
+message AwaitIndexesReport {
+  // vector_indexes requests made for (vector table, current model) pairs with
+  // at least 2,000 copied vectors.
+  int32 indexes_requested = 1;
+  int32 indexes_ready = 2;
+  // Builds that failed and were requested again.
+  int32 builds_retried = 3;
+}
+
+// ReconcileInReport is the ReconcileIn activity's result (decision N149): a
+// target restored or promoted after the catalog CAS (a″) is repaired from the
+// source, which is static (frozen/move or moved_out) until cleanup.
+message ReconcileInReport {
+  // Insert-only rows re-copied with ins_seq >= f_pre (a source value) as
+  // INSERT ... ON CONFLICT DO NOTHING, and mutable-class rows restored the
+  // same way (an existing target row is kept: it is the copy or a
+  // post-activation write).
+  int64 rows_recopied = 1;
+  int64 mutable_rows_restored = 2;
+  int64 f_pre = 3;
+  // Delete intents replayed on the target afterwards (decision N122).
+  int32 intents_replayed = 4;
 }
 
 // ReconcileReport is the Reconcile activity's result (decisions N124, N137).
 // Any residual mismatch ends in Rollback.
 message ReconcileReport {
-  // Insert-only rows re-copied: `ins_seq ≥ engram_seq_floor(T_pre)`.
+  // Insert-only rows re-copied: `ins_seq ≥ engram_seq_floor(T_pre)` (computed
+  // on the source and passed as a number, decision N147).
   int64 rows_recopied = 1;
   // Mutable-table rows upserted, and target rows absent on the source deleted.
   int64 mutable_rows_upserted = 2;
@@ -1171,6 +1225,14 @@ message MoveCheckpoint {
   CutoverStep cutover_step = 13;
   ReconcileReport reconcile = 14;
   PreVerifyReport pre_verify = 15;
+  // The source's `nextval('engram_ins_seq')` at Plan and its final value under
+  // the freeze; the target's sequence is advanced past each (engram_seq_advance,
+  // decision N147).
+  int64 w_plan = 16;
+  int64 w_final = 17;
+  AwaitIndexesReport await_indexes = 18;
+  // Set once ReconcileIn ran after a target restore or failover (N149).
+  ReconcileInReport reconcile_in = 19;
 
   // Removed in the D22 redesign (decision N124): the replay floor
   // `int64 copy_start_seq = 2` (p0), `int64 applied_seq = 3`, the pre-freeze

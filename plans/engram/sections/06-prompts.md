@@ -394,7 +394,7 @@ and the evidence segment of §3 (N117) stays small. Idempotency, proposals and b
 §5.2.2; this section is the prompts. **Proposal attempts (N121):** the routing result is stored
 write-once under `(batch_key, attempt)` and nothing is ever deleted; every `update` or `merge` op
 in it carries the `base_version` the stage-2 prompt will show (set by the system, never by the
-model). If the base is no longer current at apply (N120) the whole proposal is discarded and the
+model). If the base is no longer current at apply (a compare-and-set at commit, N143, N144) the whole proposal is discarded and the
 batch is re-routed as a new attempt with the same prompt on fresh candidates; an overflow of
 `consolidate.max_observations_per_scope` re-runs as a new attempt with `prompt_variant =
 'capacity'`, i.e. the same prompt with `{capacity_note}` filled, so the stored overflowing list
@@ -501,7 +501,7 @@ misplace a fact; it cannot put text into an observation.
 | Temperature | 0.0 |
 | Inputs | `mode ∈ {update, create, rebuild}`; `previous` (text; present only for `update`); `sources[]` `{fact_id, quote}`: the observation's own **visible** sources (≤ 10 most recent for `update`, ≤ 30 for `rebuild`); `attached[]` `{id, text, mentioned_at, said_at, occurred}`: the facts newly attached by stage 1 (≤ 8) |
 | Modes | `update`: previous text shown. `create`: no previous text. `rebuild` (a **root rebuild**: a `merge` survivor from the union of live sources, a `drop_source`, an observation whose segment holds a tombstoned or hidden input, or a capacity rewrite): **no previous text is shown**, live sources only |
-| Zero sources (N135) | a `rebuild` that finds **no visible source** retires the observation without calling the model (exempt from `quota.Reserve`); a version with no visible source is never served |
+| Zero sources (N135) | a `rebuild` that finds **no visible source** retires the observation without calling the model (exempt from `quota.Reserve`); a version with no visible source is never served. A stage-2 write whose target observation was retired meanwhile re-routes its facts as a new attempt instead of stamping them `done` (N157) |
 | Inputs recorded (N117) | `observation_inputs(observation_id, version, fact_id)` = the `attached` facts ∪ the `sources` rendered; every one of them is a source of this observation. `observation_versions.root_version = version` for `create` and `rebuild`, else the previous value; `effective_at = max(mentioned_at of every fact rendered, effective_at of the previous version)` (D9) |
 | Not cached | the result depends on the observation's state |
 | Max output tokens | 800 |
@@ -793,7 +793,7 @@ answer is still returned).
 
 | Field | Value |
 |---|---|
-| Purpose | Produce structured edit operations that bring a **visible** page up to date with added, changed and retired evidence, preserving everything else byte-identical (§5.3). Used only when no input in the current version's evidence segment is tombstoned or hidden (N117); otherwise the refresh is a root rebuild with `page_full/v1` |
+| Purpose | Produce structured edit operations that bring a **visible** page up to date with added, changed and retired evidence, preserving everything else byte-identical (§5.3). Used only when no input in the current version's evidence segment is tombstoned or hidden (N117); otherwise the refresh is a root rebuild with `page_full/v1`. Commit (both prompts, N144): the idempotency lookup by `commit_key` first, then the compare-and-set on `$expected`; the markdown blob key is attempt-unique, `pages/{page_id}/v{n}-{sha256(markdown)[:16]}.md` |
 | Model class | `models.reflect` |
 | Temperature | 0.2 |
 | Inputs | `topic` (page name + `source_query`), `document` (sections with ids, blocks with ids and text), `added[]`, `changed[]` `{id, old_text, new_text}`, `retired[]` `{id, text}` (evidence consolidation retired because it was refuted or merged away; never a deleted or invalidated item), `kept_sources` count, `max_tokens`. Only visible evidence is rendered (N116) |
@@ -870,7 +870,7 @@ TOPIC: {topic}
 
 | Field | Value |
 |---|---|
-| Purpose | First version of a page; the **root rebuild** used when the current version is hidden because an input in its segment was tombstoned or hidden (the refresh `Expunge` nudges, N119); and the fallback when delta validation fails twice or `source_query` changed (§5.3.2 step 5). `page_versions.root_version = version` |
+| Purpose | First version of a page; the **root rebuild** used when the current version is hidden because an input in its segment was tombstoned or hidden (the refresh `Expunge` nudges, N119); and the fallback when delta validation fails twice or `source_query` changed (§5.3.2 step 5). `page_versions.root_version = version`; same commit order as `page/v1` (N144), root rebuilds included |
 | Model class | `models.reflect` |
 | Temperature | 0.2 |
 | Inputs | `topic`, `evidence[]` (**visible** observation versions preferred, then facts; packed to `2 × max_tokens`), `max_tokens`. No previous version is shown: it may carry deleted content, and a page written without it has the smallest possible segment |
@@ -989,13 +989,14 @@ derivation set.
 | One LME-M run (≈ 13× the ingestion) | | **≈ $1 540** (≈ $1 210 with the batch API); the harness budget guard stays `--max-cost-usd 2000` | ≈ $900 |
 | One LoCoMo run (10 conversations, ≈ 92 k tokens) | ≈ 120 chunks, 1 200 facts, 150 batches | ≈ **$0.19** | ≈ $0.12 |
 | Per 1 k facts (the §8.8 unit; 25 documents) | A-F = 10: 100 chunks, 125 batches. A-F = 4: 250 chunks, 125 batches | extraction $0.066 + consolidation $0.079 + summaries $0.010 + embeddings $0.002 → **≈ $0.157 per 1 k facts** | extraction $0.120 + $0.079 + $0.010 + $0.006 → **≈ $0.21** |
-| Initial fill of 1 B facts online (D3) | A-F = 10: 100 M chunks, 125 M batches, 25 M documents; throughput `min(N_workers × 32 / L_extract, RPM_cap / (60 × calls_per_chunk))` = `600 / (60 × 3.5)` ≈ **2.9 chunks/s per cell**, 11.4 chunks/s at 4 cells | **≈ $157 k ≈ $160 k** at list prices (≈ $124 k with the batch API); **≈ 100 days** (≈ 400 days for one cell) | $211 k; 250 M chunks at ≈ 4.9 chunks/s per cell: **≈ 150 days** |
+| Initial fill of 1 B facts online (D3) | A-F = 10: 100 M chunks, 125 M batches, 25 M documents; throughput `min(N_workers × 32 / L_extract, RPM_cap / (60 × calls_per_chunk))` = `600 / (60 × 3.5)` ≈ **2.9 chunks/s per cell**, 14.5 chunks/s at 5 cells | **≈ $157 k ≈ $160 k** at list prices (≈ $124 k with the batch API); **≈ 80 days** at 5 cells (154 shards at the 6.5 M target; ≈ 400 days for one cell) | $211 k; 250 M chunks at ≈ 4.9 chunks/s per cell: **≈ 120 days** |
+| One shard at the 6.5 M-fact target (N154) | 650 k chunks, 812 k batches, 163 k documents (the 1 B-fact figures ÷ 154) | ≈ **$1 020** (≈ $810 with the batch API); 154 such shards = the $157 k above | ≈ $1 370 |
 | `RetainBackfill` fill (batch API, no RPM cap; a launch prerequisite, N130) | the same counts | ≈ $124 k; bounded by batch-API turnaround and quota, not by the RPM cap; the planning figure is weeks, measured in M2.5 | ≈ $151 k |
 
 Reading the table: consolidation is **≈ 50 %** of all-in ingest cost at A-F = 10, so the
 Phase 2 cost gate in §10 is set from the measured A-F with a 25 % margin (**≤ $0.30 per LME-S
 haystack at A-F = 10**, 1.25 × $0.24); "$70–120 per LME-S run" is exactly the span between
-A-F = 4 and A-F = 10. A fill of 1 B facts at ≈ 100 days online is why `RetainBackfill` is in
+A-F = 4 and A-F = 10. A fill of 1 B facts at ≈ 80 days online is why `RetainBackfill` is in
 the committed scope. The §6.1 summary refresh rule (N60) keeps the summary and re-embedding
 lines small on append-heavy conversations.
 
@@ -1005,12 +1006,10 @@ class (extract, routing, write, page refresh, each Reflect iteration); workflows
 counts prompt + completion tokens of every call above through `token_usage` (PD-1 / N25); the
 per-call caps in the first table bound the worst case of one activity.
 
-### Round-4 changes
+### Round-5 changes
 
 | Item | Removed | Added |
 |---|---|---|
-| Re-extraction (§6.0) | `fact_hidden(reason = 'reextract')` hiding derived content | cause-tagged hide read by the fact and chunk arms only, `stale_write` on affected observations, old-key facts purged after 1 h (N135) |
-| Consolidation (§6.3) | proposal keyed by `batch_key` alone | attempts, `base_version` per op, capacity re-run as a new attempt, zero-source retirement without a call (N121, N135) |
-| Pages (§6.6) | refresh committed without re-verification | the N120 commit rule, `page_full/v1` after a refused commit |
-| Reflect (§6.5, §6.8) | typical cost $0.085 (2.1 k output) | $0.114 (5.1 k output); `search_pages` the first forced step once pages exist (N139) |
-| Throughput formula (§6.8) | `min(32 / L, …)` | `min(N_workers × 32 / L_extract, RPM_cap / (60 × calls_per_chunk))` |
+| Page and observation commit (§6.3, §6.6) | CAS before the idempotency check, version-numbered markdown key, `stale_write = false` | `commit_key` lookup first, `$expected` CAS for every writer, attempt-unique blob key (N144) |
+| Stage 2 (§6.3) | a write to a retired target stamped `done` | the facts re-route as a new attempt (N157) |
+| Fill (§6.8, Table 6.8-B) | 125 shards, 4 cells, 11.4 chunks/s, ≈ 100 days (≈ 150 at A-F = 4) | 154 shards, 5 cells, 14.5 chunks/s, ≈ 80 days (≈ 120 at A-F = 4); a per-shard row at 6.5 M facts (N154) |

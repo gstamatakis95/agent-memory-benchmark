@@ -1,6 +1,16 @@
 -- =============================================================================
 -- Engram catalog (control plane) schema
--- Database: engram_catalog (one small PostgreSQL 16 instance + streaming replica, D4)
+-- Database: engram_catalog (one small PostgreSQL 16 instance + ONE SYNCHRONOUS STANDBY, D4, N146)
+--   synchronous_commit = remote_apply, synchronous_standby_names = 'FIRST 1 (catalog-standby)': the catalog
+--   arbitrates moves and holds the replay floor and the 'deleting' state, so a catalog commit that a protocol step
+--   observed must survive a failover (promotion is RPO 0). It is the one place where N92's rejection of a synchronous
+--   standby does not apply: writes are off the hot path, so a blocked commit degrades operations, never reads or retains.
+--   Standby down: catalog writes block, CatalogStandbyDown pages at 60 s, `engramctl catalog degrade --async` is the
+--   operator's explicit, logged switch (never automatic). A catalog RESTORE from backup (RPO 60 s, the only lossy path)
+--   is followed by `engramctl catalog reconcile --from-shards` BEFORE it serves writes: the shards' ownership rows are
+--   the source of truth (source moved_out => move >= committed; target active with move_epoch => done/cleaning;
+--   target ready/incoming with source frozen/move => cutover; shard frozen/delete => deleting) and every namespace's
+--   epoch is raised to max(epoch over its shard rows).
 -- Plain SQL, PostgreSQL 16, schema public (section 9 wraps it as migrations/catalog/0001_init.sql).
 -- No extensions required (gen_random_uuid() is core). Apply as the owner role catalog_migrate.
 --
@@ -120,12 +130,14 @@ CREATE TABLE shards (
   task_queue            text NOT NULL,             -- 'shard-{shard_id}' (Temporal)
   kafka_topic           text NOT NULL,             -- 'engram.events.shard-{shard_id}' (used only if Kafka is on)
   replay_floor          timestamptz,               -- N134: lower bound for delete-intent replay; lowered with min() by every restore/failover, NEVER raised while intents are retained (35 d); lives here so a PITR or a stale promotion cannot lose it
+  replay_floor_mirror   timestamptz,               -- N146: the lowest restore target `engramctl restore replay` wrote to blob storage (_control/restores/{shard}/{target}.json) BEFORE replaying; replay uses replay_floor_effective, so a catalog restore that lost the lowered replay_floor cannot raise the floor
+  replay_floor_effective timestamptz GENERATED ALWAYS AS (least(replay_floor, replay_floor_mirror)) STORED,
   system_identifier     bigint,                    -- N123: pg_control_system().system_identifier of the current primary; written on PROMOTION before the virtual endpoint flips
   timeline_id           integer,                   -- N123: pg_control_checkpoint().timeline_id; the mover compares its session's value at Freeze and (c), the relay every 10 s
   dedicated_tenant_id   text REFERENCES tenants (tenant_id),   -- NULL = shared pool
   max_namespaces        integer NOT NULL DEFAULT 120 CHECK (max_namespaces > 0),
-  soft_cap_facts        bigint  NOT NULL DEFAULT 8000000,     -- N114/D3: 8 M live facts target
-  hard_cap_facts        bigint  NOT NULL DEFAULT 12000000,    -- 12 M hard cap
+  soft_cap_facts        bigint  NOT NULL DEFAULT 6500000,     -- N114/N154/D3: 6.5 M live facts target (hot set about 73 GB with both covering link indexes; was 8 M)
+  hard_cap_facts        bigint  NOT NULL DEFAULT 10000000,    -- 10 M hard cap (was 12 M)
   volume_bytes          bigint  NOT NULL DEFAULT 600000000000 CHECK (volume_bytes > 0),   -- 600 GB local NVMe; ShardNearCapacity pages at 70 % of it (relation bytes, N114)
   namespaces_count      integer NOT NULL DEFAULT 0 CHECK (namespaces_count >= 0),
   facts_estimate        bigint  NOT NULL DEFAULT 0 CHECK (facts_estimate >= 0),
@@ -221,6 +233,8 @@ CREATE TABLE namespace_moves (
   t_copy                 timestamptz,               -- N124: source now() when the dirty copy began; the catch-up copy takes ins_seq >= engram_seq_floor(t_copy)
   t_pre                  timestamptz,               -- N124: source now() at the pre-freeze verification; the freeze re-copies ins_seq >= engram_seq_floor(t_pre)
   w_pre                  bigint,                    -- N124: nextval('engram_ins_seq') taken with t_pre
+  w_plan                 bigint,                    -- N147: the source's nextval at Plan; the target's engram_ins_seq is advanced past it (engram_seq_advance)
+  w_final                bigint,                    -- N147: the source's final value under the freeze; the target is advanced past it BEFORE (b'), recorded here
   terminated_workflows   text[] NOT NULL DEFAULT '{}',  -- workflow ids terminated at drain, restarted on the target (N97)
   error                  text,
   created_by             text NOT NULL,             -- operator principal (engramctl) or 'rebalancer'
@@ -231,7 +245,11 @@ CREATE TABLE namespace_moves (
   committed_at           timestamptz,               -- (a'') the catalog CAS cutover -> committed: the point of no return
   moved_out_at           timestamptz,               -- (c) on the source; informational (the arbiter is committed_at)
   activated_at           timestamptz,               -- (b'') target ready -> active
-  target_backup_at       timestamptz,               -- N143: completion of a FULL target backup that STARTED after activated_at; source cleanup waits for it and for the 24 h grace
+  activated_timeline     integer,                   -- N149: the target's timeline_id when (b'') ran
+  target_timeline_changed_at timestamptz,           -- N149: the target's last timeline change (restore or promotion) after activation, NULL if none (catalog.MoveBackups.RecordTimeline)
+  reconciled_in_at       timestamptz,               -- N149: ReconcileIn completed (the target was repaired from the source)
+  target_backup_started_at timestamptz,             -- N149: start of the FULL target backup that gates cleanup
+  target_backup_at       timestamptz,               -- N143: completion of a FULL target backup that STARTED after activated_at (and, N149, after the target's last timeline change and ReconcileIn); source cleanup waits for it and for the 24 h grace
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
   CHECK (to_epoch = from_epoch + 1),
@@ -239,7 +257,13 @@ CREATE TABLE namespace_moves (
   CHECK (state NOT IN ('reconciling', 'cutover', 'committed', 'cleaning', 'done') OR frozen_at IS NOT NULL),
   CHECK (state NOT IN ('committed', 'cleaning', 'done') OR committed_at IS NOT NULL),
   CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL),
-  CHECK (state <> 'done' OR (activated_at IS NOT NULL AND target_backup_at IS NOT NULL AND target_backup_at >= activated_at))
+  CHECK (ready_at IS NULL OR w_final IS NOT NULL),                                     -- N147: no 'ready' before the target's sequence passed W_final
+  CHECK (state <> 'done' OR (activated_at IS NOT NULL AND target_backup_at IS NOT NULL AND target_backup_at >= activated_at)),
+  -- N149: the cleanup gate is content-recoverable: the target's last timeline change is either absent or followed by a
+  -- ReconcileIn, and the gating backup STARTED after the later of activation, the timeline change and the reconcile
+  CHECK (state <> 'done' OR (target_backup_started_at IS NOT NULL
+         AND (target_timeline_changed_at IS NULL OR reconciled_in_at >= target_timeline_changed_at)
+         AND target_backup_started_at >= greatest(activated_at, target_timeline_changed_at, reconciled_in_at)))
 );
 
 CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)

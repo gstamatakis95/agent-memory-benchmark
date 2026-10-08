@@ -10,7 +10,7 @@ project**, joined by a private network and by DNS names that are decided here, n
 
 **Hosts and endpoints (N114).** A shard is a 128 GB, 8 vCPU Postgres instance on its own local
 NVMe volume of **600 GB at ≥ 50 k IOPS** (D3, N114). Four shards share a 512 GB host, so a full
-32-shard cell is eight shard hosts. The other services sit on separate hosts so that a shard host failure takes out at most
+32-shard cell is eight shard hosts (1 B facts is 154 shards at the 6.5 M target, 5 cells, N154). The other services sit on separate hosts so that a shard host failure takes out at most
 four shards and never the API or Temporal.
 
 | Host class | Runs | Count in a full cell |
@@ -18,7 +18,7 @@ four shards and never the API or Temporal.
 | shard host (512 GB, 4 NVMe volumes) | 4 × (`shard-N-postgres` 112 GB limit, `shard-N-pgbouncer`, `shard-N-exporter`) | 8 |
 | app host | `envoy`, `engram-api` ×2, `engram-worker` ×2, `engram-mcp` (replicas spread over ≥ 2 hosts) | 2 to 3 |
 | temporal host | the Temporal services of this cell (frontend, history, matching, worker) and `temporal-postgres` primary | 2 |
-| control host | `catalog-postgres` + replica + failover agent, Prometheus, Grafana, OTel collector, Jaeger | 2 |
+| control host | `catalog-postgres` + its **synchronous standby** (`catalog-standby`, on the other control host) + failover agent, Prometheus, Grafana, OTel collector, Jaeger | 2 |
 
 Endpoints are DNS names with a 5 s TTL in the cell's private zone, never container names:
 `shard-N-primary.cell-C` (the Postgres primary; flipped by `engramctl shard failover`),
@@ -41,9 +41,9 @@ services:
     <<: *pg-shard
     environment: { POSTGRES_DB: engram, POSTGRES_USER: engram, POSTGRES_PASSWORD_FILE: /run/secrets/shard_1_pw, STANZA: shard-1 }
     volumes: [shard-1-data:/var/lib/postgresql/data, ./pgbackrest/shard-1.conf:/etc/pgbackrest/pgbackrest.conf:ro, ./gucs/engram.d:/etc/postgresql/engram.d:ro]
-  shard-1-pgbouncer:                                   # POOL_MODE transaction; pools per (database, user): engram_app 24 + 4 reserve, engram_admin 6; MAX_CLIENT_CONN 500, MAX_PREPARED_STATEMENTS 200
+  shard-1-pgbouncer:                                   # POOL_MODE transaction; pools per (database, user): engram_app 40, engram_admin 2; MAX_CLIENT_CONN 500, MAX_PREPARED_STATEMENTS 200 (N155)
     image: edoburu/pgbouncer:${PGBOUNCER_TAG}
-    environment: { DB_HOST: shard-1-postgres, DB_NAME: engram, POOL_MODE: transaction, DEFAULT_POOL_SIZE: "24", RESERVE_POOL_SIZE: "4" }
+    environment: { DB_HOST: shard-1-postgres, DB_NAME: engram, POOL_MODE: transaction, DEFAULT_POOL_SIZE: "40", RESERVE_POOL_SIZE: "0" }
   shard-1-exporter:                                    # postgres_exporter + the generated custom queries of §9.4 (P-14)
     image: prometheuscommunity/postgres-exporter:${PGEXP_TAG}
     environment: { DATA_SOURCE_URI: "shard-1-postgres:5432/engram?sslmode=disable", PG_EXPORTER_EXTEND_QUERY_PATH: /queries.yaml }
@@ -58,12 +58,12 @@ the `ALTER ROLE … SET` statements and the Compose limits are generated from it
 
 | Setting | Value | Why |
 |---|---|---|
-| `shared_buffers` / `effective_cache_size` / container limit | 32 GB / 96 GB / 112 GB | hot set ≈ 80 GB at the 8 M target, links reverse index included; usable cache ≈ 80 to 96 GB (§3.7, N114) |
-| `synchronous_commit` | `local` (database default and `ALTER ROLE` for `engram_app`, `engram_relay`, `engram_move`, `engram_admin`) | no synchronous standby exists; a commit cannot hang (N122) |
+| `shared_buffers` / `effective_cache_size` / container limit | 32 GB / 96 GB / 112 GB | hot set ≈ 73 GB at the 6.5 M target with both covering link indexes (≈ 90 GB at 8 M, which is why 8 M is not the target); usable cache ≈ 80 to 96 GB (§3.7, N114, N154) |
+| `synchronous_commit` | `local` (database default and `ALTER ROLE` for `engram_app`, `engram_relay`, `engram_move`, `engram_admin`) | no synchronous standby exists for a shard; a commit cannot hang (N122). The catalog is the one exception: `synchronous_commit = remote_apply`, `synchronous_standby_names = 'FIRST 1 (catalog-standby)'` (N146); `config lint` checks both sides |
 | `maintenance_work_mem`, `max_parallel_maintenance_workers` | 1 GB default; the index runner sets **2.4 KB × vectors per build (≤ 5 GB)**; 4 | HNSW needs ≈ 2.25 KB per element in memory, so a build past `maintenance_work_mem` falls to ≈ 3 ms per on-disk insert; the parallel DSM is sized by it, hence `shm_size: 8g` and one build per shard at a time (N138) |
 | `wal_compression` | `zstd` | purge and move WAL (N119) |
-| `vacuum_index_cleanup` (vector partitions) | `off`, permanently | autovacuum must never repair an HNSW graph (5 to 6 times a rebuild); hygiene rebuilds first (N138) |
-| `max_connections`, `work_mem`, `max_wal_size`, `checkpoint_timeout` | 100, 64 MB, 8 GB, 15 min | the connection budget below stays at ≈ 52 |
+| `vacuum_index_cleanup` (vector partitions) | `off`, permanently | autovacuum must never repair an HNSW graph (5 to 6 times a rebuild); hygiene rebuilds every touched graph on the partition, then runs one `VACUUM (INDEX_CLEANUP ON)` (N138, N152) |
+| `max_connections`, `work_mem`, `max_wal_size`, `checkpoint_timeout` | 100, 64 MB, 8 GB, 15 min | the connection budget below stays at ≈ 53 (3 reserved) |
 | `wal_level`, `archive_mode`, `archive_timeout`, `archive_command` | `replica`, on, 60 s, `pgbackrest --stanza=${STANZA} archive-push %p` | RPO ≤ 60 s for retains |
 | `autovacuum_max_workers`, `autovacuum_freeze_max_age`, `vacuum_freeze_min_age` (content partitions) | 6, 10⁹, 10⁷ | XID arithmetic below (P-11) |
 | `plan_cache_mode` (`engram_app`) | `force_custom_plan` | per-namespace partial index predicates need custom plans (N112) |
@@ -77,13 +77,13 @@ check; a budget that is exceeded is a §11 item, not a tuning session.
 
 | Budget | Value | Basis |
 |---|---|---|
-| IOPS | **≈ 10 k page touches per MID recall**, measured: 3 vector arms ≈ 1 250 each (HNSW at ef 150: 943 to 1 882), graph arm ≈ 3 700 on the temporal family through the links reverse index, BM25 ≈ 200 (unmeasured), joins; 50 QPS at a 5 % miss rate ≈ **25 k IOPS** of the 50 k budget. The exact path costs 2 060 page reads at 2 100 interleaved rows (not 3.2 MB) | M0.6 re-derives the table with the real arm SQL, the exact path, 10 % and 1 % tag filters and an old `as_of` (N114, N138) |
-| Hot set | **≈ 80 GB at the 8 M target** (vectors and HNSW 2 048 B per row ≈ 16 GB each, links with the reverse index ≈ 16 GB, `ins_seq` indexes ≈ 5 %); usable cache ≈ 80 to 96 GB of the 112 GB container, so the margin is thin and R37's trigger applies | |
-| Connections | pgbouncer `engram_app` pool 24 (+4 reserve) per shard, **shared**: recall concurrency ≈ 12, ack and retain commits ≈ 4, Reflect ≈ 4, the rest for schedulers; per-process pool 16 everywhere. **Other roles have their own pools** (pgbouncer pools are per database and user): `engram_admin` via pgbouncer, pool 6 (at most two expunges run per shard through a shard-wide advisory slot, each with a purge and a Materialize connection plus the Finish step); `engram_move` direct, ≤ 6 (4 copy streams + 2); `engram_relay` direct, 2; `engram_migrate` (index runner) direct, 2; exporter 2; `engramctl` 4. Total server connections ≈ **52 of `max_connections` 100** | pool wait p95 < 50 ms (`PoolSaturation`); the DSN files and sizes are in the config below (P-9) |
+| IOPS | **≈ 10 k page touches per MID recall**, measured: 3 vector arms ≈ 1 250 each (HNSW at ef 150: 943 to 1 882), graph arm ≈ 3 700 on the temporal family through the links reverse index, BM25 ≈ 200 (unmeasured), joins; 50 QPS at a 5 % miss rate ≈ **25 k IOPS** of the 50 k budget. The exact path costs 2 060 page reads at 2 100 interleaved rows (not 3.2 MB). A filtered vector arm at θ adds ≈ 20–30 k buffers; the budget assumes **≤ 20 % of recalls carry a filter with `E ≥ θ`** (N151) | M0.6 re-derives the table with the real arm SQL, the exact path, 10 % and 1 % tag filters and an old `as_of`, and measures the filtered share on the benchmark traces (N114, N151) |
+| Hot set | **≈ 73 GB at the 6.5 M target**, counting **both** covering link indexes (PK and reverse, ≈ 29 GB at 6.5 M); vectors and HNSW 2 048 B per row ≈ 20.5 GB each per 10 M facts, `ins_seq` indexes ≈ 12 % of the footprint (only their tail is hot). At 8 M the hot set is ≈ 90 GB (links ≈ 36 GB), above the 80 to 96 GB of usable cache, so 8 M is not the target; ≈ 10 GB of headroom remains at 6.5 M and R37's trigger applies. M0.6 measures the graph arm's resident set (N154) | the target returns to 8 M only by a register revision if that set at 8 M is ≤ 80 GB |
+| Connections (N155) | a MID recall holds ≈ **305 connection-ms** (four 60 ms arms, two graph waves, visibility), ≈ 15 server connections mean at 50 QPS and ≈ 25 at p99. Per shard: `engram_app` pgbouncer pool **40** (recall ≤ 32, ack/commit and Reflect ≤ 8), per API process pool **20** (two processes), `engram_admin` 2, `engram_move` direct 4, `engram_relay` direct 1, `engram_migrate` 1, index runner 1, exporter 2, `engramctl` 2: ≈ **53 of `max_connections` 100** (3 reserved). The DAG scheduler admits at most **16 concurrent arm transactions per API process per shard** (a semaphore in `ReadSession`); queueing at ρ ≈ 0.47 on 32 servers is < 2 ms p95 (Erlang-C), budgeted as a **4 ms pool-wait term** on the critical path (216 → 220 ms). A cell instance holds 32 × 20 = 640 connections through pgbouncer | `PoolSaturation` keeps wait p95 < 50 ms; `TestReadSession_ConcurrentArms` asserts ≤ 320 connection-ms per MID recall; M0.5 records Σ arm transaction time |
 | CPU (8 vCPU) | recall ≤ 4, commits and consolidation applies ≤ 2, expunge, autovacuum and index builds ≤ 2 (builds use the 4 maintenance workers, one build per shard); recall p95 under concurrent ingest is an **M0.5 exit** | |
 | XIDs | 50 writes/s + relay cursors batched to 1/s per consumer (4 consumers) ≈ **54 XIDs/s ≈ 4.7 M/day ≈ 1.7×10⁹/year** (the first plan had 2×10⁸/year; cursor updates every 100 ms made it ≈ 90/s, a 2×10⁸ freeze age every ≈ 26 days). `autovacuum_freeze_max_age = 10⁹` is reached in ≈ 214 days, the 50 % alert in ≈ 107 days. Content partitions are insert-only, so the insert-triggered vacuums freeze as they go (`vacuum_freeze_min_age = 10 M`) and an aggressive vacuum skips all-frozen pages | P-11 |
-| Disk | **volume 600 GB**; relations ≈ 150 GB at 8 M facts, ≈ 230 GB at the 12 M cap (≈ 181 GB per 10 M); ingest WAL ≈ 13 KB per fact ≈ 13 GB/day at 1 M facts/day | capacity signals are **relation bytes per namespace** (hidden and unpurged rows, old-model vectors included), not `live_facts`; `ShardNearCapacity` pages at 70 % of the volume (420 GB) (N114) |
-| Purge WAL | a purged fact costs 35 to 82 KB of WAL (9 index-driven FK cascades; 1 000 facts = 35 to 82 MB per batch). `PurgeBatch`, `PurgeRows`, `DerivedPurge` and move cleanup measure the `pg_current_wal_insert_lsn` delta per batch and **pace to ≤ 25 MB/s per shard** (at most two expunges per shard, one budget between them; they also yield while `pg_wal` > 20 GB or archive lag > 120 s). A 100 k-fact document ≈ 3.5 to 8 GB ≈ 2.5 to 5.5 min; a 1 M-fact namespace delete ≈ 35 to 82 GB ≈ 25 to 55 min, inside the 24 h purge SLA. The repair vacuum (≈ 110 KB per fact) is gone: a touched index is rebuilt first (§9.2). `archive-push-queue-max = 100 GB`, archive throughput must sustain ≥ 50 MB/s (purge 25 + ingest + backup traffic), measured in M1.7 | `wal_compression = zstd` (14.2 to 8.9 MB on a vector-heavy batch); a **differential follows every namespace delete and every move**, and the expunge takes one whenever WAL since the last backup exceeds 13 GB, which keeps the RTO bound of §9.3 (N119) |
+| Disk | **volume 600 GB**; relations ≈ 132 GB at the 6.5 M target, ≈ 203 GB at the 10 M cap (≈ 181 GB per 10 M plus 12 % for the `ins_seq` indexes); ingest WAL ≈ 13 KB per fact ≈ 13 GB/day at 1 M facts/day | capacity signals are **relation bytes per namespace** (hidden and unpurged rows, old-model vectors included), not `live_facts`; `ShardNearCapacity` pages at 70 % of the volume (420 GB) (N114) |
+| Purge WAL | a purged fact costs 35 to 82 KB of WAL (9 index-driven FK cascades; 1 000 facts = 35 to 82 MB per batch). `PurgeBatch`, `PurgeRows`, `DerivedPurge` and move cleanup measure the `pg_current_wal_insert_lsn` delta per batch and **pace to ≤ 25 MB/s per shard** (at most two expunges per shard, one budget between them; they also yield while `pg_wal` > 20 GB or archive lag > 120 s). A 100 k-fact document ≈ 3.5 to 8 GB ≈ 2.5 to 5.5 min; a 1 M-fact namespace delete ≈ 35 to 82 GB ≈ 25 to 55 min, inside the 24 h purge SLA. The repair vacuum (≈ 110 KB per fact) is gone: a touched index is rebuilt first (§9.2), and that rebuild's WAL (≈ 1.5 to 1.8 KB per vector) is paced by the same budget (N152). `archive-push-queue-max = 100 GB`, archive throughput must sustain ≥ 50 MB/s (purge 25 + ingest + backup traffic), measured in M1.7 | `wal_compression = zstd` (14.2 to 8.9 MB on a vector-heavy batch); a **differential follows every namespace delete and every move**, and the expunge takes one whenever WAL since the last backup exceeds 13 GB, which keeps the RTO bound of §9.3 (N119) |
 | Hosts | 4 shards per 512 GB host (4 × 600 GB local NVMe), 8 shard hosts per full cell | above |
 
 **Temporal: one cluster per cell with fixed history shards (P-9; N71 reversed).** Production
@@ -119,18 +119,18 @@ per-tenant and per-namespace overrides of the N66 keys live in the catalog, neve
 
 ```yaml
 cell: { id: 1, peers: { 2: "envoy-cell-2:8080" } }              # phase 3 forwarding
-catalog: { dsn_file: /run/secrets/catalog_dsn, primary_alias: catalog-primary.cell-1,
+catalog: { dsn_file: /run/secrets/catalog_dsn, primary_alias: catalog-primary.cell-1, standby: catalog-standby.cell-1,   # synchronous standby (N146)
            cache: { size: 100000, ttl: 60s, negative_ttl: 5s, stale_serve_existing: forever, stale_negative_max: 10m } }   # D4
 shards:                                                          # ≤ 32 per cell
   - id: 1
     pgbouncer: shard-1-pgbouncer.cell-1:6432
     direct: shard-1-primary.cell-1:5432                          # relay, mover, engramctl; flipped by failover
-    dsn_file: /run/secrets/shard_1_dsn                           # engram_app via pgbouncer, pool 16 per process
-    admin_dsn_file: /run/secrets/shard_1_admin_dsn               # engram_admin via pgbouncer (Expunge purge, Materialize, Finish), pool 6 per shard
-    move_dsn_file: /run/secrets/shard_1_move_dsn                 # engram_move, direct (mover), ≤ 6
-    relay_dsn_file: /run/secrets/shard_1_relay_dsn               # engram_relay, direct, 2
-    migrate_dsn_file: /run/secrets/shard_1_migrate_dsn           # engram_migrate, direct: read only by the index runner (N138)
-    pool: { size: 16, acquire_timeout: 2s, statement_timeout: { write: 30s, read: 5s }, idle_in_transaction_session_timeout: 30s }   # admin and move: 30 s / 30 s
+    dsn_file: /run/secrets/shard_1_dsn                           # engram_app via pgbouncer (pool 40), pool 20 per process
+    admin_dsn_file: /run/secrets/shard_1_admin_dsn               # engram_admin via pgbouncer (Expunge purge, Materialize, Finish), pool 2 per shard
+    move_dsn_file: /run/secrets/shard_1_move_dsn                 # engram_move, direct (mover), ≤ 4
+    relay_dsn_file: /run/secrets/shard_1_relay_dsn               # engram_relay, direct, 1
+    migrate_dsn_file: /run/secrets/shard_1_migrate_dsn           # engram_migrate, direct, 1: read only by the index runner (N138)
+    pool: { size: 20, arm_semaphore: 16, acquire_timeout: 2s, statement_timeout: { write: 30s, read: 5s }, idle_in_transaction_session_timeout: 30s }   # admin and move: 30 s / 30 s
     blob: { prefix: "1/", credential_file: /run/secrets/shard_1_blob }
     task_queue: shard-1
     index: { create_at_vectors: 2000, drop_below_vectors: 1000, ef_search: arm_cap, mwm_kb_per_vector: 2.4, mwm_max: 5GB, xmin_guard: 5m }   # N112, N138
@@ -142,12 +142,13 @@ temporal: { address: temporal.cell-1:7233, namespace: engram, history_shards: 51
             continue_as_new: { chunks: 100, history_bytes: 20MiB } }
 visibility: { marker_set_alert: 16000, allowed_docs_join_above: 8000 }                 # N116: chunk_tomb and doc_tomb sets only (invalidations are an anti-join)
 expunge: { batch: 1000, wal_mb_per_s: 25, max_active_per_shard: 2, reextracted_grace: 1h, materialize_sla: 15m, purge_sla: 24h, index_sla: 48h,
-           hygiene: { rebuild_fraction: 0.01, rebuild_min_elements: 2000 }, tombstone_ttl: 24h }   # N119, N138: pacing by WAL, not by a pause
+           hygiene: { rebuild_fraction: 0.01, rebuild_min_elements: 2000, unit: partition, weekly: 168h, starved_alert_after: 30m }, tombstone_ttl: 24h }   # N119, N138, N152: pacing by WAL (rebuild WAL included), the partition is the hygiene unit
 gateway: { base_url: https://gateway.internal, key_file: /run/secrets/gateway_key, retry: { base: 100ms, max: 5s, attempts: 5 },
            limits: { gpt-oss-120b: { rpm: 600, tpm: 2000000 }, nomic-embed-text-v1.5: { rpm: 6000 }, bge-reranker-base: { rpm: 3000, pairs_per_s: 80000 } } }   # pairs_per_s: A-R1, measured in M0.5
 models: { embed: nomic-embed-text-v1.5, rerank: bge-reranker-base, extract: gpt-oss-120b, consolidate: gpt-oss-120b, reflect: gpt-oss-120b }
 recall: { default_budget: mid, caps: { low: 50, mid: 150, high: 400 }, rerank_top: { low: 0, mid: 50, high: 150 }, rerank_min_remaining: 106ms, graph_budget_ms: 30, exact_scan_below_vectors: 2000,
-          exact_path_below_eligible: 5000 }               # N106 (generated), N138: θ fixed by the M0.6 sweep
+          exact_path_below_eligible: 50000,               # θ: starts at 50 k, M0.6 fixes it in [20 k, 100 k] (N151)
+          hnsw_max_scan_floor: 20000, hnsw_max_scan_cap: 100000, exact_fallback_below: 4θ, allowed_docs_array_max: 500 }   # N106 (generated), N138, N151
 quota: { defaults: { recalls_per_min: 600, retains_per_min: 120, llm_tokens_per_day: 20000000, max_facts: 2000000 } }
 api: { listen: ":9000", deadline_caps: { default: 30s, Recall: 10s, Retain: 30s, Reflect: 330s, WaitOperation: 65s, StreamSnapshot: 600s } }   # N11
 telemetry: { otlp: otel-collector:4317, metrics_listen: ":9464", log_level: info, log_sample_success: 100, trace_sample: 0.05 }
@@ -211,8 +212,8 @@ index). It serves requests through a `requested → building → ready | failed`
 lease, so a row stuck in `building` is re-leased and retried. Before every build it checks
 `pg_index.indisvalid` and drops an invalid index first (never `IF NOT EXISTS`, which accepts an
 invalid index and leaves the namespace on the exact path forever), and it **refuses to start
-while any `backend_xmin` is older than 5 min** (an open snapshot blocks `CREATE INDEX
-CONCURRENTLY`). It runs `CREATE INDEX CONCURRENTLY fv_<ns8> ON fact_vectors_pNN USING hnsw
+while any client-backend `backend_xmin` is older than 5 min** (an open snapshot blocks `CREATE INDEX
+CONCURRENTLY`; the check ignores `VACUUM` commands and walsenders, and `IndexRunnerStarved` alerts after 30 min of refusals, N152). It serves move-target requests first and regardless of `purgeable_namespaces` (N153). It runs `CREATE INDEX CONCURRENTLY fv_<ns8> ON fact_vectors_pNN USING hnsw
 (embedding halfvec_cosine_ops) WHERE namespace_id = '…' AND embedding_model = '…'` on the
 namespace's partition at **2,000 live vectors** and `DROP INDEX` below 1,000, for each of
 `fact_vectors`, `chunk_vectors` and `observation_version_vectors`; at most 450 such indexes per
@@ -231,12 +232,20 @@ about 2.25 KB per element must fit) and `shm_size: 8g`:
 
 Past ≈ 2.1 M vectors a build no longer fits and drops to ≈ 3 ms per on-disk insert, so the
 default quota `max_facts` 2 M and the move-candidate threshold keep namespaces below it; a
-larger one is a dedicated-shard decision. **Hygiene:** each purge batch adds to
-`vector_indexes.purged_since_build`; a touched HNSW is rebuilt at **1 % of `rows_at_build` or
-2 k purged elements, whichever comes first**, then `VACUUM (INDEX_CLEANUP ON)`, at ≈ 0.35 ms per
-vector (a 1 M-vector namespace: ≈ 6 min per 10 k purged facts). Vector partitions carry
-`vacuum_index_cleanup = off`, so autovacuum never repairs a graph; `pgstattuple` and any
-dead-fraction signal are not used.
+larger one is a dedicated-shard decision. **Hygiene (N138, N152): the partition is the unit.** Each purge batch adds to
+`vector_indexes.purged_since_build`; a touched HNSW is **due** at `purged_since_build ≥ max(1 % of
+rows_at_build, 2 000)` (the 2 k floor binds only below 200 k rows). When any index on a vector partition
+is due, the runner rebuilds **every** HNSW on that partition with `purged_since_build > 0` with
+`REINDEX INDEX CONCURRENTLY` (after dropping any `<name>_ccnew*` leftover, which is also how a crash
+mid-rebuild is repaired) and only then runs one `VACUUM (INDEX_CLEANUP ON)` of the partition; a partition
+is never vacuumed with index cleanup while an un-rebuilt touched graph sits on it. A weekly partition
+hygiene, and one after every namespace delete on the partition, applies the same rule to partitions with
+dead tuples and no due index, which covers small namespaces without an HNSW. A rebuild costs ≈ 0.35 ms
+per vector and writes ≈ 1.5 to 1.8 KB of WAL per vector, paced by the shared 25 MB/s purge budget: a
+1 M-vector namespace rebuilds every 10 k purged facts, ≈ 6 min and ≈ 1.7 GB of WAL. Repair against rebuild
+depends on the fraction purged (≈ 1× at 0.2 %, 2× at 1 %, 5 to 6× at 4 %), and a partition vacuum reads
+every HNSW on it (≈ 1 GB per partition at target). Vector partitions carry `vacuum_index_cleanup = off`,
+so autovacuum never repairs a graph; `pgstattuple` and any dead-fraction signal are not used.
 
 **Version tables.** goose's `goose_db_version` records applied files; each shard also has
 `shard_meta(shard_id, schema_version, applied_at, engram_min_version, engram_max_version)` with
@@ -253,6 +262,7 @@ engramctl migrate --check-rls --shard 7                  # the §8.3 static chec
 engramctl migrate status                                 # shard × schema_version × binary compatibility
 engramctl index build|drop|status [--namespace X]        # partitioned indexes; per-namespace requests go to the runner
 engramctl index run                                      # the index runner daemon (control host, engram_migrate)
+engramctl catalog degrade --async | reconcile --from-shards   # N146: explicit, logged; never automatic
 engramctl config lint                                    # gucs.yaml vs live settings, secrets, role GUCs
 ```
 
@@ -291,8 +301,8 @@ outside every shard's data prefix, with its own credential); `repo-cipher-type=a
 
 | Setting | Value | Rationale |
 |---|---|---|
-| Full backup | weekly (Sunday 02:00 cell-local), `process-max=4` | ≤ 230 GB of relations at the 12 M cap → ≈ 20 min at 200 MB/s (A-O10) |
-| Differential | daily 02:00, block incremental, **and after every namespace delete and every move** (plus a **full** backup of the target shard started after each move's activation, which gates the source cleanup, N143; and whenever WAL since the last backup exceeds 13 GB) | content is immutable, so changed blocks ≈ new rows and index pages: ≈ 20 to 40 GB/day at 1 M facts/day, an estimate M1.7 replaces with the measured number; a purge writes 35 to 82 KB of WAL per fact (§9.1), which the post-delete differential takes out of the RTO term; without block incremental HNSW insertion touches most 1 GB segments (P-13) |
+| Full backup | weekly (Sunday 02:00 cell-local), `process-max=4` | ≤ 203 GB of relations at the 10 M cap → ≈ 17 min at 200 MB/s (A-O10) |
+| Differential | daily 02:00, block incremental, **and after every namespace delete and every move** (plus a **full** backup of the target shard started after each move's activation, which gates the source cleanup, N143; and whenever WAL since the last backup exceeds 13 GB, taken by a shard-level WAL watcher on `engram_pg_wal_since_backup_bytes` whatever wrote the WAL, N157) | content is immutable, so changed blocks ≈ new rows and index pages: ≈ 20 to 40 GB/day at 1 M facts/day, an estimate M1.7 replaces with the measured number; a purge writes 35 to 82 KB of WAL per fact (§9.1), which the post-delete differential takes out of the RTO term; without block incremental HNSW insertion touches most 1 GB segments (P-13) |
 | WAL archiving | continuous, `archive_timeout=60`, `archive-async`, `archive-push-queue-max = 100 GB` | **RPO ≤ 60 s for retains**; ≈ 13 GB/day of ingest WAL at 1 M facts/day, plus the paced purge (≤ 25 MB/s); archive throughput ≥ 50 MB/s |
 | Retention | 4 full sets (≈ 28 days) + WAL between; catalog and Temporal: 8 full | the tenant-facing deletion window (below) |
 | Verification | `pgbackrest verify` daily; a **restore drill** per shard quarterly and for every new shard before it accepts namespaces (`engramctl backup drill --with-deletes`) | a backup that was never restored is a hypothesis |
@@ -300,21 +310,21 @@ outside every shard's data prefix, with its own credential); `repo-cipher-type=a
 **RPO and RTO.** RPO: retains ≤ 60 s; **acknowledged deletes and invalidations 0** (the intent
 objects below); a delete committed but not acknowledged may be lost and is re-applied by the
 client's retry. **RTO is a function of the WAL since the last backup:** provision 5 min +
-`pgbackrest restore --type=time` ≈ 20 to 25 min for ≤ 230 GB with `process-max=8` + WAL replay
+`pgbackrest restore --type=time` ≈ 20 to 25 min for ≤ 203 GB with `process-max=8` + WAL replay
 ≈ 1.2 min per GB (15 min for the 13 GB of a nominal day) + intent replay and verification ≤ 10 min
 + epoch bump and re-enable ≤ 2 min, which is **≤ 60 min while WAL since the last backup is
 ≤ 13 GB**; the post-delete and post-move differentials and the 13 GB trigger of §9.1 keep it
-there. Catalog RTO ≤ 15 min (promote the replica, §9.6). During a restore the shard's ≈ 120
+there. Catalog: promoting the synchronous standby is RPO 0 and ≤ 60 s; a restore from backup (RPO 60 s, the only lossy path) is followed by `engramctl catalog reconcile --from-shards` before the catalog serves writes (N146, §9.6). During a restore the shard's ≈ 120
 namespaces are unavailable; the rest of the cell is unaffected (D2).
 
-**Delete intents (N122, rev. D23).** `DeleteDocument`, `DeleteNamespace`, `DeleteTenant`,
+**Delete intents (N122, rev. D24).** `DeleteDocument`, `DeleteNamespace`, `DeleteTenant`,
 `Invalidate` and `Restore` run the marker transaction (its `deletion_log` row included; for a
 namespace, `freeze_delete` and the catalog `deleting` state), **then** `put` the intent object
 `_control/deletes/{tenant}/{ns}/{deleted_at}-{operation_id}.json` with the control credential,
 **then** ack. Only the attempt that committed the marker writes the intent, with the marker's
 exact effect `{subject, kind, up_to_version | memory_ids, deleted_at, operation_id,
 prev_operation_id}`; `prev_operation_id` is the subject's last `deletion_log` entry, read under
-the document lock. A duplicate that finds the subject already `deleting` or hidden returns the
+the document lock, or, for a fact, under `pg_advisory_xact_lock(engram_doc_lock_keys(ns, memory_id))`, so concurrent `Invalidate`/`Restore` calls form one chain (N150). A duplicate that finds the subject already `deleting` or hidden returns the
 existing operation and, before acking, ensures the intent of the marker it observed exists
 (put-if-absent under that marker's own name and content), so an ack always implies an intent and
 a duplicate never writes a second object. The key has no shard, so the intent follows the
@@ -327,23 +337,23 @@ per namespace** as `TenantDelete` fences each, and acks after the catalog `delet
 tenant-level intent (namespaces are fenced asynchronously, `TENANT_DELETING` is the read
 barrier). Rejected: intent before commit (an orphan intent deletes content acknowledged after
 it), a separate `.committed` record (two puts; the put after commit is the commit record), the
-catalog as intent store, and `synchronous_commit = on` with a standby (doubles the footprint,
-still blocks when the standby is down).
+catalog as intent store, and `synchronous_commit = on` with a standby **for a shard** (doubles the footprint,
+still blocks when the standby is down; the small catalog is the one place this rejection does not apply, N146).
 
 **Replay floor (N134).** The floor is `catalog.shards.replay_floor`, outside the restorable
 shard state, so neither a PITR nor a stale promotion can lose it. Every restore and failover
 lowers it with `min()` of its restore target; it is **never raised** while intents are retained
-(35 days bounds the replay work; `deletion_log` makes a replay idempotent). A floor raised when a
+(35 days bounds the replay work; `deletion_log` makes a replay idempotent). The floor is also derivable: before a replay starts, `engramctl restore replay` writes `_control/restores/{shard}/{restore_target}.json` (the restore target and the floor it will use) to blob storage, and every replay reads `floor = min(catalog.shards.replay_floor, min over those objects for the shard)`, so a catalog restored from backup that lost the lowered floor cannot raise it (N146). A floor raised when a
 replay completes would be lost with the replay's own commits (`Durability_RaiseOnReopen`).
 
 **Restore procedure** (`engramctl restore --shard N --target-time T`; every step is idempotent and
 resumes from its last completed step):
 
-1. **Fence.** Catalog: every namespace on `N` whose state is not `deleting` → `restoring` (`freeze_reason = restore`); `NOTIFY`. Writes fail `NamespaceFrozen`, reads are rejected (`RESTORING`); stop the shard's containers and keep the old volume (renamed `shard-N-data.pre-restore-{ts}`) for 7 days. The catalog `replay_floor` is lowered to `min(floor, T)` first.
-2. **Reconcile open moves (N123, N125).** For every `namespace_moves` row naming `N` the catalog CAS arbitrates: the reconcile CASes `cutover → rolled_back`; if it reads `committed` it completes (c), (b″) and (d) itself (`reconcile_out`). Exactly one side wins and the loser stops. A move that rolled back is undone from the target side (`unready_target`/`abort_move`, target rows and blobs deleted) and the restored row thawed. A restore to a point **before a move-in** is an ordinary move whose source is a scratch instance restored from the old source's backup and which ends with a replay of the namespace's intents from `cutover_at − margin` before `ready`.
+1. **Fence.** Catalog: every namespace on `N` whose state is not `deleting` → `restoring` (`freeze_reason = restore`); `NOTIFY`. Writes fail `NamespaceFrozen`, reads are rejected (`RESTORING`); stop the shard's containers and keep the old volume (renamed `shard-N-data.pre-restore-{ts}`) for 7 days. The restore object `_control/restores/{shard}/{T}.json` is put first, then the catalog `replay_floor` is lowered to `min(floor, T)`.
+2. **Reconcile open moves (N123, N125).** For every `namespace_moves` row naming `N` the catalog CAS arbitrates: the reconcile CASes `cutover → rolled_back`; if it reads `committed` it completes (c), (b″) and (d) itself (`reconcile_out`). Exactly one side wins and the loser stops. A move that rolled back is undone from the target side (`unready_target`/`abort_move`, target rows and blobs deleted) and the restored row thawed. For a move that reads `committed` or `cleaning` whose **target** is the restored or promoted shard, the reconcile first runs `ReconcileIn` (N149): from the intact source (`frozen/move` or `moved_out`) it re-copies insert-only rows with `ins_seq ≥ F_pre` (a source value) and the whole mutable class as `INSERT … ON CONFLICT DO NOTHING`, replays the namespace's intents, then takes the admin edges `incoming → ready → active` (`reconcile_in`, allowed only while the catalog move is `committed`/`cleaning`), after the target's indexes are ready (N153). For a **source** restored to a point before cleanup, `restore cleanup-moved-out` (part of `restore_done`) re-runs `engram_cleanup_namespace` for every `moved_out` row whose move is past `committed`, so resurrected rows are removed again. A restore to a point **before a move-in** is an ordinary move whose source is a scratch instance restored from the old source's backup and which ends with a replay of the namespace's intents from `cutover_at − margin` before `ready`.
 3. **Restore** into a fresh volume (`pgbackrest restore --type=time --target=T --target-action=promote`), start Postgres with `listen_addresses` restricted to `engramctl`, every ownership row `frozen/restore`, run `engramctl migrate --check-rls` and the `shard_meta` check (a backup from an older schema is migrated forward).
 4. **Epoch.** New epoch = catalog epoch + 1, **written to the catalog first**, then to the shard's rows, **skipping namespaces whose open move is `committed` and namespaces whose catalog state is `deleting`**; this fences any zombie of the old Postgres and forces every cache to re-resolve (`moved_out_at` is informational).
-5. **Replay intents (N122, N134).** `engramctl restore replay --shard N` lists, for each hosted namespace, the intents with `deleted_at ≥ replay_floor − 10 min` and applies each **verbatim** (the recorded `up_to_version` or `memory_ids`, never recomputed from restored state) through the admin variant of the marker transaction (same statements, fence bypassed while `frozen/restore`). **Order is per subject, in `prev_operation_id` chain order** (a broken chain starts at its oldest present member); order across subjects is irrelevant and no clock bound is needed, so a `Restore` after an `Invalidate` is honoured wherever each was served. Each intent carries the namespace epoch it committed under, and **an intent older than an already-applied entry of the same subject is skipped** (N143); a repeated `Invalidate` or `Restore` has its own entry and is replayed in its place in the chain. A delete acked after the restore point is never acked from a marker the restore removed: the handler re-reads the marker after the intent put and returns `UNAVAILABLE` if it is gone, so the client's retry re-applies it. Namespace and tenant intents whose catalog row is not `deleting` or `deleted` are skipped; those that apply take the `restore_delete` edge (`frozen/restore → frozen/delete`) and restart their purge. Then `restore_done`. The read fence rejects `frozen/delete` and `frozen/restore`, so nothing is served before the replay ends.
+5. **Replay intents (N122, N134).** `engramctl restore replay --shard N` lists, for each hosted namespace, the intents with `deleted_at ≥ replay_floor − 10 min` and applies each **verbatim** (the recorded `up_to_version` or `memory_ids`, never recomputed from restored state) through the admin variant of the marker transaction (same statements, fence bypassed while `frozen/restore`). **Order is per subject, in `prev_operation_id` chain order** (a broken chain starts at its oldest present member); order across subjects is irrelevant and no clock bound is needed, so a `Restore` after an `Invalidate` is honoured wherever each was served. Each intent carries the namespace epoch it committed under and a replayed `deletion_log` row **stores that recorded epoch** (`applied_epoch` records the epoch it was applied under, informationally); **an intent whose recorded epoch is older than the recorded epoch of an already-applied entry of the same subject is skipped** (N143, N150), so `Invalidate(e)` then `Restore(e)` replay in chain order and both apply; a repeated `Invalidate` or `Restore` has its own entry and is replayed in its place in the chain. A delete acked after the restore point is never acked from a marker the restore removed: the handler re-reads the marker after the intent put and returns `UNAVAILABLE` if it is gone, so the client's retry re-applies it. Namespace and tenant intents whose catalog row is not `deleting` or `deleted` are skipped; those that apply take the `restore_delete` edge (`frozen/restore → frozen/delete`) and restart their purge. Then `restore_done`. The read fence rejects `frozen/delete` and `frozen/restore`, so nothing is served before the replay ends.
 6. **Consumers.** Cursors beyond `max(seq)` are reset to `max(seq)`; an external `index` consumer triggers `engramctl index rebuild --shard N`; the Kafka sink emits `RestoreMarker{shard, restored_to: T, epoch_bump: true}`.
 7. **In-flight work.** Workflows on `shard-N` at epoch `e` fail their next ownership check; `engramctl restore` restarts the operations that were `RUNNING` or `DEFERRED` at `T` with the new epoch and the same `operation_id` (the durable per-chunk state and the extraction cache make this a resume). Operations acked between `T` and the fence are **lost** and reported to the affected tenants' contacts (A-O11).
 8. **Blob reconciliation.** `engramctl blob gc --shard N --reconcile` deletes orphans from after `T` but **skips the prefixes of namespaces the catalog places on `N` until their recovery moves are `done`**; a ledger row whose blob was deleted after `T` is marked `blob_missing` and reported. Moved-out source prefixes are kept for the 28-day backup window (`CleanupMove` deletes the rows after 24 h and a full target backup taken after activation, the blob prefix only after 28 days). Pending markers restart their `Expunge`.
@@ -352,7 +362,7 @@ resumes from its last completed step):
 **Failover is the same path (N123).** `engramctl shard failover N`: (1) fence the old primary if
 reachable (`pg_ctl stop -m immediate`, detach its volume); (2) reconcile open moves as in step 2;
 (3) promote the standby (asynchronous: there is no synchronous standby, RPO for retains ≤ 60 s,
-for acknowledged deletes 0 through the intents) with `listen_addresses` restricted; (4) lower the
+for acknowledged deletes 0 through the intents) with `listen_addresses` restricted; (4) put the restore object and lower the
 replay floor, write the new epoch (catalog first, same skips as step 4) and set every row
 `frozen/restore`; (5) write the new `(system_identifier, timeline_id)` into `catalog.shards`
 **before** flipping `shard-N-primary` and `RELOAD`ing pgbouncer; (6) replay intents as in step 5;
@@ -391,7 +401,7 @@ never content.
 | Retain | `rpc.Retain` → `authz.verify`, `catalog.resolve`, `blob.put_raw`, `store.ledger_insert`, `temporal.start`; then `wf.RetainDocument` → `act.Chunk`, `act.SummarizeDocument`, per chunk `act.ExtractChunk` (attr `cache_hit`), `act.EmbedChunk`, `act.ResolveEntities`, `act.BuildLinks`, `act.CommitChunk`, `act.FinalizeVersion`, `signal.Consolidate` |
 | Delete | `rpc.DeleteDocument` → `authz.verify`, `store.marker_tx` (markers, `deletion_log`, outbox event), `intent.put`, `temporal.signal_with_start(Expunge)` |
 | Expunge | `wf.Expunge` → `expunge.materialize` (attrs: markers, versions hidden), `expunge.purge` (per batch: table, rows, WAL bytes, throttle wait), `expunge.derived_purge` (stubs), `expunge.index_hygiene`, `expunge.finish` |
-| Move | `wf.Move` → `move.plan`, `move.bulkcopy` (per table), `move.preverify` (active namespace), `move.freeze`, `move.reconcile` (per table class), `move.drain`, `move.cutover` (b′, a″ catalog CAS, c, b″, d), `move.restart`, `move.cleanup` |
+| Move | `wf.Move` → `move.plan`, `move.bulkcopy` (per table), `move.preverify` (active namespace), `move.wait_indexes`, `move.freeze`, `move.reconcile` (per table class), `move.drain`, `move.cutover` (b′, a″ catalog CAS, c, b″, d), `move.restart`, `move.cleanup` |
 | Reflect | `rpc.Reflect` → per iteration `reflect.iter{n}` → `gateway.chat`, `tool.{search_memories|search_observations|search_pages|get_page|expand_fact}` |
 
 Span attributes: `engram.cell`, `engram.shard`, `engram.tenant_id`, `engram.namespace_id`,
@@ -421,12 +431,12 @@ report` and the optional OTel delta export. Cardinality is bounded by `#shards �
 | `engram_observations_hidden_total` | counter | shard, cause (`document`, `invalidation`) | observation chains that `Expunge.Materialize` hid (`MaterializeResult.observations_hidden`, one per `derived_hidden` row of kind `observation`); the blast radius of deletes and invalidations, read against the rebuild rate (R27) |
 | `engram_intent_put_seconds`, `engram_intent_failures_total`, `engram_intent_replayed_total` | histogram, counter | shard (kind) | intent `put` latency (≈ 10 to 50 ms), failed puts (deletes refused), intents applied by a restore replay |
 | `engram_delete_ack_seconds` | histogram | shard, kind | `intent.put` + marker transaction |
-| `engram_hnsw_indexes`, `engram_hnsw_build_seconds`, `engram_hnsw_purged_fraction`, `engram_index_requests` | gauge, histogram, gauge, gauge | shard, table, state | per-namespace partial indexes (≤ 450 per shard), build time, worst `purged_since_build / rows_at_build` (hygiene triggers at 1 %), `vector_indexes` requests by state (`requested`, `building`, `failed`) |
+| `engram_hnsw_indexes`, `engram_hnsw_build_seconds`, `engram_hnsw_purged_fraction`, `engram_index_requests` | gauge, histogram, gauge, gauge | shard, table, state | per-namespace partial indexes (≤ 450 per shard), build time, worst `purged_since_build / rows_at_build` (a graph is due at `max(1 %, 2 k)`; the partition is rebuilt as a unit), `vector_indexes` requests by state (`requested`, `building`, `failed`) |
 | `engram_outbox_lag_events`, `engram_outbox_lag_seconds`, `engram_outbox_relay_leader`, `engram_outbox_gap_watch`, `engram_outbox_aborted_seqs_total`, `engram_outbox_rows` | gauge, counter | shard, consumer | outbox health (consumers: `index`, `kafka`) |
-| `engram_catalog_resolve_total`, `engram_catalog_cache_age_seconds`, `engram_catalog_reresolve_total`, `engram_catalog_failover_total` | counter, gauge | result / shard | resolver cache; there is no cap on serving existing entries (D4), the alert is on the gauge |
+| `engram_catalog_resolve_total`, `engram_catalog_cache_age_seconds`, `engram_catalog_reresolve_total`, `engram_catalog_failover_total`, `engram_catalog_standby_lag_seconds` | counter, gauge | result / shard | resolver cache; there is no cap on serving existing entries (D4), the alert is on the gauge; synchronous-standby state (N146) |
 | `engram_wrong_shard_or_epoch_total`, `engram_namespace_frozen_retries_total`, `engram_namespace_not_ready_total` | counter | shard, surface | fencing rejections; freeze retries; `ready` rejections (N125) |
 | `engram_move_phase`, `engram_move_duration_seconds`, `engram_move_freeze_seconds`, `engram_move_reconcile_rows_total`, `engram_move_rollbacks_total`, `engram_move_cutover_window_seconds`, `engram_move_rejected_rows_total` | gauge, histogram, counter | shard / phase / reason | move progress; freeze window; rows re-copied or merged by the reconcile; rollbacks by step; time between (c) and (b″) |
-| `engram_pg_pool_in_use`, `engram_pg_pool_wait_seconds`, `engram_pg_tx_seconds` | gauge, histogram | shard, kind | pool pressure, transaction duration |
+| `engram_pg_pool_in_use`, `engram_pg_pool_wait_seconds`, `engram_pg_tx_seconds`, `engram_recall_arm_semaphore_wait_seconds` | gauge, histogram | shard, kind | pool pressure, transaction duration; wait for one of the 16 arm slots (N155) |
 | `engram_shard_live_facts`, `engram_shard_namespaces`, `engram_shard_relation_bytes`, `engram_shard_volume_bytes`, `engram_shard_unavailable` | gauge | shard, reason | capacity signals (hourly `engramctl stats`): relation bytes include hidden and unpurged rows; schema mismatch, restoring, draining |
 | `engram_blob_ops_total`, `engram_blob_latency_seconds`, `engram_xcache_total` | counter, histogram | shard, op, code/result | blob client; extraction cache |
 | `engram_backup_last_success_timestamp_seconds`, `engram_wal_archive_lag_seconds` | gauge | shard | from the pgBackRest exporter |
@@ -447,7 +457,7 @@ queries export, with bounded cardinality (16 partitions × the content tables �
 | `engram_pg_fence_holder_age_seconds` | `pg_locks` (granted advisory locks) joined to `pg_stat_activity.xact_start` | `FenceHolderStuck` (> 10 s) |
 | `engram_pg_index_build_progress{index}` | `pg_stat_progress_create_index` | `IndexBuildStuck` |
 | `engram_pg_oldest_backend_xmin_age_seconds` | `pg_stat_activity.backend_xmin` | the index runner's 5 min guard; `IndexRunnerBlocked` |
-| `engram_pg_wal_since_backup_bytes`, `engram_archive_queue_bytes` | pgBackRest `info`, `pg_stat_archiver` | the 13 GB differential trigger (RTO), `ArchiveQueueHigh`, purge pacing |
+| `engram_pg_wal_since_backup_bytes`, `engram_archive_queue_bytes` | pgBackRest `info`, `pg_stat_archiver` | the shard-level WAL watcher's 13 GB differential trigger (RTO), `ArchiveQueueHigh`, purge pacing |
 
 **SLOs** (30-day windows, per cell; each has a burn-rate alert pair 14.4×/1 h and 6×/6 h):
 
@@ -468,6 +478,7 @@ queries export, with bounded cardinality (16 partitions × the content tables �
 | Alert | Condition | Severity | Runbook |
 |---|---|---|---|
 | `ShardDown` | `pg_up{shard} == 0` for 1 min, or `UNAVAILABLE` > 50 % for a shard for 2 min | page | §9.6 a shard down |
+| `CatalogStandbyDown` | the catalog's synchronous standby not streaming for 60 s (catalog commits block meanwhile) | page | §9.6 catalog down: restore the standby, or the explicit `engramctl catalog degrade --async` |
 | `CatalogDown` | catalog `pg_up == 0` for 1 min, or `engram_catalog_cache_age_seconds > 300` (ticket) / `> 900` (page) | page / ticket | §9.6 catalog down |
 | `ExpungeMaterializeSlow` | `engram_expunge_oldest_pending_seconds{phase="materialize"} > 900` | page | §9.6 expunge stuck (the namespace is in degraded mode) |
 | `ExpungePurgeSlow` / `ExpungeIndexSlow` | phase `purge` > 86 400 s / `index` > 172 800 s | ticket | §9.6 expunge stuck |
@@ -476,6 +487,7 @@ queries export, with bounded cardinality (16 partitions × the content tables �
 | `XIDAgeHigh` | `engram_pg_xid_age > 5×10⁸` | ticket (page at 8×10⁸) | §9.6 XID age |
 | `AutovacuumLong` | any autovacuum > 30 min | ticket | §9.6 XID age; usually a large purge without a prior `DROP INDEX` |
 | `HNSWRebuildPending` | `engram_hnsw_purged_fraction` > 2 % for 24 h, or a `vector_indexes` row `building` past its lease or `failed` | ticket | the index runner is not rebuilding: `engramctl index status`, §9.6 index runner |
+| `IndexRunnerStarved` | the index runner refused to start for 30 min (open client snapshot) | ticket | a long snapshot or a stuck export: find it in `pg_stat_activity` (VACUUM and walsenders are excluded) |
 | `IndexRunnerBlocked` | `engram_pg_oldest_backend_xmin_age_seconds` > 600 with a request waiting | ticket | a long snapshot blocks builds: find the transaction in `pg_stat_activity` |
 | `ArchiveQueueHigh` | `engram_archive_queue_bytes` > 50 GB | page | purge pacing yields at 20 GB `pg_wal`; fix archiving (credentials, blob endpoint) |
 | `FenceHolderStuck` | `engram_pg_fence_holder_age_seconds > 10` | page | a writer or the mover holds the namespace fence: `pg_stat_activity`, then §9.6 move stuck |
@@ -488,7 +500,7 @@ queries export, with bounded cardinality (16 partitions × the content tables �
 | `RecallLatencyBurn` | burn rate > 14.4 for 1 h / > 6 for 6 h | page / ticket | rerank latency, pool wait, `ef_search`, hot namespace |
 | `GatewayRateLimited`, `OperationsDeferred` | rate-limited > 50 % of wall time for 10 min; DEFERRED > 0 for 1 h for a tenant not at quota | ticket | §9.6 |
 | `BackupStale` | `time() − engram_backup_last_success_timestamp_seconds > 26 h` | page | run the backup by hand; blob credentials and stanza |
-| `ShardNearCapacity` | **relation bytes > 70 % of the volume (420 GB)** or `live_facts > 12e6` (hard cap) or `namespaces > 120` or `engram_hnsw_indexes > 400` | page (bytes, cap) / ticket | §9.5 placement; bytes include unpurged rows, so check expunge lag first |
+| `ShardNearCapacity` | **relation bytes > 70 % of the volume (420 GB)** or `live_facts > 10e6` (hard cap) or `namespaces > 120` or `engram_hnsw_indexes > 400` | page (bytes, cap) / ticket | §9.5 placement; bytes include unpurged rows, so check expunge lag first |
 | `PoolSaturation` | pool wait p95 > 50 ms for 10 min | ticket | hot namespace or long transactions |
 | `SchemaMismatch`, `XcacheErrors` | `engram_shard_unavailable{reason="schema"} == 1`; xcache errors > 1/s | page / ticket | §9.2; blob store trouble |
 
@@ -506,26 +518,26 @@ phase, oldest pending age, marker-set sizes, degraded namespaces, purge rate and
 
 ### 9.5 Shard provisioning
 
-`engramctl shard add --id 3 --cell 1 --host shard-host-2 --capacity-facts 8000000 --volume /mnt/nvme/shard-3 [--dedicated-tenant acme]`:
+`engramctl shard add --id 3 --cell 1 --host shard-host-2 --capacity-facts 6500000 --volume /mnt/nvme/shard-3 [--dedicated-tenant acme]`:
 
 1. **Provision.** Render the `shard-3-postgres`/`pgbouncer`/`exporter` blocks on the chosen shard host (at most four shards per host, 128 GB each), create the 600 GB NVMe volume (≥ 50 k IOPS), generate secrets and a prefix-scoped blob credential for `3/*`, generate the pgBackRest config, create the DNS names of §9.1, `docker compose up -d`; the catalog row is inserted `provisioning` (invisible to placement).
 2. **Schema.** `engramctl migrate --shard 3` on the direct connection: extensions (`vector`, `pg_search`, `pg_trgm`, `pg_stat_statements`), roles (`engram_app` `NOBYPASSRLS`, `engram_relay`, `engram_move` namespace-confined and without `BYPASSRLS`, `engram_migrate` the table owner and the only role the index runner uses, `engram_admin` the only role allowed `DELETE` on content tables: `engramctl` and the Expunge purge; there is no worker or expunge role, the worker connects as `engram_app`; `engram_entity_fuzzy` is revoked from `engram_relay` and `engram_move`) with the role GUCs and 30 s timeouts of §9.1 and a pgbouncer pool per role, tables, 16 hash partitions per big table, RLS policies, B-tree/BM25/trgm indexes (per-namespace vector indexes are created later by the sweeper), `shard_meta`; then `--check-rls` and `engramctl config lint`.
 3. **Backups.** `pgbackrest stanza-create`, first full backup, `verify`, and a restore drill into a scratch container (`engramctl backup drill --shard 3 --with-deletes`) before step 5.
 4. **Config.** Append the `shards[]` block, rolling-restart api and worker one replica at a time; `engramctl shard check 3` writes a canary namespace (`_canary/3`), retains, waits, recalls, deletes (exercising the intent `put`), waits for the expunge to finish.
-5. **Register.** Catalog `UPDATE shards SET state='active', soft_cap_facts=8000000, max_namespaces=150, dedicated_tenant_id=…, blob_prefix='3'`; from here `CreateNamespace` may place namespaces on shard 3.
+5. **Register.** Catalog `UPDATE shards SET state='active', soft_cap_facts=6500000, max_namespaces=150, dedicated_tenant_id=…, blob_prefix='3'`; from here `CreateNamespace` may place namespaces on shard 3.
 
 Shard states are the catalog's and nothing else's: `provisioning → active → full → draining →
 retired`, plus `readonly`. **Placement** (`CreateNamespace`, D2): `pick_shard()` among `active`
 shards in the tenant's pool: lowest `facts_estimate / soft_cap_facts`, then `namespaces_count`
 (**derived** from `namespace_ownership` by `pick_shard`, never incremented by hand, so it cannot
-drift, N131), then `shard_id`. A new cell is added when every shard is `full` or a cell reaches 32.
+drift, N131), then `shard_id`. A new cell is added when every shard is `full` or a cell reaches 32 (5 cells for 1 B facts).
 
 **Capacity signals that change placement or trigger moves:**
 
 | Signal | Threshold | Action |
 |---|---|---|
-| `live_facts` | > 8 M (the target) | `state='full'`; plan moves of the largest namespaces if growth > 2 %/day |
-| `live_facts` | > 12 M (hard cap) | page; forced moves until < 10 M |
+| `live_facts` | > 6.5 M (the target) | `state='full'`; plan moves of the largest namespaces if growth > 2 %/day |
+| `live_facts` | > 10 M (hard cap) | page; forced moves until < 8 M |
 | `namespaces`; per-namespace indexes | > 120; > 400 | `full` (≈ 120 namespaces × 3 vector tables ≈ 360 indexes, cap 450) |
 | relation bytes (hidden and unpurged rows included) | > 70 % of the volume (420 GB) | page; check expunge lag, old-model vectors and outbox trim before moving namespaces |
 | recall p95 | > 300 ms for 3 days at mid budget | hot-namespace playbook |
@@ -555,21 +567,22 @@ writer lifetime; the ring `engram_seq_log(sampled_at, seq)`, sampled each minute
 
 | Step | What happens | Rollback |
 |---|---|---|
-| Plan | catalog `namespace_moves`; target row `incoming`; source `start_move` sets `move_epoch`, which pauses the expunge and the schedulers for the namespace; the source's `system_identifier` and `timeline_id` are recorded; `T_copy = now()`; schema version and column-list hashes compared | `abort_move`, delete the target row |
+| Plan | catalog `namespace_moves`; target row `incoming`; source `start_move` sets `move_epoch`, which pauses the expunge and the schedulers for the namespace; the source's `system_identifier` and `timeline_id` are recorded; `T_copy = now()`; `engram_seq_advance(W_plan)` on the target (`W_plan` = the source's `nextval`, N147); schema version and column-list hashes compared | `abort_move`, delete the target row |
 | BulkCopy | `READ COMMITTED` ranges of ≤ 100 k rows by primary key, restartable at `(table, last_key)`, up to 4 parallel streams, through a `TEMP` table and `INSERT … ON CONFLICT` under RLS in replica mode (N91); one blob key per copied row (owner-keyed, N104); caches (`xcache`, `ecache`, `staging`, `consolidate/`) not copied; **the target has no HNSW** until the copy ends, then the index runner builds the partial per-namespace indexes (§9.2) | `abort_move`, delete target rows, drop the target's indexes by their `engram_hnsw_ddl` names, delete the blob prefix |
-| Pre-freeze verification | namespace still **active**: take `W_pre`; against insert-only rows with `ins_seq < engram_seq_floor(now)` run counts, `bit_xor(hashtextextended(pk::text, 0))` up to 2 M rows, `VerifyFK` and the blob existence checks, plus one catch-up copy of `ins_seq ≥ engram_seq_floor(T_copy)`. None of this runs under the freeze | as above |
+| Pre-freeze verification | namespace still **active**; order inside the activity (N148): (a) take `t_c = clock_timestamp()` and `F_c = engram_seq_floor(t_c)` on the **source**; (b) one catch-up copy of every insert-only table for `ins_seq ≥ F_copy` (`F_copy = engram_seq_floor(T_copy)`, a source value; idempotent upserts by PK ranges); (c) only then counts, `bit_xor(hashtextextended(pk::text, 0))` up to 2 M rows, `VerifyFK` and blob existence checks over `ins_seq < F_c` on **both** sides, `F_c` passed to the target as a number (`engram_seq_floor` is never evaluated on the target, N147). A mismatch runs one more round (new `t_c`, catch-up, check) before `Rollback`. None of this runs under the freeze | as above |
+| Index readiness | after verification and before Freeze the mover requests the namespace's partial indexes (`vector_indexes` rows for every `(vector table, current model)` with ≥ 2,000 copied vectors) and waits until each is `ready` with `rows_at_build ≥ 0.99 × the verified count` (bounded by the `P-db` 12 h `StartToClose`; a `failed` build retries once, then `Rollback`); the runner serves these first (N153) | as above |
 | Freeze | exclusive fence, **one** attempt with `lock_timeout = 35 s` (no retry storm); source `frozen/move`; reads continue; watchdog `max(120 s, 60 s + 1 s per 10 k facts)`, ≤ 15 min, armed until (c) | `thaw_move` (allowed while the target is unreachable; a `ready` row accepts nothing and `unready_target` runs at next contact), then the rows above |
-| Reconcile | no source write transaction exists: re-copy and verify only insert-only rows with `ins_seq ≥ engram_seq_floor(T_pre)`; merge-diff the mutable class (upsert differences, delete target rows absent on the source); check the excluded class by `count ≤`; `VerifyFK` on the target restricted to the same range; wait until every source consumer cursor passes the namespace's final `max(seq)` (bound 120 s, twice the gap horizon, else rollback); any mismatch → rollback. **Freeze work = rows inserted since `T_pre − 10 min` + mutable rows**; M1.5 measures it on a namespace with a consolidation backlog and `APPEND` re-embeds | as above |
+| Reconcile | no source write transaction exists: re-copy and verify only insert-only rows with `ins_seq ≥ F_pre` (`engram_seq_floor(T_pre)` evaluated on the source and passed as a number); merge-diff the mutable class (upsert differences, delete target rows absent on the source); check the excluded class by `count ≤`; `VerifyFK` on the target restricted to the same range; wait until every source consumer cursor passes the namespace's final `max(seq)` (bound 120 s, twice the gap horizon, else rollback); any mismatch → rollback. **Freeze work = rows inserted since `T_pre − 10 min` + mutable rows**; M1.5 measures it on a namespace with a consolidation backlog and `APPEND` re-embeds | as above |
 | Drain, Restart | in-flight operations are read from the source `operations` rows (never from Temporal visibility; `RetainBackfill` parents have rows too) and restarted on the target (`TERMINATE_IF_RUNNING`, memo epoch e + 1; across cells, on the target cell's cluster); singleton-backed kinds (expunge, consolidate) are skipped | |
-| Cutover | (a) `cutover` recorded; (b′) target `incoming → ready` (nothing routes to it; callers get retryable `NamespaceNotReady`); the mover re-checks its timeline against the catalog; **(a″) catalog CAS `namespace_moves.state: cutover → committed` (`WHERE move_id AND state = 'cutover'` and the exact source and target shards, epochs, timeline and catalog namespace row the mover verified; every other step is likewise a CAS on the ownership rows it verified, N143): the point of no return**; (c) source `frozen/move → moved_out` with the target hint, only after the mover read `committed`; (b″) target `ready → active` (sub-second, retried forever); (d) catalog `namespaces` flip `WHERE epoch = e AND state = 'frozen'`, with "already `(target, e + 1)`" the only idempotent success. Between (c) and (b″) there is no owner at all | before (a″): `unready_target`, `thaw_move`; onto a shard that had a `moved_out` row, `return_abort` restores the permanent fence value; a restore or failover reconcile CASes `cutover → rolled_back` or, reading `committed`, completes (c), (b″), (d) itself |
-| Cleanup | after 24 h **and** a full backup of the target started after activation (`namespace_moves.target_backup_at` set; `engramctl move cleanup` refuses earlier, N143): `DROP INDEX` of the namespace's partial indexes on the source (deterministic names), `engram_cleanup_namespace` batches (a `SECURITY DEFINER` function whose outer `DELETE` carries `namespace_id`) paced by WAL like the purge, the `moved_out` row stays; the source **blob prefix is deleted only after the 28-day backup window** | |
+| Cutover | (a) `cutover` recorded; (b′) target `incoming → ready` (precondition: indexes ready, re-checked on the rows; the target's sequence is advanced to `W_final`, the source's final value under the freeze, recorded on `namespace_moves`; nothing routes to it; callers get retryable `NamespaceNotReady`); the mover re-checks its timeline against the catalog; **(a″) catalog CAS `namespace_moves.state: cutover → committed` (`WHERE move_id AND state = 'cutover'` and the exact source and target shards, epochs, timeline and catalog namespace row the mover verified; every other step is likewise a CAS on the ownership rows it verified, N143): the point of no return**; (c) source `frozen/move → moved_out` with the target hint, only after the mover read `committed`; (b″) target `ready → active` (sub-second, retried forever); (d) catalog `namespaces` flip `WHERE epoch = e AND state = 'frozen'`, with "already `(target, e + 1)`" the only idempotent success. Between (c) and (b″) there is no owner at all | before (a″): `unready_target`, `thaw_move`; onto a shard that had a `moved_out` row, `return_abort` restores the permanent fence value; a restore or failover reconcile CASes `cutover → rolled_back` or, reading `committed`, completes (c), (b″), (d) itself |
+| Cleanup | after 24 h, `target_backup_at` and the timeline gate (N149, N143(5)): `catalog.shards(target).timeline_id` equals `namespace_moves.activated_timeline` **or** a `reconciled_in_at` is later than the last timeline change, and in either case a full target backup started after `max(activated_at, reconciled_in_at)`; `engramctl move cleanup` refuses earlier, so the only copy is never deleted while the target may lack rows the source still holds. Then `DROP INDEX` of the namespace's partial indexes on the source (deterministic names), `engram_cleanup_namespace` batches (a `SECURITY DEFINER` function whose outer `DELETE` carries `namespace_id`) paced by WAL like the purge, the `moved_out` row stays; the source **blob prefix is deleted only after the 28-day backup window** | |
 
 Moves never touch `outbox_cursors`. Expected: copy ≥ 2 000 facts/s per stream (B-tree and BM25
 bound, an M1.5 measurement; the previous HNSW-bound figure was ≈ 540 facts/s), freeze < 30 s for
-≤ 1 M facts. The expunge stays paused from Plan to done: insert-only tables only ever lose rows
+≤ 1 M facts. A copied row sorts below every row the target inserts after cutover because the target's sequence was advanced (N147). The expunge stays paused from Plan to done: insert-only tables only ever lose rows
 through it, which is what makes "the difference after a dirty copy is exactly the rows inserted
 after the copy began" true. A 1 M-fact move writes ≈ 18 to 20 GB of WAL on the target (535 B per
-link, 2 KB per vector), and a differential backup follows it; a **full** backup of the target started after activation gates the source cleanup (N143).
+link, 2 KB per vector), and a differential backup follows it; a **full** backup of the target started after activation (and after the last timeline change) gates the source cleanup (N143, N149).
 
 **Schedulers act only on active ownership (N97).** Every shard-wide scheduler (op-sweeper,
 DEFERRED resumer, `expunge-sweep`, `consolidate-sweep`, `page-cron`, `outbox-trim`, stats and
@@ -596,16 +609,23 @@ the `engram.yaml` entry, rolling-restarts api and worker, and keeps the volume f
 
 Each runbook: symptoms → checks → actions → verification. Commands are `engramctl` unless stated.
 
-**Catalog down.** *Symptoms:* `CatalogDown`; new or rarely used namespaces fail `UNAVAILABLE`;
+**Catalog down or its standby down.** *Symptoms:* `CatalogDown` or `CatalogStandbyDown`; new or rarely used namespaces fail `UNAVAILABLE`;
 `engram_catalog_cache_age_seconds` rising; every cached namespace keeps working for as long as the
-outage lasts (the shard-side fence makes staleness safe, D4). *Checks:* `docker compose ps
-catalog-postgres catalog-failover`, whether the agent already promoted
-(`engram_catalog_failover_total`, the `catalog-primary` alias), replica lag. *Actions:* the agent
-promotes after 30 s unreachable and flips the alias; if it is down, `pg_ctl promote` in the replica
-and `engramctl catalog promote --to replica`; if both are lost, restore from `_backups/catalog/`
-(RPO 60 s) and run `engramctl move reconcile`, which compares `namespace_ownership` on every shard
-with the catalog and repairs the catalog from the shards (the shards are the source of truth for
-ownership). *Verify:* resolve errors 0, cache age 0, `LISTEN` reconnected.
+outage lasts (the shard-side fence makes staleness safe, D4). With the **standby down** the primary
+keeps serving reads but catalog *writes* (moves, deletes, epoch bumps, namespace lifecycle) block: that
+degrades operations, not recall or retain. *Checks:* `docker compose ps catalog-postgres
+catalog-standby catalog-failover`, `engram_catalog_standby_lag_seconds`, whether the agent already promoted
+(`engram_catalog_failover_total`, the `catalog-primary` alias). *Actions:* standby down → restore it
+(re-seed from the primary); only if that will take long, `engramctl catalog degrade --async`, an explicit,
+logged operator switch (never automatic) that is reverted once the standby catches up. Primary down → the
+agent promotes the standby after 30 s unreachable and flips the alias (RPO 0: every commit a protocol step
+observed is on the standby); if the agent is down, `pg_ctl promote` on the standby and `engramctl catalog
+promote --to standby`. If both are lost, restore from `_backups/catalog/` (RPO 60 s) and **before the catalog serves
+writes** run `engramctl catalog reconcile --from-shards`, which treats the shards' ownership rows as the
+source of truth: a source `moved_out` with a target hint ⇒ the move is at least `committed`; a target `active` with
+`move_epoch` ⇒ `done` or `cleaning`; a target `ready`/`incoming` with a source `frozen/move` ⇒ `cutover`; a shard
+`frozen/delete` ⇒ `deleting`; every namespace's catalog epoch is raised to the maximum over its shard rows, and
+the replay floor is `min(catalog, blob mirror)` (§9.3). *Verify:* resolve errors 0, cache age 0, `LISTEN` reconnected, standby streaming.
 
 **A shard down.** *Symptoms:* `ShardDown`; `UNAVAILABLE` for that shard's namespaces only.
 *Checks:* container state and logs, volume health (`dmesg`, `df`), `pg_controldata`, pgbouncer
@@ -649,13 +669,13 @@ rotate the credential (`engramctl secret rotate --control`). If the store lost o
 would miss deletes: `engramctl intent audit --shard N` compares `deletion_log` rows with intent
 objects (every acknowledged marker must have one) before the next restore drill.
 
-**Index runner stuck, blocked or failed** (`HNSWRebuildPending`, `IndexRunnerBlocked`,
-`IndexBuildStuck`). *Checks:* `engramctl index status` (requests by state and lease, invalid
+**Index runner stuck, blocked, starved or failed** (`HNSWRebuildPending`, `IndexRunnerBlocked`,
+`IndexRunnerStarved`, `IndexBuildStuck`). *Checks:* `engramctl index status` (requests by state and lease, invalid
 indexes), the oldest `backend_xmin` (an export or a long transaction blocks `CREATE INDEX
 CONCURRENTLY`), `pg_stat_progress_create_index`, the daemon on the control host. *Actions:* end
 the long transaction; a `building` row past its lease is re-leased by itself; an `INVALID` index
 is dropped by the next build, never re-accepted; a namespace served by the exact path longer than
-expected has an invalid or failed index. Never run `CREATE INDEX` by hand as `engram_admin` (it is
+expected has an invalid or failed index. A partition's graphs are rebuilt as a unit before any vacuum with index cleanup; a rebuild left `<name>_ccnew*` leftovers is repaired by the next run (dropped first). Rebuild WAL (≈ 1.7 GB per 1 M-vector namespace) is paced by the shared purge budget, so a long rebuild queue behind a large delete is expected, not an incident. Never run `CREATE INDEX` by hand as `engram_admin` (it is
 not the owner). *Verify:* the request reaches `ready`, `indisvalid` is true, purged fraction
 returns to 0.
 
@@ -671,11 +691,11 @@ differential that the post-delete rule would have taken. *Verify:* queue drains,
 mismatches, last error, the source's and target's ownership states), the source's timeline against
 `catalog.shards`. *Actions by step:* **BulkCopy slow** → check target pool wait and B-tree/BM25
 write rate (the target has no HNSW yet); throttle a hot namespace with a temporary quota
-(`engramctl move throttle X --retains-per-min 60`) rather than freezing early. **Reconcile
+(`engramctl move throttle X --retains-per-min 60`) rather than freezing early. **Index readiness** (`move.wait_indexes`) → the move waits for the target's partial indexes (≥ 2,000 copied vectors per table); check `engramctl index status` for the target, a `failed` build retries once and then rolls the move back. **Sequence** → the target's `engram_ins_seq` is advanced at Plan and again before `ready`; `engramctl move status X` shows `W_plan`, `W_final` and the target's value, and an export or consolidation watermark on a namespace moved in less than 10 min ago answers `UNAVAILABLE` with `RetryInfo 10 min` by design (N147). **Reconcile
 mismatch** → the move already rolled back (source `active`, target rows deleted): read the
 mismatch report, fix the cause (usually a writer lifetime beyond 60 s: check
 `statement_timeout`), retry. **Frozen > 60 s** → the watchdog rolls back at `max(120 s, …)`;
-`engramctl move rollback X` is safe at any step before (a″) (each step is a CAS on the ownership rows it verified, so a rollback racing a step makes one of them stop with `MoveFenced`, N143). **Cleanup waits** for the 24 h grace and for `target_backup_at`; `engramctl move status X` shows which is outstanding, and `engramctl backup full --shard T` forces the backup. **After the catalog CAS (a″)** the move
+`engramctl move rollback X` is safe at any step before (a″) (each step is a CAS on the ownership rows it verified, so a rollback racing a step makes one of them stop with `MoveFenced`, N143). **Target restored or failed over after (a″)** → the §9.3 reconcile runs `ReconcileIn` from the intact source; do not clean up the source meanwhile. **Cleanup waits** for the 24 h grace, `target_backup_at` and the timeline gate (a full backup that started after the last timeline change or `reconciled_in_at`); `engramctl move status X` shows which is outstanding, and `engramctl backup full --shard T` forces the backup. **After the catalog CAS (a″)** the move
 is `committed`: `engramctl move resume X` completes (c), (b″) and (d) (between (c) and (b″) the
 namespace has no owner); never roll back after (a″). **Source
 failed over mid-move** → the move is `MoveFenced`; the §9.3 restore step 2 settles it by the catalog CAS. *Verify:*
@@ -723,15 +743,15 @@ operation resumes from its committed chunks.
 | ND-12 | Envoy retries only a fixed allowlist of reads on transport failures; writes and long streams have `num_retries: 0`. *(adopted as N24)* | Writes are made idempotent by `request_id`/`operation_id` at the client. | Retrying everything. |
 | ND-13 | Secrets are file-mounted, re-read every 60 s and on `SIGHUP`; DSN rotation is scripted with pgbouncer `RELOAD` first. *(adopted as N24)* | No restarts; no secrets in `docker inspect`. | Environment secrets. |
 | ND-14 | Restore and failover share one path: fence, reconcile open moves by the catalog CAS, restore or promote with restricted `listen_addresses`, `frozen/restore`, epoch bump (catalog first), verbatim intent replay per subject chain from the catalog replay floor, `restore_done`. *(N122, N123, N134)* | A restored or promoted shard must not serve a deleted document or accept a zombie. | Silent restore; `synchronous_commit = on` with a standby. |
+| ND-15 | The catalog has one synchronous standby (`remote_apply`) and is repairable from the shards' ownership rows; shards keep `synchronous_commit = local`. *(N146)* | The catalog arbitrates moves and holds the replay floor and `deleting`; its writes are off the hot path, so a blocked commit degrades operations only. | An asynchronous catalog replica (loses `committed`, the lowered floor and `deleting` within the lag). |
 
-### Round-4 changes
+### Round-5 changes
 
 | Area | Removed | Added |
 |---|---|---|
-| Shard size | 10 M target / 20 M cap, 300 GB, ≥ 10 k IOPS, 1 400 touches per recall, `live_facts` signals | 8 M / 12 M, 600 GB, NVMe ≥ 50 k IOPS, ≈ 10 k touches ≈ 25 k IOPS, hot set ≈ 80 GB, relation-byte signals, `ShardNearCapacity` at 70 % (N114) |
-| Purge | fixed 50 ms pause, repair vacuum, `HNSWDeadFraction`, `pgstattuple` | WAL pacing ≤ 25 MB/s, zstd, archive budget, differential after every delete and move, RTO as a function of WAL (N119) |
-| Indexes | sweeper-issued DDL, `IF NOT EXISTS`, 2 GB `maintenance_work_mem`, 4 GB `shm` | index runner with lease and `indisvalid` check, xmin guard, 2.4 KB per vector builds to 2 M, 1 % rebuild trigger, `shm` 8 GB (N138) |
-| Connections and roles | one shared pool, no admin or move timeouts | per-role DSNs and pools (≈ 52 of 100), 30 s timeouts on `engram_admin` and `engram_move`, one 35 s exclusive-lock rule (N133e, N139) |
-| Durability | intent before the marker, floor in `shard_meta`, name-order replay | intent after commit, floor in the catalog never raised, verbatim chain-order replay, `restore_delete` edge, blob prefixes kept 28 days (N122, N123, N134) |
-| Moves | `created_at` re-copy key, snapshot of the whole namespace under the freeze, `moved_out` as the point of no return | three table classes, `ins_seq` re-copy, pre-freeze verification, catalog CAS (a″) (N124, N125, N137) |
-| Temporal | gate at 1 000 events/s | gate at the sized backfill peak, 580 to 5 800 events/s (N139) |
+| Shard size and hot set | 8 M / 12 M, hot set ≈ 80 GB, links ≈ 16 GB, `ins_seq` ≈ 5 %, 125 shards in 4 cells | 6.5 M / 10 M, hot set ≈ 73 GB with both link indexes, `ins_seq` ≈ 12 %, 154 shards in 5 cells; `soft_cap_facts` 6.5 M, forced moves until < 8 M (N154) |
+| Connections | pool 24 + 4 reserve, per-process 16, ≈ 52 | `engram_app` 40, per process 20, arm semaphore 16, ≈ 53, 4 ms pool-wait term, 220 ms path (N155) |
+| Catalog | asynchronous replica, `engramctl move reconcile` | synchronous standby, `CatalogStandbyDown`, `catalog degrade --async`, `catalog reconcile --from-shards` (N146) |
+| Replay | floor in the catalog only; epoch re-stamped | blob mirror `_control/restores/…` read as `min`, recorded epochs, fact marker lock (N146, N150) |
+| Hygiene | per-index trigger `1 % or 2 k`, `VACUUM` after one rebuild | partition unit, `REINDEX INDEX CONCURRENTLY` of every touched graph, rebuild WAL paced, weekly pass, `IndexRunnerStarved` (N152) |
+| Move | floor evaluated on the target, check before catch-up, cleanup on any backup | `engram_seq_advance`, source-value floors, catch-up then check, index readiness, `ReconcileIn`, timeline gate (N147 to N149, N153) |

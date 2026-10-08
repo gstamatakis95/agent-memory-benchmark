@@ -2,9 +2,14 @@
 //
 // Long-running operations. Every asynchronous unit of work is an Operation,
 // and the workflow behind it depends on its kind (decision N136):
-//   * RETAIN_DOCUMENT, CREATE_SNAPSHOT and REFRESH_PAGE run as their own
-//     Temporal workflow, id `ns/{namespace_id}/op/{operation_id}` on task
-//     queue `shard-{shard_id}` (decision D11);
+//   * RETAIN_DOCUMENT and CREATE_SNAPSHOT run as their own Temporal workflow,
+//     id `ns/{namespace_id}/op/{operation_id}` on task queue
+//     `shard-{shard_id}` (decision D11);
+//   * REFRESH_PAGE is singleton-backed: the refresh runs in the per-page
+//     workflow `ns/{namespace_id}/page/{page_id}`, started or nudged by
+//     SignalWithStart with the operation_id in the nudge; WaitOperation polls
+//     the page row, CancelOperation cancels nothing but the nudge, and a
+//     move's Restart skips it (decision N157, review A-5);
 //   * DELETE_DOCUMENT is the per-namespace Expunge singleton
 //     (`ns/{namespace_id}/expunge`) plus the tombstone's `operation_id`, with
 //     progress read from the expunge's own bookkeeping; DELETE_NAMESPACE runs
@@ -93,7 +98,9 @@ enum OperationKind {
   // Background consolidation round (never client-created; listed for
   // observability of consolidation_lag).
   OPERATION_KIND_CONSOLIDATE = 4;
-  // PageService.RefreshPage.
+  // PageService.RefreshPage; singleton-backed (the per-page workflow
+  // `ns/{namespace_id}/page/{page_id}` carries the operation_id in its nudge,
+  // decision N157).
   OPERATION_KIND_REFRESH_PAGE = 5;
   // ExportService.CreateSnapshot.
   OPERATION_KIND_CREATE_SNAPSHOT = 6;

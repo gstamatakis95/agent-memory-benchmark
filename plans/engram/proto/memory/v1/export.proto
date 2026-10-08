@@ -21,9 +21,19 @@
 // byte stream cannot be filtered on read). A delete therefore EXPIRES the
 // snapshots that could contain the document; Invalidate and Restore never
 // expire a snapshot. Instead GetSnapshotManifest returns a live
-// `hidden_overlay` (the currently invalidated facts and the hidden derived
-// versions) that the sync client applies before serving, so curation reaches a
-// synced agent within one manifest poll and the next snapshot honours it.
+// `hidden_overlay` (the currently invalidated facts and the derived versions
+// the read predicate hides now) that the sync client applies before serving,
+// so curation reaches a synced agent within one manifest poll and the next
+// snapshot honours it. The overlay is computed from the live predicate (the
+// evidence-segment test over `fact_hidden(invalidate)` and the open
+// tombstones), not from `derived_hidden` alone, so it is correct before
+// Materialize has run, and it is restricted to markers newer than the
+// manifest's `as_of` plus Restores (decisions N145, N157, review A-11).
+//
+// Document tags (decision N157, review A-13). A tag change creates no version,
+// so the delta also carries a `documents` part: one line per document whose
+// `(document_id, tag_generation)` differs between the two snapshots, with the
+// document's current tags.
 // After a delete expired the latest ready snapshot, the expunge starts a
 // system-initiated snapshot (debounced 10 min per namespace), so read-only
 // sync clients regain a servable copy.
@@ -92,7 +102,8 @@ enum SnapshotFileKind {
   // pages/<name>.md: current version of each page.
   SNAPSHOT_FILE_KIND_PAGE = 5;
   // delta-v{n-1}-v{n}.jsonl.zst: upsert and delete records between the
-  // previous version and this one, from a diff of the two snapshots.
+  // previous version and this one, from a diff of the two snapshots, plus a
+  // `documents` part keyed by (document_id, tag_generation) (decision N157).
   SNAPSHOT_FILE_KIND_DELTA = 6;
 }
 
@@ -142,13 +153,18 @@ message SnapshotManifest {
   // versions stay listed (so a client learns why its chain is broken) but
   // StreamSnapshot refuses them.
   bool expired = 15;
-  google.protobuf.Timestamp expired_at = 16;
+  // When the snapshot expired; the source is the `export_snapshots.expires_at`
+  // column, set together with `state = 'expired'` and an `expired_reason`
+  // (decision N157). Renamed from `expired_at` in round 5 (pre-1.0 exception,
+  // plan section 4.5); the old name is reserved.
+  google.protobuf.Timestamp expires_at = 16;
   // Ids (facts, chunks, observations) deleted between base_version and this
   // version, also when the base snapshot has expired (decision N126). The
   // sync client applies them before serving. Long lists are paged into the
   // delta file's delete records; this field holds at most the first 10,000.
   repeated string deleted_ids = 17;
 
+  reserved "expired_at";
   reserved 100 to 199;
 }
 
@@ -160,7 +176,9 @@ message HiddenVersion {
   string id = 2;
   // The hidden range: every version of the observation or page whose
   // root_version equals `root_version` and whose version is at least
-  // `from_version` is hidden (decision N117).
+  // `from_version` is hidden (decision N117). The sync client compares
+  // `root_version` (decision N145): after a rebuild started a new root, the
+  // next snapshot's version is not over-hidden by the old range.
   int64 root_version = 3;
   int64 from_version = 4;
 }
@@ -174,10 +192,13 @@ enum HiddenKind {
 
 // HiddenOverlay is the live curation state that the sync client applies to a
 // snapshot before serving it (decision N126): the facts currently invalidated
-// (`fact_hidden` with cause `invalidate`) and the derived versions currently
-// hidden (`derived_hidden` rows). It is computed when the manifest is read,
-// is paged (the first page comes with the manifest) and reflects Restore as
-// well: a restored fact is simply absent.
+// (`fact_hidden` with cause `invalidate`) and the derived versions the read
+// predicate hides now (computed with the evidence-segment test, so versions
+// whose Materialize is still owed are included; decision N145). Only markers
+// newer than the manifest's `as_of`, plus Restores, are listed, because the
+// snapshot itself was built through the predicate. It is computed when the
+// manifest is read, is paged (the first page comes with the manifest) and
+// reflects Restore as well: a restored fact is simply absent.
 message HiddenOverlay {
   // Ids of invalidated facts.
   repeated string hidden_memory_ids = 1;

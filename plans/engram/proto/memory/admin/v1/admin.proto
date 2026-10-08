@@ -1,12 +1,17 @@
 // memory/admin/v1/admin.proto
 //
-// Admin-only control-plane API (served on the same port as memory.v1 but
-// behind the admin interceptor and a separate Envoy route that is not
-// exposed to tenants). Scopes (decision D13, N139): `tenant.admin` is
-// tenant-bound, the interceptor enforcing token.tenant_id ==
-// request.tenant_id on every tenant-level method; `engram.operator` is
-// fleet-wide with its own audience and covers ShardService, MoveService and
-// ListTenants. Three services fixed by decision D1:
+// Control-plane API served on the same port as memory.v1 behind the admin
+// interceptor. Scopes and routes (decisions D13, N139, N157, review A-12):
+// `engram.operator` is fleet-wide with its own audience and covers
+// ShardService, MoveService, ListTenants, CreateTenant and the quota and
+// isolation paths of UpdateTenant; those methods are served ONLY on the
+// separate Envoy admin route that is not exposed to tenants. `tenant.admin`
+// is tenant-bound (the interceptor enforces token.tenant_id ==
+// request.tenant_id) and covers the tenant's own lifecycle: GetTenant,
+// DeleteTenant, GetTenantOperation and the display_name and config paths of
+// UpdateTenant, served on the tenant-facing listener. A tenant administrator
+// can therefore never raise its own quotas or change its isolation. Three
+// services fixed by decision D1:
 //   TenantService — tenants, quotas, config, isolation;
 //   ShardService  — shard registry and namespace → shard resolution;
 //   MoveService   — the per-namespace move protocol of decision D5 (dirty
@@ -33,7 +38,8 @@ option go_package = "example.com/engram/gen/go/memory/admin/v1;adminv1";
 // TenantService manages tenants.
 service TenantService {
   // CreateTenant mints the tenant row; `tenant_id` is chosen by the control
-  // plane caller and must match `[a-z0-9-]{1,64}`.
+  // plane caller and must match `[a-z0-9-]{1,64}`. Scope engram.operator only
+  // (admin route).
   rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
   // GetTenant returns one tenant.
   rpc GetTenant(GetTenantRequest) returns (GetTenantResponse) {
@@ -45,7 +51,11 @@ service TenantService {
   }
   // UpdateTenant patches display_name, quotas, config and isolation.
   // Changing isolation to DEDICATED does not move namespaces; it only
-  // constrains future placement (use MoveService to relocate).
+  // constrains future placement (use MoveService to relocate). The paths
+  // `quotas`, `quotas.*` and `isolation` and the state change need
+  // engram.operator; `display_name` and `config` are open to the tenant's own
+  // tenant.admin token, and a tenant token naming an operator path is
+  // PERMISSION_DENIED (decision N157, review A-12).
   rpc UpdateTenant(UpdateTenantRequest) returns (UpdateTenantResponse);
   // DeleteTenant marks the tenant DELETING in the catalog, writes the
   // tenant-level delete intent object (decision N122, put after the catalog
@@ -122,8 +132,11 @@ service MoveService {
   // (FAILED_PRECONDITION).
   rpc RollbackMove(RollbackMoveRequest) returns (RollbackMoveResponse);
   // CleanupMove runs decision D5 step 7 after the 24 h grace AND a full backup
-  // of the target shard that started after activation (decision N143; before
-  // both it is refused with FAILED_PRECONDITION): drops the
+  // of the target shard that started after activation, and after the
+  // timeline gate of decision N149 (the target's timeline equals the one
+  // recorded at activation, or the target was repaired by ReconcileIn and the
+  // backup started after both; before all of these it is refused with
+  // FAILED_PRECONDITION): drops the
   // namespace's partial indexes on the source shard by their deterministic
   // names, deletes its rows (`engram_cleanup_namespace`, batched) and sets the
   // move DONE. The source blob prefix is kept until the 28-day backup window
@@ -241,8 +254,9 @@ message ListTenantsResponse {
 message UpdateTenantRequest {
   memory.v1.RequestMeta meta = 1;
   Tenant patch = 2;
-  // Allowed paths: display_name, isolation, quotas, quotas.*, config, state
-  // (ACTIVE ↔ SUSPENDED only).
+  // Allowed paths: display_name, config (tenant.admin or engram.operator);
+  // isolation, quotas, quotas.*, state (ACTIVE ↔ SUSPENDED only;
+  // engram.operator only).
   google.protobuf.FieldMask update_mask = 3;
   string etag = 4;
 
@@ -491,7 +505,9 @@ message ReleaseNamespaceResponse {
 enum MoveState {
   MOVE_STATE_UNSPECIFIED = 0;
   MOVE_STATE_PLANNED = 1;
-  // Dirty bulk copy; the source stays writable (decision N124).
+  // Dirty bulk copy; the source stays writable (decision N124). The pre-freeze
+  // verification (catch-up first, then the checks below a closed floor, N148)
+  // and the wait for the target's partial indexes (N153) run inside COPYING.
   MOVE_STATE_COPYING = 2;
   // Removed in v1.0.0-rc6 (decision N124): `MOVE_STATE_CATCHING_UP = 3`.
   // There are no catch-up rounds; the freeze is followed by a reconcile.
@@ -560,6 +576,10 @@ message MoveProgress {
   // Insert-only rows copied by the pre-freeze catch-up (namespace still
   // active, decision N124).
   int64 rows_catchup_copied = 15;
+  // Partial indexes the mover requested on the target and how many are ready;
+  // the freeze waits until all are (decision N153).
+  int32 indexes_requested = 16;
+  int32 indexes_ready = 17;
 }
 
 // Move is one namespace relocation.
@@ -591,6 +611,12 @@ message Move {
   // Earliest time at which the source blob prefix may be deleted: 28 days
   // after cleanup, the backup window (decision N123).
   google.protobuf.Timestamp source_blobs_gc_after = 16;
+  // Completion of the first full target backup that started after activation
+  // (CleanupMove's gate, decision N143), and, when the target was restored or
+  // promoted after the point of no return, when ReconcileIn repaired it
+  // (decision N149).
+  google.protobuf.Timestamp target_backup_at = 17;
+  google.protobuf.Timestamp reconciled_in_at = 18;
 
   reserved 100 to 199;
 }

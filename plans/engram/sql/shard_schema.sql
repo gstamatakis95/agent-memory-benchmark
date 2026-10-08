@@ -51,7 +51,8 @@
 -- runs with statement_timeout = idle_in_transaction_session_timeout = 30 s and the outbox INSERT is
 -- the LAST statement before COMMIT, so a drawn outbox.seq is committed or aborted within one
 -- timeout of being drawn; the relay's 60 s gap watchlist relies on it. Every role runs
--- synchronous_commit = local (N122): a commit never waits for a standby, so the invariant holds.
+-- synchronous_commit = local (N122): a commit never waits for a standby, so the invariant holds (shards only; the
+-- catalog alone has a synchronous standby, N146).
 --
 -- Roles (LOGIN; passwords are set by provisioning from the shard secret, section 9):
 --   engram_migrate  owner of every object; DDL only (BYPASSRLS so data migrations and the
@@ -123,7 +124,7 @@ END $$;
 
 -- Role defaults (N82, N122). Row and advisory waits end after lock_timeout; exclusive takers raise it
 -- to 35 s with SET LOCAL for their single attempt. statement_timeout stays the outer bound.
--- synchronous_commit = local on every role: no synchronous standby exists (N122).
+-- synchronous_commit = local on every role: no synchronous standby exists on a shard (N122; the catalog is the one exception, N146).
 ALTER ROLE engram_app   SET lock_timeout = '2s';
 ALTER ROLE engram_app   SET statement_timeout = '30s';
 ALTER ROLE engram_app   SET idle_in_transaction_session_timeout = '30s';
@@ -399,6 +400,14 @@ BEGIN
     RAISE EXCEPTION 'namespace % still has data rows on this shard; run engram_cleanup_namespace first', NEW.namespace_id
       USING ERRCODE = '55006';
   END IF;
+  -- N153: nothing becomes 'ready' before the namespace's partial HNSW indexes are ready (the first recall after
+  -- activation must not be a whole-namespace exact scan); the same precondition guards ReconcileIn
+  IF NEW.state = 'ready' AND t.edge IN ('ready_target', 'reconcile_in') AND NOT engram_move_indexes_ready(NEW.namespace_id) THEN
+    RAISE EXCEPTION 'namespace % has vector indexes that are not ready (N153)', NEW.namespace_id USING ERRCODE = '55006';
+  END IF;
+  IF OLD.state = 'ready' AND NEW.state = 'active' THEN
+    NEW.moved_in_at := now();
+  END IF;
   NEW.updated_at := now();
   RETURN NEW;
 END $$;
@@ -473,6 +482,23 @@ LANGUAGE sql STABLE AS $$
                     ORDER BY l.sampled_at DESC LIMIT 1), 0);
 $$;
 
+-- ins_seq is PER SHARD and copied verbatim by a move, so the target's sequence must be advanced past the source's
+-- or every row the target inserts after cutover sorts BELOW the copied ones and the export and a second move
+-- miss them (N147). engram_seq_advance(p_to) only moves forward; the mover calls it on the target at Plan (the
+-- source's nextval then, W_plan) and at (b') (the source's final value under the freeze, W_final), before the
+-- target becomes 'ready'. SECURITY DEFINER (setval needs UPDATE on the sequence); engram_move and engram_admin only.
+-- engram_seq_floor is never evaluated on the target for a move: every floor a move uses is a SOURCE value passed as
+-- a number (PreVerify, Reconcile, ReconcileIn, cleanup verification).
+CREATE FUNCTION engram_seq_advance(p_to bigint) RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  v bigint;
+BEGIN
+  v := setval('engram_ins_seq', greatest((SELECT last_value FROM engram_ins_seq), p_to) + 1);
+  PERFORM engram_seq_sample();
+  RETURN v;
+END $$;
+
 -- =============================================================================
 -- Namespace-keyed tables (the big ones are partitioned further down)
 -- =============================================================================
@@ -500,6 +526,7 @@ CREATE TABLE namespace_ownership (
   move_epoch        bigint,
   target_shard_id   integer,
   target_epoch      bigint,
+  moved_in_at       timestamptz,                   -- N147: set by the trigger on ready -> active; BeginSnapshot and the consolidation watermark wait 10 min after it (the target's seq ring has no sample below W_final until then)
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
   UNIQUE (namespace_id, tenant_id),                -- FK target for the tenant_id denormalisation
@@ -559,6 +586,8 @@ INSERT INTO ownership_transitions (edge, role_name, from_state, from_reason, to_
   ('thaw_move',       'engram_admin', 'frozen',   'move',    'active',    NULL,      'same',    'close',    'none',  'restore/failover reconcile: the move is rolled back (N123)'),
   ('ready_target',    'engram_move',  'incoming', NULL,      'ready',     NULL,      'same',    'none',     'none',  'cutover (b''): nothing routes to ready'),
   ('unready_target',  'engram_move',  'ready',    NULL,      'incoming',  NULL,      'same',    'none',     'none',  'rollback after (b'')'),
+  ('reconcile_in',    'engram_admin', 'incoming', NULL,      'ready',     NULL,      'same',    'none',     'none',  'N149: a target restored or promoted after the point of no return, repaired from the source by ReconcileIn; only while the catalog move is committed/cleaning, and the indexes are ready (N153)'),
+  ('reconcile_in',    'engram_admin', 'ready',    NULL,      'active',    NULL,      'same',    'close',    'none',  'N149: the repaired target serves; incoming -> ready -> active, never through a state that routes before the repair'),
   ('cutover_c',       'engram_move',  'frozen',   'move',    'moved_out', NULL,      'same',    'none',     'set',   'cutover (c), the point of no return; clears freeze_reason'),
   ('activate_target', 'engram_move',  'ready',    NULL,      'active',    NULL,      'same',    'close',    'none',  'cutover (b''''): the row already carries e + 1'),
   ('return_move',     'engram_move',  'moved_out', NULL,     'incoming',  NULL,      'greater', 'retarget', 'clear', 'a later move back to this shard; data rows must be gone'),
@@ -648,6 +677,8 @@ CREATE TABLE namespace_stats (
   pending_markers     bigint NOT NULL DEFAULT 0 CHECK (pending_markers >= 0),   -- alert above 16 k (N116)
   bytes_estimate      bigint NOT NULL DEFAULT 0 CHECK (bytes_estimate >= 0),   -- relation bytes, hidden and unpurged rows included: the capacity signal (N114), not live_facts
   mentioned_histogram jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(mentioned_histogram) = 'object'),   -- {"2026-01": facts, ...}: the as_of selectivity estimate (N138)
+  observations_by_tag jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(observations_by_tag) = 'object'),   -- {"tag": current observation versions}: the observation arm's own estimate (N151)
+  hidden_fraction     real NOT NULL DEFAULT 0 CHECK (hidden_fraction >= 0 AND hidden_fraction <= 1),   -- hidden / total facts: subtracted from the eligible estimate (N151)
   recalls_1h          bigint NOT NULL DEFAULT 0,
   retains_1h          bigint NOT NULL DEFAULT 0,
   updated_at          timestamptz NOT NULL DEFAULT now(),
@@ -677,8 +708,9 @@ CREATE TRIGGER namespace_models_touch BEFORE UPDATE ON namespace_models
 -- issues index DDL) leases it (state 'building', lease_until), checks pg_index.indisvalid and drops an
 -- invalid index BEFORE every build (never CREATE ... IF NOT EXISTS), then marks it 'ready' with
 -- rows_at_build; a build whose lease expired is re-leased. purged_since_build is the expunge's own
--- bookkeeping (one writer, engram_admin): hygiene rebuilds a touched index at 1 % of rows_at_build or
--- 2 k elements, whichever comes first (view engram_index_hygiene_due), then VACUUM (INDEX_CLEANUP ON).
+-- bookkeeping (one writer, engram_admin): a touched index is DUE at max(1 % of rows_at_build, 2 k) purged elements
+-- (view engram_index_hygiene_due, N152); when any index on a partition is due the runner rebuilds every touched index
+-- on that partition (view engram_index_partition_hygiene) with REINDEX INDEX CONCURRENTLY and only then vacuums the partition.
 CREATE TABLE vector_indexes (
   namespace_id     uuid NOT NULL,
   tenant_id        text NOT NULL,
@@ -749,13 +781,19 @@ CREATE TABLE outbox_skipped (
 -- subject already applied (here or by an earlier replay step), so a stale intent can never override a later one.
 -- A second Invalidate or Restore of the same fact is NOT a silent no-op: it writes its own row (fresh operation_id,
 -- prev_operation_id = the subject's last entry) and its own intent, although visibility does not change.
+-- N150: epoch is ALWAYS the intent's recorded epoch (a replay keeps it; the guard compares recorded epochs only);
+-- applied_epoch is the epoch a replay committed under (informational). The subject is (class, id) independent of the
+-- action kind (document | memory = invalidate and restore | namespace | tenant), so the chain of a fact reads the last
+-- entry of either kind; every marker transaction on a fact first takes pg_advisory_xact_lock(engram_doc_lock_keys(ns,
+-- memory_id::text)) so concurrent calls form one chain.
 CREATE TABLE deletion_log (
   namespace_id  uuid NOT NULL,
   tenant_id     text NOT NULL,
   intent_key    text NOT NULL CHECK (octet_length(intent_key) BETWEEN 1 AND 512),
   kind          text NOT NULL CHECK (kind IN ('document', 'invalidate', 'restore', 'namespace', 'tenant')),
   subject_id    text NOT NULL,                     -- document_id | memory_id::text | namespace_id::text | tenant_id
-  epoch         bigint NOT NULL,
+  epoch         bigint NOT NULL,                   -- the intent's RECORDED epoch (N150), never the shard's current one
+  applied_epoch bigint CHECK (applied_epoch IS NULL OR applied_epoch >= epoch),   -- N150: informational, set by a replay
   operation_id  uuid,
   prev_operation_id uuid,
   effect        jsonb NOT NULL CHECK (jsonb_typeof(effect) = 'object'),   -- {up_to_version} | {memory_ids}
@@ -764,7 +802,7 @@ CREATE TABLE deletion_log (
   PRIMARY KEY (namespace_id, intent_key)
 );
 
-CREATE INDEX deletion_log_subject_idx ON deletion_log (namespace_id, kind, subject_id, deleted_at DESC);
+CREATE INDEX deletion_log_subject_idx ON deletion_log (namespace_id, subject_id, deleted_at DESC);   -- N150: the subject's last entry of either kind
 
 -- =============================================================================
 -- Namespace-scoped tables. The class of each table (insert-only, mutable, expiring, shard-local; N113,
@@ -830,6 +868,7 @@ CREATE TABLE documents (
   item_timestamp    timestamptz,
   context           text NOT NULL DEFAULT '',
   tags              text[] NOT NULL DEFAULT '{}' CHECK (engram_tags_valid(tags)),
+  tag_generation    integer NOT NULL DEFAULT 0 CHECK (tag_generation >= 0),   -- N157/A-13: bumped by every tag change; the export delta's documents part is keyed (document_id, tag_generation)
   metadata          jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
   document_hash     bytea CHECK (document_hash IS NULL OR octet_length(document_hash) = 32),   -- hash of the chunk-hash list
   summary_blob_key  text,                         -- docsum/{sha256(document_hash || prompt_version || model)}.json
@@ -845,6 +884,17 @@ CREATE TABLE documents (
 ) WITH (fillfactor = 70);
 
 CREATE INDEX documents_updated_idx  ON documents (namespace_id, updated_at DESC);
+
+-- tag_counts (N157/A-13): documents per tag, maintained in the SAME transactions that change documents.tags
+-- (ack, UpdateDocumentTags, the delete marker); ListTags reads it instead of unnesting every document.
+CREATE TABLE tag_counts (
+  namespace_id  uuid NOT NULL,
+  tenant_id     text NOT NULL,
+  tag           text NOT NULL,
+  doc_count     integer NOT NULL CHECK (doc_count >= 0),
+  PRIMARY KEY (namespace_id, tag),
+  FOREIGN KEY (namespace_id, tenant_id) REFERENCES namespace_ownership (namespace_id, tenant_id)
+) WITH (fillfactor = 70);
 CREATE INDEX documents_deleting_idx ON documents (namespace_id, deleted_at) WHERE state = 'deleting';
 -- the tag filter is resolved once per recall against this index into an allowed-document set (N116)
 CREATE INDEX documents_tags_gin     ON documents USING gin (namespace_id, tags);
@@ -873,6 +923,7 @@ CREATE TABLE document_versions (
   ledger_id       uuid NOT NULL,
   chunk_count     integer CHECK (chunk_count >= 0),
   fact_count      integer CHECK (fact_count >= 0),                       -- written once by FinalizeVersion: the eligible-rows estimate of the selectivity-aware plan sums it over the current versions (N138)
+  fact_count_by_type jsonb CHECK (fact_count_by_type IS NULL OR jsonb_typeof(fact_count_by_type) = 'object'),   -- {"world": n, "experience": m}, written with fact_count (N151): the estimate honours the requested fact types
   chunks_done     integer NOT NULL DEFAULT 0 CHECK (chunks_done >= 0),   -- written per wave by the workflow (N69), never per chunk
   body_hash       bytea CHECK (body_hash IS NULL OR octet_length(body_hash) = 32),   -- sha256 of the FULL reconstructed body; NULL until stored
   body_key        text,                                                   -- ver/{document_id}/v{version} (owner-keyed blob, N104)
@@ -882,6 +933,7 @@ CREATE TABLE document_versions (
   PRIMARY KEY (namespace_id, document_id, version),
   FOREIGN KEY (namespace_id, document_id) REFERENCES documents (namespace_id, document_id),
   FOREIGN KEY (namespace_id, ledger_id)   REFERENCES ingest_ledger (namespace_id, ledger_id),
+  CHECK ((fact_count IS NULL) = (fact_count_by_type IS NULL)),
   CHECK (body_key IS NULL OR body_hash IS NOT NULL),
   CHECK (body_key IS NULL OR body_key = 'ver/' || document_id || '/v' || version::text),
   CHECK ((update_mode = 'append') = (append_base_version IS NOT NULL))
@@ -1040,7 +1092,7 @@ CREATE TABLE fact_links (
   link_type      link_type NOT NULL,
   weight         real NOT NULL DEFAULT 1.0 CHECK (weight >= 0.0 AND weight <= 1.0),
   ins_seq        bigint NOT NULL DEFAULT nextval('engram_ins_seq'),
-  PRIMARY KEY (namespace_id, src_memory_id, dst_memory_id, link_type),
+  PRIMARY KEY (namespace_id, src_memory_id, dst_memory_id, link_type) INCLUDE (weight),   -- N154: covering, so a hop never reads the heap
   FOREIGN KEY (namespace_id, src_memory_id) REFERENCES facts (namespace_id, memory_id) ON DELETE CASCADE,
   FOREIGN KEY (namespace_id, dst_memory_id) REFERENCES facts (namespace_id, memory_id) ON DELETE CASCADE,
   CHECK (src_memory_id <> dst_memory_id),
@@ -1126,6 +1178,7 @@ CREATE TABLE observations (
   stale_write       boolean NOT NULL DEFAULT false,      -- evidence changed under it (replace-retire, restore, re-extraction): rewrite wanted; FinalizeVersion sets it in its own transaction (N135)
   stale_delete      boolean NOT NULL DEFAULT false,      -- Materialize found a victim in its segment: root rebuild wanted (N119)
   stale_since       timestamptz,
+  stale_seq         bigint NOT NULL DEFAULT 0 CHECK (stale_seq >= 0),   -- N144: monotone, bumped by every writer that sets a stale flag; a rewrite captures it and clears the flags ONLY if unchanged (compare-and-clear, as pages, N37)
   tags              text[] NOT NULL DEFAULT '{}' CHECK (engram_tags_valid(tags)),   -- consolidation scope tags
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
@@ -1166,14 +1219,17 @@ CREATE TABLE observation_versions (
   prompt_version    text NOT NULL,
   model             text NOT NULL,
   stub              boolean NOT NULL DEFAULT false,
+  commit_key        bytea CHECK (commit_key IS NULL OR octet_length(commit_key) = 32),   -- N144: sha256(id || base_version || evidence_hash || prompt_version || attempt_nonce); NULL only on a stub
   created_at        timestamptz NOT NULL DEFAULT now(),
   ins_seq           bigint NOT NULL DEFAULT nextval('engram_ins_seq'),
   PRIMARY KEY (namespace_id, observation_id, version),
   UNIQUE (namespace_id, ov_id),
+  UNIQUE (namespace_id, observation_id, commit_key),               -- N144: the commit transaction asks for it FIRST; a hit means a previous attempt committed
   FOREIGN KEY (namespace_id, observation_id) REFERENCES observations (namespace_id, observation_id),
   CHECK (root_version BETWEEN 1 AND version),
   CHECK (CASE WHEN stub THEN text = '' AND source_count = 0
-              ELSE octet_length(text) BETWEEN 1 AND 8192 AND source_count >= 1 END)
+              ELSE octet_length(text) BETWEEN 1 AND 8192 AND source_count >= 1 END),
+  CHECK (stub OR commit_key IS NOT NULL)
 ) PARTITION BY HASH (namespace_id);
 
 CREATE TABLE observation_version_vectors (
@@ -1184,6 +1240,7 @@ CREATE TABLE observation_version_vectors (
   observation_id   uuid NOT NULL,
   version          integer NOT NULL,
   effective_at     timestamptz NOT NULL,
+  obs_tags         text[] NOT NULL DEFAULT '{}',              -- immutable copy of observations.tags at insert (N151): the tag test runs inside the scan (not named 'tags': check 12 keeps content tables tag-free)
   embedding        halfvec(768) STORAGE MAIN NOT NULL,
   created_at       timestamptz NOT NULL DEFAULT now(),
   ins_seq          bigint NOT NULL DEFAULT nextval('engram_ins_seq'),
@@ -1448,17 +1505,21 @@ CREATE TABLE page_versions (
   pv_id              uuid NOT NULL,
   root_version       integer NOT NULL,
   text               text NOT NULL,
-  markdown_blob_key  text NOT NULL,                  -- pages/{page_id}/v{version}.md
+  markdown_blob_key  text NOT NULL,                  -- pages/{page_id}/v{version}-{sha256(markdown)[:16]}.md: ATTEMPT-UNIQUE (N144); '_stub' on a stub (never dereferenced)
   effective_at       timestamptz NOT NULL,           -- D9 rule, same as observation_versions
-  evidence_hash      bytea NOT NULL CHECK (octet_length(evidence_hash) = 32),
+  evidence_hash      bytea NOT NULL CHECK (octet_length(evidence_hash) = 32),   -- a stub carries 32 zero bytes
   stub               boolean NOT NULL DEFAULT false,
+  commit_key         bytea CHECK (commit_key IS NULL OR octet_length(commit_key) = 32),   -- N144: see observation_versions; NULL only on a stub
   created_at         timestamptz NOT NULL DEFAULT now(),
   ins_seq            bigint NOT NULL DEFAULT nextval('engram_ins_seq'),
   PRIMARY KEY (namespace_id, page_id, version),
   UNIQUE (namespace_id, pv_id),
+  UNIQUE (namespace_id, page_id, commit_key),                -- N144: the first statement of the commit transaction
   FOREIGN KEY (namespace_id, page_id) REFERENCES pages (namespace_id, page_id),
   CHECK (root_version BETWEEN 1 AND version),
-  CHECK (CASE WHEN stub THEN text = '' ELSE octet_length(text) BETWEEN 1 AND 262144 END)
+  CHECK (CASE WHEN stub THEN text = '' ELSE octet_length(text) BETWEEN 1 AND 262144 END),
+  CHECK (stub OR commit_key IS NOT NULL),
+  CHECK (stub = (markdown_blob_key = '_stub'))
 ) WITH (fillfactor = 100);
 
 -- page_version_vectors: INSERT-ONLY, keyed (pv_id, embedding_model) like the other vector tables (N111).
@@ -1550,8 +1611,10 @@ CREATE INDEX page_sources_source_idx ON page_sources (namespace_id, source_id);
 -- passes the rows in 'pending' and 'materialized' (purged ones have no rows left to hide).
 -- intent_key names the blob-storage intent object (deterministic from deleted_at and operation_id): it is
 -- put AFTER this row commits and before the ack (N122). event_seq is the seq of the DocumentDeleted event
--- written in the same transaction (the transaction draws it first and inserts the outbox row last), so the
--- purge gate engram_consumers_passed is a comparison with the cursors, not a scan of the outbox (P-15).
+-- written in the same transaction: the tombstone is inserted with event_seq NULL and the FINAL statement is
+-- WITH s AS (INSERT INTO outbox ... RETURNING seq) UPDATE document_tombstones SET event_seq = s.seq, so the seq is drawn
+-- (N157/A-10) inside the last statement and the 60 s gap horizon holds. A committed row always has it; the purge gate
+-- engram_consumers_passed(NULL) is false (P-15).
 CREATE TABLE document_tombstones (
   namespace_id   uuid NOT NULL,
   tenant_id      text NOT NULL,
@@ -1560,7 +1623,7 @@ CREATE TABLE document_tombstones (
   deleted_at     timestamptz NOT NULL,
   operation_id   uuid,
   intent_key     text,
-  event_seq      bigint NOT NULL,
+  event_seq      bigint,                                 -- NULL only inside the marker transaction (N157)
   expunge_state  text NOT NULL DEFAULT 'pending' CHECK (expunge_state IN ('pending', 'materialized', 'purged')),
   materialized_at timestamptz,
   purged_at      timestamptz,
@@ -1596,7 +1659,12 @@ CREATE INDEX chunk_tombstones_retired_idx ON chunk_tombstones (namespace_id, ret
 -- cause = 'invalidate' only (re-extraction is a write: dependents are flagged stale_write, not hidden), and
 -- the old-key facts are purged after 1 h (target REEXTRACTED_FACTS), which bounds the marker sets. The
 -- 'invalidate' set is permanent by design and is tested by primary-key anti-join, never passed as an
--- array. reason is the caller's free text. FK cascade removes the markers when the fact is purged.
+-- array. reason is the caller's free text.
+-- NO foreign key to facts (N145, C-2): an acknowledged invalidation outlives the fact row it names. The 'invalidate'
+-- row dies only with the namespace or an explicit Restore; the 'reextract' row is deleted EXPLICITLY by the
+-- REEXTRACTED_FACTS and CHUNK_TOMBSTONES purges of the facts they remove. materialized_at is the durable "Materialize
+-- still owed" state of an invalidation: Materialize (and the per-shard purge-sweep) finds its work from the partial
+-- index below and stamps it in the batch that wrote the derived_hidden(invalidation) rows, never from a signal payload.
 CREATE TABLE fact_hidden (
   namespace_id  uuid NOT NULL,
   tenant_id     text NOT NULL,
@@ -1605,9 +1673,13 @@ CREATE TABLE fact_hidden (
   hidden_at     timestamptz NOT NULL DEFAULT now(),
   reason        text NOT NULL DEFAULT '' CHECK (octet_length(reason) <= 1024),
   intent_key    text,
+  materialized_at timestamptz,                   -- N145: stamped by Materialize (engram_admin); NULL = derived hiding still owed
   PRIMARY KEY (namespace_id, memory_id, cause),
-  FOREIGN KEY (namespace_id, memory_id) REFERENCES facts (namespace_id, memory_id) ON DELETE CASCADE
+  CHECK (cause = 'invalidate' OR materialized_at IS NULL)
 ) WITH (fillfactor = 50);
+
+CREATE INDEX fact_hidden_unmaterialized_idx ON fact_hidden (namespace_id, hidden_at)
+  WHERE cause = 'invalidate' AND materialized_at IS NULL;                 -- the sweeper's and Materialize's worklist (N145)
 
 -- curation_log (A-16), INSERT-ONLY: every Invalidate / Restore with the fact's content_hash and
 -- document. CommitChunk re-applies the LAST action per (document_id, content_hash) to the new facts
@@ -2034,34 +2106,55 @@ LANGUAGE sql STABLE AS $$
         OR EXISTS (SELECT 1 FROM fact_hidden h WHERE h.namespace_id = p_ns AND h.memory_id = f.memory_id));
 $$;
 
---   (3) the base, as a COMPARE-AND-SET at commit (N143, BaseCurrentAtCommit): the version the writer rendered from
---       is still CURRENT and VISIBLE, and the same statement advances current_version, so two writers that rendered
---       from the same base cannot both commit (the SHARED derivation lock does not serialise them; the row lock of
---       this UPDATE does). It is the last check before the version rows are inserted, in the commit transaction:
---         UPDATE observations SET current_version = v + 1 WHERE ... AND current_version = base_version
---       Zero rows (NULL result) means the writer lost: ROLLBACK and discard the rendered result. Returns the new
---       version number the caller inserts into observation_versions / page_versions. A root rebuild has no base
---       (p_base IS NULL): it advances the row it holds and skips the equality and visibility checks. Inheriting
---       root(base) and requiring only a visible base is rejected: a visible but superseded base still lets stale
---       text overwrite a rebuild. VOLATILE: this is a write, never a read-only probe.
-CREATE FUNCTION engram_derivation_base_cas(p_ns uuid, p_kind text, p_id uuid, p_base integer) RETURNS integer
+--   (0) FIRST, before anything else, the commit transaction asks whether THIS execution already committed (N144):
+--       engram_derivation_commit_seen(ns, kind, id, commit_key) returns the version a previous attempt committed,
+--       or NULL. A hit means "return that version and touch nothing" (no CAS, no blob delete, no re-render). Only
+--       a miss runs the compare-and-set below. The CAS-first order of N143 turned a retry of a committed commit
+--       into "lost the CAS": it deleted the markdown of the version it had committed (delta) or advanced
+--       current_version to a version that did not exist (root rebuild) (C-1).
+CREATE FUNCTION engram_derivation_commit_seen(p_ns uuid, p_kind text, p_id uuid, p_commit_key bytea) RETURNS integer
+LANGUAGE sql STABLE AS $$
+  SELECT CASE p_kind
+           WHEN 'observation' THEN (SELECT v.version FROM observation_versions v
+                                     WHERE v.namespace_id = p_ns AND v.observation_id = p_id AND v.commit_key = p_commit_key)
+           WHEN 'page'        THEN (SELECT v.version FROM page_versions v
+                                     WHERE v.namespace_id = p_ns AND v.page_id = p_id AND v.commit_key = p_commit_key)
+         END;
+$$;
+
+--   (3) the base, as a COMPARE-AND-SET at commit (N143, N144, BaseCurrentAtCommit): the version the writer rendered from
+--       is still CURRENT, and the same statement advances current_version, so two writers that rendered from the same
+--       base cannot both commit (the SHARED derivation lock does not serialise them; the row lock of this UPDATE does).
+--       It is the last check before the version rows are inserted:
+--         UPDATE observations SET current_version = $expected + 1 WHERE ... AND current_version = $expected
+--       EVERY writer passes the version it READ (root rebuilds included; $expected = the current_version at LoadPage /
+--       the read of the batch): there is no blind write and no "advance whatever it holds" branch. A delta or merge
+--       (p_check_visible) additionally requires the base version to be VISIBLE; a root rebuild is written from live
+--       sources only and may start from a hidden current version. NULL (zero rows) means the writer lost: ROLLBACK,
+--       discard the rendered result, and delete only a blob this execution minted that no page_versions row names.
+--       Inheriting root(base) and requiring only a visible base is rejected. VOLATILE: this is a write.
+CREATE FUNCTION engram_derivation_base_cas(p_ns uuid, p_kind text, p_id uuid, p_expected integer,
+                                           p_check_visible boolean DEFAULT true) RETURNS integer
 LANGUAGE plpgsql VOLATILE AS $$
 DECLARE
   v integer;
 BEGIN
+  IF p_expected IS NULL THEN
+    RETURN NULL;                                  -- no blind writes (N144)
+  END IF;
   IF p_kind = 'observation' THEN
     UPDATE observations o SET current_version = o.current_version + 1
      WHERE o.namespace_id = p_ns AND o.observation_id = p_id
-       AND (p_base IS NULL
-            OR (o.current_version = p_base
-                AND NOT engram_obs_version_hidden(p_ns, p_id, p_base, engram_doc_tomb(p_ns, false))))
+       AND o.current_version = p_expected
+       AND (NOT p_check_visible OR p_expected = 0
+            OR NOT engram_obs_version_hidden(p_ns, p_id, p_expected, engram_doc_tomb(p_ns, false)))
     RETURNING o.current_version INTO v;
   ELSIF p_kind = 'page' THEN
     UPDATE pages g SET current_version = g.current_version + 1
      WHERE g.namespace_id = p_ns AND g.page_id = p_id
-       AND (p_base IS NULL
-            OR (g.current_version = p_base
-                AND NOT engram_page_version_hidden(p_ns, p_id, p_base, engram_doc_tomb(p_ns, false))))
+       AND g.current_version = p_expected
+       AND (NOT p_check_visible OR p_expected = 0
+            OR NOT engram_page_version_hidden(p_ns, p_id, p_expected, engram_doc_tomb(p_ns, false)))
     RETURNING g.current_version INTO v;
   END IF;
   RETURN v;   -- NULL: zero rows updated (lost the compare-and-set, or an unknown kind/id) -> discard
@@ -2146,6 +2239,8 @@ LANGUAGE sql STABLE AS $$
    WHERE f.namespace_id = p_ns AND f.memory_id > w.wm
      AND f.memory_id < u.first_open
      AND f.ins_seq < engram_seq_floor(now())
+     AND NOT EXISTS (SELECT 1 FROM namespace_ownership o        -- N147: a moved-in namespace's ring has no sample below W_final for 10 min
+                      WHERE o.namespace_id = p_ns AND o.moved_in_at > now() - interval '10 minutes')
    ORDER BY f.memory_id DESC
    LIMIT 1;
 $$;
@@ -2156,7 +2251,7 @@ $$;
 -- (Kafka off) have no cursor row.
 CREATE FUNCTION engram_consumers_passed(p_event_seq bigint) RETURNS boolean
 LANGUAGE sql STABLE AS $$
-  SELECT NOT EXISTS (
+  SELECT p_event_seq IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM outbox_cursors c
      WHERE c.consumer IN ('index', 'kafka') AND c.last_seq < p_event_seq);
 $$;
@@ -2205,7 +2300,7 @@ DECLARE
     'consolidation_batches', 'observation_versions', 'observations',
     'entity_mentions', 'fact_links', 'facts', 'entity_aliases', 'entities',
     'document_version_chunks', 'chunks', 'document_versions', 'ingest_ledger', 'documents',
-    'export_snapshots', 'token_usage_events', 'token_usage', 'quota_counters', 'batch_jobs',
+    'export_snapshots', 'token_usage_events', 'token_usage', 'quota_counters', 'batch_jobs', 'tag_counts',
     'idempotency_keys', 'operations', 'vector_indexes', 'namespace_models', 'namespace_stats'];
 BEGIN
   PERFORM set_config('engram.namespace_id', p_ns::text, true);   -- ns_isolation passes even without BYPASSRLS
@@ -2286,7 +2381,8 @@ $$;
 -- owns one index per (vector table, embedding model): 120 namespaces per shard (N142) give ~360 expected
 -- small indexes per shard, cap 450, alert at 400. Queries that must match the partial-index predicate carry the literal namespace id and model
 -- (plan_cache_mode = force_custom_plan, so the bound parameters are constants at plan time).
--- p_action = 'create' | 'drop'. Names are deterministic, so rollback_target and namespace delete drop by
+-- p_action = 'create' | 'drop' | 'rebuild' (N152: REINDEX INDEX CONCURRENTLY, preceded by one DROP INDEX CONCURRENTLY row
+-- (index_state 'leftover') per <name>_ccnew* leftover of a crashed rebuild). Names are deterministic, so rollback_target and namespace delete drop by
 -- name and orphans cannot hide. 'create' is a plain CREATE INDEX CONCURRENTLY, NEVER IF NOT EXISTS: the
 -- runner reads index_state first and acts on it ('invalid' -> run the drop statement, then create;
 -- 'valid' -> nothing to build), because a retry that merely skips an existing INVALID index leaves the
@@ -2300,11 +2396,12 @@ DECLARE
   v_abbr   text;
   v_rem    integer;
   v_part   text;
+  v_left   text;
 BEGIN
   IF p_table NOT IN ('fact_vectors', 'chunk_vectors', 'observation_version_vectors', 'page_version_vectors') THEN
     RAISE EXCEPTION 'not a vector table: %', p_table USING ERRCODE = '22023';
   END IF;
-  IF p_action NOT IN ('create', 'drop') THEN
+  IF p_action NOT IN ('create', 'drop', 'rebuild') THEN
     RAISE EXCEPTION 'unknown action %', p_action USING ERRCODE = '22023';
   END IF;
   v_parent := p_table::regclass;
@@ -2324,7 +2421,20 @@ BEGIN
       index_state := coalesce((SELECT CASE WHEN x.indisvalid THEN 'valid' ELSE 'invalid' END
                                  FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid
                                 WHERE ic.relname = index_name AND ic.relnamespace = 'public'::regnamespace), 'absent');
+      IF p_action = 'rebuild' THEN
+        FOR v_left IN SELECT ic.relname::text FROM pg_class ic
+                       WHERE ic.relnamespace = 'public'::regnamespace AND ic.relname LIKE index_name || '\_ccnew%'
+        LOOP
+          index_state := 'leftover';
+          statement := format('DROP INDEX CONCURRENTLY IF EXISTS %I', v_left);
+          RETURN NEXT;
+        END LOOP;
+        index_state := coalesce((SELECT CASE WHEN x.indisvalid THEN 'valid' ELSE 'invalid' END
+                                   FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid
+                                  WHERE ic.relname = index_name AND ic.relnamespace = 'public'::regnamespace), 'absent');
+      END IF;
       statement := CASE p_action
+        WHEN 'rebuild' THEN format('REINDEX INDEX CONCURRENTLY %I', index_name)
         WHEN 'create' THEN format('CREATE INDEX CONCURRENTLY %I ON %I USING hnsw (embedding halfvec_cosine_ops) '
                                   'WITH (m = 16, ef_construction = 128) WHERE namespace_id = %L AND embedding_model = %L',
                                   index_name, v_part, p_ns, p_model)
@@ -2363,20 +2473,87 @@ LANGUAGE sql STABLE AS $$
     LEFT JOIN vector_indexes i ON i.namespace_id = p_ns AND i.vector_table = n.t AND i.embedding_model = cur.embedding_model;
 $$;
 
+-- N153: are all of a namespace's vector indexes built? True iff every vector table with >= p_min vectors of the
+-- CURRENT model has a vector_indexes row 'ready' with rows_at_build >= 0.99 x the vectors it holds. Precondition of
+-- ready_target / reconcile_in (checked by engram_check_ownership on the rows, not on a flag) and of the first recall
+-- after activation. SECURITY DEFINER (counts across RLS for the mover/admin; EXECUTE is not granted to app/relay).
+CREATE FUNCTION engram_move_indexes_ready(p_ns uuid, p_min integer DEFAULT 2000) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  WITH cur AS (SELECT m.embedding_model FROM namespace_models m WHERE m.namespace_id = p_ns),
+       n AS (
+         SELECT 'fact_vectors'::text AS t, count(*) AS c FROM fact_vectors v, cur WHERE v.namespace_id = p_ns AND v.embedding_model = cur.embedding_model
+         UNION ALL SELECT 'chunk_vectors', count(*) FROM chunk_vectors v, cur WHERE v.namespace_id = p_ns AND v.embedding_model = cur.embedding_model
+         UNION ALL SELECT 'observation_version_vectors', count(*) FROM observation_version_vectors v, cur WHERE v.namespace_id = p_ns AND v.embedding_model = cur.embedding_model
+         UNION ALL SELECT 'page_version_vectors', count(*) FROM page_version_vectors v, cur WHERE v.namespace_id = p_ns AND v.embedding_model = cur.embedding_model)
+  SELECT NOT EXISTS (
+    SELECT 1 FROM n CROSS JOIN cur
+      LEFT JOIN vector_indexes i ON i.namespace_id = p_ns AND i.vector_table = n.t AND i.embedding_model = cur.embedding_model
+     WHERE n.c >= p_min AND (i.state IS DISTINCT FROM 'ready' OR i.rows_at_build < 0.99 * n.c));
+$$;
+
+-- N151: the eligible-rows estimate E of the cost-based semantic plan: the sum over the CURRENT versions of p_docs of the
+-- counts of the requested fact types (p_types NULL = all), less the namespace's hidden fraction. The caller passes the
+-- allowed-document set as ONE array (<= 500 documents inline as an array constant, above that as IN (SELECT unnest($1)));
+-- no per-element estimation happens in the planner.
+CREATE FUNCTION engram_eligible_facts(p_ns uuid, p_docs text[], p_types text[] DEFAULT NULL) RETURNS bigint
+LANGUAGE sql STABLE AS $$
+  SELECT floor(coalesce(sum(CASE WHEN p_types IS NULL THEN v.fact_count
+                                 ELSE (SELECT coalesce(sum((v.fact_count_by_type ->> t)::bigint), 0) FROM unnest(p_types) t) END), 0)
+               * (1 - coalesce((SELECT s.hidden_fraction FROM namespace_stats s WHERE s.namespace_id = p_ns), 0)))::bigint
+    FROM documents d
+    JOIN document_versions v ON v.namespace_id = d.namespace_id AND v.document_id = d.document_id AND v.version = d.current_version
+   WHERE d.namespace_id = p_ns AND d.state = 'active' AND d.document_id IN (SELECT unnest(p_docs));
+$$;
+
+-- N145: the subjects of an Invalidate/Restore of p_memory beyond itself: the visible same-content_hash TWIN in the same
+-- document (the re-extraction twin), found through facts, or through curation_log when the named fact was already purged.
+-- The marker transaction writes fact_hidden for the fact and for each row returned, under the per-fact lock (N150).
+CREATE FUNCTION engram_invalidation_twins(p_ns uuid, p_memory uuid) RETURNS SETOF uuid
+LANGUAGE sql STABLE AS $$
+  WITH m AS (SELECT engram_doc_tomb(p_ns) AS d, engram_chunk_tomb(p_ns) AS c),
+       src AS (SELECT f.document_id, f.content_hash FROM facts f WHERE f.namespace_id = p_ns AND f.memory_id = p_memory
+               UNION ALL
+               SELECT c.document_id, c.content_hash FROM curation_log c WHERE c.namespace_id = p_ns AND c.memory_id = p_memory
+               LIMIT 1)
+  SELECT t.memory_id
+    FROM src
+    JOIN facts t ON t.namespace_id = p_ns AND t.document_id = src.document_id AND t.content_hash = src.content_hash
+    CROSS JOIN m
+   WHERE t.memory_id <> p_memory
+     AND t.document_version >= coalesce((SELECT d.life_start FROM documents d WHERE d.namespace_id = p_ns AND d.document_id = src.document_id), 1)
+     AND NOT engram_doc_hidden(m.d, t.document_id, t.document_version)
+     AND t.chunk_id <> ALL (m.c)
+     AND NOT EXISTS (SELECT 1 FROM fact_hidden h WHERE h.namespace_id = p_ns AND h.memory_id = t.memory_id);
+$$;
+
 -- The index runner's work queue: requested builds, requested drops, and builds whose lease expired.
 CREATE VIEW engram_index_runner_queue AS
   SELECT namespace_id, vector_table, embedding_model, state, requested_at, lease_until
     FROM vector_indexes
    WHERE state IN ('requested', 'dropping') OR (state = 'building' AND lease_until < now());
 
--- Hygiene trigger (N138): a touched HNSW is rebuilt when the purge has removed 1 % of the elements it was
--- built over or 2 k elements, whichever comes first, then VACUUM (INDEX_CLEANUP ON). Vector partitions carry
--- vacuum_index_cleanup = off, so autovacuum never repairs a graph (repair costs 5 to 6 times a rebuild).
+-- Hygiene (N138, N152): the unit is the PARTITION. A touched HNSW is DUE at purged_since_build >=
+-- max(1 % of rows_at_build, 2 000) (the 2 k floor binds below 200 k rows). When any index on a vector partition is due,
+-- the runner rebuilds EVERY touched index on that partition (engram_hnsw_ddl 'rebuild' = REINDEX INDEX CONCURRENTLY,
+-- after dropping any <name>_ccnew* leftover; a crash mid-rebuild is repaired the same way) and only then runs one
+-- VACUUM (INDEX_CLEANUP ON) of the partition: a partition is never vacuumed with index cleanup while an un-rebuilt
+-- touched graph sits on it. Vector partitions carry vacuum_index_cleanup = off, so autovacuum never repairs a graph.
 CREATE VIEW engram_index_hygiene_due AS
   SELECT namespace_id, vector_table, embedding_model, rows_at_build, purged_since_build
     FROM vector_indexes
    WHERE state = 'ready'
-     AND purged_since_build >= least(2000, greatest(1, ceil(rows_at_build * 0.01)));
+     AND purged_since_build >= greatest(2000, ceil(rows_at_build * 0.01));
+
+-- The rebuild set: every touched ready index on a partition that has at least one DUE index.
+CREATE VIEW engram_index_partition_hygiene AS
+  WITH idx AS (
+    SELECT i.namespace_id, i.vector_table, i.embedding_model, i.rows_at_build, i.purged_since_build, d.partition_name, d.index_name
+      FROM vector_indexes i
+      CROSS JOIN LATERAL engram_hnsw_ddl(i.vector_table, i.namespace_id, i.embedding_model, 'create') d
+     WHERE i.state = 'ready'),
+  due AS (SELECT DISTINCT partition_name FROM idx
+           WHERE purged_since_build >= greatest(2000, ceil(rows_at_build * 0.01)))
+  SELECT idx.* FROM idx JOIN due USING (partition_name) WHERE idx.purged_since_build > 0;
 
 -- A build must not start while any backend holds an old snapshot (the index build waits for them all and
 -- blocks every other build behind it): the runner refuses while this view is non-empty. Needs
@@ -2385,6 +2562,8 @@ CREATE VIEW engram_old_snapshots AS
   SELECT pid, usename, backend_xmin, xact_start
     FROM pg_stat_activity
    WHERE backend_xmin IS NOT NULL AND coalesce(xact_start, query_start) < now() - interval '5 minutes'
+     AND backend_type = 'client backend'                        -- N152: CREATE INDEX CONCURRENTLY does not wait for autovacuum workers or walsenders
+     AND query !~* '^\s*(auto)?vacuum'                          -- ... nor for a VACUUM command
      AND pid <> pg_backend_pid();
 
 -- 2. Ordinary index added to a partitioned table later (P-10): CREATE INDEX ... ON ONLY the parent
@@ -2474,7 +2653,7 @@ BEGIN
   FOREACH t IN ARRAY ARRAY[
     'documents', 'document_versions', 'entities', 'entity_aliases', 'observations', 'observation_sources',
     'pages', 'page_sources', 'operations', 'document_tombstones', 'chunk_tombstones', 'fact_hidden',
-    'derived_hidden', 'expunge_progress', 'quota_counters', 'token_usage', 'batch_jobs', 'consolidation_batches',
+    'derived_hidden', 'expunge_progress', 'quota_counters', 'token_usage', 'batch_jobs', 'consolidation_batches', 'tag_counts',
     'consolidation_state', 'export_snapshots', 'idempotency_keys', 'blob_tombstones', 'namespace_models'] LOOP
     EXECUTE format('COMMENT ON TABLE %I IS %L', t, 'class: mutable');
   END LOOP;
@@ -2531,8 +2710,8 @@ CREATE INDEX page_version_vectors_model_idx ON page_version_vectors (namespace_i
 -- facts_doc_idx / facts_mentioned_idx and joins the vector table by primary key.
 
 -- fact_links: the PK serves forward expansion; the reverse index serves the other direction and
--- the FK cascade of the purge
-CREATE INDEX fact_links_reverse_idx ON fact_links (namespace_id, dst_memory_id, src_memory_id);
+-- the FK cascade of the purge (N154: BOTH indexes are covering and both are in the hot set)
+CREATE INDEX fact_links_reverse_idx ON fact_links (namespace_id, dst_memory_id, src_memory_id, link_type) INCLUDE (weight);   -- N154: both link indexes cover the hop (two index ranges, no heap)
 
 -- entity_mentions
 CREATE INDEX entity_mentions_entity_idx ON entity_mentions (namespace_id, entity_id, mentioned_at);
@@ -2552,8 +2731,8 @@ CREATE INDEX page_versions_bm25 ON page_versions
   WITH (key_field = 'pv_id');
 -- pg_search:end
 
--- The re-copy key of the move (N137): every insert-only table has (namespace_id, ins_seq) (about 5 % of the
--- footprint). Created from the class tags, so a new insert-only table cannot miss it.
+-- The re-copy key of the move (N137): every insert-only table has (namespace_id, ins_seq) (about 12 % of the
+-- footprint, N154; only their tail is hot). Created from the class tags, so a new insert-only table cannot miss it.
 DO $$
 DECLARE
   r record;
@@ -2656,6 +2835,8 @@ REVOKE EXECUTE ON FUNCTION engram_consumers_passed(bigint) FROM PUBLIC, engram_a
 -- entity names by setting the scope GUC); the sequence ring and the scheduler samplers are admin-only too.
 REVOKE EXECUTE ON FUNCTION engram_entity_fuzzy(uuid, text, integer, real) FROM PUBLIC, engram_relay, engram_move;
 REVOKE EXECUTE ON FUNCTION engram_seq_sample() FROM PUBLIC, engram_app, engram_relay, engram_move;
+-- N147, N153: the sequence advance and the index-readiness probe are for the mover and admin only.
+REVOKE EXECUTE ON FUNCTION engram_seq_advance(bigint), engram_move_indexes_ready(uuid, integer) FROM PUBLIC, engram_app, engram_relay;
 GRANT SELECT ON shard_meta, ownership_transitions TO engram_app, engram_relay, engram_move, engram_admin;
 
 -- engram_app: ordinary namespace transactions. Content: SELECT + INSERT only (no UPDATE, no DELETE;
@@ -2669,13 +2850,14 @@ GRANT SELECT, INSERT ON
   deletion_log, outbox
   TO engram_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-  documents, document_versions, entities, entity_aliases,
+  documents, document_versions, entities, entity_aliases, tag_counts,
   observations, observation_sources, consolidation_batches, consolidation_state, batch_jobs,
   pages, page_sources, operations, idempotency_keys, token_usage, quota_counters,
   blob_tombstones, export_snapshots
   TO engram_app;
 GRANT SELECT, INSERT, UPDATE ON namespace_stats, namespace_models TO engram_app;
 GRANT SELECT, INSERT ON document_tombstones TO engram_app;                 -- Delete(document); the Expunge's state changes are engram_admin's
+GRANT UPDATE (event_seq) ON document_tombstones TO engram_app;             -- N157: the marker transaction's final statement stamps the outbox seq it drew
 GRANT SELECT, INSERT, DELETE ON chunk_tombstones, fact_hidden TO engram_app;   -- REPLACE / un-retire; Invalidate / Restore (cause 'invalidate' only; FinalizeVersion inserts 'reextract')
 GRANT SELECT ON document_tombstone_view TO engram_app;                    -- the tombstone view of a DELETING document (N136)
 GRANT SELECT, DELETE ON derived_hidden TO engram_app;                      -- Restore removes the rows with cause (invalidation, f)
@@ -2703,7 +2885,7 @@ GRANT SELECT, INSERT ON
   TO engram_move;                       -- outbox_skipped is shard-local (its seqs mean nothing on the target) and is not copied
 GRANT SELECT, INSERT, UPDATE, DELETE ON
   namespace_ownership, namespace_stats, namespace_models, vector_indexes,
-  documents, document_versions, entities, entity_aliases,
+  documents, document_versions, entities, entity_aliases, tag_counts,
   observations, observation_sources, consolidation_batches, consolidation_state, batch_jobs,
   pages, page_sources, operations, idempotency_keys, token_usage, quota_counters,
   blob_tombstones, export_snapshots,
@@ -2719,7 +2901,8 @@ GRANT EXECUTE ON FUNCTION engram_cleanup_namespace(uuid, integer) TO engram_move
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO engram_admin;
 REVOKE INSERT, UPDATE, DELETE ON ownership_transitions FROM engram_admin;   -- the machine is data nobody edits at run time
 GRANT SELECT ON schedulable_namespaces, purgeable_namespaces, engram_invalid_indexes,
-  engram_index_runner_queue, engram_index_hygiene_due, engram_old_snapshots, document_tombstone_view TO engram_admin;
+  engram_index_runner_queue, engram_index_hygiene_due, engram_index_partition_hygiene, engram_old_snapshots,
+  document_tombstone_view TO engram_admin;
 GRANT EXECUTE ON FUNCTION engram_consumers_passed(bigint), engram_seq_sample() TO engram_admin;
 
 -- =============================================================================
@@ -2836,7 +3019,7 @@ BEGIN
   END IF;
   IF (SELECT count(DISTINCT edge) FROM ownership_transitions
        WHERE edge IN ('ready_target', 'unready_target', 'activate_target', 'return_abort', 'reconcile_out',
-                      'abort_move', 'thaw_move', 'cutover_c', 'restore_delete')) <> 9 THEN
+                      'abort_move', 'thaw_move', 'cutover_c', 'restore_delete', 'reconcile_in')) <> 10 THEN
     RAISE EXCEPTION 'ownership_transitions lacks cutover or rollback edges (N125)';
   END IF;
 
@@ -2918,6 +3101,10 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey)
                   WHERE k.conrelid = 'fact_hidden'::regclass AND k.contype = 'p' AND a.attname = 'cause') THEN
     RAISE EXCEPTION 'fact_hidden primary key must include cause (N135)';
+  END IF;
+  -- 16b. an invalidation outlives its fact (N145): no foreign key from fact_hidden to facts
+  IF EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = 'fact_hidden'::regclass AND k.contype = 'f') THEN
+    RAISE EXCEPTION 'fact_hidden must not reference facts (N145)';
   END IF;
   IF has_table_privilege('engram_app', 'consolidation_proposals', 'DELETE')
      OR has_table_privilege('engram_app', 'consolidation_proposals', 'UPDATE')

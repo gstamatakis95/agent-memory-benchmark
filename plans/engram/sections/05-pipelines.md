@@ -13,6 +13,12 @@ asynchronous `Expunge` during which SLOs may degrade (§5.4). Round 4 added thre
 pipelines below apply: **evidence outlives the facts it names, and re-extraction is a write**
 (N135, §5.1.2 step 7, §5.4.2); **one commit rule for every writer of a derived version** (N120,
 §5.0); and **every acknowledged delete has a committed marker and an intent** (N122, §5.4.1).
+Round 5 (D24) tightened four seams of those rules: a derived-version commit **decides its own
+idempotency before the base compare-and-set** and no commit is blind (N144, §5.0); an invalidation
+is **independent of the fact row** and is discovered from its marker, not from a signal (N145,
+§5.4.5); a move **copies before it checks, advances the target's sequence, waits for the target's
+indexes** and repairs a target restored after the point of no return (N147 to N149, N153, §5.5); and
+replay keeps recorded epochs under a per-subject lock (N150, §5.5.5).
 
 ### 5.0 Conventions shared by every pipeline
 
@@ -59,15 +65,18 @@ epoch=$2`.
   nothing.
 - **Lock key spaces are disjoint (N113):** namespace fence `hashtextextended(ns, 0)`, derivation
   lock `hashtextextended(ns, 1)` (used only by writers of derived versions, N120), document lock
-  `(hashtext(ns), hashtext(doc))`. One- and two-argument advisory locks are distinct lock tags,
-  so no cross-kind collision exists.
+  `(hashtext(ns), hashtext(doc))`, and the **per-fact lock** `engram_doc_lock_keys(ns, memory_id)`
+  (the same two-argument form, taken by every `Invalidate` and `Restore` before it reads
+  `prev_operation_id`, so concurrent curation of one fact forms one chain, N150). One- and
+  two-argument advisory locks are distinct lock tags, so no cross-kind collision exists.
 - Every write transaction runs with `statement_timeout = idle_in_transaction_session_timeout =
   30 s` and its outbox `INSERT` is the **last statement** before `COMMIT`, one multi-row
   statement when it emits several events (invariant A-F1, D6): a drawn `seq` is committed or
   aborted within one timeout of being drawn, which the relay's 60 s gap watchlist (§5.6) assumes;
   `engramlint sql` fails a builder whose outbox append is followed by another statement, and every
   scheduler write to `operations` or the outbox goes through the same `InNamespace` (N131).
-  Every role runs `synchronous_commit = local`; no synchronous standby exists (N122).
+  Every shard role runs `synchronous_commit = local`; no synchronous standby exists on shards
+  (N122); the catalog alone has one (N146).
   **Ids are minted per attempt, inside the transaction** after the fence prelude (`chunk_id`,
   `memory_id`, version and operation ids), so an id's timestamp is never older than its commit by
   more than one writer timeout (C-19, N139); the one exception is `ledger_id`, minted for the
@@ -83,29 +92,44 @@ degraded-mode root rebuilds, merges) and `CommitPageVersion` (`page/v1` and `pag
 in one *derivation transaction*:
 
 1. fence prelude, then the **shared** derivation lock (`engram_try_derivation_lock`; refused →
-   retryable);
+   retryable); the transaction's **first statement** is the idempotency lookup (step 3);
 2. **re-verify every rendered input in a fresh statement under that lock**: fact inputs against the
    full marker sets (all open tombstones, `chunk_tomb`, `fact_hidden` of both causes);
    observation-version inputs, including the base text a delta was rendered from, with
    `engram_obs_version_hidden` against **all open tombstones** (`engram_doc_tomb(ns, false)`), not
    only pending ones;
-3. **check the base as a compare-and-set at commit** (N143): the version the writer rendered from
-   is still current and visible, and the same statement advances it:
-   `UPDATE observations SET current_version = v + 1 WHERE … AND current_version = base_version`
-   (`pages` likewise), as the first write of the commit transaction, before any version row is
+3. **decide idempotency first** (N144): `SELECT version FROM page_versions WHERE namespace_id AND
+   page_id AND commit_key = $k` (`observation_versions` likewise), with `commit_key =
+   sha256(root_id ‖ base_version ‖ evidence_hash ‖ prompt_version ‖ attempt_nonce)`, where
+   `attempt_nonce` is minted **once per Temporal activity execution id** (`ActivityInfo.ActivityID ‖
+   WorkflowRunID`: stable across the retries of one scheduled activity, not per attempt) and stored
+   on the version row (`commit_key`, unique per root). **A hit means a previous attempt committed:
+   return that version and touch nothing** (no CAS, no blob delete). Only a miss goes on;
+4. **check the base as a compare-and-set at commit** (N143, N144): the version the writer rendered
+   from is still current and visible, and the same statement advances it:
+   `UPDATE observations SET current_version = $expected + 1 WHERE … AND current_version =
+   $expected` (`pages` likewise), as the first write after the lookup, before any version row is
    inserted. **Zero rows means the writer lost: discard.** A plain read of `current_version` is not
    enough, because the *shared* derivation lock does not serialise two writers that rendered from
-   the same base; the row lock of the `UPDATE` does (`BaseCurrentAtCommit`, `Derivation.tla`). A
-   root rebuild has no base: it advances the row it holds and skips the equality check;
-4. on any failure (zero rows included) `ROLLBACK`, discard the rendered result and re-derive from current evidence (a
+   the same base; the row lock of the `UPDATE` does (`BaseCurrentAtCommit`, `Derivation.tla`). The
+   compare-and-set is **the same for every writer, root rebuilds included**: `$expected` is the
+   `current_version` the writer read when it loaded the root (`LoadPage`, the batch's candidate
+   read), and `engram_derivation_base_cas(p_base IS NULL)` has no "advance whatever it holds"
+   branch, so a rebuild never overwrites a version that landed meanwhile and `current_version`
+   never names a row that does not exist (`NoPhantomVersion`). The same transaction clears the
+   stale flags only with `WHERE stale_seq = $captured` (N37), never unconditionally;
+5. on any failure (zero rows included) `ROLLBACK`, discard the rendered result and re-derive from current evidence (a
    root rebuild for observations, `page_full/v1` for pages); the writer never "repairs" a result by
-   adjusting its inputs.
+   adjusting its inputs. Blob keys written for a version are **attempt-unique** (`pages/{page_id}/v{n}-
+{sha256(markdown)[:16]}.md`), so the failure branch deletes only the key this execution minted and,
+in the same transaction, only after `NOT EXISTS (SELECT 1 FROM page_versions WHERE
+markdown_blob_key = $key)`: the blob of a committed row is never a deletion candidate.
 
-The SQL helpers are `engram_facts_all_visible` (step 2, fact inputs), `engram_obs_version_hidden` / `engram_page_version_hidden` (one `p_doc_tomb` jsonb of all open tombstones; invalidation is an anti-join on `fact_hidden` with `cause = 'invalidate'`) and `engram_derivation_base_cas` (step 3, the compare-and-set, returns the new version number or NULL). The lock is never held across an LLM call (a refresh would block `Materialize` for a minute): the
+The SQL helpers are `engram_facts_all_visible` (step 2, fact inputs), `engram_obs_version_hidden` / `engram_page_version_hidden` (one `p_doc_tomb` jsonb of all open tombstones; invalidation is an anti-join on `fact_hidden` with `cause = 'invalidate'`) and `engram_derivation_base_cas` (step 4, the compare-and-set with a required `p_base`, returns the new version number or NULL). The lock is never held across an LLM call (a refresh would block `Materialize` for a minute): the
 re-verification, not the lock, covers the call's duration. `Materialize` and `Restore` take the
 lock exclusively, and `Materialize` re-reads `fact_hidden` and the open tombstones in every batch
 (§5.4.2); markers take no lock. A configuration without the lock, without the page re-verify,
-without the base compare-and-set (a read-only base check does not satisfy `BaseCurrentAtCommit`), or with a once-computed `Materialize` fails in `Derivation.tla` (N141).
+without the base compare-and-set (a read-only base check does not satisfy `BaseCurrentAtCommit`), with the compare-and-set before the idempotency lookup (`Derivation_CasBeforeIdem.cfg` fails `NoPhantomVersion`), or with a once-computed `Materialize` fails in `Derivation.tla` (N141, N144).
 
 **Retry-policy notation.** `initial / coefficient / max interval / max attempts / non-retryable
 error types`. Named policies (`ScheduleToClose` bounds the whole retry chain; `StartToClose`
@@ -150,12 +174,15 @@ statements, N112, N138), never written on the commit path. State transitions are
 SUCCEEDED|FAILED|CANCELLED`; an `UPDATE … WHERE state NOT IN (terminal)` guard makes a late
 activity from a terminated workflow harmless.
 
-**Operations and workflows (N136).** Retain, export and page refresh run at `ns/{ns}/op/{op}`;
+**Operations and workflows (N136, N157).** Retain and export run at `ns/{ns}/op/{op}`;
 `DELETE_DOCUMENT` is the expunge singleton plus the tombstone's `operation_id`, with progress read
-from `expunge_progress`; consolidate is its singleton. `DELETE_*` operations are non-cancellable
+from `expunge_progress`; consolidate is its singleton; **`REFRESH_PAGE` is singleton-backed too**:
+a manual refresh is a `SignalWithStart` of `ns/{ns}/page/{page_id}` whose nudge carries the
+`operation_id`, and `WaitOperation` polls the page row. `DELETE_*` operations are non-cancellable
 (`CancelOperation` → `PreconditionFailed{OPERATION_NOT_CANCELLABLE}`), `WaitOperation` on them
 polls the tombstone (or, for a namespace and a tenant, the catalog), and the move's `Restart` and
-its reconcile loop skip singleton-backed kinds (the singletons are restarted by `SignalWithStart`,
+its reconcile loop skip singleton-backed kinds (`DELETE_DOCUMENT`, `CONSOLIDATE`, `REFRESH_PAGE`; the
+singletons are restarted by `SignalWithStart`,
 §5.5.1 step 7). `RetainBackfill` parents get an `operations` row so that a move's `Drain` sees them.
 
 **Heartbeats and history bounds.** Any activity that can run longer than 30 s heartbeats every
@@ -577,7 +604,7 @@ sequenceDiagram
 every throughput gate names its gateway profile, the uncapped fake or the D3 cap (N139). With
 `L_extract ≈ 3–6 s` the first term is 5–10 chunks/s per worker;
 a 600 RPM cap yields **≈ 2.9 chunks/s per cell** regardless of worker count, so filling 1 B facts
-online takes **≈ 100 days at 4 cells**. Embedding (≤ 64 texts per call, ≈ 100 ms) and Postgres (`CommitChunk` ≈ 15 ms) are not the bottleneck.
+online takes **≈ 80 days at 5 cells** (N154). Embedding (≤ 64 texts per call, ≈ 100 ms) and Postgres (`CommitChunk` ≈ 15 ms) are not the bottleneck.
 
 **`RetainBackfill`** (workflow `ns/{ns}/backfill/{backfill_id}` on `shard-{id}`, started by
 `engramctl backfill`; a **launch prerequisite in the committed scope**, N130) moves extraction off
@@ -633,7 +660,9 @@ admin-tx activity that joins `namespace_ownership` and acts **only on rows with 
 `UNION` the namespaces with stale (`stale_write OR stale_delete`) observations — and signals each
 namespace's singleton with `Nudge{reason = sweep}`. The same sweep **advances the watermark**: it
 moves `watermark_memory_id` up to just below the smallest unconsolidated fact id, visible or
-marker-hidden, and never past `ins_seq < engram_seq_floor(now())`: the guard is commit-based, because
+marker-hidden, and never past `ins_seq < engram_seq_floor(now())` (deferred for ten minutes on a
+namespace whose `moved_in_at` is that recent, because the target's ring has no sample below the
+copied rows until then, N147): the guard is commit-based, because
 an id timestamp cannot bound a transaction (a `CommitChunk` that minted a lower id may commit
 later, C-19), and ids are minted per attempt inside the transaction (§5.0). Facts purged as
 re-extracted twins get their `done` stamp from the purge itself (§5.4.2), so they never pin it. Rejected: one Temporal
@@ -740,9 +769,14 @@ with no facts never starts one.
          predicate closes the window, `Derivation.tla`, §7), and, for an `update` or `merge`, the
          base version's text that was rendered to the writer with `engram_obs_version_hidden`
          against **all open tombstones**.
-      5. **Check the base (rule step 3):** for every `update` and `merge`,
+      5. **Idempotency, then the base (rule steps 3 and 4, N144):** the first statement is the
+         `observation_versions.commit_key` lookup (`commit_key = sha256(observation_id ‖ base_version ‖
+         evidence_hash ‖ prompt_version ‖ attempt_nonce)`; a hit returns the version already
+         committed and touches nothing). Then, for every `update` and `merge`,
          `observations.current_version = base_version` and the base is visible, as the compare-and-set of
-         §5.0 step 3 (zero rows = discard). A root rebuild has no base. `root_version` of an applied `update` is inherited from that base.
+         §5.0 step 4 (zero rows = discard). A **root rebuild passes `$expected` too**: the
+         `current_version` it read with its candidate set, so a rebuild cannot overwrite a version
+         that landed meanwhile. `root_version` of an applied `update` is inherited from that base.
       A failure in 4 or 5 → `ROLLBACK`, then in a separate transaction
       `consolidation_batches.state = 'discarded'` with the next `attempt` (nothing is deleted; the
       `consolidation_applied` reference to `(batch_key, attempt)` guarantees no write of the old
@@ -751,8 +785,9 @@ with no facts never starts one.
       observation was root-rebuilt to v3 meanwhile would otherwise take the new root and carry
       hidden text into a visible segment (C-3), and the same check closes the lost update without
       any delete. The workflow drops missing ids (a new `batch_key`), re-queues the batch at the
-      front of its group for fresh routing, and the facts stay pending. A write whose target
-      observation is now retired is skipped.
+      front of its group for fresh routing, and the facts stay pending. A stage-2 write whose target
+      observation is now retired **re-routes its facts** (a new attempt) instead of stamping them
+      `done` (C-13); only a `skip` decision stamps a fact without a write.
       6. `create`: `INSERT observations(observation_id, tags, current_version = 1)`;
          `INSERT observation_versions(…, version = 1, root_version = 1, text, effective_at, …)` and
          its vector in `observation_version_vectors`; `INSERT observation_version_sources`
@@ -765,7 +800,8 @@ with no facts never starts one.
          under the derivation lock** (insert the new set before deleting the shown-and-dropped
          ones, never an unshown source, N57 as restated); then `UPDATE observations SET
          current_version, proof_count, stale_write = false, stale_delete = false, stale_since =
-         NULL` (a narrow mutable row). `retire`: `UPDATE observations SET retired_at = now()`.
+         NULL WHERE stale_seq = $captured` (a narrow mutable row; the flags are cleared only if
+         no mark landed since the writer captured `stale_seq`, as for pages, N37, N144). `retire`: `UPDATE observations SET retired_at = now()`.
          **Nothing hides anything:** hiding is the read predicate over the committed
          `observation_inputs` (N117), so a version written with a victim in view is hidden whether
          the marker came before or after this commit.
@@ -902,7 +938,7 @@ The page's `refresh_policy` is the single `RefreshPolicy{trigger, interval, debo
 |---|---|---|
 | After consolidation | `Consolidate` round end (§5.2 step 4) | `refresh_policy.trigger = AFTER_CONSOLIDATION` and the page's `stale_write` was raised by this round (its `tag_filter` matched a touched scope, evaluated by `engram_tag_match` inside `ApplyBatch`) |
 | Schedule | per-shard schedule `shard/{id}/page-cron` every 5 min (admin tx: pages with `trigger = SCHEDULED` whose current version is older than `interval`, joined to `namespace_ownership` `active`) | `trigger = SCHEDULED`; a refresh with nothing changed ends `NoChange` without an LLM call |
-| Manual | `PageService.RefreshPage` (creates an `operations` row of kind `REFRESH_PAGE`) | always |
+| Manual | `PageService.RefreshPage` (creates an `operations` row of kind `REFRESH_PAGE` and `SignalWithStart`s the per-page singleton with the `operation_id` in the nudge; the refresh has no workflow of its own, `WaitOperation` polls the page row, `Restart` skips it, N157) | always |
 | Delete or invalidate | `Expunge.Materialize` and `Invalidate` (§5.4) | **always**, whatever the trigger says: a page that cites a hidden input must be rebuilt (there is no `on_delete` policy, N128) |
 
 `stale_write = true` means "evidence matching my filter changed since my last refresh";
@@ -920,7 +956,8 @@ sleeping until `last_refreshed_at + debounce`; manual, delete and invalidate ref
 #### 5.3.2 Steps
 
 1. **`LoadPage`** (read tx + blob get): page row, the current *visible* `page_versions` row and its
-   markdown (`{prefix}/pages/{page_id}/v{n}.md`), `page_sources`, `stale_seq`. If the current
+   markdown (its `markdown_blob_key`, `{prefix}/pages/{page_id}/v{n}-{hash16}.md`), `page_sources`,
+   `stale_seq`, and `current_version` as `$expected` for the commit. If the current
    version is hidden, no previous markdown is loaded.
 2. **`GatherEvidence`** (read tx, no LLM): `recall.Planner` over `source_query` with the page's
    `tag_filter`, `as_of = now()`, `prefer_observations = true`, budget `mid`, `max_tokens = 2 ×
@@ -949,29 +986,37 @@ sleeping until `last_refreshed_at + debounce`; manual, delete and invalidate ref
    from a hidden version would carry the victim's content). A full rebuild starts a new root
    segment (`root_version = version`).
 6. **`CommitPageVersion`** (embed and blob put, then fenced **derivation** tx, the commit rule of
-   §5.0): embed the page `text` (`search_document:` prefix) and put
-   `{prefix}/pages/{page_id}/v{n+1}.md` (idempotent key). Then, in one transaction: fence prelude
-   and the **shared** derivation lock; **re-verify every id rendered to the prompt in a fresh
-   statement** — fact inputs against the full marker sets (all open tombstones, `chunk_tomb`,
-   `fact_hidden` of both causes) and observation-version inputs with `engram_obs_version_hidden`
-   against all open tombstones; **check the base by compare-and-set** (N143): `UPDATE pages SET
-   current_version = n + 1 WHERE … AND current_version = base_version` (the version `page/v1` edited; the base must be visible; `page_full/v1` has
-   no base), zero rows = lost. Any failure →
-   `ROLLBACK`, delete the blob this activity put, discard the rendered page and re-run
-   `FullRebuild` from the current evidence (the commit never "repairs" by adjusting inputs). A
-   refresh whose LLM call spanned a delete and its `Materialize` is therefore refused here (C-2),
-   and a crash leaves at worst an orphan `v{n+1}.md` that the orphan sweep removes. Otherwise:
-   `INSERT page_versions(page_id, version = n + 1, root_version, markdown_blob_key, text,
-   effective_at, evidence_hash) ON CONFLICT DO NOTHING` (zero rows → a previous attempt committed:
-   read it and return) and its `page_version_vectors` row (the BM25 entry on `text` is written by
+   §5.0): mint the activity's `attempt_nonce` (once per activity execution id, stable across its
+   retries), embed the page `text` (`search_document:` prefix) and put the **attempt-unique**
+   `{prefix}/pages/{page_id}/v{n+1}-{sha256(markdown)[:16]}.md`. Then, in one transaction: fence
+   prelude and the **shared** derivation lock; **first statement, the idempotency lookup**:
+   `SELECT version FROM page_versions WHERE namespace_id AND page_id AND commit_key = $k` with
+   `$k = sha256(page_id ‖ base_version ‖ evidence_hash ‖ prompt_version ‖ attempt_nonce)` — **a hit
+   means a previous attempt of this activity committed: return that version, touch nothing** (no
+   compare-and-set, no blob delete; N144). On a miss: **re-verify every id rendered to the prompt in
+   a fresh statement** — fact inputs against the full marker sets (all open tombstones,
+   `chunk_tomb`, `fact_hidden` of both causes) and observation-version inputs with
+   `engram_obs_version_hidden` against all open tombstones; **check the base by compare-and-set**
+   (N143, N144): `UPDATE pages SET current_version = $expected + 1 WHERE … AND current_version =
+   $expected` — for **every** writer: `$expected` is the `current_version` read at `LoadPage`, the
+   version `page/v1` edited (visible) or the one a `page_full/v1` rebuild replaces, zero rows =
+   lost. Any failure → `ROLLBACK`, delete the blob this execution minted **only if** `NOT EXISTS
+   (SELECT 1 FROM page_versions WHERE markdown_blob_key = $key)` (the blob of a committed row is
+   never a deletion candidate), discard the rendered page and re-run `FullRebuild` from the current
+   evidence (the commit never "repairs" by adjusting inputs). A refresh whose LLM call spanned a
+   delete and its `Materialize` is therefore refused here (C-2), and a crash leaves at worst an
+   orphan markdown blob that the orphan sweep removes. Otherwise: `INSERT page_versions(page_id,
+   version = $expected + 1, root_version, markdown_blob_key, text, effective_at, evidence_hash,
+   commit_key)` (the unique `(page_id, commit_key)` makes a race between two attempts of one
+   activity harmless) and its `page_version_vectors` row (the BM25 entry on `text` is written by
    the insert; `SearchPages` shares the observation visibility and purge path, A-14); `INSERT
    page_version_inputs` for **every id rendered to the prompt** (`added`, `changed` new side and
    `retired` for `page/v1`; the evidence list for `page_full/v1`; kind `fact` or `observation`,
    `source_id`, `source_version`, `document_id`) — the segment's input set, with no foreign key to
    `facts` (N135); `root_version` is inherited from the previous version for a delta and equals
    `version` for a full rebuild; the previous version's write-once `page_version_meta.superseded_at`;
-   replace `page_sources`; `UPDATE pages SET current_version = n + 1, stale_write = false,
-   stale_delete = false WHERE stale_seq = $captured`; `token_usage_events`; `operations` (manual) →
+   replace `page_sources`; `UPDATE pages SET stale_write = false, stale_delete = false WHERE
+   stale_seq = $captured` (the version number was advanced by the compare-and-set); `token_usage_events`; `operations` (manual) →
    `SUCCEEDED{page_version}`; outbox `PageVersionCreated{page_id, version, root_version}`.
    `effective_at = max(effective_at of every observation version and mentioned_at of every fact
    rendered to the prompt, effective_at(n))` — monotone (D9).
@@ -987,7 +1032,7 @@ sleeping until `last_refreshed_at + debounce`; manual, delete and invalidate ref
 | `DeltaEdit` | activity | `sha256(page_id ‖ n ‖ evidence digest ‖ prompt_version)` (not cached) | `P-llm` after `quota.Reserve`; validation failure → retry once → full | none | none | — |
 | `ApplyDeltaOps` | activity (pure) | deterministic | `P-pure` | — | none | — |
 | `FullRebuild` | activity | as `DeltaEdit` | `P-llm` | none | none | — |
-| `CommitPageVersion` | activity | `(ns, page_id, n + 1)` unique | `P-blob` then `P-frozen` | shared try-lock, `active` @ epoch + shared derivation lock; inputs re-verified, `current_version = base_version` checked (N120) | derivation tx | `PageVersionCreated` |
+| `CommitPageVersion` | activity | `commit_key = sha256(page_id ‖ base_version ‖ evidence_hash ‖ prompt_version ‖ attempt_nonce)` looked up **first**, then `(ns, page_id, n + 1)` unique (N144) | `P-blob` then `P-frozen` | shared try-lock, `active` @ epoch + shared derivation lock; inputs re-verified, `current_version = $expected` checked and advanced (N120, N144) | derivation tx | `PageVersionCreated` |
 
 #### 5.3.4 Sequence
 
@@ -1014,7 +1059,7 @@ sequenceDiagram
       W->>G: page_full/v1 rebuild, new root segment
     end
     W->>B: put pages/{page_id}/v{n+1}.md
-    W->>DB: CommitPageVersion tx under the shared derivation lock: re-verify inputs and base version, then page_versions, page_version_inputs, page_sources, clear flags if stale_seq unchanged
+    W->>DB: CommitPageVersion tx under the shared derivation lock: commit_key lookup first, re-verify inputs, base version CAS, then page_versions, page_version_inputs, page_sources, clear flags if stale_seq unchanged
   end
 ```
 
@@ -1022,10 +1067,10 @@ sequenceDiagram
 
 | Scenario | What happens | Net effect |
 |---|---|---|
-| Crash after the blob put, before the tx | Retry re-puts the same key and inserts the version | one version |
-| Crash after the tx, before the result is recorded | Retry hits `ON CONFLICT DO NOTHING` on `(page_id, n + 1)` → returns the committed version | one version |
+| Crash after the blob put, before the tx | The retry keeps the activity's `attempt_nonce`, re-puts the same attempt-unique key and inserts the version | one version |
+| Crash after the tx, before the result is recorded | The retry's first statement finds its `commit_key` and returns the committed version; it runs no compare-and-set and deletes no blob (a CAS-first order would fail on the advanced `current_version`, roll back and delete the committed markdown) | one version, `current_version = n + 1`, blob intact (`TestPageRefresh_CommitRetry`) |
 | A delete lands mid-refresh (the LLM call spans the marker and its `Materialize`) | The commit re-verifies every rendered input in a fresh statement under the shared derivation lock after `Materialize` finished; the victim is covered by an open tombstone, so the commit is refused, the blob deleted and `page_full/v1` runs from current evidence. If the marker commits after the commit, `Materialize` waited for the lock the commit held and records the version. The marker bumps `stale_seq`, so the follow-up refresh runs | the page never serves the victim (`TestPageRefresh_DeleteMidCall`; `Derivation_PageNoVerify` must fail) |
-| The page's base version was replaced by a rebuild while the delta was being written | `current_version ≠ base_version` → the commit is refused and the refresh re-runs from the new version | no lost rebuild (N120) |
+| The page's base version was replaced by a rebuild while the delta was being written, or a rebuild raced a delta | `current_version ≠ $expected` for either writer → the commit is refused and the refresh re-runs from the new version (a rebuild no longer "advances whatever it holds") | no lost rebuild, no phantom version (N120, N144) |
 | The current version is hidden | `GetPage` → `PAGE_HIDDEN`; the nudge from the expunge runs a **full rebuild** from visible evidence | the page is absent, not stale, until the rebuild lands |
 | Delta ops reference unknown blocks twice | Full rebuild; front matter `mode: full` (alert if > 10 % of refreshes are full) | correctness over cost |
 | Evidence exceeds the model context | `GatherEvidence` caps at `2 × max_tokens`; full rebuild uses the packer's skip-not-truncate rule | bounded prompt |

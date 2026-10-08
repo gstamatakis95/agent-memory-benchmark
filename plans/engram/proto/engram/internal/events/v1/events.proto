@@ -47,9 +47,10 @@
 // oneof members as unknown fields) and count them in
 // `events_unknown_payload_total`. This package has not shipped v1.0.0, so the
 // round-3 and round-4 redesigns changed it incompatibly. Until v1.0.0,
-// `buf breaking` is baselined on `main@HEAD~1` and every intended break
+// `buf breaking` is baselined on the merge target (`main`) for pull requests
+// and on `main@HEAD~1` only in the push-to-main job, and every intended break
 // carries a labelled exception and a changelog entry (plan section 4.5,
-// decision N139); the breaks are listed here:
+// decisions N139, N157); the breaks are listed here:
 //   * N80: every id field that changed from `string` to `bytes` got a NEW
 //     field number and (round 4) a new `_bytes` name; the old number and name
 //     are `reserved`. A consumer built before the change therefore ignores
@@ -108,6 +109,7 @@ message Event {
     RestoreMarker restore_marker = 39;
     NamespaceDeleted namespace_deleted = 48;
     ChunksTombstoned chunks_tombstoned = 49;
+    DocumentTagsUpdated document_tags_updated = 50;
   }
 
   // Removed in the D22 redesign: 22 `ChunksRetired` (now 49), 36
@@ -215,8 +217,26 @@ message DocumentDeleted {
   reserved 2 to 6, 8 to 15;
 }
 
+// DocumentTagsUpdated: UpdateDocumentTags changed the filter tags of a
+// document (decision N157, review A-13). A tag change creates no document
+// version, so this event and the document's `tag_generation` are how outbox
+// consumers and the export delta learn about it. Written in the same
+// transaction as the `documents` row update and the `tag_counts` change.
+message DocumentTagsUpdated {
+  string document_id = 1;
+  // The document's tag_generation after the change.
+  int64 tag_generation = 2;
+  // The document's current_version when the tags changed.
+  int64 version = 3;
+  // How many tags the call added and removed (the tags are on the row).
+  int32 tags_added = 4;
+  int32 tags_removed = 5;
+}
+
 // FactInvalidated: a `fact_hidden(invalidate)` marker was inserted (decision
-// N115). Re-extraction markers (`reextract`) are not events: they are inserted
+// N115). When the same document holds a visible same-content twin, the same
+// transaction hides it and writes one event per fact (decision N145). The
+// marker does not depend on the fact row and outlives its purge. Re-extraction markers (`reextract`) are not events: they are inserted
 // by FinalizeVersion and covered by ChunksTombstoned / the version events.
 // Observation and page versions whose segment names the fact are hidden by the
 // read predicate; no per-version event exists.

@@ -30,7 +30,14 @@
 // counts, versions) is empty. GetDocumentVersion and GetDocumentBody of a
 // version the tombstone covers answer NOT_FOUND with reason DOCUMENT_DELETED.
 // A Retain into the same document_id starts a new life above up_to_version
-// and is served normally.
+// and is served normally. The same cover rule filters every DocumentService
+// path: a revived document lists only the versions above the pending
+// tombstone's up_to_version (GetDocument with include_versions, ListDocuments),
+// and a tombstone never matches a non-empty tag_filter or metadata filter
+// (its tags and metadata are empty by construction; decision N157, review
+// A-14). DocumentState is generated from the same table as the SQL
+// document_state enum: SQL `deleted` is never exposed, and INGESTING is
+// SQL `active` with current_version = 0.
 syntax = "proto3";
 
 package memory.v1;
@@ -87,7 +94,10 @@ service DocumentService {
   }
   // ListTags lists the distinct filter tags of the namespace's documents with
   // their document counts, optionally by prefix (decision N139). Tags of
-  // DELETING documents are not counted.
+  // DELETING documents are not counted. Served from the per-namespace
+  // `tag_counts` table that every transaction changing a document's tags
+  // maintains, so the cost does not grow with the number of documents
+  // (decision N157, review A-13).
   rpc ListTags(ListTagsRequest) returns (ListTagsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -95,7 +105,13 @@ service DocumentService {
   // semantics; tags are normalised as at retain, decision N32). Tags live on
   // the document row only (decision N116), so tag filters see the change at
   // once; existing observations keep their scope and nothing is re-extracted.
-  // A DELETING document is NOT_FOUND{DOCUMENT_DELETED}. Scope memory.write.
+  // The transaction bumps the document's `tag_generation`, emits the
+  // DocumentTagsUpdated outbox event and adds the document to the next export
+  // delta's `documents` part (a tag change creates no version). A later
+  // Retain with REPLACE or APPEND recomputes the document's tags from the
+  // union of the items' tags and so drops tags set here (documented, decision
+  // N157). A DELETING document is NOT_FOUND{DOCUMENT_DELETED}, a use of
+  // NotFound.reason that errors.proto lists. Scope memory.write.
   rpc UpdateDocumentTags(UpdateDocumentTagsRequest) returns (UpdateDocumentTagsResponse);
 }
 
@@ -104,7 +120,8 @@ enum DocumentState {
   DOCUMENT_STATE_UNSPECIFIED = 0;
   // Has at least one active version.
   DOCUMENT_STATE_ACTIVE = 1;
-  // First version still ingesting; nothing visible yet.
+  // First version still ingesting; nothing visible yet (SQL state `active`
+  // with current_version = 0).
   DOCUMENT_STATE_INGESTING = 2;
   // Tombstone committed (the delete is effective); expunge in progress. Not
   // returned by List unless `include_deleting`, and then as the content-free
@@ -160,6 +177,10 @@ message Document {
   int64 up_to_version = 16;
   // DELETING only: the DELETE_DOCUMENT operation that tracks the expunge.
   string delete_operation_id = 17;
+  // Monotone counter bumped by every UpdateDocumentTags and every retain that
+  // recomputes the tags; the export delta keys its `documents` part by
+  // (document_id, tag_generation) (decision N157).
+  int64 tag_generation = 18;
 
   reserved 100 to 199;
 }
@@ -184,7 +205,9 @@ message GetDocumentRequest {
   NamespaceRef namespace = 1;
   string document_id = 2;
   google.protobuf.FieldMask read_mask = 3;
-  // Also return `versions`.
+  // Also return `versions`. Versions a pending delete tombstone covers
+  // (version <= up_to_version) are never listed, also after the document id
+  // was retained again (decision N157, review A-14).
   bool include_versions = 4;
 
   reserved 100 to 199;
@@ -201,7 +224,8 @@ message GetDocumentResponse {
 message ListDocumentsRequest {
   NamespaceRef namespace = 1;
   PagingRequest paging = 2;
-  // Tag filter over the document's tag union.
+  // Tag filter over the document's tag union. A tombstone view
+  // (include_deleting) never matches a non-empty filter.
   TagFilter tag_filter = 3;
   // Prefix match on document_id (e.g. "session-2026-09-").
   string document_id_prefix = 4;

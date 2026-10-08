@@ -110,8 +110,9 @@ message NotFound {
   NamespaceRef namespace = 3;
   // Optional stable code refining why the resource is gone. Currently
   // "DOCUMENT_DELETED": the document version is covered by a delete marker
-  // (GetDocumentVersion, GetDocumentBody of a deleted version; decision
-  // N136). Empty for a plain unknown id.
+  // (GetDocumentVersion, GetDocumentBody of a deleted version, and
+  // UpdateDocumentTags on a DELETING document; decisions N136, N157). Empty
+  // for a plain unknown id.
   string reason = 4;
 }
 

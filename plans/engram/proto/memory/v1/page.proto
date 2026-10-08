@@ -67,7 +67,10 @@ service PageService {
   // are small; no purge operation).
   rpc DeletePage(DeletePageRequest) returns (DeletePageResponse);
   // RefreshPage starts a refresh (kind REFRESH_PAGE) and returns the
-  // Operation; a running refresh is returned instead of a new one.
+  // Operation; a running refresh is returned instead of a new one. The refresh
+  // runs in the per-page singleton workflow (SignalWithStart of
+  // `ns/{namespace_id}/page/{page_id}` with the operation_id in the nudge);
+  // WaitOperation polls the page row (decision N157, review A-5).
   rpc RefreshPage(RefreshPageRequest) returns (RefreshPageResponse);
 }
 

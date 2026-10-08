@@ -245,7 +245,8 @@ orchestrator. Commit after every green step; update PROGRESS.md.
   target (`proto`, not `plans/engram/proto`); generated stubs committed; `PageService`/`ExportService` registered
   answering `UNIMPLEMENTED` (N14); the §2 stub module: every interface of PLAN.md §2.2 with bodies `panic("stub")`,
   the leaves `internal/{id,errs,pipeline,fsm,txn}` real; depguard config from §2.1's table; the method-count lint
-  (≤ 5) and the RPC→interface coverage check (`TestDeps_EveryRPCHasPath`, N157); CI running S + T0.
+  (≤ 5) and the RPC→interface coverage check (`TestDeps_EveryRPCHasPath`, N157); CI running S + T0, including
+  golangci-lint with `lll` at 120, gofmt, `buf format` and `scripts/check-line-length.sh` for SQL/TLA+/Lean.
 - READ: PLAN.md §2.1, §2.2 (all signatures), §2.4, §4.1, §4.2, §4.5; register D1, D14, N1, N128, N132, N139,
   N140, N157, N167; proto/README.md.
 - TESTS: `make lint test-unit` < 30 s; `TestDeps_EveryRPCHasPath`; a deliberate field-number change fails

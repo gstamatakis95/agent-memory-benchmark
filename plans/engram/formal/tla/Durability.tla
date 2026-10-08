@@ -79,13 +79,24 @@
 (*                     through the intent put); FALSE: both read the same  *)
 (*                     prev, the chain forks and replay order is           *)
 (*                     unspecified.                                        *)
+(*                                                                         *)
+(* D27 addition (N182): the tenant-level delete.  DeleteTenant writes the  *)
+(* catalog `deleting` row and a tenant intent (tdp = 1), TenantDelete then *)
+(* takes freeze_delete on each of the tenant's two namespaces (tdp = 2, 3),*)
+(* and the operation is acknowledged (ta) only once both are fenced.  A    *)
+(* catalog restore (the existing CatalogRestore, RPO 60 s) reverts the     *)
+(* `deleting` row when no namespace is fenced yet (tdp = 4: the operation  *)
+(* is FAILED{CATALOG_RESTORED}); once a namespace is frozen/delete the     *)
+(* reconcile re-derives `deleting` from the shard rows (N163(2)).          *)
+(*   TenantAckBeforeFence TRUE  the ack follows the `deleting` row and the *)
+(*                     intent, before the fences (the rejected order)      *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, Sequences
 
 CONSTANTS Shape, MaxT, Lat, Skew, Margin, MaxRestores,
           IntentAfterCommit, AckNeedsIntent, AckRecheck, DupReput, ReplayFirst,
           FloorMode, OrderMode, EpochGuard,
-          BlobFloor, MaxCatLoss, ReplayCurrentEpoch, ConcurrentX, SubjectLock, HelpPrev
+          BlobFloor, MaxCatLoss, ReplayCurrentEpoch, ConcurrentX, SubjectLock, HelpPrev, TenantAckBeforeFence
 
 ShapeDoc  == <<[s |-> "y", k |-> "del"], [s |-> "y", k |-> "del"], [s |-> "y", k |-> "ret"]>>
 ShapeFact == <<[s |-> "x", k |-> "inv"], [s |-> "x", k |-> "res"], [s |-> "x", k |-> "inv"]>>
@@ -95,8 +106,8 @@ OpIds == 1..N
 S(i) == Shape[i].s
 K(i) == Shape[i].k
 
-VARIABLES t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat
-vars == <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+VARIABLES t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta
+vars == <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
 \* dbq: the marker rows the shard has applied, in application order: [op, eff, ep] (ep: the epoch the row records).
 \* eff: for a document delete, the versions it covers (the tombstone's up_to_version).
@@ -110,10 +121,11 @@ TypeOK ==
   /\ t \in 0..MaxT /\ intents \subseteq OpIds /\ db \subseteq OpIds /\ Len(dbq) <= 2 * N
   /\ sst \in {"active", "restoring"} /\ fl \in 0..(MaxT + 1) /\ bf \in 0..(MaxT + 1)
   /\ \A i \in OpIds : ops[i].ph \in Phases
+  /\ tdp \in 0..4 /\ ta \in BOOLEAN
 
 Init ==
   /\ t = 0 /\ ops = [i \in OpIds |-> NoOp] /\ intents = {} /\ dbq = << >>
-  /\ sst = "active" /\ fl = MaxT + 1 /\ nIssued = 0 /\ nRestore = 0 /\ cn = 0 /\ ep = 1 /\ bf = MaxT + 1 /\ nCat = 0
+  /\ sst = "active" /\ fl = MaxT + 1 /\ nIssued = 0 /\ nRestore = 0 /\ cn = 0 /\ ep = 1 /\ bf = MaxT + 1 /\ nCat = 0 /\ tdp = 0 /\ ta = FALSE
 
 -----------------------------------------------------------------------------
 (* What the marker tables show *)
@@ -145,7 +157,7 @@ Issue ==
           /\ sk <= t
           /\ ops' = [ops EXCEPT ![i] = [NoOp EXCEPT !.ph = "new", !.it = t, !.at = t - sk]]
   /\ nIssued' = nIssued + 1
-  /\ UNCHANGED <<t, intents, dbq, sst, fl, nRestore, cn, ep, bf, nCat>>
+  /\ UNCHANGED <<t, intents, dbq, sst, fl, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
 \* ConcurrentX: the marker transaction of a fact subject begins by reading the subject's previous entry
 \* (prev_operation_id).  With the subject lock (N150) it waits while another transaction of the subject is open.
@@ -156,7 +168,7 @@ TxnBegin(o) ==
   \* HelpPrev: under the lock the transaction first puts the intent of the subject's latest entry if it is missing
   \* (a marker whose writer crashed between commit and put); otherwise that entry is a hole in the chain.
   /\ intents' = IF HelpPrev /\ LastOn("x") # 0 THEN intents \cup {LastOn("x")} ELSE intents
-  /\ UNCHANGED <<t, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+  /\ UNCHANGED <<t, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
 \* The marker transaction: a local commit, refused by the namespace fence while restoring.
 \* A duplicate (subject already deleting / hidden) writes no marker and observes the existing one.
@@ -176,7 +188,7 @@ Commit(o) ==
                /\ ops' = [ops EXCEPT ![o] = [@ EXCEPT !.ph = "committed", !.ct = t, !.cn0 = cn + 1, !.ep = ep,
                             !.eff = eff, !.obs = o,
                             !.prev = IF k = "ret" THEN 0 ELSE IF ConcurrentX /\ s = "x" THEN ops[o].rd ELSE LastOn(s)]]
-  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, ep, bf, nCat>>
+  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, ep, bf, nCat, tdp, ta>>
 
 \* Design: after the commit, put the intent of the marker this attempt relies on (its own, or the
 \* one a duplicate observed).  Old order: before the commit, its own.
@@ -188,7 +200,7 @@ PutIntent(o) ==
             /\ intents' = intents \cup {ops[o].obs}
        ELSE /\ ops[o].ph = "new" /\ o \notin intents
             /\ intents' = intents \cup {o}
-  /\ UNCHANGED <<t, ops, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+  /\ UNCHANGED <<t, ops, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
 IntentOK(o) == ops[o].obs \in intents \/ ~AckNeedsIntent \/ (ops[o].obs # o /\ ~DupReput)
 
@@ -196,23 +208,33 @@ Ack(o) ==
   /\ ops[o].ph = "committed"
   /\ K(o) = "ret" \/ (IntentOK(o) /\ (AckRecheck => ops[o].obs \in db))
   /\ ops' = [ops EXCEPT ![o].ph = "acked"]
-  /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+  /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
 \* The client sees an error: before the commit (Abort), or after it with the intent not yet put
 \* (CrashBeforePut), or with the intent put (LostAck).
 Abort(o) == /\ ops[o].ph = "new" /\ K(o) # "ret"
             /\ ops' = [ops EXCEPT ![o].ph = "failed"]
-            /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+            /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 CrashBeforePut(o) == /\ ops[o].ph = "committed" /\ K(o) # "ret" /\ ops[o].obs \notin intents
                      /\ ops' = [ops EXCEPT ![o].ph = "failed"]
-                     /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+                     /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 LostAck(o) == /\ ops[o].ph = "committed" /\ K(o) # "ret" /\ ops[o].obs \in intents
               /\ ops' = [ops EXCEPT ![o].ph = "failed"]
-              /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+              /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
+
+\* DeleteTenant: the catalog `deleting` row, then the tenant intent (the RPC waits for the row's replication).
+TenantRow == /\ tdp = 0 /\ tdp' = 1
+             /\ UNCHANGED <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, ta>>
+\* TenantDelete: freeze_delete on one more namespace of the tenant.
+TenantFence == /\ tdp \in 1..2 /\ tdp' = tdp + 1
+               /\ UNCHANGED <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, ta>>
+\* The operation's acknowledged_at: after the last fence (design) or after the intent (TenantAckBeforeFence).
+TenantAck == /\ ~ta /\ (IF TenantAckBeforeFence THEN tdp \in 1..3 ELSE tdp = 3) /\ ta' = TRUE
+             /\ UNCHANGED <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp>>
 
 Tick ==
   /\ t < MaxT /\ t' = t + 1
-  /\ UNCHANGED <<ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+  /\ UNCHANGED <<ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
 \* Restore or failover to point p: commits after p are lost; the floor (catalog) is not.
 RestoreTo(p) ==
@@ -222,15 +244,16 @@ RestoreTo(p) ==
   /\ fl' = IF FloorMode = "target" THEN p ELSE IF fl < p THEN fl ELSE p
   /\ bf' = IF bf < p THEN bf ELSE p                      \* the blob-store floor record, written before the replay (N146)
   /\ ep' = ep + 1
-  /\ UNCHANGED <<t, ops, intents, nIssued, cn, nCat>>
+  /\ UNCHANGED <<t, ops, intents, nIssued, cn, nCat, tdp, ta>>
 
 \* CatalogRestore: the catalog is restored from a backup (or fails over asynchronously) and its floor goes back to
 \* its initial (highest) value; the blob-store record is not affected.
 CatalogRestore ==
-  /\ nCat < MaxCatLoss /\ fl < MaxT + 1
+  /\ nCat < MaxCatLoss /\ (fl < MaxT + 1 \/ tdp = 1)
   /\ fl' = MaxT + 1              \* the oldest value is the worst case: the replay window only narrows as the floor rises
   /\ nCat' = nCat + 1
-  /\ UNCHANGED <<t, ops, intents, dbq, sst, nIssued, nRestore, cn, ep, bf>>
+  /\ tdp' = IF tdp = 1 THEN 4 ELSE tdp          \* before any fence the `deleting` row is gone; after one the reconcile re-derives it
+  /\ UNCHANGED <<t, ops, intents, dbq, sst, nIssued, nRestore, cn, ep, bf, ta>>
 
 RFloor == IF BlobFloor THEN (IF fl < bf THEN fl ELSE bf) ELSE fl
 InWindow(o) == o \in intents /\ ops[o].at + Margin >= RFloor
@@ -250,15 +273,15 @@ Replay(o) ==
   /\ LET eff == IF K(o) = "del" /\ ~IntentAfterCommit THEN AllRet ELSE ops[o].eff IN
      dbq' = Append(dbq, [op |-> o, eff |-> eff, ep |-> IF ReplayCurrentEpoch THEN ep ELSE ops[o].ep])
   /\ ops' = [ops EXCEPT ![o].ct = t]
-  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
 Reopen ==
   /\ sst = "restoring" /\ (ReplayFirst => Pending = {})
   /\ sst' = "active"
   /\ fl' = IF FloorMode = "raise" THEN MaxT + 1 ELSE fl
-  /\ UNCHANGED <<t, ops, intents, dbq, nIssued, nRestore, cn, ep, bf, nCat>>
+  /\ UNCHANGED <<t, ops, intents, dbq, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
-Next == Tick \/ Reopen \/ Issue \/ (\E p \in 0..MaxT : RestoreTo(p)) \/ CatalogRestore
+Next == Tick \/ TenantRow \/ TenantFence \/ TenantAck \/ Reopen \/ Issue \/ (\E p \in 0..MaxT : RestoreTo(p)) \/ CatalogRestore
         \/ (\E o \in OpIds : TxnBegin(o) \/ PutIntent(o) \/ Commit(o) \/ Ack(o) \/ Abort(o) \/ CrashBeforePut(o)
                              \/ LostAck(o) \/ Replay(o))
 
@@ -273,7 +296,9 @@ LastCommitted(s) ==
 AckImpliesIntent == \A o \in OpIds : (ops[o].ph = "acked" /\ K(o) # "ret") => ops[o].obs \in intents
 
 \* The marker an acknowledged delete relies on is in force whenever the shard serves.
-AckedDeleteSurvives == sst = "active" => \A o \in OpIds : (ops[o].ph = "acked" /\ K(o) = "del") => ops[o].obs \in db
+AckedDeleteSurvives ==
+  /\ sst = "active" => \A o \in OpIds : (ops[o].ph = "acked" /\ K(o) = "del") => ops[o].obs \in db
+  /\ ta => tdp # 4                                       \* an acknowledged tenant delete is never reverted (N182)
 
 \* Invalidate/Restore: per-subject chain order makes the last state win, whatever the clocks say.
 IntentOrderLastWins ==

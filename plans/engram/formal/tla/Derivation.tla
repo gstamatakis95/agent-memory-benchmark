@@ -8,6 +8,8 @@
 (*   hidden    fact_hidden(cause = invalidate); Restore deletes it         *)
 (*   itag      fact_hidden.invalidation_op (N162): the id of the Invalidate  *)
 (*             that wrote the row; a lazily added twin carries the same id  *)
+(*   clog      curation_log, per subject: the last action (inv / res) and   *)
+(*             its operation id; the lazy twin reads its tag here (N174)    *)
 (*   hidRe     fact_hidden(cause = reextract): a stale-key fact; the fact  *)
 (*             and chunk arms skip it, derived versions do NOT (N135)      *)
 (*   ctomb     chunk_tombstones (REPLACE retires the fact; not a deletion) *)
@@ -64,8 +66,8 @@
 (*                        twins that are not hidden for another cause)      *)
 (*   DocLock=FALSE        Invalidate/Restore do not wait for a lazy twin    *)
 (*                        in flight (no exclusive document lock)            *)
-(*   TagFromLastLog       Invalidate always takes a fresh tag and the lazy  *)
-(*                        twin reads the curation_log's last tag            *)
+(*   TagFromLastLog       Invalidate always logs a fresh tag although the   *)
+(*                        rows of its subject keep the old one (TagFromLog) *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -93,8 +95,9 @@ Group(f) == {g \in Facts : g = f \/ Twin[g] = f \/ Twin[f] = g}     \* the subje
 
 VARIABLES tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX,
           matPhase, matDocs, matV0, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet,
-          cv, ginv, mat, matOwe, sig, itag, lz, lastOp
-NewV == <<cv, ginv, mat, matOwe, sig, itag, lz, lastOp>>
+          cv, ginv, mat, matOwe, sig, itag, lz, clog
+NewV == <<cv, ginv, mat, matOwe, sig, itag, lz, clog>>
+Subj(f) == CHOOSE g \in Group(f) : \A h \in Group(f) : g <= h      \* the representative of the subject
 vars == <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX,
           matPhase, matDocs, matV0, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet, NewV>>
 
@@ -159,7 +162,8 @@ TypeOK ==
   /\ \A n \in Nodes : \A i \in 1..Len(vers[n]) : vers[n][i] \in Rec
   /\ \A n \in Nodes : Len(vers[n]) <= MaxVer(n)
   /\ cv \in [Nodes -> 0..(MaxVerP + 2)] /\ ginv \subseteq Facts /\ mat \subseteq Facts /\ matOwe \subseteq Facts /\ sig \in BOOLEAN
-  /\ itag \in [Facts -> 0..MaxCuration] /\ lastOp \in 0..MaxCuration
+  /\ itag \in [Facts -> 0..MaxCuration]
+  /\ clog \in [Facts -> [act : {"none", "inv", "res"}, tag : 0..MaxCuration]]
   /\ lz = NoLz \/ (lz.f \in Facts /\ lz.tag \in 0..MaxCuration)
   /\ lockX \in BOOLEAN /\ matPhase \in {"idle", "running", "scanned"}
   /\ props \subseteq Prop
@@ -172,7 +176,7 @@ Init ==
   /\ wr = [w \in Writers |-> IdleW] /\ props = {}
   /\ budget = Budget /\ nDel = 0 /\ nCur = 0 /\ nRet = 0
   /\ cv = [n \in Nodes |-> 0] /\ ginv = {} /\ mat = {} /\ matOwe = {} /\ sig = FALSE
-  /\ itag = [f \in Facts |-> 0] /\ lz = NoLz /\ lastOp = 0
+  /\ itag = [f \in Facts |-> 0] /\ lz = NoLz /\ clog = [f \in Facts |-> [act |-> "none", tag |-> 0]]
 
 -----------------------------------------------------------------------------
 (* Ingest, and the markers: the only synchronous writes of a delete, an    *)
@@ -200,7 +204,7 @@ Invalidate(f) ==
          t == IF ~TagFromLastLog /\ old # {} THEN CHOOSE x \in old : TRUE ELSE nCur + 1 IN
      /\ hidden' = hidden \cup G /\ ginv' = ginv \cup G
      /\ itag' = [g \in Facts |-> IF g \in G THEN t ELSE itag[g]]
-     /\ lastOp' = t
+     /\ clog' = [clog EXCEPT ![Subj(f)] = [act |-> "inv", tag |-> t]]
   /\ nCur' = nCur + 1
   /\ sig' = MatSignalOnly            \* the lossy signal after the ack (MatSignalOnly only)
   /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
@@ -220,9 +224,10 @@ Restore(f) ==
      /\ hidden' = hidden \ S /\ dh' = {r \in dh : \A g \in S : r[4] # <<"inv", g>>}
      /\ ginv' = ginv \ S /\ mat' = mat \ S /\ matOwe' = matOwe \ S      \* the stamp dies with the marker row
      /\ itag' = [g \in Facts |-> IF g \in S THEN 0 ELSE itag[g]]
+  /\ clog' = [clog EXCEPT ![Subj(f)] = [act |-> "res", tag |-> 0]]
   /\ nCur' = nCur + 1
   /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, gone, vers, hw, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nRet, cv, sig, lz, lastOp>>
+                 wr, props, budget, nDel, nRet, cv, sig, lz>>
 
 \* REPLACE retires a fact's chunk (chunk_tombstones); observations and pages stay visible.
 Replace(f) ==
@@ -244,9 +249,9 @@ Reextract(f) ==
 LazyTwinRead(f) ==
   /\ lz = NoLz /\ f \in born \ gone /\ f \in hidden /\ f \notin hidRe /\ Twin[f] # 0 /\ Twin[f] \notin born
   /\ ~TombTrue(f) /\ nRet < MaxRetire
-  /\ lz' = [f |-> f, tag |-> IF TagFromLastLog THEN lastOp ELSE itag[f]] /\ nRet' = nRet + 1
+  /\ lz' = [f |-> f, tag |-> clog[Subj(f)].tag] /\ nRet' = nRet + 1
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
-                 matSnap, wr, props, budget, nDel, nCur, cv, ginv, mat, matOwe, sig, itag, lastOp>>
+                 matSnap, wr, props, budget, nDel, nCur, cv, ginv, mat, matOwe, sig, itag, clog>>
 
 LazyTwinCommit ==
   /\ lz # NoLz /\ Twin[lz.f] \notin born
@@ -254,7 +259,7 @@ LazyTwinCommit ==
   /\ hidden' = hidden \cup {Twin[lz.f]} /\ ginv' = ginv \cup {Twin[lz.f]}
   /\ itag' = [itag EXCEPT ![Twin[lz.f]] = lz.tag] /\ lz' = NoLz
   /\ UNCHANGED <<tomb, ms, ctomb, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur, nRet, cv, mat, matOwe, sig, lastOp>>
+                 wr, props, budget, nDel, nCur, nRet, cv, mat, matOwe, sig, clog>>
 
 \* The FK of the old schema: evidence rows of observation versions die with their fact.
 \* N145: the invalidate row is independent of the fact row; CascadeHidden models the old foreign key (purges drop it).
@@ -267,14 +272,14 @@ ChunkPurge(f) ==                    \* grace elapsed: the retired chunk's fact i
   /\ gone' = gone \cup {f} /\ vers' = Strip({f})
   /\ hidden' = hidden \ DropH({f}) /\ mat' = mat \ DropH({f}) /\ matOwe' = matOwe \ DropH({f})
   /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur, nRet, cv, ginv, sig, itag, lz, lastOp>>
+                 wr, props, budget, nDel, nCur, nRet, cv, ginv, sig, itag, lz, clog>>
 
 ReextractPurge(f) ==                \* REEXTRACTED_FACTS: the old-key fact is deleted after 1 h
   /\ f \in hidRe /\ f \notin gone
   /\ gone' = gone \cup {f} /\ vers' = Strip({f})
   /\ hidden' = hidden \ DropH({f}) /\ mat' = mat \ DropH({f}) /\ matOwe' = matOwe \ DropH({f})
   /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur, nRet, cv, ginv, sig, itag, lz, lastOp>>
+                 wr, props, budget, nDel, nCur, nRet, cv, ginv, sig, itag, lz, clog>>
 
 -----------------------------------------------------------------------------
 (* Writers of derived versions (N120, N121): Propose = stage 2 stored      *)
@@ -357,7 +362,7 @@ Commit(w) ==
   /\ \E lost \in (IF AllowRetry THEN BOOLEAN ELSE {FALSE}) :
        wr' = [wr EXCEPT ![w] = IF lost THEN [ph |-> "lost", p |-> wr[w].p] ELSE IdleW]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 budget, nDel, nCur, nRet, ginv, mat, matOwe, sig, itag, lz, lastOp>>
+                 budget, nDel, nCur, nRet, ginv, mat, matOwe, sig, itag, lz, clog>>
 
 \* N144: the re-execution of a committed Commit with the same rendered result (same commit_key).  Design: the
 \* commit transaction first looks for a row with its commit_key; a hit returns that version and touches nothing.
@@ -371,7 +376,7 @@ RetryCommit(w) ==
      cv' = IF CasFirst /\ casOk /\ hit THEN [cv EXCEPT ![n] = cv[n] + 1] ELSE cv
   /\ wr' = [wr EXCEPT ![w] = IdleW]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
-                 matSnap, props, budget, nDel, nCur, nRet, ginv, mat, matOwe, sig, itag, lz, lastOp>>
+                 matSnap, props, budget, nDel, nCur, nRet, ginv, mat, matOwe, sig, itag, lz, clog>>
 
 AbortW(w) ==
   /\ AllowAbortW /\ wr[w].ph # "idle"
@@ -403,7 +408,7 @@ MatBegin ==
   /\ matTodo' = Nodes /\ matPhase' = "running"
   /\ matOwe' = hidden \ mat /\ sig' = FALSE                \* the run owes the unstamped invalidations it read
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matSnap, wr, props, budget, nDel, nCur, nRet,
-                 cv, ginv, mat, itag, lz, lastOp>>
+                 cv, ginv, mat, itag, lz, clog>>
 
 \* One batch (one node): the scan under the exclusive lock re-reads the open tombstones and fact_hidden.
 MatScan(n) ==
@@ -427,19 +432,19 @@ MatEnd ==
   /\ matPhase' = "idle" /\ matDocs' = {} /\ matV0' = {}
   /\ mat' = mat \cup matOwe /\ matOwe' = {}                 \* materialized_at stamped for what the run covered
   /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet,
-                 cv, ginv, sig, itag, lz, lastOp>>
+                 cv, ginv, sig, itag, lz, clog>>
 
 StampTrivial(f) ==                  \* an invalidation whose fact no version cites needs no rows: stamped without a run
   /\ matPhase = "idle" /\ ~lockX /\ f \in hidden \ mat /\ ~Owed(f)
   /\ (UseLock => \A w \in Writers : wr[w].ph # "verified")        \* like a batch: waits for the shared holders
   /\ mat' = mat \cup {f}
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur, nRet, cv, ginv, matOwe, sig, itag, lz, lastOp>>
+                 wr, props, budget, nDel, nCur, nRet, cv, ginv, matOwe, sig, itag, lz, clog>>
 
 LoseSignal ==                       \* the SignalWithStart after the ack is lost (API death, a move terminating the singleton)
   /\ MatSignalOnly /\ sig /\ sig' = FALSE
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur, nRet, cv, ginv, mat, matOwe, itag, lz, lastOp>>
+                 wr, props, budget, nDel, nCur, nRet, cv, ginv, mat, matOwe, itag, lz, clog>>
 
 Purge(d) ==                         \* the victims' facts; evidence rows stay (no FK)
   /\ ms[d] = "materialized"
@@ -447,7 +452,7 @@ Purge(d) ==                         \* the victims' facts; evidence rows stay (n
   /\ gone' = gone \cup (Victims(d) \cap born) /\ vers' = Strip(Victims(d))
   /\ hidden' = hidden \ DropH(Victims(d)) /\ mat' = mat \ DropH(Victims(d)) /\ matOwe' = matOwe \ DropH(Victims(d))
   /\ UNCHANGED <<tomb, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap, wr, props,
-                 budget, nDel, nCur, nRet, cv, ginv, sig, itag, lz, lastOp>>
+                 budget, nDel, nCur, nRet, cv, ginv, sig, itag, lz, clog>>
 
 RECURSIVE Trim(_)
 Trim(s) == IF s # << >> /\ s[Len(s)].st = "absent" THEN Trim(SubSeq(s, 1, Len(s) - 1)) ELSE s
@@ -503,6 +508,11 @@ RestoreExact ==
        ((\A f \in GDeriv(x[1], x[2]) : f \notin hidden) =>
          (VisN(x[1], x[2]) <=> \A f \in GDeriv(x[1], x[2]) : ~TombTrue(f)))
   /\ \A h \in hidden \cap (born \ gone) : \A t \in Group(h) \cap (born \ gone) : t \in hidden /\ itag[t] = itag[h]
+
+\* N174(2), C8-12: the curation_log's last action of a subject carries the tag of every hidden fact of the subject, so the
+\* lazy twin that reads it resolves with the subject's Restore.
+TagFromLog ==
+  \A f \in hidden \cap (born \ gone) : clog[Subj(f)].act = "inv" /\ clog[Subj(f)].tag = itag[f]
 
 \* Precision: a version with no victim in its derivation is visible (the blast radius guard, the re-used
 \* document id is not hidden by the old tombstone); REPLACE and re-extraction hide only the fact arms.

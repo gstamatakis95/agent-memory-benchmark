@@ -108,7 +108,8 @@ RolV  == <<src, tgt, nMoves, me>>             \* roles of the current move (a se
 SqV   == <<sq>>
 IdxV  == <<idx>>
 FlagV == <<rep, cdirty, rview, abt, abp>>
-FlrV  == <<sb, flr, mv>>                    \* sb: standby snapshot; flr: the target's WAL floor is set; mv: the ownership row's move bit
+FlrV  == <<sb, flr, mv>>                    \* sb: the target's standby image; flr[s]: the shard's WAL floor (floor_lsn) and what it covers; mv: the move bit
+NoFloor == [on |-> FALSE, rows |-> {}, keys |-> {}]
 CpV   == <<cdn, cex, rc, nFault, fzt>>
 TlV   == <<tlc, nCat>>
 vars == <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
@@ -116,7 +117,8 @@ vars == <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV
 Row(st, ep) == [st |-> st, ep |-> ep]
 NoRow == Row("unread", 0)
 IdleW == [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0]
-Snap(s) == [own |-> own[s], store |-> store[s], mk |-> mk[s], ex |-> ex[s], sq |-> sq[s], idx |-> idx[s]]
+\* The standby's replayed image: the rows, the keys and the index bit (the shard's row, counter and sequence are not tracked).
+SbOf(s) == [store |-> store[s], mk |-> mk[s], idx |-> idx[s]]
 Holders(s) == {c \in Clients : wr[c].ph = "hold" /\ wr[c].sh = s}
 \* Every mover step is a compare-and-set on the rows it observed (source, target, catalog move).
 Fenced == cm = "open" /\ (~FencedSteps \/ (own[src].st \in {"active", "frozen"} /\ own[tgt].st = "incoming"))
@@ -125,10 +127,12 @@ SessionOk == mtl = tl
 Settled == \A s \in Shards : own[s].st \notin {"restoring", "replaying"}
 Max2(a, b) == IF a >= b THEN a ELSE b
 
-\* A snapshot (a backup, a standby's replay) carries the whole copy of the move: every frozen row it did not delete itself.
-Covers(B) == (frozenSet \ gone) \subseteq B.store /\ (frozenMk \ gone) \subseteq B.mk
-\* N179(3): once the copy is sealed, a restore or failover of the target to B would land below the floor if B lacks the copy.
-BelowFloor(s, B) == s = tgt /\ flr[tgt] /\ ~Covers(B)
+\* A snapshot (a backup, a standby's replay) at or past a floor carries the whole copy the floor was set for (every sealed row
+\* it did not delete itself) and its index: copy_end_lsn is read after the last index build has committed.
+CoversRows(rows, keys, B) == (rows \ gone) \subseteq B.store /\ (keys \ gone) \subseteq B.mk /\ B.idx
+\* N179(3): a restore or failover to B lands below the shard's floor if B lacks what the floor covers.  The floor stays on
+\* the row after the move (it is cleared only by return_move).
+BelowFloor(s, B) == flr[s].on /\ ~CoversRows(flr[s].rows, flr[s].keys, B)
 
 \* The copy of the current move is complete: every row of the (static) source has been copied once, and the counter.
 CopyDone == (store[src] \cup mk[src]) \subseteq cdn /\ cex
@@ -141,7 +145,7 @@ CopyPhase == IF CopyBeforeFreeze THEN mp = "planned" ELSE (mp = "frozen" /\ SrcF
 \* commit is durable (replicated, or acted on by (c)).  A commit that is neither is not a promise (N163(3)).
 Recoverable(s) ==
   IF cleaned THEN {}
-  ELSE IF s = tgt /\ flr[tgt] /\ mp \in {"sealed", "ready", "committed", "cut", "tactive", "done"}
+  ELSE IF s = tgt /\ flr[tgt].on /\ mp \in {"sealed", "ready", "committed", "cut", "tactive", "done"}
        THEN frozenSet
   ELSE IF s = src /\ ((cm = "committed" /\ rep) \/ cm = "done" \/ mp \in {"cut", "tactive", "done"}) THEN frozenSet
   ELSE {}
@@ -154,7 +158,7 @@ TypeOK ==
   /\ \A s \in Shards : store[s] \subseteq Rows /\ mk[s] \subseteq Rows /\ ex[s] \in 0..NRows
   /\ now \in 0..MaxT /\ src \in Shards /\ tgt = Other(src) /\ nMoves \in 0..MaxMoves
   /\ rc \in 0..1 /\ nFault \in 0..MaxFault /\ cdn \subseteq Rows
-  /\ flr \in [Shards -> BOOLEAN] /\ mv \in [Shards -> BOOLEAN]
+  /\ flr \in [Shards -> [on : BOOLEAN, rows : SUBSET Rows, keys : SUBSET Rows]] /\ mv \in [Shards -> BOOLEAN]
 
 Init ==
   /\ cat = [sh |-> "s1", ep |-> 1] /\ cm = "none" /\ mp = "none"
@@ -164,7 +168,7 @@ Init ==
   /\ sq = [s \in Shards |-> IF s = "s1" THEN SqSkew ELSE 0]
   /\ idx = [s \in Shards |-> s = "s1"]
   /\ bak = [s \in Shards |-> [own |-> own[s], store |-> {}, mk |-> {}, ex |-> 0, sq |-> sq[s], idx |-> idx[s]]]
-  /\ sb = bak /\ flr = [s \in Shards |-> FALSE] /\ mv = [s \in Shards |-> FALSE]
+  /\ sb = [s \in Shards |-> [store |-> {}, mk |-> {}, idx |-> idx[s]]] /\ flr = [s \in Shards |-> NoFloor] /\ mv = [s \in Shards |-> FALSE]
   /\ used = {} /\ sqt = [r \in Rows |-> 0]
   /\ committed = {} /\ lost = {} /\ gone = {}
   /\ wr = [c \in Clients |-> IdleW] /\ cc = [c \in Clients |-> cat]
@@ -248,7 +252,7 @@ Plan ==
      /\ me' = cat.ep + 1
      /\ idx' = [idx EXCEPT ![t] = FALSE]
      /\ mv' = [mv EXCEPT ![t] = TRUE]
-  /\ flr' = [s \in Shards |-> FALSE]
+  /\ flr' = [flr EXCEPT ![Other(cat.sh)] = NoFloor]
   /\ nMoves' = nMoves + 1
   /\ mp' = "planned" /\ cm' = "open"
   /\ mtl' = tl
@@ -316,8 +320,8 @@ BuildIndex ==
 \* replayed it (sb covers the copy); the floor flr is then recorded.  A restore or failover of the target lands at or past it.
 SealCopy ==
   /\ mp = "built" /\ Fenced /\ SrcFrozen
-  /\ FloorBeforeCut => Covers(sb[tgt])
-  /\ flr' = [flr EXCEPT ![tgt] = TRUE]
+  /\ FloorBeforeCut => CoversRows(frozenSet, frozenMk, sb[tgt])
+  /\ flr' = [flr EXCEPT ![tgt] = [on |-> TRUE, rows |-> frozenSet, keys |-> frozenMk]]
   /\ mp' = "sealed"
   /\ UNCHANGED <<CatV, mtl, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, sb, mv>>
 
@@ -432,7 +436,7 @@ Thaw ==
   /\ store' = [store EXCEPT ![tgt] = {}] /\ mk' = [mk EXCEPT ![tgt] = {}] /\ ex' = [ex EXCEPT ![tgt] = 0]
   /\ idx' = [idx EXCEPT ![tgt] = FALSE]
   /\ cat' = IF cat.sh = tgt THEN [sh |-> src, ep |-> own[src].ep] ELSE cat
-  /\ mv' = [s \in Shards |-> FALSE] /\ flr' = [s \in Shards |-> FALSE]            \* return_move clears the floor and the move bit
+  /\ mv' = [s \in Shards |-> FALSE] /\ flr' = [flr EXCEPT ![tgt] = NoFloor]        \* return_move clears the floor and the move bit
   /\ UNCHANGED <<cm, mtl, fin, HistV, CliV, EnvV, FzV, RolV, SqV, rep, cdirty, rview, abp, CpV, TlV, sb>>
 AbortAny == AllowAbort /\ AbortCAS
 AbortRetry == mp = "aborting" /\ AbortCAS
@@ -462,9 +466,10 @@ Backup(s) ==
 RestoreCore(s, B, lossy) ==
   /\ nRestore < MaxRestore /\ own[s].st \notin {"restoring", "replaying"} /\ cat.ep < MaxEp
   /\ \A o \in Shards : tlc[o] = 0 \/ o = s            \* repeated faults hit one shard (a fault of both copies is outside the model)
+  /\ (lossy => ~cdirty)          \* a restore to an older point needs the catalog-first epoch write, which waits for the reconcile (7.2.2)
   /\ IF ~lossy
        THEN /\ UNCHANGED <<DatV, lost, sq, idx>> /\ fin' = [fin EXCEPT ![s] = own[s]]
-            /\ sb' = [sb EXCEPT ![s] = Snap(s)]
+            /\ sb' = [sb EXCEPT ![s] = SbOf(s)]
        ELSE /\ lost' = lost \cup ((store[s] \ B.store) \ Recoverable(s))
             /\ store' = [store EXCEPT ![s] = B.store \ gone]
             /\ mk' = [mk EXCEPT ![s] = B.mk \ gone]
@@ -472,7 +477,7 @@ RestoreCore(s, B, lossy) ==
             /\ sq' = [sq EXCEPT ![s] = B.sq]
             /\ idx' = [idx EXCEPT ![s] = B.idx]
             /\ fin' = [fin EXCEPT ![s] = B.own]
-            /\ sb' = [sb EXCEPT ![s] = [B EXCEPT !.store = B.store \ gone, !.mk = B.mk \ gone]]
+            /\ sb' = [sb EXCEPT ![s] = [store |-> B.store \ gone, mk |-> B.mk \ gone, idx |-> B.idx]]
   /\ wr' = [c \in Clients |-> IF wr[c].ph = "hold" /\ wr[c].sh = s THEN IdleW ELSE wr[c]]
   /\ own' = [own EXCEPT ![s] = Row("restoring", own[s].ep)]
   /\ tl' = IF s = src THEN tl + 1 ELSE tl
@@ -481,26 +486,27 @@ RestoreCore(s, B, lossy) ==
   /\ UNCHANGED <<CatV, MovV, used, sqt, committed, gone, cc, now, nBak, bak, FzV, RolV, FlagV, CpV, nCat, flr, mv>>
 
 TgtPhase == cm \in {"committed", "done"}
-\* A restore to B, refused below the floor (N179(3)); the shard's own catalog reconcile follows.  There is no ~cdirty guard
-\* (N185): a promotion's reads interleave with a shard restore.
+\* A restore to B, refused below the floor (N179(3)); the shard's own catalog reconcile follows.  A shard restore that began
+\* before a catalog promotion is read by it (N185); a lossless failover may also start while the reconcile runs.
 RestoreTo(s, B) == RestoreCore(s, B, FALSE) \/ (~BelowFloor(s, B) /\ RestoreCore(s, B, TRUE))
 Restore(s) == ~(s = tgt /\ TgtPhase) /\ RestoreTo(s, bak[s])
 \* The target restored or promoted after the commit point, to bak[tgt]: an ordinary restore at a new epoch (N169).
 TgtRestore == TgtPhase /\ me < MaxEp /\ RestoreTo(tgt, bak[tgt])
-\* The standby of s is promoted with what it has replayed; refused when that is below the target's floor (N179(3)).
+\* The target's standby is promoted with what it has replayed (rows, keys, index; the row, counter and sequence are the
+\* primary's); refused when that is below the floor (N179(3)).  The source's lagging promotion is Restore to an older backup.
 Failover(s) ==
-  /\ (s = tgt /\ TgtPhase) => me < MaxEp
+  /\ s = tgt /\ (TgtPhase => me < MaxEp)
   /\ FailoverChecksFloor => ~BelowFloor(s, sb[s])
-  /\ RestoreCore(s, sb[s], TRUE)
+  /\ RestoreCore(s, [own |-> own[s], store |-> sb[s].store, mk |-> sb[s].mk, ex |-> ex[s], sq |-> sq[s], idx |-> sb[s].idx], TRUE)
 
 \* The standby replays the primary up to now, or is rebuilt from the base backup and starts again from there (N179(3)).  Enabled
 \* while a failover can still happen, and for the seal's wait.
 StandbyReplay(s) ==
-  /\ own[s].st \notin {"restoring", "replaying"}
-  /\ \/ /\ sb[s] # Snap(s) /\ (nRestore < MaxRestore \/ (s = tgt /\ mp = "built"))
-        /\ sb' = [sb EXCEPT ![s] = Snap(s)] /\ nBak' = nBak
-     \/ /\ nRestore < MaxRestore /\ nBak < MaxBak /\ sb[s] # bak[s]      \* rebuilt from a base backup (PG8-8); it uses the extra-backup budget
-        /\ sb' = [sb EXCEPT ![s] = bak[s]] /\ nBak' = nBak + 1
+  /\ s = tgt /\ own[s].st \notin {"restoring", "replaying"}
+  /\ \/ /\ sb[s] # SbOf(s) /\ (nRestore < MaxRestore \/ mp = "built")
+        /\ sb' = [sb EXCEPT ![s] = SbOf(s)] /\ nBak' = nBak
+     \/ /\ nRestore < MaxRestore /\ nBak < MaxBak /\ sb[s] # [store |-> bak[s].store, mk |-> bak[s].mk, idx |-> bak[s].idx]
+        /\ sb' = [sb EXCEPT ![s] = [store |-> bak[s].store, mk |-> bak[s].mk, idx |-> bak[s].idx]] /\ nBak' = nBak + 1   \* rebuilt from a base backup (PG8-8); it uses the extra-backup budget
   /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, now, tl, nRestore, bak, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, flr, mv>>
 
 \* N171(2), N163(3): the catalog promotion loses an arbiter outcome that the standby has not replayed; the promotion
@@ -540,11 +546,14 @@ ReadShard(s) ==
   /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, cdirty, abt, abp, CpV, TlV, FlrV>>
 
 \* The owner is the highest-epoch active/frozen/restoring row (frozen/restore counts, N180(4)); at one epoch an active or
-\* frozen row outranks a restoring one.  A re-derived `committed` (the source row moved_out) writes the routing row and
+\* frozen row outranks a restoring one.  A restoring row of the move's target is an owner only once the source row reads
+\* moved_out: before that the target holds no namespace (a move-in that was never activated), and with the literal rule the
+\* higher epoch of its incoming row would route the catalog to it before the commit (found by TLC, section 7.2.2).  A re-derived `committed` (the source row moved_out) writes the routing row and
 \* nothing else: it never activates a shard row (N172).
 ApplyReconcile ==
   /\ ShardTruth /\ cdirty /\ \A s \in Shards : rview[s] # NoRow
-  /\ LET owners == {s \in Shards : rview[s].st \in {"active", "frozen", "restoring", "replaying"}} IN
+  /\ LET owners == {s \in Shards : rview[s].st \in {"active", "frozen"}
+                                    \/ (rview[s].st \in {"restoring", "replaying"} /\ ~(s = tgt /\ rview[src].st # "moved_out"))} IN
      LET rank(s) == 2 * rview[s].ep + (IF rview[s].st \in {"active", "frozen"} THEN 1 ELSE 0) IN
      LET anyEp == Max2(rview["s1"].ep, rview["s2"].ep) IN
        cat' = IF owners # {}
@@ -586,7 +595,7 @@ ReconcileDesign(s) ==
                       /\ fin' = [fin EXCEPT ![tgt] = Row("none", 0)]
                       /\ own' = [own EXCEPT ![tgt].st = "replaying",
                                             ![src] = IF @.st = "frozen" THEN Row("active", @.ep) ELSE @]
-            /\ mv' = [t2 \in Shards |-> FALSE] /\ flr' = [t2 \in Shards |-> FALSE]
+            /\ mv' = [t2 \in Shards |-> FALSE] /\ flr' = [flr EXCEPT ![tgt] = NoFloor]
             /\ UNCHANGED <<actSet, actMk, abt, abp>>
      ELSE IF s = tgt /\ cmE \in {"committed", "done"}      \* N169: an ordinary restore after (c)/(d), at a new epoch
        THEN /\ seen

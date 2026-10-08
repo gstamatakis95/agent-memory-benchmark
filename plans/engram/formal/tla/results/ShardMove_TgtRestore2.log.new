@@ -1,0 +1,29 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=46745 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 108 and seed -3844029131680196849 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30031] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
+Parsing file /tmp/Integers.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module ShardMove
+Starting... (2026-10-08 18:25:13)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-08 18:25:14.
+Progress(13) at 2026-10-08 18:25:17: 357,697 states generated (357,697 s/min), 99,068 distinct states found (99,068 ds/min), 47,545 states left on queue.
+Progress(23) at 2026-10-08 18:26:17: 13,462,185 states generated (13,104,488 s/min), 3,330,315 distinct states found (3,231,247 ds/min), 434,306 states left on queue.
+Progress(28) at 2026-10-08 18:27:17: 26,331,590 states generated (12,869,405 s/min), 6,640,103 distinct states found (3,309,788 ds/min), 1,163,570 states left on queue.
+Progress(30) at 2026-10-08 18:28:17: 39,340,360 states generated (13,008,770 s/min), 10,082,504 distinct states found (3,442,401 ds/min), 2,306,078 states left on queue.
+Progress(31) at 2026-10-08 18:29:17: 52,583,472 states generated (13,243,112 s/min), 13,526,060 distinct states found (3,443,556 ds/min), 3,338,880 states left on queue.
+Progress(32) at 2026-10-08 18:30:17: 65,531,548 states generated (12,948,076 s/min), 16,909,044 distinct states found (3,382,984 ds/min), 4,304,151 states left on queue.
+Progress(32) at 2026-10-08 18:31:17: 78,718,961 states generated (13,187,413 s/min), 20,219,909 distinct states found (3,310,865 ds/min), 5,116,497 states left on queue.
+Progress(33) at 2026-10-08 18:32:17: 91,782,764 states generated (13,063,803 s/min), 23,410,498 distinct states found (3,190,589 ds/min), 5,621,613 states left on queue.
+Progress(33) at 2026-10-08 18:33:17: 104,693,369 states generated (12,910,605 s/min), 26,663,675 distinct states found (3,253,177 ds/min), 6,332,443 states left on queue.

@@ -1,0 +1,214 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=46745 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 73 and seed 3569614779451150873 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 29309] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Durability.tla
+Parsing file /tmp/Integers.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Parsing file /tmp/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Durability
+Starting... (2026-10-08 18:19:44)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-08 18:19:45.
+Error: Invariant AckedDeleteSurvives is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ nRestore = 0
+/\ dbq = <<>>
+/\ sst = "active"
+/\ nIssued = 0
+/\ bf = 3
+/\ cn = 0
+/\ t = 0
+/\ nCat = 0
+/\ tdp = 0
+/\ ep = 1
+/\ intents = {}
+/\ fl = 3
+/\ ta = FALSE
+/\ ops = << [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+State 2: <TenantRow line 226, col 14 to line 227, col 100 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<>>
+/\ sst = "active"
+/\ nIssued = 0
+/\ bf = 3
+/\ cn = 0
+/\ t = 0
+/\ nCat = 0
+/\ tdp = 1
+/\ ep = 1
+/\ intents = {}
+/\ fl = 3
+/\ ta = FALSE
+/\ ops = << [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+State 3: <TenantAck line 232, col 14 to line 233, col 101 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<>>
+/\ sst = "active"
+/\ nIssued = 0
+/\ bf = 3
+/\ cn = 0
+/\ t = 0
+/\ nCat = 0
+/\ tdp = 1
+/\ ep = 1
+/\ intents = {}
+/\ fl = 3
+/\ ta = TRUE
+/\ ops = << [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+State 4: <CatalogRestore line 252, col 3 to line 256, col 79 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<>>
+/\ sst = "active"
+/\ nIssued = 0
+/\ bf = 3
+/\ cn = 0
+/\ t = 0
+/\ nCat = 1
+/\ tdp = 4
+/\ ep = 1
+/\ intents = {}
+/\ fl = 3
+/\ ta = TRUE
+/\ ops = << [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+73 states generated, 54 distinct states found, 35 states left on queue.
+The depth of the complete state graph search is 5.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 5 and the 95th percentile is 5).
+Finished in 00s at (2026-10-08 18:19:45)

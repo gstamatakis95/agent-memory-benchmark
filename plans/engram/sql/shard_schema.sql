@@ -59,6 +59,10 @@
 --   checkpoint_timeout = 30min, max_wal_size = 16GB, checkpoint_completion_target = 0.9, wal_compression = zstd,
 --   archive_timeout = 60, tcp_keepalives_idle/interval/count = 10 s / 5 s / 3 (N167).
 --
+-- Move seal (N179): the copy is sealed - WAL archived and standby-replayed through namespace_moves.copy_end_lsn - before
+-- (b'); namespace_ownership.floor_lsn on the target row is the shard-truth copy of that floor. shm_size is fixed at
+-- container creation (32g on the shard image, N187).
+--
 -- Roles (LOGIN; passwords are set by provisioning from the shard secret, section 9):
 --   engram_migrate  owner of every object; DDL only (BYPASSRLS so data migrations and the
 --                   SECURITY DEFINER functions engram_cleanup_namespace / engram_entity_fuzzy run).
@@ -132,7 +136,11 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'engram_admin') THEN
     CREATE ROLE engram_admin LOGIN BYPASSRLS;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'engram_stats_reader') THEN
+    CREATE ROLE engram_stats_reader NOLOGIN;       -- N181: owns engram_standby_replayed and nothing else
+  END IF;
 END $$;
+GRANT pg_read_all_stats TO engram_stats_reader;
 
 -- Role defaults (N82, N122). Row and advisory waits end after lock_timeout; exclusive takers raise it
 -- to 35 s with SET LOCAL for their single attempt. statement_timeout stays the outer bound.
@@ -393,6 +401,9 @@ BEGIN
     IF t.epoch_rule = 'one' AND NEW.epoch <> 1 THEN
       RAISE EXCEPTION 'a new ownership row must start at epoch 1 (got %)', NEW.epoch USING ERRCODE = '23514';
     END IF;
+    IF NEW.floor_lsn IS NOT NULL THEN
+      RAISE EXCEPTION 'floor_lsn is stamped by ready_target only (N179)' USING ERRCODE = '23514';
+    END IF;
     NEW.updated_at := now();
     RETURN NEW;
   END IF;
@@ -438,6 +449,12 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
 
+  -- N179(1): ready_target stamps floor_lsn, return_move clears it, every other edge keeps it.
+  IF (t.edge = 'ready_target' AND NEW.floor_lsn IS NULL)
+     OR (t.edge = 'return_move' AND NEW.floor_lsn IS NOT NULL)
+     OR (t.edge NOT IN ('ready_target', 'return_move') AND NEW.floor_lsn IS DISTINCT FROM OLD.floor_lsn) THEN
+    RAISE EXCEPTION 'edge % of namespace % violates the floor_lsn rule (N179)', t.edge, NEW.namespace_id USING ERRCODE = '23514';
+  END IF;
   IF t.edge = 'freeze_delete' AND OLD.move_id IS NOT NULL THEN   -- N177: a namespace with an open move answers NAMESPACE_BUSY
     RAISE EXCEPTION 'namespace % has an open move', NEW.namespace_id
       USING ERRCODE = '55006';
@@ -459,7 +476,7 @@ BEGIN
       RAISE EXCEPTION 'namespace %: the target sequence has not passed w_final (N147)', NEW.namespace_id USING ERRCODE = '55006';
     END IF;
   END IF;
-  IF OLD.state = 'ready' AND NEW.state = 'active' THEN
+  IF (OLD.state = 'ready' AND NEW.state = 'active') OR (t.edge = 'restore_done' AND OLD.move_id IS NOT NULL) THEN
     NEW.moved_in_at := now();
   END IF;
   NEW.updated_at := now();
@@ -588,12 +605,14 @@ CREATE TABLE namespace_ownership (
   target_shard_id   integer,
   target_epoch      bigint,
   w_final           bigint,                        -- N147, N125 (b'): the source's final engram_ins_seq; required on 'ready'
-  moved_in_at       timestamptz,                   -- N147: set by the trigger on ready -> active; BeginSnapshot and the consolidation watermark wait 10 min after it (the target's seq ring has no sample below W_final until then)
+  floor_lsn         pg_lsn,                        -- N179(1): the target's copy_end_lsn, stamped by ready_target, kept by every later edge of the row, cleared by return_move
+  moved_in_at       timestamptz,                   -- N147, N180(1): set by the trigger on ready -> active and on restore_done of a row with move_id; BeginSnapshot and the consolidation watermark wait 10 min after it (the target's seq ring has no sample below W_final until then)
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
   UNIQUE (namespace_id, tenant_id),                -- FK target for the tenant_id denormalisation
   CHECK (state NOT IN ('incoming', 'ready') OR move_id IS NOT NULL),
   CHECK (state <> 'ready' OR w_final IS NOT NULL),
+  CHECK (state <> 'ready' OR floor_lsn IS NOT NULL),
   CHECK ((state = 'frozen') = (freeze_reason IS NOT NULL)),   -- a thaw and cutover (c) clear the reason
   CHECK ((state = 'moved_out') = (target_shard_id IS NOT NULL)),
   CHECK ((target_shard_id IS NULL) = (target_epoch IS NULL)),
@@ -610,7 +629,7 @@ CREATE TABLE namespace_ownership (
 --   epoch_rule: one = epoch 1, any, same, plus1 = exactly +1, greater = strictly greater (restore
 --     and failover use the catalog epoch + 1, written to the catalog first).
 --   move_effect on (move_id, move_epoch): none = unchanged, open = start_move (move_id set from
---     NULL, move_epoch = epoch + 1), close = both NULL, retarget = a NEW move_id and move_epoch NULL
+--     NULL, move_epoch = epoch + 1), close = both NULL (whether or not they were set: restore_done relies on it), retarget = a NEW move_id and move_epoch NULL
 --     (moved_out -> incoming).
 --   target_effect on (target_shard_id, target_epoch): none, set = cutover (c) / reconcile_out
 --     (target shard differs, target_epoch = epoch + 1), clear, restore = return_abort (the hint of
@@ -649,7 +668,7 @@ INSERT INTO ownership_transitions (edge, role_name, from_state, from_reason, to_
   ('restore_delete',  'engram_admin', 'frozen',   'restore', 'frozen',    'delete',  'same',    'none',     'none',  'replay of a namespace/tenant delete intent onto a restored shard (N122, C-13); no pass through active'),
   ('thaw_move',       'engram_move',  'frozen',   'move',    'active',    NULL,      'same',    'close',    'none',  'rollback after the freeze'),
   ('thaw_move',       'engram_admin', 'frozen',   'move',    'active',    NULL,      'same',    'close',    'none',  'restore/failover reconcile: the move is rolled back (N123)'),
-  ('ready_target',    'engram_move',  'incoming', NULL,      'ready',     NULL,      'same',    'none',     'none',  'cutover (b''): nothing routes to ready'),
+  ('ready_target',    'engram_move',  'incoming', NULL,      'ready',     NULL,      'same',    'none',     'none',  'cutover (b''): nothing routes to ready; stamps floor_lsn'),
   ('unready_target',  'engram_move',  'ready',    NULL,      'incoming',  NULL,      'same',    'none',     'none',  'rollback after (b'')'),
   ('cutover_c',       'engram_move',  'frozen',   'move',    'moved_out', NULL,      'same',    'none',     'set',   'cutover (c), after (a'''') was read and replicated (N171); clears freeze_reason'),
   ('activate_target', 'engram_move',  'ready',    NULL,      'active',    NULL,      'same',    'close',    'none',  'cutover (b''''): the row already carries e + 1'),
@@ -659,10 +678,11 @@ INSERT INTO ownership_transitions (edge, role_name, from_state, from_reason, to_
   ('reconcile_out',   'engram_admin', 'frozen',   'move',    'moved_out', NULL,      'same',    'close',    'set',   'same, from a restored frozen/move row'),
   ('reconcile_out',   'engram_admin', 'frozen',   'restore', 'moved_out', NULL,      'same',    'close',    'set',   'same, from a restored frozen/restore row'),
   ('epoch_bump',      'engram_admin', 'active',   NULL,      'active',    NULL,      'greater', 'none',     'none',  'failover bump: new epoch = catalog epoch + 1'),
-  ('restore_done',    'engram_admin', 'frozen',   'restore', 'active',    NULL,      'greater', 'none',     'none',  'restore completion after intent replay: catalog epoch + 1'),
+  ('restore_done',    'engram_admin', 'frozen',   'restore', 'active',    NULL,      'greater', 'close',    'none',  'restore completion after intent replay: catalog epoch + 1; closes a set move_id (N180(1))'),
   ('rollback_target', 'engram_move',  'incoming', NULL,      NULL,        NULL,      'any',     'none',     'none',  'DELETE of the target row on rollback'),
   ('rollback_target', 'engram_admin', 'incoming', NULL,      NULL,        NULL,      'any',     'none',     'none',  'operator cleanup'),
   ('rollback_target', 'engram_admin', 'ready',    NULL,      NULL,        NULL,      'any',     'none',     'none',  'operator cleanup after a restore of the target'),
+  ('rollback_target', 'engram_admin', 'frozen',   'restore', NULL,        NULL,      'any',     'none',     'none',  'N183: a restored active row below its floor, after freeze_restore'),
   ('purge_deleted',   'engram_admin', 'frozen',   'delete',  NULL,        NULL,      'any',     'none',     'none',  'DELETE after NamespacePurged');
 
 -- The machine is immutable once loaded (a change is a migration that drops this trigger first).
@@ -880,7 +900,8 @@ CREATE TABLE deletion_log (
   CHECK (replay_outcome IS DISTINCT FROM 'skipped' OR applied_epoch IS NULL),
   CHECK (replay_outcome IS DISTINCT FROM 'applied' OR applied_epoch IS NOT NULL),
   CHECK (left(subject_id, length(subject_class) + 1) = subject_class || ':'),             -- N162: the id is the encoded form of its class
-  CHECK (subject_class = CASE kind WHEN 'invalidate' THEN 'memory' WHEN 'restore' THEN 'memory' ELSE kind END)
+  CHECK (subject_class = CASE kind WHEN 'invalidate' THEN 'memory' WHEN 'restore' THEN 'memory' ELSE kind END),
+  CHECK (invalidation_op IS NULL OR kind = 'invalidate')                                   -- PG8-14
 );
 
 CREATE INDEX deletion_log_subject_idx ON deletion_log (namespace_id, subject_class, subject_id, ins_seq DESC);   -- N150, N162: the chain tip of a subject (either kind) by ins_seq
@@ -2396,8 +2417,8 @@ $$;
 -- SECURITY DEFINER, owned by engram_migrate: engram_move has no DELETE on source data and cannot
 -- bypass RLS, so this is the only way a move frees the source. EXECUTE is granted to engram_move and
 -- engram_admin only. It refuses unless the ownership row is moved_out (source cleanup after cutover
--- (c)) or incoming (target rollback); it runs only while the catalog row reads 'cleaning', and `restore cleanup-moved-out`
--- calls it for 'done' moves only (N170). Each call deletes at most p_batch rows from the first
+-- (c)) or incoming (target rollback). It is called by the cleanup activity while the catalog row reads 'cleaning' (and once
+-- more, expecting 0, before 'done'), and by `restore cleanup-moved-out` for 'cleaning' and 'done' moves (N170, N184(2)). Each call deletes at most p_batch rows from the first
 -- non-empty table in FK order and returns the count; 0 means done. The outer DELETE carries
 -- namespace_id (P-19). Run engram_hnsw_ddl(..., 'drop') FIRST: the namespace's partial indexes are
 -- dropped with DROP INDEX CONCURRENTLY, so no HNSW graph is repaired row by row (N112).
@@ -2492,7 +2513,7 @@ $$;
 -- issued on a partitioned parent. These functions GENERATE the statements. The INDEX RUNNER (`engramctl
 -- index`, control host, role engram_migrate: the one owner of index DDL, N138) executes them one at a time,
 -- each as its own top-level statement, serialised per shard with maintenance_work_mem = 2.4 KB x vectors
--- (<= 5 GB) and shm_size = 8g, refuses to start a build while any backend_xmin is older than 5 min
+-- (<= 5 GB; shm_size is 32g on the shard image), refuses to start a build while any backend_xmin is older than 5 min
 -- (engram_old_snapshots), and records progress in vector_indexes.
 -- =============================================================================
 
@@ -2999,6 +3020,14 @@ END $$;
 -- Relay role: all-namespace SELECT on outbox only (D6/N4).
 CREATE POLICY relay_read_all ON outbox FOR SELECT TO engram_relay USING (true);
 
+-- N179(1), N181: true iff a streaming standby replayed p_lsn (false with none; the shard twin of catalog_replicated). The
+-- owner must be a member of pg_read_all_stats (pg_stat_get_wal_senders masks the rows otherwise); `config lint` asserts it.
+CREATE FUNCTION engram_standby_replayed(p_lsn pg_lsn) RETURNS boolean
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT coalesce(bool_or(replay_lsn >= p_lsn), false) FROM pg_catalog.pg_stat_replication WHERE state = 'streaming'
+$$;
+ALTER FUNCTION engram_standby_replayed(pg_lsn) OWNER TO engram_stats_reader;
+
 -- =============================================================================
 -- Grants. Only parent tables are granted: partitions stay ungranted, so a direct partition
 -- reference by engram_app/engram_move fails with permission denied (a query through the
@@ -3011,6 +3040,8 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO engram_app, engram_relay, eng
 -- N93: the SECURITY DEFINER cleanup is callable by the move executor and admin only; the index and
 -- expunge helpers that read shard-wide state are admin-only too.
 REVOKE EXECUTE ON FUNCTION engram_cleanup_namespace(uuid, integer) FROM PUBLIC, engram_app, engram_relay;
+REVOKE EXECUTE ON FUNCTION engram_standby_replayed(pg_lsn) FROM PUBLIC, engram_app, engram_relay;
+GRANT EXECUTE ON FUNCTION pg_switch_wal() TO engram_move;                    -- N179(1): SealCopy (bootstrap, superuser)
 REVOKE EXECUTE ON FUNCTION engram_consumers_passed(bigint) FROM PUBLIC, engram_app, engram_relay, engram_move;
 -- P-9: the relay and the move executor must not reach the definer entity lookup (it would read any namespace's
 -- entity names by setting the scope GUC); the sequence ring and the scheduler samplers are admin-only too.
@@ -3200,7 +3231,7 @@ BEGIN
   END IF;
   IF (SELECT count(DISTINCT edge) FROM ownership_transitions
        WHERE edge IN ('ready_target', 'unready_target', 'activate_target', 'return_abort', 'reconcile_out',
-                      'abort_move', 'thaw_move', 'cutover_c', 'restore_delete')) <> 9 THEN
+                      'abort_move', 'thaw_move', 'cutover_c', 'restore_delete', 'restore_done', 'rollback_target')) <> 11 THEN
     RAISE EXCEPTION 'ownership_transitions lacks cutover or rollback edges (N125)';
   END IF;
 

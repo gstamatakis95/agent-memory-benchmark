@@ -573,11 +573,11 @@ orphan intent would delete content acknowledged later).
 
 A namespace move is **freeze, then copy, then verify, then cut over** (D5, N160, N161): `Plan` (with a blob pre-warm) →
 `Freeze` → `Drain` → one sequence advance → copy **every table** from the now-static source by primary-key ranges, WAL-paced →
-`VerifyFrozen` (count and primary-key hash per table, equality on a static set) → `BuildIndexes` under the freeze → `MoveBackup` (an incremental backup of the target, N169) → wait for the
+`VerifyFrozen` (count and primary-key hash per table, equality on a static set) → `BuildIndexes` under the freeze → `SealCopy` (the target's WAL archived and standby-replayed through `copy_end_lsn`, the floor of any restore or failover of the target, N179) → wait for the
 outbox consumers → cutover with a `ready` state and a catalog CAS as the point of no return, with a rollback at every step
 before it. A move is an operator tool for rebalancing: rare, allowed to take hours, and the namespace is read-only for the
 whole window (reads continue; writes get `NamespaceFrozen{retry_after, frozen_until_estimate}`). Plan computes a window
-estimate (≈ 26 min per 1 M live facts at the planning rates); the rebalancer starts a move unattended only at 10 min or less (≈ 350 k facts),
+estimate (≈ 27 min per 1 M live facts at the planning rates); the rebalancer starts a move unattended only at 10 min or less (≈ 350 k facts),
 larger ones need an operator-scheduled window of at least max(1.5 × estimate, estimate + 10 min) (default 4 h, cap 8 h), and a move that has not passed the CAS by its freeze
 deadline rolls back by itself. Nothing is ever merged into a target that has served writes.
 
@@ -590,7 +590,7 @@ flowchart TB
   C["FrozenCopy: every table by PK ranges from the static source, WAL-paced"]
   V["VerifyFrozen: count and PK hash per table, VerifyFK, blobs"]
   IX["BuildIndexes under the freeze"]
-  MB["MoveBackup: incremental backup of the target, complete and archived"]
+  MB["SealCopy: pg_switch_wal on the target, WAL archived and standby-replayed through copy_end_lsn"]
   CW["Consumer-cursor wait"]
   B1["b1: target incoming to ready (nothing routes to ready)"]
   A2["a2: catalog CAS cutover to committed - POINT OF NO RETURN, then wait for the standby to replay it and re-read"]
@@ -615,8 +615,7 @@ not a statement on the source, because the arbiter must sit where the restore re
 standby is asynchronous (N163), every shard action on an arbiter outcome (the cut, the thaw, the rollback) waits until the standby has replayed it and re-reads the row (N171). The mover compares its
 session's timeline with the catalog at `Freeze`, at the CAS and at (c), so a zombie primary can be neither frozen nor cut over
 (N123). Restore and failover first settle every open move against the catalog, then bring the shard up `frozen/restore` and
-replay the delete intents (N122, N123, N134; §5.5.5). A target restored after the CAS is always an ordinary restore (`incoming`, `ready` or `active → frozen/restore`), because the
-move backup precedes the commit point (N169); the source is cleaned up 24 h after activation (N170). The full step list, step table and crash table are §5.5.
+replay the delete intents (N122, N123, N134; §5.5.5). A target restored after the CAS is an ordinary restore (`incoming`, `ready` or `active → frozen/restore`) that may not go below the seal's floor (N179); one that restores an activated target closes the move (N180); the source is cleaned up 24 h after activation (N170). The full step list, step table and crash table are §5.5.
 
 ### 1.7 Where every shard-scoped resource lives
 

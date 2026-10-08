@@ -1,6 +1,6 @@
 # Engram: implementation plan for a Go + Postgres agent-memory service
 
-**Status:** design plan, v1.6 (2026-10-08, after seven adversarial reviews: `reviews/round-1.md` to `reviews/round-7.md`; register D20 (round 1), D21, D22 (N111 to N134), D23 (N135 to N143), D24 (N144 to N159), D25 (N160 to N168), D26 (round 7, N169 to N178)). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
+**Status:** design plan, v1.7 (2026-10-08, after eight adversarial reviews: `reviews/round-1.md` to `reviews/round-8.md`; register D20 (round 1), D21, D22 (N111 to N134), D23 (N135 to N143), D24 (N144 to N159), D25 (N160 to N168), D26 (round 7, N169 to N178), D27 (round 8, N179 to N188)). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
 **Scope:** everything needed to build, verify and operate a Hindsight-class long-term memory service in Go,
 exposed as gRPC (`memory.v1`), with PostgreSQL 16 as the per-shard system of record, Temporal for
 asynchronous work, an AI gateway for every model call and blob storage for large or immutable data.
@@ -21,9 +21,9 @@ replay floor lives in the catalog; moves re-copy by an insertion sequence and ar
 catalog CAS; and the shard was sized from a measured hot set. Round 5 found no blocker (D24). Round 6 (D25, N160 to N168) replaced the shard-move protocol, which had produced a blocker or major in three rounds, with **freeze-then-copy**: the namespace is read-only for a bounded, size-proportional window (unattended only when the
 estimate is ≤ 10 min, operator-scheduled windows up to 8 h), every row is copied from a static source, and verification is
 equality on a static set. The rest of D25: the curation subject is `(document_id, content_hash)`; the catalog has **one asynchronous hot standby** and reconciles from the shards on every promotion and restore; filtered recalls are their own class (θ = 10 k, p95 ≤ 1 s); the shard is **5.5 M facts target / 10 M cap** on the same 128 GB instance (182 shards, 6 cells
-for 1 B facts). Round 7 (D26, N169 to N178) found every major in a recovery path around that core, so it removed recovery paths: **the target is backed up before the commit point**, so a post-commit target is an ordinary restore and the re-run is deleted; the cleanup gate is a schema fact at the entry to `cleaning`; one replicated-ack helper serves every catalog outcome a shard or a client acts on (N169 to N172). The six TLA+ specifications are **written and model-checked** with their must-fail configurations; §7.1 states what each omits, and Phase 0 spec work (M0.7) is the must-fail manifest, invariant code and trace converter.
-The committed scope is now **≈ 85.25 ew against 78 ew of capacity** (7.25 ew over, MVP in week 24,
-Phase 2 exit in week 29, stated in §10).
+for 1 B facts). Round 7 (D26, N169 to N178) removed recovery paths around that core (the re-run is deleted, the cleanup gate is a schema fact at the entry to `cleaning`, one replicated-ack helper serves every catalog outcome a shard or a client acts on). Round 8 (D27, N179 to N188) found every major in the paths round 7 added around the target backup, so **it is replaced by a WAL floor**: the copy is sealed when the target's WAL is archived and its standby has replayed through `copy_end_lsn`, and that LSN is the floor of every target restore and failover (N179); a restore that activates a target closes the move (N180). The six TLA+ specifications are **written and model-checked** with their must-fail configurations; §7.1 states what each omits, and Phase 0 spec work (M0.7) is the must-fail manifest, invariant code and trace converter.
+The committed scope is now **≈ 86.25 ew against 78 ew of capacity** (8.25 ew over, MVP in week 24,
+Phase 2 exit in week 30, stated in §10).
 
 ## How to read this plan
 
@@ -94,7 +94,7 @@ Phase 2 exit in week 29, stated in §10).
   from the static source, verified by count and key-hash equality, the target's indexes are built, and
   cutover goes through a `ready` state with a single point of no return, the **catalog CAS
   `cutover → committed`** (checked as replicated before the source is fenced). Rollback exists at every
-  step before it and at the window deadline; the target is backed up before the commit point, so a restored target takes the ordinary restore path; cleanup waits 24 h after activation.
+  step before it and at the window deadline; the copy is sealed (WAL archived and standby-replayed through `copy_end_lsn`) before the commit point, and that LSN is the floor of any target restore; cleanup waits 24 h after activation.
 - **Time travel is exact for facts, observations and their evidence, and for chunks subject to a stated rule (N85).**
   Every fact and chunk carries `mentioned_at` = the item timestamp, set by the server; observations are
   versioned with `effective_at = max(mentioned_at over every fact rendered to the writer, effective_at of
@@ -107,12 +107,12 @@ Phase 2 exit in week 29, stated in §10).
   specifications are written and model-checked, each with must-fail configurations whose logs are in
   `formal/tla/results/`; four Lean 4 developments exist but are not type-checked here (§7). §7.1 lists the
   prose mechanisms each spec omits.
-- **Size:** about **124.5 engineer-weeks** in total; the committed six-month scope for three engineers is
-  Phases 0 to 2, **≈ 85.25 ew** against 78 ew of capacity (conformance and measurements, the MVP with
+- **Size:** about **125.5 engineer-weeks** in total; the committed six-month scope for three engineers is
+  Phases 0 to 2, **≈ 86.25 ew** against 78 ew of capacity (conformance and measurements, the MVP with
   moves behind an admin flag, the expunge and delete-intent log, consolidation, Reflect and
-  `RetainBackfill`), so the MVP lands in week 24 and the Phase 2 exit in week 29; pages, export,
+  `RetainBackfill`), so the MVP lands in week 24 and the Phase 2 exit in week 30; pages, export,
   multi-cell and most of the formal tooling are a separate 39.25-ew track. One shard holds **5.5 M facts**
-  (10 M hard cap, 600 GB, ≈ 138 GB at the target and ≈ 248 GB at the cap, NVMe ≥ 50 k IOPS), one API + worker stack serves up to 32 shards, and 1 B
+  (10 M hard cap, 600 GB, ≈ 138 GB at the target and ≈ 250 GB at the cap, NVMe ≥ 50 k IOPS), one API + worker stack serves up to 32 shards, and 1 B
   facts is 182 shards in 6 cells: **≈ 67 days to fill online** at 3.5 gateway calls per chunk and
   600 RPM per cell, ≈ $160 k at list prices (Table 6.8-B); `RetainBackfill` through the batch API is a
   launch prerequisite.

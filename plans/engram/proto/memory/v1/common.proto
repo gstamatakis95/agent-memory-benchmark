@@ -35,11 +35,17 @@ option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
 // gRPC metadata) so it is part of the idempotency hash and of the audit log.
 message RequestMeta {
   // Client-supplied idempotency key for unary writes (Retain, Delete*,
-  // Invalidate, Restore, Create*/Update*). Opaque, 1-128 bytes, unique per
+  // Invalidate, Restore, Create*/Update*). Required (INVALID_ARGUMENT,
+  // REQUEST_ID_REQUIRED) on every write whose ack waits for catalog
+  // replication (decision N184: CreateTenant, UpdateTenant,
+  // UpdateTenantLimits, DeleteTenant, CreateNamespace, UpdateNamespace,
+  // DeleteNamespace, StartMove, CleanupMove, RollbackMove); a retry after
+  // UNAVAILABLE reuses it. Opaque, 1-128 bytes, unique per
   // (tenant, namespace, method) for 24 h. A replay with the same key and an
   // identical request hash returns the stored response; the same key with a
   // different hash fails with ALREADY_EXISTS + OperationConflict
-  // {reason = IDEMPOTENCY_KEY_REUSED}. Optional on reads (tracing only).
+  // {reason = IDEMPOTENCY_KEY_REUSED}. Optional on other writes and on reads
+  // (tracing only).
   string request_id = 1;
   // Wall-clock time at the client when the request was built. Informational:
   // logged next to the server time to diagnose clock skew; never used for

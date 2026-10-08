@@ -50,7 +50,9 @@ message FieldViolation {
   string description = 2;
   // Stable machine code: "REQUIRED", "TOO_LONG", "OUT_OF_RANGE", "BAD_FORMAT",
   // "UNKNOWN_ENUM_VALUE", "UNKNOWN_FIELD_MASK_PATH", "OUTPUT_ONLY",
-  // "MISSING_DEADLINE", "DEADLINE_TOO_LONG", "INCONSISTENT".
+  // "MISSING_DEADLINE", "DEADLINE_TOO_LONG", "INCONSISTENT",
+  // "REQUEST_ID_REQUIRED" (field "meta.request_id" missing on a write whose
+  // ack waits for catalog replication; decision N184).
   string reason = 3;
 }
 
@@ -260,9 +262,9 @@ enum OperationConflictReason {
   // The same request_id/operation_id was reused with a different request
   // hash within the retention window (ALREADY_EXISTS).
   OPERATION_CONFLICT_REASON_IDEMPOTENCY_KEY_REUSED = 1;
-  // The namespace has a delete or move cutover in progress (ABORTED).
+  // A delete, or a move before activation, is in progress (ABORTED).
   // DeleteNamespace during an open move answers this with RetryInfo 30 s
-  // (decision N177).
+  // (decisions N177, N184).
   OPERATION_CONFLICT_REASON_NAMESPACE_BUSY = 3;
   // A refresh of the same page is already running (ABORTED).
   OPERATION_CONFLICT_REASON_PAGE_REFRESHING = 4;
@@ -301,7 +303,11 @@ message Precondition {
   // "MOVE_WINDOW_REQUIRED" (StartMove of a namespace whose window estimate
   // exceeds the 10 min an unattended move may take, without an operator
   // `window`) and "MOVE_WINDOW_TOO_SHORT" (the given `window` is below
-  // max(1.5 W_est, W_est + 10 min); cap 8 h; decision N173).
+  // max(1.5 W_est, W_est + 10 min); cap 8 h; decision N173),
+  // "MOVE_TARGET_ARCHIVE_UNHEALTHY" (StartMove: the target has no completed
+  // backup or its WAL archiver is failing or lagging; decision N179) and
+  // "MOVE_PAST_COMMIT" (RollbackMove after the catalog commit (a″); decision
+  // N184).
   // "MOVE_TOO_LARGE" is reserved for a future per-namespace cap and unused.
   string type = 1;
   // Resource the precondition applies to (id).

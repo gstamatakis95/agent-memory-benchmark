@@ -1006,6 +1006,6 @@ class (extract, routing, write, page refresh, each Reflect iteration); workflows
 counts prompt + completion tokens of every call above through `token_usage` (PD-1 / N25); the
 per-call caps in the first table bound the worst case of one activity.
 
-### Round-7 changes
+### Round-8 changes
 
-None. The §6.8 fill figures (182 shards, 6 cells, ≈ 67 days) are unchanged by D26 (N176).
+None. The §6.8 fill figures (182 shards, 6 cells, ≈ 67 days) are unchanged by D27.

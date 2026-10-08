@@ -28,7 +28,11 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'catalog_admin') THEN
     CREATE ROLE catalog_admin LOGIN;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'catalog_stats_reader') THEN
+    CREATE ROLE catalog_stats_reader NOLOGIN;      -- N181: owns catalog_replicated and nothing else
+  END IF;
 END $$;
+GRANT pg_read_all_stats TO catalog_stats_reader;
 
 -- -----------------------------------------------------------------------------
 -- Enumerations (closed sets; extend with ALTER TYPE ... ADD VALUE in a migration)
@@ -39,12 +43,13 @@ CREATE TYPE shard_state     AS ENUM ('provisioning', 'active', 'full', 'draining
 CREATE TYPE namespace_state AS ENUM ('creating', 'active', 'moving', 'frozen', 'restoring', 'deleting', 'deleted');
 -- 'restoring' (N64): the shard is being restored; its ownership rows are frozen/restore and surface as NamespaceFrozen.
 -- move_state (D5, N125, N160): planned -> frozen (source write-fenced; reads continue) -> copied (copy, verify, indexes, move
--- backup, consumer wait done) -> cutover ((b') target ready) -> committed ((a'') the CAS, the point of no return; then (c),
+-- seal, consumer wait done) -> cutover ((b') target ready) -> committed ((a'') the CAS, the point of no return; then (c),
 -- (b''), (d)) -> cleaning -> done. rolled_back is reachable up to and including cutover, and from no later state; restore
--- and failover CAS cutover -> rolled_back and exactly one of the two CASes wins (N123, N161(4)). The trigger
+-- and failover CAS cutover -> rolled_back and exactly one of the two CASes wins (N123, N161(4)). 'lost' (N183) is
+-- terminal, admin-only, from committed or cleaning: a restore left the move-in below its floor. The trigger
 -- catalog_check_move_transition enforces the edges.
 CREATE TYPE move_state      AS ENUM ('planned', 'frozen', 'copied', 'cutover', 'committed',
-                                     'cleaning', 'done', 'rolled_back');
+                                     'cleaning', 'done', 'rolled_back', 'lost');
 
 -- -----------------------------------------------------------------------------
 -- Helpers
@@ -126,8 +131,8 @@ CREATE TABLE shards (
   timeline_id           integer,                   -- N123: pg_control_checkpoint().timeline_id; the mover compares its session's value at Freeze and (c), the relay every 10 s
   dedicated_tenant_id   text REFERENCES tenants (tenant_id),   -- NULL = shared pool
   max_namespaces        integer NOT NULL DEFAULT 120 CHECK (max_namespaces > 0),
-  soft_cap_facts        bigint  NOT NULL DEFAULT 5500000,     -- N114/N165/D3: 5.5 M live facts target (hot set about 74 GB, footprint about 138 GB; 225 GB per 10 M; 6.5 M only if M0.6 measures <= 80 GB)
-  hard_cap_facts        bigint  NOT NULL DEFAULT 10000000,    -- 10 M hard cap (about 248 GB)
+  soft_cap_facts        bigint  NOT NULL DEFAULT 5500000,     -- N114/N165/D3: 5.5 M live facts target (hot set about 74 GB, footprint about 138 GB; 250 GB per 10 M; 6.5 M only if M0.6 measures <= 80 GB)
+  hard_cap_facts        bigint  NOT NULL DEFAULT 10000000,    -- 10 M hard cap (about 250 GB)
   volume_bytes          bigint  NOT NULL DEFAULT 600000000000 CHECK (volume_bytes > 0),   -- 600 GB local NVMe; ShardNearCapacity pages at 70 % of it (relation bytes, N114)
   namespaces_count      integer NOT NULL DEFAULT 0 CHECK (namespaces_count >= 0),
   facts_estimate        bigint  NOT NULL DEFAULT 0 CHECK (facts_estimate >= 0),
@@ -208,7 +213,15 @@ CREATE TRIGGER namespaces_touch BEFORE UPDATE ON namespaces
 -- max(1.5 * w_est, w_est + 10 min), cap 8 h; before (a'') the deadline rolls back (MoveWindowExceeded), after it the
 -- page MoveFrozenPastDeadline (N171(4)), never a rollback.
 -- Cleanup gate (N170): committed -> cleaning needs now() >= activated_at + 24 h, enforced once, in
--- catalog_check_move_transition. The move backup (N169) precedes 'cutover'; nothing else is checked.
+-- catalog_check_move_transition. activated_at is stamped by a separate same-state UPDATE ((b'') by the mover, or
+-- `engramctl restore` for a target the restore path activated, N180(1)) before the committed -> cleaning statement;
+-- the trigger reads OLD.activated_at; backdating by catalog_admin is within the admin trust. CleanupMove takes
+-- committed -> cleaning only; the cleanup activity records 'done' after one extra engram_cleanup_namespace returning 0
+-- (N184(2)). The seal (N179) precedes 'cutover': CHECKs below.
+-- Reconcile (N163, N180(4), N184(5), N185): the owner of a namespace is its highest-epoch active/frozen/* shard row
+-- (frozen/restore counts), re-read once on a torn snapshot; a re-derived 'committed' writes routing only and never
+-- activates a shard row; its copy_end_lsn comes from the target row's floor_lsn; a shard unreadable within 5 s is
+-- skipped (ReconcileIncomplete).
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespace_moves (
   move_id                uuid PRIMARY KEY,
@@ -221,7 +234,7 @@ CREATE TABLE namespace_moves (
   state                  move_state NOT NULL DEFAULT 'planned',
   source_system_id       bigint,                    -- N123: a mismatch fails MoveFenced
   source_timeline_id     integer,
-  w_est_seconds          integer NOT NULL CHECK (w_est_seconds >= 0),   -- N173(1): rows/R_copy + build(vectors) + bytes/R_backup + verify; about 26 min per 1 M facts
+  w_est_seconds          integer NOT NULL CHECK (w_est_seconds >= 0),   -- N173(1): rows/R_copy + build(vectors) + max(wal_build/R_archive, wal_build/R_redo) + verify; about 27 min per 1 M facts
   window_seconds         integer NOT NULL CHECK (window_seconds > 0 AND window_seconds <= 28800),   -- N173(3): the operator window (cap 8 h, default 4 h)
   w_final                bigint,                    -- N147: the source's nextval under the freeze; the target is advanced past it once at the start of FrozenCopy ((b') checks last_value > w_final)
   terminated_workflows   text[] NOT NULL DEFAULT '{}',  -- workflow ids terminated at drain, restarted on the target (N97)
@@ -237,27 +250,34 @@ CREATE TABLE namespace_moves (
   rolled_back_replicated_at timestamptz,            -- N171(2): the standby replayed the 'rolled_back' CAS; thaw / unready_target / rollback_target wait for it
   moved_out_at           timestamptz,               -- (c) on the source; informational (the arbiter is committed_at)
   activated_at           timestamptz,               -- (b'') target ready -> active
-  move_backup_started_at timestamptz,               -- N169(1): start of the pgBackRest incremental of the target
-  move_backup_at         timestamptz,               -- N169(1): that incremental complete, with its last WAL segment archived, before (b') (catalog.MoveBackups)
+  copy_end_lsn           pg_lsn,                    -- N179(1): pg_switch_wal() on the target after the last index commit (the floor of every target restore and failover)
+  copy_end_timeline      int4,
+  copy_sealed_at         timestamptz,               -- N179(1): segment archived (pgbackrest check) and standby replayed (engram_standby_replayed), before (b')
+  reconciled_at          timestamptz,               -- N184(5): re-derived from shard truth; the reconcile stamped copy_sealed_at and committed_replicated_at with it
+  lost_at                timestamptz,               -- N183
+  lost_restore_id        text,                      -- N183: the _control/restores/ marker that caused it
+  recovered_from_move_id uuid REFERENCES namespace_moves (move_id),   -- N183: set on the recovery move of a lost move-in
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
   CHECK (to_epoch = from_epoch + 1),
   CHECK ((source_system_id IS NULL) = (source_timeline_id IS NULL)),
-  CHECK (state NOT IN ('frozen', 'copied', 'cutover', 'committed', 'cleaning', 'done') OR frozen_at IS NOT NULL),
+  CHECK (state NOT IN ('frozen', 'copied', 'cutover', 'committed', 'cleaning', 'done', 'lost') OR frozen_at IS NOT NULL),
   CHECK ((frozen_at IS NULL) = (freeze_deadline IS NULL)),
-  CHECK (state NOT IN ('committed', 'cleaning', 'done') OR committed_at IS NOT NULL),
+  CHECK (state NOT IN ('committed', 'cleaning', 'done', 'lost') OR committed_at IS NOT NULL),
   CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL),
   CHECK (ready_at IS NULL OR w_final IS NOT NULL),                                     -- N147: no 'ready' before the target's sequence passed W_final
   CHECK (window_seconds >= greatest(1.5 * w_est_seconds, w_est_seconds + 600)),        -- N173(3): StartMove refuses a shorter window
   CHECK (freeze_deadline IS NULL OR freeze_deadline <= frozen_at + window_seconds * interval '1 second'),
   CHECK (created_by <> 'rebalancer' OR w_est_seconds <= 600),                          -- N173: unattended only when W_est <= 10 min
-  CHECK (state NOT IN ('cutover', 'committed', 'cleaning', 'done') OR move_backup_at IS NOT NULL),   -- N169(1): the backup precedes the commit point
-  CHECK (moved_out_at IS NULL OR committed_replicated_at IS NOT NULL),                 -- N171(2)
+  CHECK (state NOT IN ('cutover', 'committed', 'cleaning', 'done', 'lost') OR copy_sealed_at IS NOT NULL),   -- N179(1): the seal precedes the commit point
+  CHECK (copy_sealed_at IS NULL OR copy_sealed_at > frozen_at),
+  CHECK (state <> 'lost' OR (lost_at IS NOT NULL AND lost_restore_id IS NOT NULL)),    -- N183
+  CHECK (moved_out_at IS NULL OR committed_replicated_at IS NOT NULL),                 -- N171(2); the reconcile satisfies it with committed_replicated_at = reconciled_at
   CHECK (state <> 'done' OR finished_at IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)
-  WHERE state NOT IN ('done', 'rolled_back');
+  WHERE state NOT IN ('done', 'rolled_back', 'lost');
 CREATE INDEX namespace_moves_state_idx ON namespace_moves (state, updated_at);
 
 CREATE TRIGGER namespace_moves_touch BEFORE UPDATE ON namespace_moves
@@ -279,7 +299,7 @@ BEGIN
        ('planned', 'frozen'), ('frozen', 'copied'), ('copied', 'cutover'),
        ('cutover', 'committed'), ('committed', 'cleaning'), ('cleaning', 'done'),
        ('planned', 'rolled_back'), ('frozen', 'rolled_back'), ('copied', 'rolled_back'),
-       ('cutover', 'rolled_back')) THEN
+       ('cutover', 'rolled_back'), ('committed', 'lost'), ('cleaning', 'lost')) THEN
     RETURN NEW;
   END IF;
   RAISE EXCEPTION 'illegal move transition % -> % (move %)', OLD.state, NEW.state, OLD.move_id
@@ -485,11 +505,14 @@ GRANT EXECUTE ON FUNCTION pick_shard(text) TO catalog_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO catalog_admin;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO catalog_admin;
 
--- N171(1): true iff a streaming standby replayed p_lsn (false with none). p_lsn = pg_current_wal_lsn() read after COMMIT
--- in the same session (an upper bound). catalog_admin holds no pg_read_all_stats (config lint checks it).
+-- N171(1), N181: true iff a streaming standby replayed p_lsn (false with none). p_lsn = pg_current_wal_lsn() read after
+-- COMMIT in the same session (an upper bound). The owner must be a member of pg_read_all_stats (pg_stat_get_wal_senders
+-- masks the rows otherwise); `config lint` asserts pg_has_role(owner, 'pg_read_all_stats', 'USAGE') and that no
+-- application role holds it.
 CREATE FUNCTION catalog_replicated(p_lsn pg_lsn) RETURNS boolean
-LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
-  SELECT coalesce(bool_or(replay_lsn >= p_lsn), false) FROM pg_stat_replication WHERE state = 'streaming'
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT coalesce(bool_or(replay_lsn >= p_lsn), false) FROM pg_catalog.pg_stat_replication WHERE state = 'streaming'
 $$;
+ALTER FUNCTION catalog_replicated(pg_lsn) OWNER TO catalog_stats_reader;
 REVOKE ALL ON FUNCTION catalog_replicated(pg_lsn) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION catalog_replicated(pg_lsn) TO catalog_admin, catalog_app;

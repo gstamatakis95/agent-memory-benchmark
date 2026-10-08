@@ -154,7 +154,7 @@ Two keys exist because two different things need retry-safety: a *call* and a *u
 | On replay with identical request hash | The stored response bytes are returned (no re-execution). | The existing `Operation` is returned in whatever state it is. |
 | On reuse with a different hash | `ALREADY_EXISTS` + `OperationConflict{reason: IDEMPOTENCY_KEY_REUSED}`. | Same. |
 | Format | Opaque, 1–128 bytes. | Any RFC 4122 UUID (validated as a UUID, UUIDv7 recommended; the per-document ids derived below are UUIDv5, so "UUIDv7 only" would have rejected the server's own ids — N72, review F-44). |
-| Optional? | Optional on writes (a write without it is simply not replay-safe; documented, not rejected). Ignored on reads except for tracing. | Optional; the server mints one. |
+| Optional? | **Required** (`INVALID_ARGUMENT`, reason `REQUEST_ID_REQUIRED`, N184) on `CreateTenant`, `UpdateTenant`, `UpdateTenantLimits`, `DeleteTenant`, `CreateNamespace`, `UpdateNamespace`, `DeleteNamespace`, `StartMove`, `CleanupMove`, `RollbackMove`; the CLI and SDKs mint one. Optional on other writes (a write without it is not replay-safe; not rejected). Ignored on reads except for tracing. | Optional; the server mints one. |
 | Multi-document `Retain` | One `request_id` covers the whole call. | With exactly one `document_id` in the request the supplied id is used verbatim; with several, per-document ids are `UUIDv5(operation_id, document_id)` so a retry regenerates the same ids. Items without a `document_id` get the minted id `UUIDv5(operation_id, "item/" ‖ index)` whenever an `operation_id` is present (N127); a retain with neither `operation_id` nor `request_id` mints fresh UUIDv7s and is **not replay-safe** (documented, not rejected). |
 
 The request hash is SHA-256 over the **normalised protojson** rendering of the request with `meta`
@@ -239,13 +239,15 @@ generated from `internal/errs` (`make gen-docs`): **one gRPC code per detail typ
 | `WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state}` | `FAILED_PRECONDITION` | The shard's `namespace_ownership` row disagrees with the resolved (shard, epoch): stale catalog cache, move cut over between resolve and execute, restore bumped the epoch (D2 row 3). The API invalidates its catalog entry, re-resolves and retries the whole call **once** for writes; a call that sees `namespace_state = MOVED_OUT` (the window between cutover sub-steps (c) and (d), §5.5) re-resolves in a **bounded loop of ≤ 5 s**, exactly like `NamespaceFrozen`, because the catalog still names the source until (d) and a single retry would fail identically (N52, N125). It is surfaced only when that also fails and counts against the availability SLI. The routing hint of the permanent `moved_out` row (`target_shard_id`, `next_epoch`, N93) travels as the **internal** `engram.internal.errors.v1.MovedOutHint`, consumed by the router and dropped by the interceptor; no shard id is part of a public message (N128, A-12). | Retry with backoff (a fresh resolve happens server-side). Never persist epochs. |
 | `NamespaceFrozen{namespace_id, retry_after, reason, frozen_until_estimate}` (+ `RetryInfo`) | `FAILED_PRECONDITION` | Writes during the freeze window of a move or a restore (D5); a move freeze lasts for the whole copy (minutes to hours) and carries `frozen_until_estimate`, the move's freeze deadline, to which clients back off (N160); or while an exclusive taker is queued on the namespace fence and the writer's `try`-lock was refused (`reason` unspecified, `retry_after` = 200 ms; the fence never waits, N82; the internal `FenceBusy` detail is mapped to this). Reads continue only for a move freeze; a restore freeze rejects them too (`RESTORING`, N122). A **delete** freeze is not reported here: it is `PreconditionFailed{NAMESPACE_DELETING}` everywhere (N139). The API already retried with backoff for up to 30 s. | Retry after `retry_after`. |
 | `NamespaceNotReady{namespace_id, retry_after}` (+ `RetryInfo`) | `UNAVAILABLE` | The target shard of a move is `ready` but not yet `active` (cutover sub-steps (b′) to (b″), well under a second, N125). The API retries inside its bounded loop first. | Retry after `retry_after`. |
-| `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: page already refreshing, snapshot already running, or `NAMESPACE_BUSY` (a delete or a move is open; `DeleteNamespace` during a move carries `RetryInfo{30 s}`, N177). | `WaitOperation(existing_operation_id)` then resubmit. |
+| `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: page already refreshing, snapshot already running, or `NAMESPACE_BUSY` (a delete, or a move before activation, is in progress; `DeleteNamespace` during a move carries `RetryInfo{30 s}`, N177). | `WaitOperation(existing_operation_id)` then resubmit. |
 | `OperationConflict{reason: IDEMPOTENCY_KEY_REUSED}` | `ALREADY_EXISTS` | `request_id`/`operation_id` reused with a different request hash; namespace/page `name` already taken. | Use a fresh id; the stored one is bound to a different request. |
-| `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation (`OPERATION_TERMINAL`) or on a `DELETE_*` operation (`OPERATION_NOT_CANCELLABLE`, N136), etag mismatch, `Invalidate` on a non-fact id (a second `Invalidate` of the same fact succeeds, not an error, and changes no visibility, but still writes its own `deletion_log` row and intent, N139, N143), `Restore` of a fact whose subject has no `invalidate` marker (`NOT_INVALIDATED`), `StartMove` without the operator window the estimate needs (`PreconditionFailed{type: MOVE_WINDOW_REQUIRED}`) or with one below `max(1.5 × W_est, W_est + 10 min)` or above 8 h (`MOVE_WINDOW_TOO_SHORT`, N173; `MOVE_TOO_LARGE` is unused), namespace `DELETING` (the delete freeze included), tenant `DELETING` (`TENANT_DELETING`), snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
+| `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation (`OPERATION_TERMINAL`) or on a `DELETE_*` operation (`OPERATION_NOT_CANCELLABLE`, N136), etag mismatch, `Invalidate` on a non-fact id (a second `Invalidate` of the same fact succeeds, not an error, and changes no visibility, but still writes its own `deletion_log` row and intent, N139, N143), `Restore` of a fact whose subject has no `invalidate` marker (`NOT_INVALIDATED`), `StartMove` without the operator window the estimate needs (`PreconditionFailed{type: MOVE_WINDOW_REQUIRED}`) or with one below `max(1.5 × W_est, W_est + 10 min)` or above 8 h (`MOVE_WINDOW_TOO_SHORT`, N173; `MOVE_TOO_LARGE` is unused) `StartMove` onto a target with an unhealthy archive (`MOVE_TARGET_ARCHIVE_UNHEALTHY`, N179), `RollbackMove` after (a″) (`MOVE_PAST_COMMIT`, N184), namespace `DELETING` (the delete freeze included), tenant `DELETING` (`TENANT_DELETING`), snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
 | — | `UNAUTHENTICATED` | Missing/invalid/expired JWT. | Refresh the token. |
 | — | `PERMISSION_DENIED` | Scope or allowlist (4.1.1). | Obtain a broader token. |
 | — (+ `RetryInfo{2 s}`) | `UNAVAILABLE` | Catalog **miss** while the catalog is down (D4 as amended: cached entries of existing namespaces are served indefinitely, only misses fail), shard `READONLY`/`RETIRED` or marked unavailable by the schema-version guard (N22), pgbouncer pool exhausted. | Retry with jittered backoff; idempotent by construction. |
-| — (+ `RetryInfo{2 s}`) | `UNAVAILABLE` | A lifecycle write (`CreateTenant`, `UpdateTenant`, `UpdateTenantLimits`, `DeleteTenant`, `CreateNamespace`, `UpdateNamespace`, `DeleteNamespace`'s `deleting` row, `StartMove`, `CleanupMove`, and the catalog `idempotency_keys` row each writes) committed but not yet replayed by the standby (N171). | Retry; the retry finds the row (idempotent by key) and re-checks. |
+| — (+ `RetryInfo{2 s}`) | `UNAVAILABLE` | A lifecycle write (`CreateTenant`, `UpdateTenant`, `UpdateTenantLimits`, `DeleteTenant`, `CreateNamespace`, `UpdateNamespace`, `DeleteNamespace`'s `deleting` row, `StartMove`, `CleanupMove`, `RollbackMove`, and the catalog `idempotency_keys` row each writes) committed but not yet replayed by the standby (N171, N184). | Retry with the same `request_id`; the retry finds the row and re-checks. |
+
+**Lossy set of a catalog restore (RPO 60 s, N182):** `CreateTenant`, `UpdateTenant`, `UpdateTenantLimits`, `CreateNamespace`/`UpdateNamespace` metadata and `idempotency_keys` rows; clients retry them by `request_id` (routing, moves and deletes are re-derived from the shards).
 | — | `DEADLINE_EXCEEDED` | The deadline elapsed. For `Recall` the stream may already have delivered results; the trailing `RecallStats` is then missing. | Retry with a larger deadline or lower budget. |
 | — | `UNIMPLEMENTED` | Phase-gated service (`PageService`, `ExportService` before phase 3). | None. |
 | — | `INTERNAL` | Bug or invariant violation (e.g. embedding dims mismatch). Logged with trace id. | Report `x-engram-trace-id`. |
@@ -277,7 +279,7 @@ it is convenience, not contract (only `value` is guaranteed).
 | `MemoryService.Reflect` | **server-streaming** `ReflectResponse{delta \| tool_call \| tool_result \| citation \| answer \| stats}` | Up to 300 s of wall time with visible progress (tool steps) and token deltas; the client must be able to show something before the end. | Bidirectional (no mid-session client input exists; the loop is bounded and server-driven). Unary (300 s of silence). |
 | `OperationService.WaitOperation` | **unary long-poll** (server wait ≤ min(timeout, deadline − 500 ms, 60 s)) | It is a barrier, not a feed: one round trip, works from curl/Connect/JSON, no long-lived stream to migrate when an API replica restarts, and Envoy balances each poll. **Mechanism (N70, review F-39):** the handler parks on Temporal's workflow-result long-poll (`GetWorkflow(id).Get` with the remaining wait) — one open poll per waiter, capped per API process (`MaxOpenWaits`, default 2 000); above the cap, or when the workflow no longer exists (namespace purge), it falls back to a jittered poll of the `operations` row (1 s ± 250 ms). Singleton-backed kinds have no workflow of their own to park on: a document delete polls the tombstone, a page refresh the page row (N136, N157). Neither path needs a per-shard `LISTEN` (impossible through pgbouncer, N15). | `WatchOperation` server stream (nice-to-have for progress bars; deferred until someone needs it — `GetOperation` polling every 2 s is adequate). |
 | `ExportService.StreamSnapshot` | **server-streaming** 1 MiB parts | Files reach gigabytes; gRPC messages should stay ≤ 4 MiB; resumable by `(path, offset)` so a broken stream costs one part. | Unary presigned-URL redirect (leaks blob layout and credentials model to clients; not all deployments have public blob endpoints). |
-| `DocumentService.DeleteDocument`, `NamespaceService.DeleteNamespace` | **unary** → ack + `Operation` | The ack is the committed soft-delete marker followed by the durable intent object (N115, N122); the expunge is async and tracked (N119). `DeleteTenant` acks after the replicated catalog `deleting` row and the tenant intent and fences namespaces asynchronously, re-resolving each shard per attempt (N122, N171, N177). | — |
+| `DocumentService.DeleteDocument`, `NamespaceService.DeleteNamespace` | **unary** → ack + `Operation` | The ack is the committed soft-delete marker followed by the durable intent object (N115, N122); the expunge is async and tracked (N119). `DeleteTenant` returns after the replicated catalog `deleting` row and the tenant intent; the operation's `acknowledged_at` is set once every namespace is fenced (re-resolving each shard per attempt), the client's durability point (N122, N171, N177, N182). | — |
 | `PageService.DeletePage` | **unary** (no `Operation`) | Pages are small; the delete is fully synchronous. | — |
 | All `Get*`/`List*`/`BatchGet*` | **unary**, `idempotency_level = NO_SIDE_EFFECTS` | Enables HTTP GET in Connect (4.7). | — |
 
@@ -368,11 +370,17 @@ option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
 // gRPC metadata) so it is part of the idempotency hash and of the audit log.
 message RequestMeta {
   // Client-supplied idempotency key for unary writes (Retain, Delete*,
-  // Invalidate, Restore, Create*/Update*). Opaque, 1-128 bytes, unique per
+  // Invalidate, Restore, Create*/Update*). Required (INVALID_ARGUMENT,
+  // REQUEST_ID_REQUIRED) on every write whose ack waits for catalog
+  // replication (decision N184: CreateTenant, UpdateTenant,
+  // UpdateTenantLimits, DeleteTenant, CreateNamespace, UpdateNamespace,
+  // DeleteNamespace, StartMove, CleanupMove, RollbackMove); a retry after
+  // UNAVAILABLE reuses it. Opaque, 1-128 bytes, unique per
   // (tenant, namespace, method) for 24 h. A replay with the same key and an
   // identical request hash returns the stored response; the same key with a
   // different hash fails with ALREADY_EXISTS + OperationConflict
-  // {reason = IDEMPOTENCY_KEY_REUSED}. Optional on reads (tracing only).
+  // {reason = IDEMPOTENCY_KEY_REUSED}. Optional on other writes and on reads
+  // (tracing only).
   string request_id = 1;
   // Wall-clock time at the client when the request was built. Informational:
   // logged next to the server time to diagnose clock skew; never used for
@@ -659,19 +667,7 @@ message MetadataFilter {
 
 #### `memory/v1/errors.proto`
 
-The public typed details of 4.1.6: `ValidationError`, `QuotaExceeded`, `NotFound`,
-`WrongShardOrEpoch` (epochs and state only), `NamespaceFrozen`, `NamespaceNotReady` (the `ready`
-window of a move cutover, N125), `OperationConflict`, `PreconditionFailed`, and the enums they need
-(`ResourceKind`, `NamespaceState`, `QuotaScope`, `FreezeReason` = `MOVE`, `RESTORE` and a deprecated
-`DELETE` that is never emitted because the delete freeze is `PreconditionFailed{NAMESPACE_DELETING}`,
-N139; `OperationConflictReason`). `NotFound` carries an optional `reason` (`DOCUMENT_DELETED`, N136). `NamespaceState` is defined here, not in `namespace.proto`, because
-`WrongShardOrEpoch` needs it and `errors.proto` must not import service files. The write-path and
-routing details (`MovedOutHint`, `FenceBusy`, `DocumentBusy`, `InputBlobMissing`) moved to
-`engram/internal/errors/v1/errors.proto` (N128): a public message can never be removed once
-`v1.0.0` ships, and "stripped before leaving the API" is a runtime discipline, not a contract.
-`FREEZE_REASON_FENCE_BUSY` and `WrongShardOrEpoch` fields 5 and 6 are reserved. Each message's
-comment names its gRPC code and the client action. Full file under
-`plans/engram/proto/memory/v1/errors.proto`.
+The public typed details of 4.1.6 and their enums (`ResourceKind`, `NamespaceState`, `QuotaScope`, `FreezeReason`, `OperationConflictReason`). `NamespaceState` is defined here because `WrongShardOrEpoch` needs it and `errors.proto` must not import service files. The write-path and routing details (`MovedOutHint`, `FenceBusy`, `DocumentBusy`, `InputBlobMissing`) live in `engram/internal/errors/v1/errors.proto` (N128): a public message can never be removed once `v1.0.0` ships, and "stripped before leaving the API" is a runtime discipline, not a contract. `FREEZE_REASON_DELETE` is deprecated and never emitted (the delete freeze is `PreconditionFailed{NAMESPACE_DELETING}`, N139); `FREEZE_REASON_FENCE_BUSY` and `WrongShardOrEpoch` fields 5 and 6 are reserved. Full file under `plans/engram/proto/memory/v1/errors.proto`.
 
 #### `memory/v1/operation.proto`
 
@@ -680,7 +676,7 @@ comment names its gRPC code and the client action. Full file under
 **DELETE_TENANT**, CONSOLIDATE, REFRESH_PAGE, CREATE_SNAPSHOT), `state` (PENDING, RUNNING,
 DEFERRED, SUCCEEDED, FAILED, CANCELLED), `cancel_reason` (CLIENT_REQUEST, DOCUMENT_DELETED,
 NAMESPACE_DELETING), `progress{units_total, units_done, units_failed, units_skipped, phase}`,
-`error`, `deferred{quota, resume_at, scope}`, `result`, `timestamps`, `finished_at`, `request_id`
+`error`, `deferred{quota, resume_at, scope}`, `result`, `timestamps`, `finished_at`, `acknowledged_at` (`DELETE_TENANT`, N182), `request_id`
 and the `consolidation_lag` hint (D16). N127 closes the review-3 gaps: `result.document_version` is
 **this operation's** version and `result.superseded_by` is **the newer version number** (an `int64`
 version, not an operation id; the shard column is a `bigint` version too, N139) set when a newer
@@ -1662,10 +1658,10 @@ workers' service identity, valid on exactly `ReleaseNamespace` and `CleanupMove`
 max_request_bytes}`, `Isolation{SHARED, DEDICATED}`, config Struct); `DeleteTenant` marks the tenant
 `deleting` in the catalog (every request for the tenant then fails
 `PreconditionFailed{TENANT_DELETING}`, the read barrier), writes the tenant-level intent object and
-acks; the `TenantDelete` workflow then fences the namespaces asynchronously, one intent object per
-namespace as it fences each, so the ack has bounded fan-out (N122, A-11). It returns the
-`DELETE_TENANT` operation (derived from the catalog row); `GetTenantOperation` lists the
-per-namespace `DELETE_NAMESPACE` operations as they appear. `ShardService` (RegisterShard,
+returns the `DELETE_TENANT` operation `PENDING`; the `TenantDelete` workflow fences every namespace
+(one intent object each) and the operation reports `acknowledged_at` once the last fence is held,
+the client's durability point (`FAILED{CATALOG_RESTORED}` if a catalog restore reverted the `deleting` row first; N182). `GetTenantOperation` lists the per-namespace `DELETE_NAMESPACE`
+operations as they appear. `ShardService` (RegisterShard,
 GetShard, ListShards, DrainShard, UpdateShard, **ResolveNamespace** — the ops view of
 shard/epoch/state that `memory.v1` hides, `ReleaseNamespace`; `ShardState` is `PROVISIONING, ACTIVE,
 FULL, DRAINING, READONLY, RETIRED`). `MoveService` (StartMove, GetMove, ListMoves, RollbackMove —
@@ -1674,16 +1670,14 @@ and CleanupMove) implements the freeze-then-copy protocol of §5.5 (N160, N169).
 `window` (required when the window estimate exceeds the 10 min an unattended move may take, about 350 k facts; refused below
 `max(1.5 × W_est, W_est + 10 min)`; cap 8 h, default 4 h, N173), an optional `freeze_not_before` (a scheduled window),
 `pause_before_freeze`/`resume` and `estimate_only` (returns `window_estimate` without planning). `Move` exposes both epochs,
-`MoveState` = `PLANNED, FROZEN, COPIED, CUTOVER, COMMITTED, CLEANING, DONE, ROLLED_BACK` (`COPIED` = verify, indexes, move backup
-and consumer wait done), `window_estimate`, `window`, `freeze_deadline`
+`MoveState` = `PLANNED, FROZEN, COPIED, CUTOVER, COMMITTED, CLEANING, DONE, ROLLED_BACK, LOST` (`COPIED` = verify, indexes, seal
+and consumer wait done; `LOST` is terminal, N183), `window_estimate`, `window`, `freeze_deadline`
 (also the `frozen_until_estimate` of `NamespaceFrozen`; the move rolls back by itself at that time unless it passed (a″)),
-`cutover_step` (`READY_TARGET`, `CATALOG_COMMIT`, `MOVED_OUT_SOURCE`, `ACTIVE_TARGET`, `CATALOG_FLIP`),
-`past_point_of_no_return`, `activated_at`, `move_backup_started_at` and `move_backup_at` (the incremental backup of the target
-that precedes the cut, N169) and
+`cutover_step` (`READY_TARGET`, `CATALOG_COMMIT`, `MOVED_OUT_SOURCE`, `ACTIVE_TARGET`, `CATALOG_FLIP`; set while `COMMITTED` too),
+`past_point_of_no_return`, `activated_at`, `copy_end_lsn`, `copy_end_timeline`, `copy_sealed_at` (the target's WAL floor, N179), `committed_replicated_at`, `rolled_back_replicated_at`, `finished_at`, `reconciled_at`, `lost_at`, `lost_restore_id`, `recovered_from_move_id` and
 `MoveProgress{rows_copied, rows_estimated, bytes_copied, blobs_copied, tables_done, verify_attempts,
-indexes_requested, indexes_ready, restarted_operation_ids}`; `copy_start_seq`, `applied_seq` and the replay lag
-fields are reserved, and `Move.operation_id` is reserved (a move is not an operation, N127). Full file
-under `plans/engram/proto/memory/admin/v1/admin.proto`. `CleanupMove` takes `committed → cleaning` 24 h after `activated_at` (refused before; N170), records `done` after the last batch; source blobs go at `finished_at + 28 d`.
+indexes_requested, indexes_ready, restarted_operation_ids}`. Full file
+under `plans/engram/proto/memory/admin/v1/admin.proto`. `CleanupMove` takes `committed → cleaning` 24 h after `activated_at` (refused before; N170) and nothing else (the cleanup activity records `done`, N184); `RollbackMove` fails `PreconditionFailed{MOVE_PAST_COMMIT}` after (a″); source blobs go at `finished_at + 28 d`.
 
 #### `engram/internal/workflow/v1/workflow.proto`
 
@@ -1698,30 +1692,16 @@ key and `CommitChunkInput` is **keys-only**. **Confidentiality (N99):** text app
 only as ciphertext, at most 4 KiB per activity result, plus
 `ChunkWork.header`/`context`/`metadata_json`/`entity_hints`; the payload codec uses a per-namespace
 data key wrapped by the shard key, and deleting the wrapped key is the shredding step of a
-namespace or tenant delete. Retain activities are unchanged in shape; what changed is what they
-write: `FinalizeVersion` inserts `chunk_tombstones` and `fact_hidden(cause = 'reextract')` rows
-instead of updating facts, flags the affected observations `stale_write` and hides no derived
-version (`observations_flagged_stale`, N135), and `CommitChunk` inserts vectors into the side
-tables keyed by model (N111) and re-applies `curation_log` (N115). **Consolidation is two-stage
-(N121):** `RouteBatchInput/Result` (stage 1, `consolidate_route/v1`: `RoutingDecision{ATTACH,
-CREATE, SKIP, MERGE, DROP_SOURCE}`, nothing textual persisted), `WriteObservationInput/Result`
-(stage 2, `consolidate_write/v1`: one call per touched observation, `ObservationWrite` with the
-shown `input_fact_ids` and, for update and merge, the **`base_version`** it was written against;
-modes create, update, rebuild), `StoreProposalInput` (write-once under `(batch_key, attempt)`, N43,
-with `prompt_variant` for the capacity re-run) and `ApplyBatchInput/Result` (the derivation commit
-rule of N120: shared lock, fresh re-verification, `base_version` check, whole-proposal discard to a
-new attempt; the lineage messages are gone). **Expunge (N119, N136):** `ExpungeInput` (WAL budget
-`wal_mb_per_s` instead of a fixed pause; targets `MARKERS`, `NAMESPACE`, `CHUNK_TOMBSTONES`,
-`REEXTRACTED_FACTS`, `OLD_EMBEDDING_MODEL`), `MaterializeInput/Result` (the work is discovered from the open tombstones and from `fact_hidden` rows with no `materialized_at`, never from the payload, N145), `PurgeBatchInput/Result`,
-`DerivedPurgeInput/Result` (content-free stubs and transcripts), `ExpungeResult`. Also `TenantDeleteInput`, `RetainBackfillInput`,
+namespace or tenant delete. **Consolidation is two-stage
+(N121):** `RouteBatchInput/Result` (stage 1: `RoutingDecision{ATTACH, CREATE, SKIP, MERGE, DROP_SOURCE}`), `WriteObservationInput/Result` (stage 2: one call per touched observation, with the **`base_version`** it was written against), `StoreProposalInput` (write-once under `(batch_key, attempt)`, N43) and `ApplyBatchInput/Result` (the derivation commit rule of N120). **Expunge (N119, N136):** `ExpungeInput` (WAL budget `wal_mb_per_s`), `MaterializeInput/Result` (work discovered from open tombstones and `fact_hidden` rows, never from the payload, N145), `PurgeBatchInput/Result`, `DerivedPurgeInput/Result`, `ExpungeResult`. Also `TenantDeleteInput`, `RetainBackfillInput`,
 `ReembedNamespaceInput`, `SweeperInput` (N128: every workflow, including the schedules, has a
 `schema_version`), `RefreshPageInput`, `ExportInput` (no outbox cut), and the move messages:
 `MoveInput` (window estimate, window, `freeze_not_before`), `CopyProgress` (resumable key-range
 heartbeat of the copy from the static source), `VerifyFrozenReport` (count and primary-key hash per table on the
-complete copy, per PK range, `VerifyFK`, blobs; one re-copy of mismatching tables, N160, N175), `MoveBackupResult` (`started_at`, `completed_at`, `backup_label`, N169), `BuildIndexesReport` (the target's
+complete copy, per PK range, `VerifyFK`, blobs; one re-copy of mismatching tables, N160, N175), `SealCopyResult` (`copy_end_lsn`, `copy_end_timeline`, `archived_at`, `standby_replayed_at`, N179), `BuildIndexesReport` (the target's
 partial indexes valid before cutover, built under the freeze), `MoveCheckpoint` (`w_final` for the one sequence
 advance, `freeze_deadline`, source `system_identifier` and `timeline_id`, `CutoverStep` including
-`CATALOG_COMMIT`, the report of each phase), `MoveResult`. The pre-1.0 breaks of this
+`CATALOG_COMMIT`, the report of each phase; the field is `cutover_sub_step`), `MoveResult`. The pre-1.0 breaks of this
 file are listed in its header and in 4.5. Full file under `plans/engram/proto/engram/internal/workflow/v1/workflow.proto`.
 
 #### `engram/internal/errors/v1/errors.proto`
@@ -1985,14 +1965,17 @@ the round-3 rows when they were committed, so this table, not the tool, is their
 | 4 | `internal.workflow` | `ExpungeInput.batch_pause` (7) reserved, `wal_mb_per_s` (10) added | The purge is paced by the WAL it writes, not by a fixed pause (N119). |
 | 5 | `memory.v1` | `SnapshotManifest.expired_at` (16) renamed `expires_at` (same number; the old name is reserved) | The manifest field has the DDL column `export_snapshots.expires_at` as its source (N157, A-10). |
 | 6 | `memory.admin.v1` | `MoveState.COPYING` (2) and `RECONCILING` (9) reserved, `COPIED` (11) added; `MoveProgress` 10 to 15 reserved (`copy_started_at`, `rows_recopied`, `mutable_rows_reconciled`, `blobs_reconciled`, `freeze_watchdog`, `rows_catchup_copied`), `rows_estimated` and `verify_attempts` added; `Move` 18 to 20 reserved (`reconciled_in_at`, `cleanup_reconciled_at`, `target_content_checked_at`), `window_estimate`, `window`, `freeze_deadline` and `activated_at` added; `CleanupMoveRequest.skip_grace` (3) reserved; `StartMoveRequest` gains `window`, `freeze_not_before`, `estimate_only` | The move is freeze-then-copy: no dirty copy, no reconcile, no `ReconcileIn`, no content gate (N160, N161). |
-| 7 | `memory.admin.v1` | `Move.target_backup_at` (17) and `target_backup_started_at` (25) renamed `move_backup_at` and `move_backup_started_at` (same numbers; old names reserved); `source_blobs_gc_after` (16, derived as `finished_at + 28 d`) and `rerun_count` (26) reserved | The re-run is deleted (N169, N170); the renames were never in a tagged tree. |
-| 7 | `internal.workflow` | `MoveInput.rerun_attempt` (16) reserved; `MoveBackupResult` added | N169. |
-| 7 | `internal.events` | `DocumentDeleted` reserves the names of fields 2 to 6 and 8 to 15 | protojson names could still be recycled (N177). |
 | 6 | `memory.admin.v1` | `UpdateTenantRequest.update_mask` is limited to `display_name` and `config` (a semantic tightening, pre-1.0); `UpdateTenantLimits` added | One scope per method, so the interceptor stays the only enforcement point (N167, A-6). |
 | 6 | `internal.workflow` | `PreVerifyReport`, `AwaitIndexesReport`, `ReconcileReport` and `ReconcileInReport` deleted, `VerifyFrozenReport` and `BuildIndexesReport` added; `MoveInput.freeze_watchdog` (12) reserved; `MoveCheckpoint` 10, 14, 15, 16, 18 and 19 reserved; `MoveResult.rows_recopied` (6) reserved | The withdrawn machinery has no payload (N160). |
+| 7 | `memory.admin.v1` | `Move.target_backup_at` (17) and `target_backup_started_at` (25) renamed (same numbers; old names reserved); `source_blobs_gc_after` (16, derived as `finished_at + 28 d`) and `rerun_count` (26) reserved | The re-run is deleted (N169, N170); the renames were never in a tagged tree. |
+| 7 | `internal.workflow` | `MoveInput.rerun_attempt` (16) reserved | The re-run is deleted (N169). |
+| 7 | `internal.events` | `DocumentDeleted` reserves the names of fields 2 to 6 and 8 to 15 | protojson names could still be recycled (N177). |
+| 8 | `memory.admin.v1` | `Move` 17, 25 (`move_backup_at`, `move_backup_started_at`; second removal of these numbers, pre-1.0) and 11 (`cutover_at`) reserved; `copy_end_lsn`, `copy_end_timeline`, `copy_sealed_at`, `committed_replicated_at`, `rolled_back_replicated_at`, `finished_at`, `reconciled_at`, `lost_at`, `lost_restore_id`, `recovered_from_move_id` and `MOVE_STATE_LOST` added | The seal's WAL floor; a lost move-in is terminal (N179, N183, N184). |
+| 8 | `internal.workflow` | `MoveBackupResult` replaced by `SealCopyResult` (name not reused); `MoveCheckpoint` 13 renamed `cutover_sub_step`, `cutover_step` reserved with 9 | N179, N187. |
+| 8 | `memory.v1` | `Operation.acknowledged_at` (15) added; `request_id` required on the replicated-ack methods | N182, N184. |
 
-Every removed field number and name is `reserved`. CI runs `buf breaking --config WIRE_JSON` against the first tagged tree
-(N177); it reports a rename with a reserved old name as the break this table lists.
+Every removed field number and name is `reserved`. CI runs `buf breaking --config WIRE_JSON` against the merge base, non-gating,
+with the generated ignore list of this table's renames (N177, N187).
 
 The `string → bytes` retype of event ids is the one case where the earlier edit was *silently*
 unsafe (the same number decoded a 36-byte ASCII UUID as a 16-byte id); it is therefore done with
@@ -2338,10 +2321,11 @@ text are physically gone (≤ 24 h), and `CancelOperation` on it is refused with
 marker, makes sure its intent exists and acks. A Retain into the same
 `documentId` is accepted at once and starts a new version above the tombstone (N133).
 
-### Round-7 changes
+### Round-8 changes
 
 | Finding | Register | What changed in §4 and `proto/` |
 |---|---|---|
-| PG7-1, A7-5 | N169, N170 | `Move.move_backup_at`/`move_backup_started_at` (renamed); `rerun_count`, `source_blobs_gc_after`, `MoveInput.rerun_attempt` reserved; `MoveBackupResult`; `CleanupMove` takes `committed → cleaning` under the 24 h gate |
-| PG7-4, PG7-6, A7-12 | N171, N173 | lifecycle acks wait for `catalog_replicated`; `PreconditionFailed{MOVE_WINDOW_REQUIRED \| MOVE_WINDOW_TOO_SHORT}`, 8 h cap |
-| C7-8, A7-7 | N177 | `NAMESPACE_BUSY{RetryInfo 30 s}` for deletes during a move; `DocumentDeleted` reserved names |
+| PG8-3, A8-1, PG8-4 | N179, N183 | `Move`: seal floor and `lost` fields, `MOVE_STATE_LOST`; `SealCopyResult`; `MOVE_TARGET_ARCHIVE_UNHEALTHY` |
+| C8-5 | N182 | `Operation.acknowledged_at`; `DeleteTenant` durability point; declared lossy set (§4.1.6) |
+| A8-3, A8-5, A8-12 | N184 | `request_id` required (`REQUEST_ID_REQUIRED`); `MOVE_PAST_COMMIT`; `CleanupMove` one transition |
+| A8-6, A8-10 | N187 | `cutover_sub_step`; WIRE_JSON non-gating; changelog in round order |

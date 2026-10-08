@@ -178,6 +178,11 @@ message Operation {
   google.protobuf.Duration consolidation_lag = 13;
   // Set only when state == CANCELLED (decision N127).
   CancelReason cancel_reason = 14;
+  // DELETE_TENANT only (decision N182): set once every namespace of the tenant
+  // is fenced (`frozen/delete`); from then the delete survives a catalog
+  // restore. FAILED with reason CATALOG_RESTORED (in `error.details`) if a
+  // catalog restore reverted the `deleting` row before it was set.
+  google.protobuf.Timestamp acknowledged_at = 15;
 
   reserved 100 to 199;
 }

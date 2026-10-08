@@ -1067,9 +1067,12 @@ message ExportResult {
 // on the TARGET shard's task queue (`shard-{target_shard_id}`, register N2).
 // The executing worker opens a second, move-scoped pool to the source shard
 // (role `engram_move`); it is the only code path that holds two shard handles.
-// Protocol: plan, dirty copy, pre-freeze verification, freeze, reconcile by
-// insertion sequence, drain, cutover with a `ready` state and a catalog CAS
-// as the point of no return, restart, cleanup (decisions N124, N125, N137).
+// Protocol (freeze-then-copy, decisions N160, N161): plan with the blob
+// pre-warm, freeze, drain, one sequence advance, copy every table from the
+// static source by primary-key ranges, VerifyFrozen, BuildIndexes under the
+// freeze, wait for the outbox consumers, cutover with a `ready` state and a
+// catalog CAS as the point of no return, restart, cleanup after 24 h and a
+// post-activation backup.
 message MoveInput {
   // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
@@ -1083,16 +1086,30 @@ message MoveInput {
   string source_blob_prefix = 9;
   string target_blob_prefix = 10;
   bool pause_before_freeze = 11;
-  // Freeze watchdog: max(120 s, 60 s + 1 s per 10,000 live facts), capped at
-  // 15 min, computed by Plan from the stats row. Armed until the catalog CAS
-  // (a″) commits.
-  google.protobuf.Duration freeze_watchdog = 12;
+  // Removed in v1.0.0-rc7 (decision N160): `freeze_watchdog = 12`, replaced by
+  // the window deadline below.
+  reserved 12;
+  reserved "freeze_watchdog";
+  // W_est computed by Plan (rows / R_copy + vectors / R_build + verify + blob
+  // delta) and the operator window, at most 4 h. The freeze deadline is
+  // `frozen_at + max(1.5 × W_est, W_est + 10 min)`, capped by the window; the
+  // workflow rolls back at the deadline unless the catalog CAS (a″) committed.
+  google.protobuf.Duration window_estimate = 13;
+  google.protobuf.Duration window = 14;
+  // Do not freeze before this time (a scheduled window).
+  google.protobuf.Timestamp freeze_not_before = 15;
+  // 0 for the original run; n for the n-th re-run of the copy on a target
+  // restored to a point before its activation (decision N161): the workflow id
+  // is `move/{namespace_id}/{epoch}/rerun/{n}`, Plan is skipped, and the copy
+  // starts with a wipe of the target.
+  uint32 rerun_attempt = 16;
 }
 
-// CopyProgress is the BulkCopy activity's heartbeat and resume payload
-// (decision N124): each table is copied in key ranges of ≤ 100,000 rows,
-// READ COMMITTED, ordered by primary key, no snapshot and no barrier; ranges
-// are idempotent, so a crashed copy resumes at `(table, last_key)`.
+// CopyProgress is the FrozenCopy activity's heartbeat and resume payload
+// (decisions N124, N160): the source is static under the freeze, so each table
+// is copied in key ranges of ≤ 100,000 rows ordered by primary key, in up to 4
+// parallel streams, WAL-paced; ranges are idempotent upserts, so a crashed copy
+// resumes at `(table, last_key)`.
 message CopyProgress {
   string table = 1;
   // Primary-key value of the last row of the last completed range, in the
@@ -1110,7 +1127,8 @@ enum CutoverStep {
   CUTOVER_STEP_UNSPECIFIED = 0;
   // (b′) target `incoming → ready`; rollback still possible.
   CUTOVER_STEP_READY_TARGET = 1;
-  // (c) source `frozen/move → moved_out`, executed only after (a″) was read.
+  // (c) source `frozen/move → moved_out`, executed only after (a″) was read
+  // and the catalog standby replayed it (decision N163).
   CUTOVER_STEP_MOVED_OUT_SOURCE = 2;
   // (b″) target `ready → active`.
   CUTOVER_STEP_ACTIVE_TARGET = 3;
@@ -1120,94 +1138,36 @@ enum CutoverStep {
   CUTOVER_STEP_CATALOG_COMMIT = 5;
 }
 
-// PreVerifyReport is the PreVerify activity's result (decisions N124, N137).
-// It runs while the namespace is still active, so the whole-namespace checks
-// stay out of the freeze. Any mismatch fails the activity and rolls the move
-// back before it freezes.
-message PreVerifyReport {
-  // `nextval('engram_ins_seq')` and `now()` on the source when PreVerify
-  // started (W_pre, T_pre).
-  int64 w_pre = 1;
-  google.protobuf.Timestamp t_pre = 2;
-  // Insert-only rows copied by the catch-up copy of ins_seq at or above
-  // engram_seq_floor(T_copy).
-  int64 catchup_rows_copied = 3;
-  // Tables whose count(*) or bit_xor(hashtextextended(pk::text, 0)) differ
-  // for ins_seq below `f_c` on both sides (empty = match).
-  repeated string mismatched_tables = 4;
-  bool verify_fk_ok = 5;
-  int64 blobs_missing = 6;
-  // Order inside the activity (decision N148): take t_c and f_c =
-  // engram_seq_floor(t_c) on the source, copy first (catch-up of
-  // ins_seq >= f_copy), and only then check the range below f_c on BOTH sides.
-  // Both floors are source values passed to the target as numbers (N147).
-  int64 f_c = 7;
-  int64 f_copy = 8;
-  // Catch-up and check rounds run (1, or 2 after one mismatch; a second
-  // mismatch fails the activity and rolls the move back).
-  int32 rounds = 9;
+// VerifyFrozenReport is the VerifyFrozen activity's result (decision N160): on
+// the complete copy of the static source, per table count(*) and
+// bit_xor(hashtextextended(pk::text, 0)) over the whole namespace on both
+// sides, VerifyFK on the target, and the owner-keyed blob existence of every
+// copied row (copy-if-absent). A mismatch re-copies the mismatching tables
+// once and re-verifies; a second mismatch rolls the move back.
+message VerifyFrozenReport {
+  // Tables whose count or hash differ (empty = match); the excluded class
+  // is checked as `count(*)` on the target <= the source's.
+  repeated string mismatched_tables = 1;
+  bool verify_fk_ok = 2;
+  int64 blobs_copied = 3;
+  int64 blobs_missing = 4;
+  // Verify rounds run (1, or 2 after one mismatch was re-copied).
+  int32 attempts = 5;
+  // Tables re-copied after the first mismatch.
+  repeated string tables_recopied = 6;
 }
 
-// AwaitIndexesReport is the AwaitIndexes activity's result (decision N153):
-// after PreVerify and before Freeze the mover requests the namespace's partial
-// indexes on the target and waits until every one is ready with rows_at_build
-// at least 0.99 times the verified count. A failed build is retried once, then
-// the move rolls back.
-message AwaitIndexesReport {
-  // vector_indexes requests made for (vector table, current model) pairs with
-  // at least 2,000 copied vectors.
+// BuildIndexesReport is the BuildIndexes activity's result (decision N160): the
+// mover requests the partial indexes on the target for every (vector table,
+// current model) with at least 2,000 copied vectors, under the freeze, and
+// waits until each is `indisvalid AND indisready`
+// (`engram_move_indexes_valid(ns)`). A failed build is retried once, then the
+// move rolls back.
+message BuildIndexesReport {
   int32 indexes_requested = 1;
   int32 indexes_ready = 2;
   // Builds that failed and were requested again.
   int32 builds_retried = 3;
-}
-
-// ReconcileInReport is the ReconcileIn activity's result (decision N149): a
-// target restored or promoted after the catalog CAS (a″) is repaired from the
-// source, which is static (frozen/move or moved_out) until cleanup.
-message ReconcileInReport {
-  // Insert-only rows re-copied with ins_seq >= f_pre (a source value) as
-  // INSERT ... ON CONFLICT DO NOTHING, and mutable-class rows restored the
-  // same way (an existing target row is kept: it is the copy or a
-  // post-activation write).
-  int64 rows_recopied = 1;
-  int64 mutable_rows_restored = 2;
-  int64 f_pre = 3;
-  // Delete intents replayed on the target afterwards (decision N122).
-  int32 intents_replayed = 4;
-  // engram_seq_advance(w_final) was re-run on the target first (decision
-  // N159): a target restored to a backup taken during the copy phase brings
-  // back a low sequence together with its rows, also when every row is present
-  // and nothing was re-copied. The value the sequence was advanced past.
-  bool seq_advanced = 5;
-  int64 seq_advanced_past = 6;
-  // True for the ReconcileIn the Cleanup gate runs at cleanup time, whether or
-  // not a timeline change was recorded (decision N159).
-  bool cleanup_time = 7;
-}
-
-// ReconcileReport is the Reconcile activity's result (decisions N124, N137).
-// Any residual mismatch ends in Rollback.
-message ReconcileReport {
-  // Insert-only rows re-copied: `ins_seq ≥ engram_seq_floor(T_pre)` (computed
-  // on the source and passed as a number, decision N147).
-  int64 rows_recopied = 1;
-  // Mutable-table rows upserted, and target rows absent on the source deleted.
-  int64 mutable_rows_upserted = 2;
-  int64 mutable_rows_deleted = 3;
-  // Referenced blobs missing on the target that were copied; the cutover is
-  // refused while any is still missing.
-  int64 blobs_copied = 4;
-  int64 blobs_still_missing = 5;
-  // Tables whose count(*) or bit_xor(hashtextextended(pk::text, 0)) differ
-  // over the re-copied range, or whose excluded-class count(*) on the target
-  // exceeds the source's (empty = match).
-  repeated string mismatched_tables = 6;
-  // True once every source consumer cursor passed the namespace's final
-  // max(seq) (≤ 120 s, twice the gap horizon, else rollback).
-  bool consumers_drained = 7;
-  // VerifyFK on the target restricted to the re-copied range.
-  bool verify_fk_ok = 8;
 }
 
 // MoveCheckpoint is persisted after every step so the executor is
@@ -1223,8 +1183,9 @@ message MoveCheckpoint {
   // queue with a memo `epoch = e + 1` and WorkflowIDReusePolicy
   // TERMINATE_IF_RUNNING.
   repeated string drained_workflow_ids = 7;
-  // T_copy: `now()` on the source when the dirty copy began.
-  google.protobuf.Timestamp copy_started_at = 10;
+  // Removed in v1.0.0-rc7 (decision N160): `copy_started_at = 10` (T_copy),
+  // `reconcile = 14`, `pre_verify = 15`, `w_plan = 16`, `await_indexes = 18`
+  // and `reconcile_in = 19`.
   // Source `pg_control_system().system_identifier` and
   // `pg_control_checkpoint().timeline_id`, recorded by Plan; every later
   // activity on the source re-reads them and fails MoveFenced on mismatch
@@ -1232,23 +1193,24 @@ message MoveCheckpoint {
   uint64 source_system_identifier = 11;
   int32 source_timeline_id = 12;
   CutoverStep cutover_step = 13;
-  ReconcileReport reconcile = 14;
-  PreVerifyReport pre_verify = 15;
-  // The source's `nextval('engram_ins_seq')` at Plan and its final value under
-  // the freeze; the target's sequence is advanced past each (engram_seq_advance,
-  // decision N147).
-  int64 w_plan = 16;
+  // The source's final `nextval('engram_ins_seq')` under the freeze; the
+  // target's sequence is advanced past it once, at the start of FrozenCopy
+  // (engram_seq_advance, decisions N147, N160).
   int64 w_final = 17;
-  AwaitIndexesReport await_indexes = 18;
-  // Set once ReconcileIn ran after a target restore or failover (N149).
-  ReconcileInReport reconcile_in = 19;
+  VerifyFrozenReport verify = 20;
+  BuildIndexesReport build_indexes = 21;
+  // frozen_at + max(1.5 × W_est, W_est + 10 min), capped by the window; the
+  // workflow rolls back at this time unless (a″) committed.
+  google.protobuf.Timestamp freeze_deadline = 22;
 
   // Removed in the D22 redesign (decision N124): the replay floor
   // `int64 copy_start_seq = 2` (p0), `int64 applied_seq = 3`, the pre-freeze
   // verify watermark `Timestamp verify_watermark = 8` and the string
-  // `cutover_step = 9` ("a" to "d"; replaced by the enum in 13).
-  reserved 2, 3, 8, 9;
-  reserved "copy_start_seq", "applied_seq", "verify_watermark";
+  // `cutover_step = 9` ("a" to "d"; replaced by the enum in 13). Removed in
+  // v1.0.0-rc7 (decision N160): the dirty-copy and reconcile fields listed
+  // above.
+  reserved 2, 3, 8, 9, 10, 14, 15, 16, 18, 19;
+  reserved "copy_start_seq", "applied_seq", "verify_watermark", "copy_started_at", "reconcile", "pre_verify", "w_plan", "await_indexes", "reconcile_in";
 }
 
 // MoveResult is the terminal outcome.
@@ -1257,9 +1219,12 @@ message MoveResult {
   int64 rows_copied = 2;
   repeated string restarted_operation_ids = 4;
   string error = 5;
-  int64 rows_recopied = 6;
+  // VerifyFrozen rounds run (1, or 2 after one mismatch was re-copied).
+  int32 verify_attempts = 7;
 
   // Removed in the D22 redesign (decision N124): `int64 events_replayed = 3`.
-  reserved 3;
-  reserved "events_replayed";
+  // Removed in v1.0.0-rc7 (decision N160): `int64 rows_recopied = 6` (there is
+  // no re-copy under the freeze).
+  reserved 3, 6;
+  reserved "events_replayed", "rows_recopied";
 }

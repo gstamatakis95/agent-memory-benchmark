@@ -63,7 +63,7 @@ Four ideas carry the design; everything else is a detail of one of them.
    concurrently calls `Session.Tx`, which opens its own pooled connection, sets the scope GUCs, runs the
    read fence (`active` or `frozen/move`) and the arm's `SET LOCAL`s (`enable_seqscan = off`, no parallel
    workers, `hnsw.ef_search`, N138). One connection runs one statement at a time, so a shared
-   transaction would serialise the arms and the 220 ms path could not hold; a semaphore admits at most 16 concurrent arm transactions per API process per shard (N155).
+   transaction would serialise the arms and the 224 ms path could not hold; a semaphore admits at most 32 concurrent arm transactions per API process per shard, 4 of them filtered arms (N155, N164).
 2. The planner is a `pipeline.Pipeline[*recall.State]` whose first stage is a DAG scheduler and whose
    remaining stages run in order; each records a `StageTiming`:
 3. `Retrieve` — a DAG over named nodes. `visibility` loads, once, the two marker sets
@@ -116,11 +116,11 @@ D22 packages. `internal/reflect` is `internal/reflectagent` (N140): the old name
 | Layer | May import | Must not import |
 |---|---|---|
 | leaves (`id`, `errs`, `pipeline`, `fsm`, `txn`) | the standard library, other leaves, `gen/go`, and the **leaf-permitted modules** `github.com/google/uuid` (`id`), `go.opentelemetry.io/otel` (`pipeline`: its span), `google.golang.org/grpc/status`, `connectrpc.com/connect` and `google.golang.org/protobuf` (`errs`) | any non-leaf `internal/` package |
-| `internal/api` | `authz, catalog, router, recall, reflectagent, pages, export, move, quota, config, store, blob, workflows (clients only), intent, errs, telemetry`, `gen/go` | adapters, `cmd` |
-| Services (`recall, consolidate, reflectagent, pages, export, move, expunge, entity, link, extract, chunk`) | `store, index, gateway, blob, intent, config, quota, ledger, errs, telemetry`, `gen/go`; `reflectagent` also `recall`, `pages`; `move` also `catalog` | `internal/api`, adapters, `workflows` |
+| `internal/api` | `authz, catalog, router, recall, reflectagent, pages, export, move, quota, config, store, blob, workflows (clients only), intent, telemetry`, the leaves, `gen/go` | adapters, `cmd` |
+| Services (`recall, consolidate, reflectagent, pages, export, move, expunge, entity, link, extract, chunk`) | `store, index, gateway, blob, intent, config, quota, ledger, telemetry`, the leaves, `gen/go`; `reflectagent` also `recall`, `pages`; `pages` also `recall` (a page refresh gathers its evidence with `recall.Planner`; no cycle, `recall` imports neither `pages` nor a service); `move` also `catalog` | `internal/api`, adapters, `workflows` |
 | Infrastructure (`store, index, gateway, blob, intent, catalog, router, outbox, ledger, config, quota, telemetry`) | leaves, `gen/go`, drivers, and only the edges named below | any service package, `internal/api` |
-| `internal/workflows` | activity **interfaces** declared in itself, `gen/go/engram/internal/workflow/v1`, the Temporal SDK | concrete service packages (injected in `cmd/engram-worker`) |
-| `adapters/*` | `gen/go` (+ generated clients), `authz` (scope names), `errs` (code mapping) | any other `internal/*` |
+| `internal/workflows` | activity **interfaces** declared in itself, the leaves, `gen/go/engram/internal/workflow/v1`, the Temporal SDK | concrete service packages (injected in `cmd/engram-worker`) |
+| `adapters/*` | `gen/go` (+ generated clients), `authz` (scope names), the leaf `errs` (code mapping) | any other `internal/*` |
 | `cmd/*` | everything | — |
 
 **The import graph is acyclic by construction (N140).** The infrastructure edges are exactly:
@@ -156,6 +156,12 @@ type ChunkID uuid.UUID      // 16-byte form is what events carry, N80).
 
 // Versions are one type per entity (N140): a DocVersion cannot be passed where an ObsVersion is wanted.
 type DocVersion int64; type ObsVersion int64; type PageVersion int64; type SnapshotVersion int64
+
+// Subject is the typed curation/delete subject (N162): Class ∈ {document, memory, namespace, tenant}; Key is the
+// document_id, `document_id ‖ ':' ‖ content_hash` for memory (a fact and its twins are ONE subject), the namespace id or
+// the tenant id. Encoded `class:key` in subject locks, deletion_log and intents, so a client-chosen document_id cannot alias a fact's subject.
+type SubjectClass uint8
+type Subject struct { Class SubjectClass; Key string }
 
 type CellID string          // a cell (Temporal cluster + its shards)
 type WorkflowID string      // "ns/{ns}/op/{op}" etc.; built only by internal/workflows
@@ -217,8 +223,8 @@ type Usage interface {
 `fsm.OwnershipState` is `incoming | ready | active | frozen/{move,delete,restore} | moved_out`;
 `fsm.OperationState` is `PENDING | RUNNING | DEFERRED | SUCCEEDED | FAILED | CANCELLED` (N35, monotone,
 no `FAILED → PENDING` edge: a retry is a new operation, N139);
-`fsm.MoveState` is `planned | copying | frozen | reconciling | cutover | committed | cleaning | done | rolled_back`
-(`committed` is the catalog CAS, N125).
+`fsm.MoveState` is `planned | frozen | copied | cutover | committed | cleaning | done | rolled_back`
+(`committed` is the catalog CAS, N125; N160).
 
 ### 2.2 Modules
 
@@ -245,20 +251,20 @@ type Options struct {
 type Deps struct { // every field is an interface (2.3); complete for every served RPC (N140)
 	Router router.ShardRouter; Stores store.Stores          // one store.Store per shard of the cell: a process serves up to 32 shards
 	Catalog   catalog.Namespaces; NsAdmin catalog.NamespaceAdmin; Registry catalog.Registry; Tenants catalog.Tenants; TenantOps catalog.TenantOps
-	Moves     catalog.Moves; MoveReader catalog.MoveReader; Floor catalog.ReplayFloor // NamespaceService (List/Update via NsAdmin), TenantService, ShardService, MoveService
-	Mover     move.Orchestrator                               // MoveService.StartMove/RollbackMove (api may import move, N157)
+	Moves     catalog.Moves; MoveReader catalog.MoveReader; Floor catalog.ReplayFloor // NamespaceService (List/Update via NsAdmin), TenantService (UpdateTenant and UpdateTenantLimits both via Tenants.Update, one scope each), ShardService, MoveService
+	Mover     move.Orchestrator                               // MoveService.StartMove/RollbackMove/CleanupMove = Start/Abort/Cleanup (api may import move, N157, N167)
 	Config    config.Resolver                                // GetEffectiveConfig
 	Recall    recall.Planner; Reflect reflectagent.Agent
 	Retain    Submitter; Deleter Deleter; Ops OperationWaiter
 	Start     workflows.Starter; Signal workflows.Signaller; Wait workflows.Waiter
-	Pages     pages.Reader; PageWriter pages.Writer; PageAdmin pages.Admin // PageService: Create/Delete/Refresh, UpdatePage via PageAdmin
-	Snapshots export.Builder; Stream export.Streamer; SnapList export.SnapshotLister // ExportService: CreateSnapshot, Stream/Manifest, ListSnapshots
+	Pages     pages.Reader; PageWriter pages.Writer; PageAdmin pages.Admin // PageService: Create/Delete/Refresh, UpdatePage via PageAdmin, GetPage(name) via Reader.ByName
+	Snapshots export.Builder; Stream export.Streamer; SnapList export.SnapshotLister // ExportService: CreateSnapshot, Stream/Latest, GetSnapshotManifest(version) via SnapList.Manifest, ListSnapshots
 	Intents   intent.Log; Quota quota.Limiter; Clock func() time.Time
 }
 // The generated coverage table (`api/deps_coverage_gen.go`, produced from the proto service list by `make gen-docs`) is
 // (RPC → interface method), not (RPC → field): a field such as Stores satisfies every per-shard RPC trivially, so only the
 // method level can show that ListOperations, ListMemories, GetDocumentBody, ListTags, UpdateDocumentTags, UpdatePage,
-// ListSnapshots, ListNamespaces/UpdateNamespace and StartMove have an implementation behind them (N157, A-6). NewServer
+// ListSnapshots, ListNamespaces/UpdateNamespace, StartMove and CleanupMove have an implementation behind them (N157, A-6, N167). NewServer
 // panics at wiring time if a row names a method no non-nil dependency provides; TestDeps_EveryRPCHasPath asserts the same
 // on every CI run, so a new RPC cannot ship without the method that implements it.
 func NewServer(d Deps, o Options) *Server
@@ -283,8 +289,8 @@ type Deleter interface {
 	DeleteDocument(ctx context.Context, sc authz.RequestScope, doc id.DocumentID, o DeleteOptions) (*memoryv1.DeleteDocumentResponse, error) // DeleteOptions{OperationID, ExpectedVersion id.DocVersion (compared inside the marker tx)}
 	DeleteNamespace(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirmName string) (*memoryv1.DeleteNamespaceResponse, error) // keeps the client's operation_id
 	DeleteTenant(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirm id.TenantID) (*adminv1.DeleteTenantResponse, error)       // acks after the catalog row and the tenant intent; fences asynchronously
-	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // subject lock held until the intent put + help-previous (N150, N159); also hides the same-content twin (engram_invalidation_twins, N145); a second Invalidate changes no visibility but still writes its own deletion_log row and intent (N143)
-	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // subject lock + help-previous (N159), then the exclusive derivation lock: 40 s deadline cap; a repeated Restore also writes its own row and intent (N143)
+	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // subject (document_id, content_hash) lock held until the intent put + help-previous (N150, N159, N162); hides every live fact of the subject under one invalidation_op, one deletion_log row, one intent; a second Invalidate changes no visibility but still writes its own row and intent (N143)
+	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // subject lock + help-previous (N159), then the exclusive derivation lock: 40 s deadline cap; removes the rows carrying the invalidation's stamp (N162); a repeated Restore also writes its own row and intent (N143)
 }
 
 // OperationWaiter implements WaitOperation: park on Temporal's workflow-result long-poll (≤ MaxOpenWaits per
@@ -315,7 +321,7 @@ Pipeline of three checks) with a declarative `Policy` table instead of per-handl
 ```go
 package authz
 
-type Scope string // "memory.read" | "memory.write" | "memory.admin" | "tenant.admin" (tenant-bound: the tenant's own lifecycle, tenant-facing listener) | "engram.operator" (fleet-wide, own audience; CreateTenant and the quota/isolation paths of UpdateTenant too; N139, N157)
+type Scope string // "memory.read" | "memory.write" | "memory.admin" | "tenant.admin" (tenant-bound: the tenant's own lifecycle, tenant-facing listener) | "engram.operator" (fleet-wide, own audience; CreateTenant, UpdateTenantLimits, and GetTenant/DeleteTenant/GetTenantOperation on the admin route; N139, N157, N167) | "engram.worker" (the worker's service identity: valid on exactly ReleaseNamespace and CleanupMove, bound to its cell, N167)
 
 type Claims struct { Subject string; Tenant id.TenantID; Namespaces []id.NamespaceID /* or ["*"] */; Groups []string; Scopes []Scope; ExpiresAt time.Time }
 
@@ -325,6 +331,8 @@ type RequestScope struct { id.Scope; Caller id.Caller; Scopes []Scope; Config *c
 
 type MethodPolicy struct {
 	Scope Scope; Target Target /* Namespace | Tenant (token.tenant == request.tenant enforced) | Operator */; Bucket quota.Bucket
+	AltScope Scope // a second scope accepted on the admin route only: engram.operator for GetTenant, DeleteTenant, GetTenantOperation (it carries no tenant, so the Tenant target check is skipped for it)
+	CellBound bool // engram.worker: the token's `cell` claim must equal the shard's cell (ReleaseNamespace, CleanupMove)
 	AllowDeleting bool // only OperationService.GetOperation/WaitOperation (and TenantService.GetTenantOperation): a `deleting` namespace is otherwise FAILED_PRECONDITION (N70, N127)
 }
 type Policy map[string]MethodPolicy // key: "/memory.v1.MemoryService/Recall"
@@ -339,17 +347,17 @@ func FromContext(ctx context.Context) (RequestScope, bool)
 Outcomes: other tenant → `NOT_FOUND` (no existence oracle); same tenant outside the allowlist or
 missing scope → `PERMISSION_DENIED`; `deleting` → `FAILED_PRECONDITION` except `AllowDeleting`
 (N5). The interceptor also drops every detail of `engram.internal.errors.v1` before a response
-leaves the process (N128). *Test seam:* table tests over
-`(claims, method, catalog entry) → code`, and the cross-tenant matrix of §8 on gRPC, Connect and MCP.
+leaves the process (N128). The per-path split of `UpdateTenant` is gone: `UpdateTenant` (display name, config) is `tenant.admin`, `UpdateTenantLimits` (quotas, isolation, state) is `engram.operator`, so every method has one policy row and the interceptor stays the only enforcement point (A-6). *Test seam:* table tests over
+`(claims, method, catalog entry) → code` (the §8 policy table covers the worker scope, the cell claim and the operator's tenant methods), and the cross-tenant matrix of §8 on gRPC, Connect and MCP.
 
 #### 2.2.3 `internal/catalog` — control plane and resolver cache
 
 Owns the `engram_catalog` tables (D4) and the in-process `Resolver` (LRU 100 k, TTL 60 s, negative
 5 s, `LISTEN catalog_changes`; existing namespaces are served indefinitely while the catalog is
-unreachable, only misses fail `UNAVAILABLE` — F-21). The catalog database has **one synchronous standby**
-(`synchronous_commit = remote_apply`, N146): a commit a move step, a delete ack or an epoch bump observed survives a
-catalog failover, and a catalog restore from backup is followed by `engramctl catalog reconcile --from-shards` (after every catalog restore, N159) before it
-serves writes. *Pattern: Repository for the control plane,
+unreachable, only misses fail `UNAVAILABLE` — F-21). The catalog database has **one asynchronous hot
+standby** (N163): everything it arbitrates is also derivable from the shards' ownership rows, so **every promotion and
+every restore runs `engramctl catalog reconcile --from-shards` before the catalog serves writes**, and the one step that
+acts irreversibly on a catalog commit, the move's (c), first waits for the standby to replay that commit. *Pattern: Repository for the control plane,
 split by capability so no interface passes five methods; the Resolver is a read-through cache.*
 
 ```go
@@ -370,21 +378,19 @@ type NamespaceAdmin interface { // NamespaceService.ListNamespaces / UpdateNames
 	Update(ctx context.Context, ns id.NamespaceID, p NamespacePatch, etag string) (*Entry, error)
 }
 type Moves interface { // the move ledger: every transition is a CAS on the current state (five methods; the backup bookkeeping is MoveBackups)
-	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID) (*MoveRow, error)   // source_system_id, source_timeline_id, t_copy, w_plan recorded
-	Advance(ctx context.Context, m id.MoveID, from, to fsm.MoveState) error
+	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID, p PlanParams) (*MoveRow, error) // source_system_id, source_timeline_id, w_est_seconds, window_seconds recorded; refused when w_est > window or an unattended move exceeds 10 min (MovePrecondition{WINDOW_REQUIRED}, N160)
+	Advance(ctx context.Context, m id.MoveID, from, to fsm.MoveState) error              // stamps frozen_at and freeze_deadline = frozen_at + max(1.5 × w_est, w_est + 10 min), capped by window_seconds, on planned → frozen
 	Commit(ctx context.Context, p CommitParams) error                                   // (a″) CAS cutover → committed WHERE move_id, state = 'cutover' AND the verified source/target shards, epochs, timeline AND the catalog namespace row (source, e, frozen) (N143): THE point of no return; ErrLost if a rollback or restore won the row (N125) or any verified value changed
 	
 	Cutover(ctx context.Context, p CutoverParams) error                                 // step (d) only: shard, epoch, state, NOTIFY; success also when already (target, e + 1)
 	Rollback(ctx context.Context, m id.MoveID, reason string) error                     // CAS cutover → rolled_back (or any earlier state); ErrCommitted if (a″) won
 }
-type MoveBackups interface { // what Cleanup's gate reads (N143, N149)
-	RecordTargetBackup(ctx context.Context, m id.MoveID, startedAt, completedAt time.Time) error // sets target_backup_started_at / target_backup_at, only for a full backup that STARTED after activated_at and after the last timeline change
-	RecordTimeline(ctx context.Context, m id.MoveID, activated, changedAt *time.Time) error      // activated_timeline, target_timeline_changed_at, reconciled_in_at
-	RecordCleanupReconcile(ctx context.Context, m id.MoveID, at time.Time) error                  // cleanup_reconciled_at: the cleanup-time ReconcileIn completed (N159)
-	RecordContentCheck(ctx context.Context, m id.MoveID, c ContentCheck) error                    // source/target content rows + hash, target_content_checked_at; refused unless taken after target_backup_at (N159)
+type MoveBackups interface { // what Cleanup's gate reads (N161): activated_at + 24 h and a post-activation full target backup, nothing else
+	RecordTargetBackup(ctx context.Context, m id.MoveID, startedAt, completedAt time.Time) error // sets target_backup_started_at / target_backup_at, only for a FULL backup that STARTED after activated_at
+	CleanupGate(ctx context.Context, m id.MoveID, now time.Time) (CleanupGate, error)            // Open() reports the unmet condition (ErrGraceOpen | ErrBackupPending); the `done` CHECK repeats it
 }
-type Reconciler interface { // engramctl catalog reconcile --from-shards (N146)
-	FromShards(ctx context.Context, rows []OwnershipObservation) (*ReconcileReport, error) // the shards' ownership rows are the source of truth; raises each epoch to max over its shard rows
+type Reconciler interface { // engramctl catalog reconcile --from-shards: the first step of every catalog promotion and restore (N163)
+	FromShards(ctx context.Context, rows []OwnershipObservation) (*ReconcileReport, error) // the shards' ownership rows are the source of truth (a moved_out source with a hint ⇒ the move is at least committed; no target row and no moved_out source ⇒ rolled_back); raises each epoch to max over its shard rows
 }
 type MoveReader interface { // MoveService.GetMove / ListMoves
 	Get(ctx context.Context, m id.MoveID) (*MoveRow, error)
@@ -407,7 +413,7 @@ type Tenants interface { // tenants (admin surface)
 type TenantOps interface { // DELETE_TENANT lives in the catalog, derived from tenants.state / deleted_at (N127, N133d)
 	Operation(ctx context.Context, t id.TenantID, op id.OperationID) (*memoryv1.Operation, []*memoryv1.Operation /* per-namespace DELETE_NAMESPACE created so far */, error)
 }
-type ReplayFloor interface { // catalog.shards.replay_floor_mirror / replay_floor_effective: outside the restorable shard state (N134, N146)
+type ReplayFloor interface { // catalog.shards.replay_floor: outside the restorable shard state (N134, N163(4)); the effective floor is min(this, the _control/restores/ markers)
 	Get(ctx context.Context, s id.ShardID) (time.Time, error) // the catalog value; a replay takes min(this, intent.Log.RestoreFloor) so a catalog that lost the lowered floor cannot raise it
 	Lower(ctx context.Context, s id.ShardID, restoreTarget time.Time) (time.Time, error) // min(); there is NO method that raises it while intents are retained (35 days)
 }
@@ -424,7 +430,7 @@ replay floor, which restore and failover only lower (N134). `Entry`
 carries `embedding_model`/`embedding_dims` (`namespaces` columns) so no worker reads config for
 the vector space. `ResolverOptions` has `MaxEntries` 100 000, `TTL`, `NegativeTTL` and `StaleMax`
 (0 = unbounded). *Test seam:* a rapid
-state-machine test (plus `TestCatalog_FailoverKeepsCommitted`, `TestCatalog_ReconcileFromShards`) drives random `Plan/Advance/Commit/Cutover/Rollback` sequences against the move table
+state-machine test (plus `TestCatalog_PromotionRunsReconcile`, `TestCatalog_ReconcileDerivesRouting`, `TestMove_CutWaitsForReplicatedCommit`) drives random `Plan/Advance/Commit/Cutover/Rollback` sequences against the move table
 (no `cutover` without `frozen`; `Commit` and `Rollback` race on one row and exactly one wins; at most one
 active shard per namespace).
 
@@ -558,16 +564,17 @@ type DirectConn interface {
 	Cursors() CursorRepo                                                         // outbox_cursors: guarded UPDATE, gap watchlist
 	Close() error
 }
-// SubjectLocker (N150, N159) is the second interface the Store implementation satisfies (Store itself stays at five methods).
+// SubjectLocker (N150, N159, N162) is the second interface the Store implementation satisfies (Store itself stays at five methods).
 // Lock takes the SESSION-level subject lock pg_advisory_lock(engram_subject_lock_key(ns, subject)) on a dedicated direct
-// connection (a small pool: 2 per API process per shard, so ≈ 57 of max_connections 100 with N155's ≈ 53), with lock_timeout
-// 3 s and one attempt (refusal → retryable UNAVAILABLE). The marker writer holds the lease from before its marker transaction
-// until the intent put and the marker re-read are done; Release is called on every exit path and a crashed handler's lease
-// dies with its connection. The lease is outside the pgbouncer pool, because session locks do not survive transaction pooling.
+// connection of the `engram_subject` alias (2 per API process per shard, a role holding only pg_advisory_lock on the subject
+// key space; ≈ 57 of max_connections 100 with N164's table). The lease is taken with pg_try_advisory_lock polled every 50 ms
+// for at most 3 s, so one blocked lease never holds a slot; pool exhaustion is an immediate retryable UNAVAILABLE. The marker
+// writer holds the lease from before its marker transaction until the intent put and the marker re-read are done; Release is
+// called on every exit path and a crashed handler's lease dies with its connection (tcp_user_timeout 30 s). The lease is outside
+// the pgbouncer pool, because session locks do not survive transaction pooling.
 type SubjectLocker interface {
-	Lock(ctx context.Context, ns id.NamespaceID, subject string) (SubjectLease, error)
+	Lock(ctx context.Context, ns id.NamespaceID, subject id.Subject) (SubjectLease, error)
 }
-type ContentCheck struct { SourceRows, TargetRows int64; SourceHash, TargetHash []byte; CheckedAt time.Time } // N159: insert-only rows with ins_seq < w_final, less target-tombstoned documents
 type SubjectLease interface {
 	Latest(ctx context.Context) (DeletionRecord, bool, error) // the subject's last deletion_log entry of either kind, read while the lease is held (help-previous input)
 	Release()
@@ -577,8 +584,10 @@ type Stores interface { For(s id.ShardID) (Store, bool); Local() []id.ShardID }
 
 // ReadSession is the scope of one request on one shard. It holds no connection; every Tx opens its own, so arms
 // that run concurrently (N54) never share one (a pgx connection executes one statement at a time). A semaphore shared
-// by the process admits at most 16 concurrent arm transactions per shard (N155; pool 20 per process, `engram_app`
-// pgbouncer pool 40 with recall ≤ 32); TestReadSession_ConcurrentArms asserts the bound and ≤ 320 connection-ms per MID recall.
+// by the process admits at most 32 concurrent arm transactions per shard (N155, N164: the `engram_app` pgbouncer recall pool
+// is 32 and API-only, the worker has its own `engram_worker` pool of 8), and a second semaphore of 4 inside it admits the
+// filtered arms (E ≥ θ) so they cannot take more than a quarter of the pool; TestReadSession_ConcurrentArms asserts both
+// bounds and ≤ 320 connection-ms per MID recall.
 type ReadSession interface {
 	Scope() id.Scope
 	// Tx runs fn in ONE short READ transaction on its own pooled connection: SET LOCAL scope GUCs, the read fence
@@ -687,7 +696,7 @@ type FactReader interface {
 }
 type FactLister interface { List(ctx context.Context, q MemoryQuery) ([]Fact, string, error) } // structural filters, no ranking; an invalidated fact is listed only on request
 type GraphReader interface {
-	Neighbours(ctx context.Context, seeds []id.FactID, kinds []LinkKind, limit int, f Filter) ([]Link, error) // BOTH endpoints must be visible (N116)
+	Hop(ctx context.Context, frontier []id.FactID, kinds []LinkKind, perNode int, f Filter) ([]Link, error) // ONE statement per hop (N165): UNION ALL of `src_memory_id = ANY (frontier)` on the PK and `dst_memory_id = ANY (frontier)` on fact_links_reverse_idx (causal edges forward only), both Index Only Scans; ordered and limited per frontier node BEFORE the facts visibility join, which requires BOTH endpoints visible (N116)
 	Similar(ctx context.Context, name, typ string, min float32) ([]EntityCandidate, error)                  // via engram_entity_fuzzy (SECURITY DEFINER, N131)
 }
 ```
@@ -698,16 +707,16 @@ type GraphReader interface {
 type Markers interface {
 		TombstoneDocument(ctx context.Context, t DocumentTombstone) (DeletionRecord, error)                       // document_tombstones 'pending' covering (document, t.UpToVersion = highest version assigned, N133c); event_seq is NULL until the final statement, WITH s AS (INSERT INTO outbox … RETURNING seq) UPDATE document_tombstones SET event_seq = s.seq (A-10)
 	TombstoneChunks(ctx context.Context, reason ChunkReason, cs []id.ChunkID) error                            // 'replace' | 'reextract'
-	Hide(ctx context.Context, f id.FactID, cause HideCause, reason string) (rec DeletionRecord, changed bool, err error) // fact_hidden keyed (memory_id, cause), no FK to facts (N145): 'invalidate' | 'reextract'; under the subject lock that the caller holds until its intent is put (engram_subject_lock_key(ns, memory_id::text), SubjectLocker, N150, N159) it also hides the same-content twin (rec.MemoryIDs); a second invalidate is changed = false and a success (N139), but it still inserts its own deletion_log row (N143)
-	Unhide(ctx context.Context, f id.FactID) (rec DeletionRecord, changed bool, err error)                    // deletes the 'invalidate' row(s) only, the twin's too; a 'reextract' row is never touched (N135); works after the fact's own purge (N145)
+	Hide(ctx context.Context, f id.FactID, cause HideCause, reason string) (rec DeletionRecord, changed bool, err error) // fact_hidden keyed (memory_id, cause), no FK to facts (N145): 'invalidate' | 'reextract'; for 'invalidate', under the subject lock of (document_id, content_hash) that the caller holds until its intent is put (SubjectLocker, N150, N159, N162) it hides EVERY live fact of the subject, each stamped invalidation_op = the operation id (rec.MemoryIDs); a second invalidate is changed = false and a success (N139), but it still inserts its own deletion_log row (N143)
+	Unhide(ctx context.Context, f id.FactID) (rec DeletionRecord, changed bool, err error)                    // resolves I = fact_hidden(f).invalidation_op and deletes fact_hidden WHERE invalidation_op = I and the derived_hidden rows of those ids (N162); a 'reextract' row is never touched (N135); works after the fact's own purge (N145), NOT_FOUND{DOCUMENT_DELETED} after its document's purge
 	Expunge() ExpungeRepo                                                                                      // expunge_progress, derived_hidden, consumer-cursor check
 }
 // Every marker method also inserts the shard-local deletion_log row in the same transaction and returns the marker's exact
-// effect as a DeletionRecord{Subject, Operation, Prev, DeletedAt, UpToVersion, MemoryIDs}: Prev is the subject's last deletion_log
-// entry read under the document lock (the chain predecessor, N122). The intent object is built from that record.
+// effect as a DeletionRecord{Subject, Operation, Prev, DeletedAt, UpToVersion, MemoryIDs}: Subject is the typed id.Subject and Prev
+// the subject's chain tip read BY ins_seq under the subject lock (never deleted_at; the predecessor, N122, N162). The intent object is built from that record.
 type MarkerReader interface {
 	Sets(ctx context.Context) (MarkerSets, error)  // doc_tomb and doc_pending ({document → up_to_version}, N133c) and chunk_tomb: two indexed selects, bounded by expunge lag (N116). fact_hidden is NOT in the set: every arm tests it per candidate by primary-key anti-join
-	Curation(ctx context.Context, doc id.DocumentID, hash [32]byte) (CurationState, error) // last action for a twin, re-applied at CommitChunk
+	Curation(ctx context.Context, doc id.DocumentID, hash [32]byte) (CurationState, error) // last action for the subject (document_id, content_hash) with its invalidation_op, re-applied at CommitChunk; a later restore row suppresses the re-application (N162)
 }
 type Derived interface {
 		Observations() ObservationRepo; Pages() PageRepo; Consolidation() ConsolidationRepo // Served lives on the read side (DerivedReader)
@@ -762,7 +771,7 @@ explicit document, namespace or tenant delete under the admin role (§5.4.2), ne
 
 **Locks.** The per-document lock is `DocumentWriter.Lock` (shared try-lock for `CommitChunk`, exclusive
 for `FinalizeVersion` and the delete marker transaction: one 35 s attempt), the derivation lock is on
-`Derived`, the **subject lock** `engram_subject_lock_key(ns, subject_id)` (one-argument, seed 2; `store.SubjectLocker`, session level on a dedicated direct connection, `lock_timeout` 3 s, held by the marker writers from before the marker transaction until the intent put and the marker re-read, N150, N159), the exclusive fence on `AdminTx.Ownership().FenceExclusive` (`Freeze`, delete freeze, restore:
+`Derived`, the **subject lock** `engram_subject_lock_key(ns, subject)` (subject encoded `class:key`, N162; one-argument, seed 2; `store.SubjectLocker`, session level on a dedicated direct connection of the `engram_subject` alias, polled `pg_try_advisory_lock` for ≤ 3 s, held by the marker writers from before the marker transaction until the intent put and the marker re-read, N150, N159), the exclusive fence on `AdminTx.Ownership().FenceExclusive` (`Freeze`, delete freeze, restore:
 one 35 s attempt). Key spaces are disjoint (N113): namespace fence, derivation lock, document lock, subject lock.
 
 Roles: `engram_app` (API and worker alike; there is no worker role) runs `lock_timeout = 2 s`, `engram_move` and `engram_admin`
@@ -807,16 +816,21 @@ type Applier interface { Apply(ctx context.Context, events []*eventsv1.Event) er
 the eligible rows `E` (`engram_eligible_facts`): the sum over the current versions of `Filter.AllowedDocs` of
 `document_versions.fact_count_by_type[requested types]` (written at `FinalizeVersion`), minus the namespace's hidden
 fraction from `namespace_stats`; under `AsOf` the per-namespace monthly `mentioned_at` histogram. **Below θ**
-(starts at **50 k**, fixed by M0.6 in [20 k, 100 k] from the measured crossover) the arm runs the **exact path**,
+(starts at **10 k**, fixed by M0.6 in [5 k, 20 k] from the measured crossover; an exact arm at θ costs ≈ 42 k buffers and ≈ 65 ms warm, ≈ 4.2 buffers and 6.6 µs per eligible row, N164) the arm runs the **exact path**,
 driven from `facts_doc_idx` or `facts_mentioned_idx`, joined to the vector table by primary key, the distance in a
 `MATERIALIZED` CTE over the eligible rows and ordered outside it, `LIMIT cap`. **At or above θ** it uses the
 namespace's own **partial HNSW** (built by the index runner; `plan_cache_mode = force_custom_plan`, `ef_search` = the
 arm cap) as an iterative scan with `hnsw.max_scan_tuples = max(20 000, min(4 × ef_search / s, 100 000))`, never
 below pgvector's default, and `SET LOCAL enable_bitmapscan = off, enable_sort = off`; if the scan exhausts with fewer
 than `cap` rows and `E ≤ 4 θ`, **the arm re-runs the exact path in the same transaction** (bounded cost: HNSW cap plus
-exact(E)); only above `4 θ` does it return what it has with `RecallStats.partial`. `$allowed_docs` is passed as one
-array constant up to **500** documents and as `document_id IN (SELECT unnest($1))` above (namespace and model stay
-constants for the partial-index proof). The observation arm has its own estimate (`namespace_stats.observations_by_tag`)
+exact(E)); only above `4 θ` does it return what it has with `RecallStats.partial`. On the
+**HNSW path** `$allowed_docs` is always `document_id = ANY ($1)` with the array as a custom-plan constant (a hashed
+`ScalarArrayOp` inside the index scan; planning 5–13 ms at 1–5 k documents, accepted; M0.6's `EXPLAIN` pins require no
+`Nested Loop Semi Join` and no `Join Filter` on `document_id`); on the **exact path** the 500-document rule applies:
+one array constant up to 500 documents and `document_id IN (SELECT unnest($1))` above, which is correct there (namespace and model stay
+constants for the partial-index proof). **Filtered arms are their own class** (N164): a recall with any vector arm at
+`E ≥ θ` is counted as filtered (`RecallStats.filtered`), has p95 ≤ 1 s and passes the second arm semaphore (4 per API process per
+shard). The observation arm has its own estimate (`namespace_stats.observations_by_tag`)
 and tests tags inside the scan (`observation_version_vectors.obs_tags`, copied at insert); the chunk arm uses the fact
 estimate of its documents. A namespace below 2,000 vectors has no index and always takes the exact path. The arm's
 transaction forbids a partition scan (`enable_seqscan = off`, no parallel workers). One index per namespace and model;
@@ -826,15 +840,19 @@ failed`, with a lease); it refuses to start a build while a *client* backend's `
 (autovacuum, `VACUUM` and walsenders are excluded; `IndexRunnerStarved` alerts after 30 min of refusals), serialises
 builds per shard (`maintenance_work_mem = 2.4 KB × vectors`, ≤ 5 GB), checks `pg_index.indisvalid` and drops an
 invalid index first, and drops by the deterministic `engram_hnsw_ddl` names. **The partition is the hygiene unit
-(N152):** a touched HNSW is due at `purged_since_build ≥ max(1 % × rows_at_build, 2,000)`; when any index on a vector
-partition is due, the runner rebuilds every HNSW on it with `purged_since_build > 0` (`engram_hnsw_ddl(…, 'rebuild')` =
-`REINDEX INDEX CONCURRENTLY` after dropping `_ccnew*` leftovers; `engram_index_partition_hygiene`) and only then runs
-one `VACUUM (INDEX_CLEANUP ON)` of the partition. It serves a move target's requests at priority (N153). Neither
+(N152, N166):** a touched HNSW is due at `purged_since_build ≥ max(1 % × rows_at_build, 2,000)`; when any index on a vector
+partition is due, the runner rebuilds the neighbour graph of an index only when its `purged_since_build ≥ 0.05 % × rows_at_build`
+(≥ 50 elements; below that the partition vacuum repairs it) with `engram_hnsw_ddl(…, 'rebuild')` =
+`REINDEX INDEX CONCURRENTLY` after dropping `_ccnew*` leftovers (`engram_index_partition_hygiene`), and only then runs
+one `VACUUM (INDEX_CLEANUP ON)` of the partition. A rebuild writes its graph in one burst, so the runner starts one only while archive
+lag is under 30 s and `pg_wal` headroom is at least twice the expected burst, and holds a per-partition advisory key exclusively
+from selection until the `VACUUM` has started (purge batches take it shared with a try-lock and skip the partition meanwhile).
+It serves a move target's requests at priority (N160). Neither
 `engram-api` nor `engram-worker` runs DDL. Under `Filter.AsOf` a chunk hit's header is empty. Tag semantics exist once
 (`index/tags.go`, mirrored by the Lean decision procedure). *Test seam:* the same retrieval golden set on all
 implementations; `as_of` and visibility leakage tests assert zero hidden or future hits per arm; `TestRecall_FilteredArm`
 (topic-correlated filters at 1, 2, 5, 10 and 20 % eligible) checks `min(cap, |visible|)` with `partial = false` below
-`4 θ` on the real image; `TestIndex_Hygiene` (three namespaces purged at 0.2, 1 and 0 %).
+`4 θ` on the real image and runs at 5,000 allowed documents; `TestIndex_Hygiene` (three namespaces purged at 0.2, 1 and 0 %, a 1 M neighbour touched once and not rebuilt, a purge during the rebuild set skipped).
 
 #### 2.2.9 `internal/chunk` — heading-anchored content-defined chunker
 
@@ -972,18 +990,18 @@ type Planner interface  { Recall(ctx context.Context, q *Query, sink Sink) error
 //   Fuse → Rerank → Boost → Pack → Stream      (each of the last five is a pipeline.Step[*State])
 ```
 
-`Booster` (`Boost`, recency ≤ +10 %, temporal ≤ +10 %, proof ≤ +5 %, clamp [0.75, 1.25]) and `Sink`
-(`Batch`, `Stats`) are the two remaining one-method interfaces. Scheduling (§1.5, N54):
+`Booster` (`Boost`, recency ≤ +10 %, temporal ≤ +10 %, proof ≤ +5 %, clamp [0.75, 1.25]) is a one-method
+interface and `Sink` has two (`Batch`, `Stats`). Scheduling (§1.5, N54):
 `NeedsNone` arms start as soon as `visibility` is done and overlap the embedding round-trip, `NeedsVector` arms when the
 embedding arrives, the graph arm in two waves of 30 ms from the lexical and semantic top-20. Every
 other arm gets `min(ArmDeadline, remaining − rerankReserve − packReserve)`. **Rerank is skipped when
 the remaining deadline is below 106 ms** (= rerank p95 90 + pack 3 + stream 5 + 8, N106); at client
 deadlines ≥ 300 ms a skip counts against the rerank-skip SLO (N53), below 300 ms it is by design. The
-critical path is 220 ms p95 at MID (216 ms of stages plus a ≤ 4 ms pool-wait term, N54, N155). While markers are `pending` the observation and page arms pay a
+critical path is 224 ms p95 at MID (216 ms of stages plus a ≤ 8 ms pool-wait term, N54, N164). The graph arm is driven from Go, **one statement per hop** in the arm's read transaction (a cut at the sub-budget keeps the completed hops); the HIGH graph arm (1,000 nodes, 2 hops) has an explicit 100 ms sub-budget (N165). Filtered arms are a separate class with their own SLO and semaphore (N164). While markers are `pending` the observation and page arms pay a
 per-candidate lookup and the skip SLO is suspended for the namespace (N119). Under `as_of` the chunk
 arm adds `embedding_effective_at ≤ T`, headers are empty, entity names are suppressed; the version served
 for an observation or page is the one current at `T`, or nothing when it is hidden (N117). *Test seam:* rapid properties mirror the Lean theorems (RRF permutation invariance, packing
-within budget, boost in [0.75, 1.25]); a fake-clock test asserts the 220 ms path and the 106 ms
+within budget, boost in [0.75, 1.25]); a fake-clock test asserts the 224 ms path and the 106 ms
 reserve; leakage tests assert nothing hidden or future in any arm.
 
 #### 2.2.14 `internal/consolidate` — facts → observations (two stages)
@@ -1072,6 +1090,7 @@ package pages
 
 type Reader interface {
 		Get(ctx context.Context, sc id.Scope, c id.Caller, p id.PageID, sel VersionSelector) (*Page, string /*markdown*/, error) // PAGE_HIDDEN when hidden; reads through store.ReadTx.Derived() (N157)
+	ByName(ctx context.Context, sc id.Scope, c id.Caller, name string, sel VersionSelector) (*Page, string /*markdown*/, error) // GetPage by name (A-3)
 	List(ctx context.Context, sc id.Scope, c id.Caller, q ListQuery) ([]Page, string, error)
 	Search(ctx context.Context, sc id.Scope, c id.Caller, q SearchQuery) ([]PageHit, string, error) // BM25 over page_versions.text ∪ HNSW over page_version_vectors, visible versions, RRF, no LLM (N73, N139)
 }
@@ -1220,9 +1239,9 @@ after the watch window.
 
 #### 2.2.19 `internal/move` — namespace move saga (D5)
 
-The D5 protocol as Temporal workflow `move/{ns}/{epoch}` on `shard-{target}` (N2): **dirty copy →
-pre-freeze verification → freeze → reconcile by insertion sequence → cutover with a `ready` state and a
-catalog CAS** (N124, N125, N137). *Pattern: **Saga** with a **state machine** — every step is idempotent,
+The D5 protocol as Temporal workflow `move/{ns}/{epoch}` on `shard-{target}` (N2): **freeze, then copy every table
+from the static source, verify by equality, build the indexes under the freeze, then cut over with a `ready` state and a
+catalog CAS** (N160, N161, N125). *Pattern: **Saga** with a **state machine** — every step is idempotent,
 every step before the catalog CAS (a″) has a compensation, and (a″) is the point of no return. It is the only
 code path that holds two shard handles.*
 
@@ -1232,63 +1251,59 @@ package move
 type Fence struct { Ns id.NamespaceID; Tenant id.TenantID; Source, Target id.ShardID; Epoch id.Epoch /* e; the target holds e+1 */; Move id.MoveID
 	SrcRow, DstRow OwnershipRow /* the exact source and target namespace_ownership rows the activity VERIFIED (state, freeze_reason, epoch, move_id, target hint) */ }
 
-// Every floor a move uses (F_copy, F_c, F_pre) and the sequence values W_plan and W_final are SOURCE values passed as numbers;
-// engram_seq_floor is never evaluated on the target, and the target's sequence is advanced past the source's at Plan and
-// at ReadyTarget with engram_seq_advance (N147).
+// The source is static from Freeze to thaw or cleanup, so no floor, catch-up or merge exists: the target's sequence is advanced
+// past the source's final value W_final ONCE, at the start of FrozenCopy (N147, N160).
 // Activities are split by phase so each interface stays small (≤ 5 methods). Every activity first re-checks the fence
 // against the catalog row and both ownership rows and the source session's system_identifier/timeline (MoveFenced).
 // Every STEP, including the catalog CAS, is then a compare-and-set on the exact rows it verified (N143, ShardMove_UnfencedSteps):
 // each ownership edge is `UPDATE namespace_ownership … WHERE namespace_id AND state, freeze_reason, epoch, move_id = <the verified values>`,
 // and Moves.Commit adds the verified source/target shards, epochs and timeline to its WHERE; zero rows = MoveFenced, the step stops (TestMove_CatalogCAS).
 type Copier interface {
-	Plan(ctx context.Context, f Fence) (*PlanResult, error)         // plan_target / start_move edges; records system_id, timeline, t_copy; pauses expunge and schedulers
-	BulkCopy(ctx context.Context, f Fence) (*CopyResult, error)     // READ COMMITTED key ranges ≤ 100 k rows; resumable at (table, last_key); the three table classes of N137
-		PreVerify(ctx context.Context, f Fence) (*workflowv1.PreVerifyReport, error) // namespace still active; COPIES FIRST: t_c and F_c = engram_seq_floor(t_c) on the source, catch-up of ins_seq ≥ F_copy, THEN counts, hashes, VerifyFK, blobs below the closed F_c on both sides (F_c passed as a number); one more round on a mismatch (N148)
-	AwaitIndexes(ctx context.Context, f Fence) (*workflowv1.AwaitIndexesReport, error) // after PreVerify, before Freeze: request the target's partial indexes and wait until each is ready (rows_at_build ≥ 0.99 × verified; a failed build retries once) (N153)
+	Plan(ctx context.Context, f Fence) (*PlanResult, error)               // plan_target / start_move edges; records system_id, timeline, W_est; pauses expunge and schedulers; blob pre-warm (the only pre-freeze work)
+	FrozenCopy(ctx context.Context, f Fence) (*CopyResult, error)         // engram_seq_advance(W_final) once, then every table of all three classes by PK ranges ≤ 100 k rows, 4 streams, WAL-paced; resumable at (table, last_key)
+	VerifyFrozen(ctx context.Context, f Fence) (*workflowv1.VerifyFrozenReport, error) // count + PK hash per table over the whole namespace on both sides, VerifyFK, blob existence; one re-copy of mismatching tables, then MoveVerifyFailed
+	BuildIndexes(ctx context.Context, f Fence) (*workflowv1.BuildIndexesReport, error) // under the freeze: request the target's partial indexes, wait for engram_move_indexes_valid (indisvalid ∧ indisready); a failed build retries once
+	AwaitConsumers(ctx context.Context, f Fence) error                    // every source outbox consumer cursor past the namespace's final max(seq), bound 120 s
 }
 type Freezer interface {
-	Freeze(ctx context.Context, f Fence) error                      // exclusive fence, one 35 s attempt, freeze_move edge; watchdog armed until (a″)
-	Reconcile(ctx context.Context, f Fence) (*workflowv1.ReconcileReport, error) // re-copy ins_seq ≥ engram_seq_floor(T_pre); mutable merge-diff; excluded count ≤; blobs; relay drain 120 s; VerifyFK on the range
-	Drain(ctx context.Context, f Fence) (*DrainResult, error)       // in-flight set read from the source operations rows, backfill parents included (N97, C-20)
+	Freeze(ctx context.Context, f Fence) (deadline time.Time, err error)  // exclusive fence, one 35 s attempt, freeze_move edge; returns the freeze deadline the workflow arms as a timer until (a″)
+	Drain(ctx context.Context, f Fence) (*DrainResult, error)             // in-flight set read from the static source operations rows, backfill parents included (N97, C-20)
 }
 type Cutover interface {
 	Begin(ctx context.Context, f Fence) error          // (a) intent only
-		ReadyTarget(ctx context.Context, f Fence) error    // (b′) ready_target; preconditions: engram_seq_advance(W_final) done, engram_move_indexes_ready (the ownership trigger refuses `ready` without it) (N147, N153)
-	Commit(ctx context.Context, f Fence) error         // (a″) catalog Moves.Commit: CAS cutover → committed on the VERIFIED source/target rows (f.SrcRow, f.DstRow, timeline) — THE point of no return; the mover re-checks its timeline first
+	ReadyTarget(ctx context.Context, f Fence) error    // (b′) ready_target; the ownership trigger refuses `ready` unless engram_move_indexes_valid and last_value > w_final (N147, N160)
+	Commit(ctx context.Context, f Fence) error         // (a″) catalog Moves.Commit: CAS cutover → committed on the VERIFIED source/target rows — THE point of no return; then waits until the catalog standby's replay_lsn passed the commit LSN (≤ 10 s per attempt, N163)
 }
-type Handover interface { // only after Commit returned (the mover read `committed`)
+type Handover interface { // only after Commit returned (the mover read `committed`, replicated)
 	Source(ctx context.Context, f Fence) error         // (c) cutover_c: frozen/move → moved_out + target hint
-	ActivateTarget(ctx context.Context, f Fence) error // (b″) activate_target, retried indefinitely
+	ActivateTarget(ctx context.Context, f Fence) error // (b″) activate_target, retried indefinitely; stamps activated_at
 	Catalog(ctx context.Context, f Fence) error        // (d) shard, epoch, state, NOTIFY — retried indefinitely
 }
 type Closer interface {
 	Restart(ctx context.Context, f Fence, d *DrainResult) error // ns/{ns}/op/{op} on shard-{target}, TERMINATE_IF_RUNNING, memo epoch e+1; singleton-backed kinds (DELETE_DOCUMENT, CONSOLIDATE, REFRESH_PAGE) by SignalWithStart; reconcile loop
-		Cleanup(ctx context.Context, f Fence) error                  // after 24 h AND the N159 gate: a cleanup-time ReconcileIn (cleanup_reconciled_at), a full target backup STARTED after it and after activation, the content check (count + hash of the source's insert-only rows below w_final, less target-tombstoned documents, equal on the target, taken after the backup completed) and the timeline check (target_timeline_changed_at ≤ cleanup_reconciled_at); else ErrBackupPending / ErrGateOpen, retried (N143, N149, N159): DROP INDEX by name, engram_cleanup_namespace, the moved-out ROWS; the source blob prefix only after the 28-day window; the moved_out row stays
-		Rollback(ctx context.Context, f Fence, why string) error     // only before (a″): wins the cutover → rolled_back CAS first; see the table
-	ReconcileIn(ctx context.Context, f Fence) (*workflowv1.ReconcileInReport, error) // restore/failover of the TARGET after (a″), and once more at cleanup time (N159): FIRST engram_seq_advance(W_final) whenever the move is committed/cleaning (also when every row is present), then from the static source, INSERT … ON CONFLICT DO NOTHING of ins_seq ≥ F_pre and the mutable class, await indexes, intent replay, then admin edges incoming → ready → active (N149)
+	Cleanup(ctx context.Context, f Fence) error                 // the worker activity that DRIVES the batches once the gate holds (N161): DROP INDEX by name, engram_cleanup_namespace on the source, the moved-out ROWS; then the CleanupMove RPC records done; the source blob prefix only after the 28-day window; the moved_out row stays
+	Rollback(ctx context.Context, f Fence, why string) error   // only before (a″): wins the cutover → rolled_back CAS first; run by the workflow at the freeze deadline (MoveWindowExceeded); see the table
+	Rerun(ctx context.Context, f Fence) (*RerunResult, error)  // the TARGET restored to a point before activation (restored row incoming/ready): wipe it (engram_cleanup_namespace, drop indexes, rerun_move), then FrozenCopy, VerifyFrozen, BuildIndexes from the retained moved_out source, then reconcile_in (incoming → ready → active) and the intent replay (N161); never a merge
 }
-type Orchestrator interface { // MoveService
-	Start(ctx context.Context, ns id.NamespaceID, target id.ShardID, o StartOptions) (*Ref, error)
+type Orchestrator interface { // MoveService (api imports move, N157)
+	Start(ctx context.Context, ns id.NamespaceID, target id.ShardID, o StartOptions) (*Ref, error) // o.EstimateOnly returns Ref.WindowEstimate without planning
 	Status(ctx context.Context, m id.MoveID) (*Status, error)
 	Abort(ctx context.Context, m id.MoveID) error // rollback before (a″), else an error
+	Cleanup(ctx context.Context, m id.MoveID, o CleanupOptions) (*CleanupResult, error) // MoveService.CleanupMove: checks the N161 gate on the catalog row (catalog.MoveBackups.CleanupGate), refuses with FAILED_PRECONDITION until it holds, records `done` and blob_gc_after; the Closer.Cleanup activity drives the row batches (N167, A-3)
 }
 ```
 
 | Step | Compensation (what `Rollback` runs when this step has completed) |
 |---|---|
-| `Plan` | `rollback_target` (delete the target rows and ownership row; for a move back onto a `moved_out` shard `return_abort` restores the permanent fence value); `abort_move` on the source |
-| `BulkCopy`, `PreVerify`, `Reconcile` | the same (copied rows and indexes are discarded) |
+| `Plan` | `rollback_target` (delete the target rows and ownership row; for a move back onto a `moved_out` shard `return_abort` restores the permanent fence value); `abort_move` on the source; the pre-warmed blob prefix is deleted in the background |
 | `Freeze` | `thaw_move` first (allowed while the target is unreachable), then the above |
+| `Drain`, `FrozenCopy`, `VerifyFrozen`, `BuildIndexes`, `AwaitConsumers` | the same (copied rows and indexes are discarded; the workflows recorded by `Drain` restart on the source queue) |
 | `ReadyTarget` (b′), `Begin` (a) | the CAS `cutover → rolled_back`, `unready_target` (at next contact if the target is down), then `thaw_move` and the above |
 | `Commit` (a″) onward | none: the move completes forward (by the mover or by the restore reconcile); a reverse move is an ordinary new move |
 
-`catalog.MoveBackups` records the backup and timeline facts `Cleanup` reads; a source restored before cleanup re-runs `engram_cleanup_namespace` for `moved_out` rows of a move past `committed` (`restore cleanup-moved-out`). `StartOptions` carries `DrainWait` (15 s, max 60 s), `FreezeWatchdog(liveFacts)` (`max(120 s, 60 s + 1 s per
-10 k facts)`, ≤ 15 min), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h (source cleanup also waits for the content + timeline gate and a cleanup-time `ReconcileIn`, N143, N159), `SourceBlobGrace` 28 d and the
-cutover retry (100 ms ×1.5 → 1 s within 60 s; (b″) and (d) unlimited). *Test seam:* a model-based test from
-`ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: concurrent retain, consolidate and delete during the
-copy, rows inserted under old ids and mutable rows deleted on the source (`TestMove_ActiveBacklog`), a row committed
-between the last range copy and `Freeze`, rollback from every step before (a″), a restore racing `Commit` for the
-same row, a zombie primary with a stale timeline; a chaos test kills the worker in every phase and between (a″)
+`catalog.MoveBackups` records the backup facts the cleanup gate reads; a source restored before cleanup re-runs `engram_cleanup_namespace` for `moved_out` rows of a move past `committed` (`restore cleanup-moved-out`). `StartOptions` carries `Window` (default and maximum 4 h; required above `W_est` of 10 min unless the caller is the rebalancer, which starts a move unattended only at `W_est ≤ 10 min`), `FreezeNotBefore`, `EstimateOnly`, `DrainWait` (15 s, max 60 s), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h, `SourceBlobGrace` 28 d and the cutover retry (100 ms ×1.5 → 1 s within 60 s; (b″) and (d) unlimited). `W_est = rows / R_copy + vectors / R_build + verify + blob delta` with the planning rates `R_copy` ≈ 1,000 facts/s and `R_build` ≈ 3,000 vectors/s (≈ 25 min per 1 M live facts; M1.5 replaces them with measurements); the freeze deadline is `frozen_at + max(1.5 × W_est, W_est + 10 min)`, capped by the window. *Test seam:* a model-based test from
+`ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: writers refused `NamespaceFrozen` and resumed on the target with no pre-freeze row lost or duplicated (`TestMove_FrozenWindow`), a dropped range detected and re-copied once (`TestMove_VerifyCatchesFault`), rollback at the deadline with the source thawed and the target empty (`TestMove_WindowExceeded`), rollback from every step before (a″), a restore racing `Commit` for the
+same row, a zombie primary with a stale timeline, `(c)` waiting for the replicated commit (`TestMove_CutWaitsForReplicatedCommit`), a target restored before activation re-copied once with no duplicate and no resurrected delete (`TestMove_TargetRestoredBeforeActivation`), after activation restored ordinarily (`TestMove_TargetRestoredAfterActivation`), cleanup refused until a post-activation backup exists (`TestMove_CleanupWaitsForPostActivationBackup`); a chaos test kills the worker in every phase and between (a″)
 and (b″) (`TestMove_FailoverBetweenCAndD`).
 
 #### 2.2.20 `internal/export` — snapshots for local agentic search (phase 3)
@@ -1312,7 +1327,10 @@ type Streamer interface {
 		Latest(ctx context.Context, sh Shard, sc id.Scope) (*Manifest, error)
 	Overlay(ctx context.Context, sh Shard, sc id.Scope, page string) (*Overlay, error)       // GetSnapshotManifest's live hidden_overlay, computed with the READ PREDICATE (segment test over fact_hidden(invalidate) and open tombstones), markers newer than the manifest as_of plus Restores, with root_version (N126, N145)
 }
-type SnapshotLister interface { List(ctx context.Context, sh Shard, sc id.Scope, q SnapshotQuery) ([]Manifest, string, error) } // ExportService.ListSnapshots
+type SnapshotLister interface {
+	List(ctx context.Context, sh Shard, sc id.Scope, q SnapshotQuery) ([]Manifest, string, error) // ExportService.ListSnapshots
+	Manifest(ctx context.Context, sh Shard, sc id.Scope, v id.SnapshotVersion) (*Manifest, error)  // GetSnapshotManifest(version ≠ 0), with expired_reason (A-3, A-11)
+}
 ```
 
 The delete marker transaction expires `building` and `ready` snapshots alike
@@ -1389,16 +1407,18 @@ replace or append retire (N104).
 
 Per-namespace endpoints `/mcp/{tenant_id}/{namespace_id}`; tools generated from `memory.v1` at build
 time (`protoc-gen-engram-mcp`) through the checked-in allow-list `adapters/mcp/allow.txt`, so the surface cannot drift from the
-API (§4.6 lists the full generated set with gates, the omitted tools are in the `omit:` list and the §12 non-goal row; N157). *Pattern: **Adapter** over a gRPC *client* of the core — it holds no service and no storage, so it
+API (§4.6 lists the closed set: ten hand-tuned tools, the generated table, and the `omit:` list, which now names `ListNamespaces` and `OperationService.GetOperation`, the latter exposed as the generated `get_operation_status` so that it does not collide with the hand-tuned `get_operation` = `WaitOperation`; N157, N167). *Pattern: **Adapter** over a gRPC *client* of the core — it holds no service and no storage, so it
 cannot bypass the interceptor.*
 
 ```go
 package mcp
 
 type Tool struct { Name, Method string; InputSchema json.RawMessage; Scope authz.Scope; Streaming bool } // generated
-type CoreClient interface { Memory() memoryv1.MemoryServiceClient; Document() memoryv1.DocumentServiceClient; Page() memoryv1.PageServiceClient; Operation() memoryv1.OperationServiceClient }
+// The core clients, split so each interface stays within five methods and every generated tool has a client to call through (A-5):
+type DataClients interface { Memory() memoryv1.MemoryServiceClient; Document() memoryv1.DocumentServiceClient; Page() memoryv1.PageServiceClient; Operation() memoryv1.OperationServiceClient }
+type AdminClients interface { Namespace() memoryv1.NamespaceServiceClient; Export() memoryv1.ExportServiceClient } // get_namespace, get_effective_config, create_snapshot, get_snapshot_manifest, list_snapshots
 type Adapter interface { Tools() []Tool; Handler() http.Handler } // streamable HTTP; the JWT is forwarded unchanged
-func New(core CoreClient, tools []Tool, v authz.TokenVerifier, o Options) Adapter
+func New(d DataClients, a AdminClients, tools []Tool, v authz.TokenVerifier, o Options) Adapter
 ```
 
 The adapter validates the token with the same `TokenVerifier` before listing tools and serves
@@ -1419,10 +1439,10 @@ implementation, no second annotation layer.* Rejected: grpc-gateway.
 | Command | Does |
 |---|---|
 | `shard provision / migrate / activate / full / drain / readonly / retire` | creates DB, roles (`engram_migrate`, `engram_app`, `engram_relay`, `engram_move`, `engram_admin`), extensions, partitions, RLS; goose rollout with `--canary`; catalog state changes |
-| `index [--shard 7]` | the **index runner** daemon (N138): the one process that holds `engram_migrate`; executes `vector_indexes` requests (`requested → building → ready \| failed`, lease) with the statements of `engram_hnsw_ddl` (`CREATE INDEX CONCURRENTLY` per partition, `DROP INDEX`, and per due partition (any index at `max(1 % × rows_at_build, 2 k)` purged) `REINDEX INDEX CONCURRENTLY` of every touched HNSW, then one `VACUUM (INDEX_CLEANUP ON)`, N152), refusing to start a build while any `backend_xmin` is older than 5 min; `--namespace <ns>` requests one by hand |
-| `move start / status / abort / cleanup` | `MoveService` |
-| `catalog reconcile --from-shards` / `catalog degrade --async` | after a catalog restore, rebuild move, deleting and epoch state from the shards' ownership rows before the catalog serves writes (N146); the operator's explicit, logged switch of the catalog standby to asynchronous mode (never automatic; `CatalogStandbyDown` pages at 60 s) |
-| `restore --shard 7 --to …` / `restore replay` | pgBackRest restore, open-move reconcile by the catalog CAS (N125), epoch bump (`catalog epoch + 1`, skipping `committed` moves and `deleting` namespaces), `frozen/restore`, then replay of the delete intents newer than `catalog.shards.replay_floor − 10 min` (lowered by this restore, never raised), verbatim and per subject in chain order, the floor being min(catalog, `_control/restores/` markers) (N122, N123, N134, N146); `restore cleanup-moved-out`; `ReconcileIn` for a target restored after a move's catalog CAS (N149) |
+| `index [--shard 7]` | the **index runner** daemon (N138): the one process that holds `engram_migrate`; executes `vector_indexes` requests (`requested → building → ready \| failed`, lease) with the statements of `engram_hnsw_ddl` (`CREATE INDEX CONCURRENTLY` per partition, `DROP INDEX`, and per due partition (any index at `max(1 % × rows_at_build, 2 k)` purged) `REINDEX INDEX CONCURRENTLY` of every HNSW with ≥ 0.05 % purged, while archive lag is under 30 s and `pg_wal` headroom covers the burst, then one `VACUUM (INDEX_CLEANUP ON)`, N152, N166), refusing to start a build while any `backend_xmin` is older than 5 min; `--namespace <ns>` requests one by hand |
+| `move start [--window 2h] [--not-before …] [--estimate] / status / abort / cleanup` | `MoveService`; `--estimate` prints `W_est` without planning |
+| `catalog reconcile --from-shards` | the first step of every catalog promotion and every catalog restore: rebuild move, deleting and epoch state from the shards' ownership rows before the alias flips and the catalog serves writes (N163); `CatalogStandbyDown` pages at 60 s |
+| `restore --shard 7 --to …` / `restore replay` | pgBackRest restore, open-move reconcile by the catalog CAS (N125), epoch bump (`catalog epoch + 1`, skipping `committed` moves and `deleting` namespaces), `frozen/restore`, then replay of the delete intents newer than `catalog.shards.replay_floor − 10 min` (lowered by this restore, never raised), verbatim and per subject in chain order, the floor being min(catalog, `_control/restores/` markers) (N122, N123, N134, N163); `restore cleanup-moved-out`; a target restored after a move's catalog CAS is an ordinary restore when its row is `active` and is wiped and re-copied from the retained source when it is `incoming`/`ready` (N161) |
 | `report --tenant acme --from … --to …` | per-tenant token and cost report from `token_usage` (N62) |
 | `config lint` | checks the `postgres -c` list and role GUCs against the generated table (N131) |
 | `outbox trim / skip`, `catalog flush-cache`, `shard stats`, `backup create`, `entity split` (phase 3) | as named |
@@ -1440,16 +1460,15 @@ type Key string // _control/deletes/{tenant}/{ns}/{deleted_at}-{operation_id}.js
 // Intent records the marker's EXACT effect, taken from the store.DeletionRecord that the marker transaction returned.
 type Intent struct {
 	Kind        Kind                 // document | namespace | tenant | invalidate | restore
-	Subject     Subject              // typed: exactly one of Document / Fact is set for the document and fact kinds
+	Subject     id.Subject           // typed {Class, Key} (N162): the memory subject is (document_id, content_hash), so a fact and its twins share one chain
 	Tenant      id.TenantID; Namespace id.NamespaceID
 	Operation   id.OperationID
 	Prev        id.OperationID       // the subject's last deletion_log entry read under the document lock: the chain predecessor (zero = first)
 	DeletedAt   time.Time
 		Epoch       id.Epoch             // the namespace epoch the marker committed under (N143): replay stores THIS recorded epoch (never the shard's current one; applied_epoch is informational) and skips an intent older than an applied entry of its subject (N150)
 	UpToVersion id.DocVersion        // document kind: the tombstone's up_to_version, applied verbatim by the replay
-	MemoryIDs   []id.FactID          // invalidate and restore kinds
+	MemoryIDs   []id.FactID          // invalidate and restore kinds: the resolved set the marker hid (every fact of the subject) or removed (the stamped set)
 }
-type Subject struct { Class SubjectClass /* document | memory | namespace | tenant */; Document id.DocumentID; Fact id.FactID } // the chain subject is independent of the action kind (N150)
 
 type Log interface {
 	// Put is put-if-absent under the marker's own name and content (If-None-Match: *). The attempt that committed the marker
@@ -1459,7 +1478,7 @@ type Log interface {
 	Put(ctx context.Context, in Intent) (Key, error)
 	List(ctx context.Context, ns id.NamespaceID, since time.Time) ([]Intent, error) // in name order; replay order is Order, not name order
 		Trim(ctx context.Context, olderThan time.Duration) (int, error)                  // 35 days
-	PutRestore(ctx context.Context, shard id.ShardID, target, floor time.Time) error   // _control/restores/{shard}/{restore_target}.json, written before a replay starts (N146)
+	PutRestore(ctx context.Context, shard id.ShardID, target, floor time.Time) error   // _control/restores/{shard}/{restore_target}.json, written before a replay starts (N163)
 	RestoreFloor(ctx context.Context, shard id.ShardID) (time.Time, error)             // min over the shard's restore markers; the replay floor is min(catalog.ReplayFloor.Get, this)
 }
 
@@ -1503,7 +1522,7 @@ type Expunger interface {
 	Finish(ctx context.Context, in *workflowv1.ExpungeInput) error                                            // expunge_state 'purged'; tombstone dropped 24 h later; the documents row only if no higher tombstone is open and no version row remains (C-12)
 }
 type Hygiene interface {
-	RequestRebuild(ctx context.Context, in *workflowv1.ExpungeInput) (int, error) // marks every touched HNSW of a due partition (max(1 % × rows_at_build, 2 k) purged on any index) as `requested`; the index runner rebuilds them with REINDEX INDEX CONCURRENTLY, then vacuums the partition once (N138, N152)
+	RequestRebuild(ctx context.Context, in *workflowv1.ExpungeInput) (int, error) // marks every touched HNSW of a due partition (max(1 % × rows_at_build, 2 k) purged on any index) as `requested` when ≥ 0.05 % of its rows were purged since the build (≥ 50 elements), else the partition vacuum repairs it; the index runner rebuilds with REINDEX INDEX CONCURRENTLY, then vacuums the partition once (N138, N152, N166)
 }
 ```
 
@@ -1647,12 +1666,12 @@ type).
 |---|---|---|---|
 | Extraction concurrency | 32 in flight per `RetainDocument`; 32 per worker process across workflows (`gateway` per-model semaphore); one `quota.Reserve` per call | workflow semaphore + `gateway.RateLimiter` | D3 formula; more only burns the RPM cap |
 | Embedding concurrency | 64 in flight per process; `EmbedBatch` ≤ 64 texts per call; prefixes `search_document: ` / `search_query: ` | `gateway.RateLimiter` | cheap and fast; the cap protects the gateway |
-| Per-shard Postgres pool | 20 conns per process per shard (two API processes); ≤ 32 shards per cell → ≤ 640 per process; `engram_app` pgbouncer pool 40 (recall ≤ 32, ack/commit and Reflect ≤ 8), ≈ 53 of `max_connections` 100 (§9.1, N155) | `router.Options.PoolSize` | D3 cell bound |
-| Recall arm parallelism | one short read transaction (`ReadSession.Tx`) per concurrently running arm, one pooled connection each; a MID recall holds ≈ 305 connection-ms (≈ 15 connections mean, ≈ 25 p99 at 50 QPS); a semaphore admits ≤ 16 concurrent arm transactions per API process per shard (queueing < 2 ms p95, a ≤ 4 ms pool-wait term on the 220 ms path; N114, N155); ≤ 50 QPS per shard target | `recall.Planner`, `store.ReadSession` | keeps the pool below saturation (`PoolSaturation` wait p95 < 50 ms) |
+| Per-shard Postgres pools | pgbouncer aliases on each shard: `engram_app` recall pool **32** (API only), `engram_worker` pool **8** (worker, same role), and the direct `engram_subject` connections (2 per API process); `max_connections` 100 holds ≈ 57 (32 + 8 + 4 + admin 2 + move 4 + relay 1 + migrate 1 + runner 1; §9.1, N164) | `router.Options.PoolSize`, pgbouncer config | D3 cell bound |
+| Recall arm parallelism | one short read transaction (`ReadSession.Tx`) per concurrently running arm, one pooled connection each; a MID recall holds ≈ 425 connection-ms over six arm transactions (≈ 21 Erlangs at 50 QPS plus ≈ 3 of filtered arms: 24 on a pool of 32, ρ ≈ 0.75); a semaphore admits ≤ 32 concurrent arm transactions per API process per shard, so `N − 1` processes carry a rollout, and a second one admits ≤ 4 filtered arms (pool wait ≤ 8 ms p95 on the 224 ms path; N114, N155, N164); ≤ 50 QPS per shard target | `recall.Planner`, `store.ReadSession` | keeps the pool below saturation (`PoolSaturation` wait p95 < 50 ms) |
 | Visibility sets | two indexed selects per recall (`doc_tomb`, `chunk_tomb`; `fact_hidden` is a per-candidate anti-join); marker cap 16 k rows of one kind before the alert; degraded-mode lookup ≤ 20 ms per arm | `store.MarkerReader` | N116, N119 |
 | Rerank depth | 0 / 50 / 150 pairs by budget (N53), ≤ 300 per gateway call (D15), one call per recall; skipped below a 106 ms remaining deadline (N106) | `recall.GatewayReranker` | the reranker is a sized dependency |
-| Graph arm | two seeded waves × 30 ms, shared node budget 100/300/1000 | `recall.Planner` | N54 critical path |
-| Vector index plan | no index below 2,000 vectors; partial HNSW created at 2,000 and dropped below 1,000, per namespace and model; `ef_search` = arm cap; semantic arm exact path below θ eligible rows (50 k, M0.6), HNSW iterative scan above with an exact fallback up to 4 θ (N138, N151) | index runner (`engramctl index`), `engram_vector_index_plan`, `index.Searcher.Plan` | N112, N138 |
+| Graph arm | two seeded waves × 30 ms, shared node budget 100/300/1000; one statement per hop from Go, the HIGH arm (1,000 nodes, 2 hops) with a 100 ms sub-budget | `recall.Planner`, `store.GraphReader.Hop` | N54 critical path, N165 |
+| Vector index plan | no index below 2,000 vectors; partial HNSW created at 2,000 and dropped below 1,000, per namespace and model; `ef_search` = arm cap; semantic arm exact path below θ eligible rows (10 k, M0.6 in [5 k, 20 k]), HNSW iterative scan above with an exact fallback up to 4 θ (≤ 40 k rows); recalls with a vector arm at `E ≥ θ` are the filtered class, p95 ≤ 1 s (N138, N151, N164) | index runner (`engramctl index`), `engram_vector_index_plan`, `index.Searcher.Plan` | N112, N138 |
 | `WaitOperation` long-polls | ≤ 2,000 parked on Temporal per API process; beyond: jittered DB poll | `api.Options.MaxOpenWaits` | N70 |
 | Temporal history | continue-as-new every 100 chunks or 20 MB; no inline activity result > 4 KiB | `workflows` | N59 |
 | Outbox relay | 500 rows per read; one relay per shard; cursor advance ≤ 1 per second per consumer | `outbox.RelayOptions` | D6, N114 |
@@ -1661,25 +1680,23 @@ type).
 | Consolidation | route 8 facts per call; ≤ 100 facts per round; one write call per touched observation; ≤ 50 root rebuilds per round; one round in flight per namespace; rebuilds only while markers are pending | `Consolidate` workflow (singleton id), `config.Consolidation` | D12, N121 |
 | Expunge | one per namespace, at most two per shard; purge in 1,000-row batches paced to ≤ 25 MB/s of WAL behind the consumer-cursor check; SLAs materialize ≤ 15 min, purge ≤ 24 h, index ≤ 48 h; `ExpungeMaterializeSlow` pages at 900 s | `expunge.Expunger`, `engram_expunge_oldest_pending_seconds` | N119 |
 | Reflect | ≤ 10 iterations, ≤ 100 k context tokens, ≤ 300 s, tool deadline 10 s, ≤ 4 concurrent reflects per namespace; one `Reserve` per iteration | `reflectagent.Caps`, api semaphore | D12, N130 |
-| Move | dirty copy in key ranges of ≤ 100,000 rows, 4 parallel streams, the writer path stays live, catch-up first, then whole-namespace checks below a closed floor before the freeze (`PreVerify`, N148), and the target's indexes ready before it (`AwaitIndexes`, N153); catalog CAS as the point of no return; freeze watchdog `max(120 s, 60 s + 1 s per 10 k facts)`, ≤ 15 min; ≤ 4 moves per cell, one per namespace; cutover (b″) and (d) retried indefinitely | `move.StartOptions` | N124, N125 |
+| Move | freeze, then copy every table from the static source in primary-key ranges of ≤ 100,000 rows, 4 parallel streams, WAL-paced at 25 MB/s; `VerifyFrozen` and the index build under the freeze; freeze deadline `frozen_at + max(1.5 × W_est, W_est + 10 min)` capped by the operator window (default maximum 4 h), automatic rollback at the deadline; catalog CAS as the point of no return; ≤ 4 moves per cell, one per namespace; cutover (b″) and (d) retried indefinitely | `move.StartOptions` | N160, N161, N125 |
 | Fence acquisition | writers never wait (`pg_try_advisory_xact_lock_shared`, refusal → `NamespaceFrozen{200 ms}`); exclusive takers (fence, document lock, derivation lock) make one attempt with `lock_timeout` 35 s; role defaults 2 s (`engram_app`), 10 s (`engram_move`, `engram_admin`), 30 s statement and idle timeouts on every outbox-writing role | `store.Store.InNamespace`, role defaults | N82: no pooled connection waits behind a queued freeze |
 | Derivation lock | shared by every writer of derived versions; exclusive for `Materialize` and `Restore`, one 35 s attempt | `store.Derived` | N120 |
-| Subject lock | every marker writer takes the session-level `engram_subject_lock_key(ns, subject_id)` on a direct connection before its marker transaction and holds it until the intent put and the marker re-read; `lock_timeout` 3 s; help-previous under it | `store.SubjectLocker`, `intent.HelpPrevious` | N150, N159 |
+| Subject lock | every marker writer takes the session-level `engram_subject_lock_key(ns, subject)` (subject `class:key`, N162) on a direct `engram_subject` connection before its marker transaction and holds it until the intent put and the marker re-read; polled try-lock ≤ 3 s; help-previous under it | `store.SubjectLocker`, `intent.HelpPrevious` | N150, N159 |
 | Per-document lock | `CommitChunk` shared try-lock (`DocumentBusy`, 100 ms); `FinalizeVersion` and the delete marker exclusive, one 35 s attempt | `store.DocumentWriter.Lock` | N83 |
 | Outbox event size | ≤ 256 ids and ≤ 16 KiB per event; elided above 4,096 ids | `outbox.Writer`, `outbox.Group` | N80; the CHECK is a backstop |
 | Catalog resolver | LRU 100 k entries; single-flight per key; LISTEN reconnect backoff 1 s → 30 s | `catalog.ResolverOptions` | D4 |
 | Query embedding LRU | 10,000 entries per process, keyed `(namespace_id, sha256("search_query: " + text))` | `recall.QueryEmbedder` | repeat queries skip the 25 ms hop |
 | Streaming / request size | `Recall` batches of 10; `StreamSnapshot` 1 MiB parts; `Retain` ≤ 100 items, ≤ 8 MiB total, ≤ 1 MiB per item, raw body > 64 KiB to blob (N7) | `api` helpers | D10, D12 |
 
-### Round-5 changes
+### Round-6 changes
 
 | Register | What changed in this section |
 |---|---|
-| N144 | `InsertVersion` and `pages.Writer` look up `commit_key` first, then run the compare-and-set with `$expected` for every writer; attempt-unique markdown keys |
-| N145, N150 | `Hide`/`Unhide` run under the subject lock, resolve the twin and outlive the fact; `Materialize` works from the marker set; `Overlay` uses the live predicate; `intent` keeps recorded epochs and the subject class |
-| N146 | catalog synchronous standby; `catalog.Reconciler`; `intent.Log.PutRestore/RestoreFloor` make the replay floor derivable |
-| N147 to N149, N153 | `Copier.AwaitIndexes`, `PreVerify` copy-first, floors as source values, `Closer.ReconcileIn`, `catalog.MoveBackups` |
-| N159 | `store.SubjectLocker` (session-level subject lock held until the intent put) and `intent.HelpPrevious`; `intent` replay records skipped intents as settled; `Closer.ReconcileIn` re-runs `engram_seq_advance` and runs at cleanup time; `catalog.MoveBackups.RecordCleanupReconcile/RecordContentCheck` (content + timeline gate); every derived writer passes `$expected`; the Materialize stamp under the exclusive derivation lock |
-| N151, N152 | cost-based `Plan` (θ 50 k, exact fallback, 500-document constant), partition-level hygiene |
-| N154, N155, N54 | pool 20/40, arm semaphore 16, 220 ms critical path |
-| N157 | ≤ 5-method split: `catalog.Moves`/`MoveBackups`, `store.Tx` with `Txn()`, `ReadTx` with `Derived()`; `NamespaceAdmin`, `OperationReader`, `FactLister`, `DocumentTags`, `DocumentBodies`, `pages.Admin`, `SnapshotLister`; `move.Orchestrator` in `api.Deps`; services take `id.Scope` and `id.Caller`; leaf-permitted modules and two edges; (RPC → method) coverage; `REFRESH_PAGE` singleton-backed |
+| N160, N161 | `move` is freeze-then-copy: `Copier` = `Plan`, `FrozenCopy`, `VerifyFrozen`, `BuildIndexes`, `AwaitConsumers`; `Closer.Rerun` replaces `ReconcileIn`; `PreVerify`, `AwaitIndexes`, `Reconcile`, the floors and the content and timeline checks are deleted; `catalog.MoveBackups` is `RecordTargetBackup` + `CleanupGate`; `StartOptions` gains `Window`, `FreezeNotBefore`, `EstimateOnly` |
+| N162 | `id.Subject{Class, Key}`; the memory subject is `(document_id, content_hash)`; `Markers.Hide/Unhide` work on the subject with one `invalidation_op` stamp; chain tip by `ins_seq` |
+| N163 | asynchronous catalog standby; `catalog.Reconciler` runs on every promotion and restore; `Cutover.Commit` waits for the replicated LSN; `ReplayFloor` loses its generated columns |
+| N164, N165 | pools 32/8 and the `engram_subject` alias; arm semaphores 32 and 4 (filtered); θ = 10 k; `= ANY` on the HNSW path; 224 ms path; `GraphReader.Hop` (one statement per hop, `UNION ALL`) |
+| N166 | hygiene rebuild threshold 0.05 %, WAL and archive-lag guards, purge pause for the rebuild set |
+| N167 | `move.Orchestrator.Cleanup` (4 methods); `SnapshotLister.Manifest`, `pages.Reader.ByName`; `engram.worker` scope and `MethodPolicy.AltScope/CellBound`; `UpdateTenantLimits`; MCP `DataClients`/`AdminClients`; depguard leaves and `pages → recall` |

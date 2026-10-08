@@ -88,10 +88,13 @@ service MemoryService {
   // marker row (decisions N115, N116) followed by the intent object (N122,
   // put after the commit, before the ack): no row is updated and nothing is
   // walked. The marker row does not depend on the fact row (no foreign key,
-  // N145): it survives the purge of the fact it names. If the same document
-  // holds a visible fact with the same content_hash (the re-extraction twin
-  // of a retired fact), the same transaction hides that fact too, under the
-  // per-fact lock (decisions N145, N150); Restore mirrors it. Every observation or page version whose evidence segment names
+  // N145): it survives the purge of the fact it names. The curation subject
+  // is the pair (document_id, content_hash) of the fact named (decision
+  // N162): the same transaction hides every live fact of the subject (the
+  // fact and its same-document, same-content twins) under one subject lock,
+  // stamps their markers with one invalidation id, writes one deletion-log
+  // row and one intent, and a twin created later by re-extraction is hidden
+  // with the same stamp. Every observation or page version whose evidence segment names
   // the fact is hidden at read time by the same predicate (N117), and the
   // affected observations are scheduled for a root rebuild. Exports are not
   // expired by it; they honour it from the next snapshot and meanwhile
@@ -104,11 +107,14 @@ service MemoryService {
   // client retries (decision N143). Scope memory.write. Milliseconds in the
   // common case.
   rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
-  // Restore deletes the `invalidate` marker of a fact (and of its same-content
-  // twin, decision N145) and the derived-hidden rows that carry its cause
-  // (decisions N115, N135); a `reextract` marker is never touched, so a
-  // restore cannot resurrect a stale extraction. It is possible after the
-  // fact's own row was purged, because the marker outlives it.
+  // Restore deletes the `invalidate` markers that carry the same invalidation
+  // stamp as the named fact (the whole subject, twins included, decision
+  // N162) and the derived-hidden rows that carry their cause (decisions N115,
+  // N135); nothing is looked up by current hidden state, so it is exact. A
+  // `reextract` marker is never touched, so a restore cannot resurrect a
+  // stale extraction. It is possible after the fact's own row was purged,
+  // because the marker outlives it, but not after its document was deleted
+  // (NOT_FOUND{DOCUMENT_DELETED}: the delete purged the marker).
   // Visibility flips at commit; the intent object follows, as for Invalidate.
   // Restore takes the exclusive derivation lock and may wait for a running
   // consolidation or page commit (one attempt of up to 35 s), so its deadline
@@ -343,6 +349,13 @@ message RecallStats {
   google.protobuf.Timestamp query_timestamp_applied = 11;
   // Total server time from admission to last flush.
   google.protobuf.Duration total = 12;
+  // True when any vector arm ran at E >= theta eligible rows (theta = 10 k):
+  // the recall is counted in the filtered class, p95 <= 1 s, and its arm
+  // transactions passed the second semaphore (decision N164).
+  bool filtered = 13;
+  // True when a filtered arm exhausted its scan bound (4 theta) and returned
+  // what it had (decision N151).
+  bool partial = 14;
 }
 
 // StageTiming is one pipeline stage's timing and candidate counts.
@@ -550,9 +563,10 @@ message InvalidateRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   // Must be a MEMORY_KIND_FACT id, else FAILED_PRECONDITION
-  // {MEMORY_NOT_A_FACT}. Already-invalidated facts succeed without changing
-  // visibility and still write their own deletion-log row and intent
-  // (decisions N139, N143).
+  // {MEMORY_NOT_A_FACT}; a fact whose row was purged after the retire grace is
+  // NOT_FOUND (the subject is resolved from the fact row, decision N162).
+  // Already-invalidated facts succeed without changing visibility and still
+  // write their own deletion-log row and intent (decisions N139, N143).
   string memory_id = 3;
   // Free-text audit reason, ≤ 1 KiB.
   string reason = 4;

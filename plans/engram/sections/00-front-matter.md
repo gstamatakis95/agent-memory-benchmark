@@ -78,7 +78,7 @@ Phase 2 exit in week 29, stated in §10).
 - **Recall makes no LLM calls.** Five arms (semantic, BM25, graph, temporal, raw chunks) run with `as_of`,
   tag and type filters and the **visibility predicate** applied inside each arm; RRF (k = 60, exact
   rational arithmetic), a cross-encoder rerank on 50 pairs at the default budget, bounded boosts and
-  token-budget packing follow. The budget is a critical-path sum, 220 ms p95 at MID, and a skipped rerank
+  token-budget packing follow. The budget is a critical-path sum, 224 ms p95 at MID, and a skipped rerank
   is an SLO breach, not a degradation.
 - **Delete is an O(1) soft marker; physical work is asynchronous.** `DeleteDocument` commits one
   tombstone transaction in the shard, puts an intent object to blob storage (strongly consistent,

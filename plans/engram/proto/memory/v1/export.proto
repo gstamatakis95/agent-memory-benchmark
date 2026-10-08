@@ -163,6 +163,10 @@ message SnapshotManifest {
   // sync client applies them before serving. Long lists are paged into the
   // delta file's delete records; this field holds at most the first 10,000.
   repeated string deleted_ids = 17;
+  // Why the snapshot expired, set with `expired = true`: "ttl",
+  // "document_delete" or "namespace_delete" (the `export_snapshots.
+  // expired_reason` column; empty while not expired; round 6, review A-11).
+  string expired_reason = 18;
 
   reserved "expired_at";
   reserved 100 to 199;

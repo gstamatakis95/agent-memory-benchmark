@@ -13,12 +13,13 @@ asynchronous `Expunge` during which SLOs may degrade (§5.4). Round 4 added thre
 pipelines below apply: **evidence outlives the facts it names, and re-extraction is a write**
 (N135, §5.1.2 step 7, §5.4.2); **one commit rule for every writer of a derived version** (N120,
 §5.0); and **every acknowledged delete has a committed marker and an intent** (N122, §5.4.1).
-Round 5 (D24) tightened four seams of those rules: a derived-version commit **decides its own
-idempotency before the base compare-and-set** and no commit is blind (N144, §5.0); an invalidation
-is **independent of the fact row** and is discovered from its marker, not from a signal (N145,
-§5.4.5); a move **copies before it checks, advances the target's sequence, waits for the target's
-indexes** and repairs a target restored after the point of no return (N147 to N149, N153, §5.5); and
-replay keeps recorded epochs under a per-subject lock that is **held until the intent is put**, and records skipped intents as settled (N150, N159, §5.4.1, §5.5.5).
+Round 5 (D24) made a derived-version commit decide its own idempotency before the base
+compare-and-set (N144, §5.0), an invalidation independent of the fact row (N145, §5.4.5), and replay
+keep recorded epochs under a per-subject lock held until the intent is put (N150, N159, §5.4.1).
+Round 6 (D25) removed the machinery that kept breaking: **a move freezes the namespace, then copies
+every row from a static source, then verifies by equality** (N160, N161, §5.5), the curation subject
+is **`(document_id, content_hash)`** with `Restore` by invalidation stamp (N162, §5.4.5), and the
+catalog's standby is asynchronous and reconciled from the shards (N163, §5.5.5).
 
 ### 5.0 Conventions shared by every pipeline
 
@@ -65,11 +66,12 @@ epoch=$2`.
   nothing.
 - **Lock key spaces are disjoint (N113):** namespace fence `hashtextextended(ns, 0)`, derivation
   lock `hashtextextended(ns, 1)` (used only by writers of derived versions, N120), document lock
-  `(hashtext(ns), hashtext(doc))`, and the **subject lock** `engram_subject_lock_key(ns, subject_id)`
-  (one-argument, seed 2; N150, N159). It is taken by every marker writer (document delete,
+  `(hashtext(ns), hashtext(doc))`, and the **subject lock** `engram_subject_lock_key(ns, subject)`
+  (subject encoded `class:key`, N162; one-argument, seed 2; N150, N159). It is taken by every marker writer (document delete,
   `Invalidate`, `Restore`, namespace and tenant delete) at **session level on a dedicated direct
-  connection** (`store.SubjectLocker`, `lock_timeout` 3 s, one attempt, refusal → retryable
-  `UNAVAILABLE`) **before** its marker transaction, and is released only **after the intent put and
+  connection** (`store.SubjectLocker` on the `engram_subject` alias, 2 connections per API process;
+  the lease is taken with `pg_try_advisory_lock` polled every 50 ms for ≤ 3 s, so one blocked lease
+  never holds a slot; exhaustion is an immediate retryable `UNAVAILABLE`, N164) **before** its marker transaction, and is released only **after the intent put and
   the marker re-read** (§5.4.1 steps 1a and 4); a crashed handler's lock dies with its
   connection. Holding it across the put is what makes the chain safe: a successor cannot commit, or
   put, while its predecessor's put is in flight (`Durability_NoSubjectLock`). Under it the writer
@@ -86,7 +88,7 @@ epoch=$2`.
   `engramlint sql` fails a builder whose outbox append is followed by another statement, and every
   scheduler write to `operations` or the outbox goes through the same `InNamespace` (N131).
   Every shard role runs `synchronous_commit = local`; no synchronous standby exists on shards
-  (N122); the catalog alone has one (N146).
+  (N122); the catalog's standby is asynchronous (N163).
   **Ids are minted per attempt, inside the transaction** after the fence prelude (`chunk_id`,
   `memory_id`, version and operation ids), so an id's timestamp is never older than its commit by
   more than one writer timeout (C-19, N139); the one exception is `ledger_id`, minted for the
@@ -198,7 +200,7 @@ a manual refresh is a `SignalWithStart` of `ns/{ns}/page/{page_id}` whose nudge 
 polls the tombstone (or, for a namespace and a tenant, the catalog), and the move's `Restart` and
 its reconcile loop skip singleton-backed kinds (`DELETE_DOCUMENT`, `CONSOLIDATE`, `REFRESH_PAGE`; the
 singletons are restarted by `SignalWithStart`,
-§5.5.1 step 7). `RetainBackfill` parents get an `operations` row so that a move's `Drain` sees them.
+§5.5.1 step 9). `RetainBackfill` parents get an `operations` row so that a move's `Drain` sees them.
 
 **Heartbeats and history bounds.** Any activity that can run longer than 30 s heartbeats every
 10 s with a resumable progress payload; heartbeat timeout = 30 s. Workflows continue-as-new
@@ -451,7 +453,8 @@ manifest_key, counters}` is workflow-local.
          `mentioned_at`, N118); `fact_links ON CONFLICT DO NOTHING` in key order (undirected
          edges once with `src < dst`, N34). **Curation sticks (N115):** for each new fact whose
          `(document_id, content_hash)` matches the last action of a `curation_log` row of this life
-         (`document_version >= life_start`), insert the same `fact_hidden` marker.
+         (`document_version >= life_start`), insert the same `fact_hidden` marker with the row's
+         `invalidation_op` (N162); a later `restore` row of the subject suppresses it.
       6. `token_usage_events` / `token_usage` (PD-1). No counter, progress or `chunks_done` update.
       7. `INSERT outbox(ChunkCommitted)` (paged at 256 ids). `COMMIT`. **The facts of this chunk
          are visible to Recall from this instant (D16).**
@@ -619,7 +622,7 @@ sequenceDiagram
 every throughput gate names its gateway profile, the uncapped fake or the D3 cap (N139). With
 `L_extract ≈ 3–6 s` the first term is 5–10 chunks/s per worker;
 a 600 RPM cap yields **≈ 2.9 chunks/s per cell** regardless of worker count, so filling 1 B facts
-online takes **≈ 80 days at 5 cells** (N154). Embedding (≤ 64 texts per call, ≈ 100 ms) and Postgres (`CommitChunk` ≈ 15 ms) are not the bottleneck.
+online takes **≈ 67 days at 6 cells** (N165). Embedding (≤ 64 texts per call, ≈ 100 ms) and Postgres (`CommitChunk` ≈ 15 ms) are not the bottleneck.
 
 **`RetainBackfill`** (workflow `ns/{ns}/backfill/{backfill_id}` on `shard-{id}`, started by
 `engramctl backfill`; a **launch prerequisite in the committed scope**, N130) moves extraction off
@@ -926,7 +929,7 @@ stateDiagram-v2
 | Model returns ids not shown | The decision or write is rejected in validation; if every one is rejected the batch bisects; a persistent single-fact failure is stamped `failed` | bounded LLM spend |
 | A stored `update` against `O@v2` meets a root rebuild that made it v3 | `current_version ≠ base_version` → the whole proposal is discarded and the batch re-routed; the update never becomes v4 in segment 3 | no lost rebuild, no hidden text carried into a visible segment (`TestConsolidation_StaleProposalDiscarded`, `Derivation_StaleProposal` must fail) |
 | An all-skip batch, or a capacity retry | The empty list applies zero ops, stamps the facts `done` and sets `applied`; a capacity retry is its own attempt with `prompt_variant = 'capacity'` | the batch terminates (`TestConsolidation_AllSkipStamps`, `_CapacityAttempt`) |
-| Namespace frozen during `ApplyBatch` | `P-frozen` retries until the mover terminates the singleton and restarts it by workflow id on the target; the restarted execution re-selects the same pending facts (`fact_consolidation`, `consolidation_state` and `consolidation_applied` rows are reconciled with the namespace, N124) | no double application |
+| Namespace frozen during `ApplyBatch` | `P-frozen` retries until the mover terminates the singleton and restarts it by workflow id on the target; the restarted execution re-selects the same pending facts (`fact_consolidation`, `consolidation_state` and `consolidation_applied` rows are copied with the namespace, N160) | no double application |
 | Scope at capacity | Retry with the capacity note; second overflow stamps `note = 'capacity'` | facts stay recallable |
 | `Recall(as_of = T)` after a hidden observation was rebuilt | `o` had v1 (inputs {f1}), v2 ({f1, f5}), v3 ({f1, f5, f9}); f5's document was deleted → v2 and v3 are hidden through their shared segment (root 1) and v1 is not; the rebuild writes v4 as a **root** version (inputs without f5): `T` before `eff(v2)` returns v1, `T` in `[eff(v2), eff(v4))` returns nothing for `o` (the version current at `T` is hidden), `T ≥ eff(v4)` returns v4 | an acknowledged delete is never served through time travel, and nothing unaffected is over-hidden (`NoOverHiding`, `TestVisibility_SegmentHiding`) |
 | `update` whose new source set is disjoint from the old | New sources are inserted before the stale ones are deleted; the observation is never source-less mid-update | the belief survives its own update |
@@ -1310,7 +1313,9 @@ role. **A run is per tombstone `(document_id, up_to_version)`:** every predicate
    stated as a function of the WAL since the last backup (§9). Rows in FK order: `fact_links` and
    `entity_mentions` (cascade from `facts`), `fact_vectors`, `facts`, `chunk_vectors`, `chunks`
    (their `chunk_tombstones` rows go with them; `fact_hidden` has no foreign key, so an
-   `invalidate` row stays, N145), `document_version_chunks`,
+   `invalidate` row stays, N145, **except** that the purge of a deleted document deletes the
+   `invalidate` rows, with their free-text `reason`, of the facts whose version the tombstone covers;
+   `Restore` of such a fact is `NOT_FOUND{DOCUMENT_DELETED}`, N162), `document_version_chunks`,
    `document_versions` (`version <= up_to_version`), the victim's `entity_aliases` and
    `curation_log` rows, then the explicit-delete `ingest_ledger` rows of the covered versions under
    the admin role (the only role the append-only trigger admits for `DELETE`; right-to-erasure
@@ -1457,59 +1462,61 @@ work inside the deadline).
 
 #### 5.4.5 Soft invalidate / restore
 
-**`MemoryService.Invalidate(memory_id, reason)`**: first the **subject lock** for `(memory,
-memory_id)` (session level, direct connection, N150, N159), held until the intent is put and the
-marker re-read below, and under it **help-previous** as in §5.4.1 step 1a (the latest `deletion_log`
-entry of the fact, of either kind, gets its missing intent put); then one fenced write transaction
-(no derivation lock): fence prelude; the chain predecessor is read (the subject's last entry of
-either kind; safe because the subject lock is held), so concurrent `Invalidate` and `Restore` calls
-on one fact form one chain; **resolve the subject** (N145): the
-fact `f` and, if the same document holds a visible fact `f'` with the same `content_hash` (the re-extraction twin, found by `engram_invalidation_twins` over `curation_log` and `facts`), `f'` too; `INSERT fact_hidden(memory_id,
-cause = 'invalidate', reason)` for each — a conflict leaves visibility unchanged and succeeds (a
-double `Invalidate` hides nothing new), but it is **not silent** (N143): it still inserts its own
-`deletion_log` row (new `operation_id`, `prev_operation_id` = the subject's last entry of either
-kind, N150) and puts its own intent, so replay sees every call in chain order; a non-fact id
-`MEMORY_NOT_A_FACT`, an unknown id `NOT_FOUND` (an id whose row was purged but whose `fact_hidden`
-row exists is found, so the call succeeds); `INSERT curation_log(memory_id, content_hash,
-document_id, document_version, action = 'invalidate')`; `INSERT deletion_log(kind = 'invalidate',
-subject_id = memory_id, operation_id, prev_operation_id, deleted_at)`; `UPDATE observations SET
-stale_write = true, stale_seq = stale_seq + 1 WHERE observation_id IN (SELECT observation_id FROM
-observation_inputs WHERE fact_id = $1)` and `UPDATE pages SET stale_delete = true, stale_seq =
-stale_seq + 1` for pages whose `page_version_inputs` name the fact (narrow mutable rows); outbox
-`FactInvalidated` (one per hidden fact), `ObservationsMarkedStale`, `PagesMarkedStale`. Commit,
-**then put the intent object** with the marker's exact effect `{subject, kind = invalidate,
-memory_ids, deleted_at, operation_id, prev_operation_id, epoch}`, **re-read the marker** and ack only
-if it is still present (else `UNAVAILABLE`, §5.4.1 step 4), then release the subject lock; a
-duplicate that finds the row ensures the intent exists (put-if-absent), as in §5.4.1. Then `SignalWithStart("ns/{ns}/expunge",
-ExpungeInput{target = MARKERS, …})` — an optimisation, because the unstamped marker is the work
-list (`materialized_at IS NULL`, §5.4.2 step 1) — so Materialize records the `derived_hidden` rows
-(cause `invalidation`; there is no purge phase for an invalidation) and `Consolidate` is nudged
-(reason `invalidate`) to rebuild the affected observations from visible sources, without the fact.
-Visibility flips at commit: the fact disappears from every arm, and every observation or page
-version whose segment names it is hidden by the same predicate. The lazy `curation_log`
-re-application at `CommitChunk` stays for twins that do not exist yet, so a re-extraction of the
-same content (`content_hash`) stays invalidated. Links and mentions are kept (the graph arm
-requires both endpoints visible); pruning them on invalidate (Hindsight) would make restore
-rebuild links. `Invalidate` never expires an export snapshot (§5.7); the overlay it feeds is
-computed from the live predicate, so it is correct before Materialize (N145).
+**The curation subject is `(document_id, content_hash)`** (N162): the typed subject `id.Subject{memory,
+"{document_id}:{content_hash}"}` of the fact the caller named, read from `facts` (both columns are
+immutable; from `curation_log` when the fact row was purged, because the marker outlives it, N145).
+An `Invalidate` of a fact whose row is gone returns `NOT_FOUND`. A fact and its same-document,
+same-content twins (re-extraction creates them) are one subject, one chain, one lock, one intent.
 
-**`MemoryService.Restore(memory_id)`**: under the same **subject lock and help-previous** (taken
-first, N159), one fenced write transaction that takes the **exclusive derivation lock** (single 35 s
-attempt; it deletes `derived_hidden` rows and must not interleave with a Materialize), and mirrors
-the twin rule: `DELETE FROM
-fact_hidden WHERE memory_id = ANY($f_and_twin) AND cause = 'invalidate'` (absent → `NOT_INVALIDATED`;
-a `reextract` row is never touched, so `Restore` cannot resurrect a stale extraction next to its
-re-extracted twin, N135; the row it needs exists even after the fact's own purge, N145),
-`DELETE FROM derived_hidden WHERE cause_kind = 'invalidation' AND cause_id = $1`, `INSERT
-curation_log(action = 'restore')`, `INSERT deletion_log(kind = 'restore', …)`, mark the observations
-`stale_write` with `stale_seq + 1` (the belief is re-examined with the evidence back), outbox
-`FactRestored`; then the intent put, the marker re-read and the ack as for `Invalidate`. Every
-`Restore` that passes the `NOT_INVALIDATED` check writes its own `deletion_log` row and intent,
-including one that follows a second `Invalidate` of the same fact (N143); nothing is skipped as a
-duplicate by subject, only by `intent_key`. Versions with no remaining cause are visible again at
-once; **restore is exact because nothing else encodes the invalidation**. Tests: `RestoreExact` in
-`Derivation.tla`; the T3 v1/v2/v3 interleaving; invalidate-twice; `TestInvalidate_SurvivesChunkPurge`,
-`TestInvalidate_ResolvesTwin`, `TestIntent_ConcurrentCurationOneChain`, `TestIntent_HelpPrev`.
+**`MemoryService.Invalidate(memory_id, reason)`**: first the **subject lock** for the subject above
+(session level, direct connection, N150, N159), held until the intent is put and the marker re-read,
+and under it **help-previous** as in §5.4.1 step 1a; then one fenced write transaction (no
+derivation lock): fence prelude; the chain tip is read **by `ins_seq`** (the subject's last entry of
+either kind; safe because the subject lock is held); **every live fact of the subject** is hidden
+(`engram_invalidation_twins` without the `NOT EXISTS` filter): `INSERT fact_hidden(memory_id, cause =
+'invalidate', invalidation_op = operation_id, reason)` per fact — a conflict leaves visibility
+unchanged and keeps the original stamp, but the call is **not silent** (N143): it still inserts its
+own `deletion_log` row (`subject_class`, encoded `subject_id`, new `operation_id`,
+`prev_operation_id` = the tip) and puts its own intent, so replay sees every call in chain order. A
+non-fact id is `MEMORY_NOT_A_FACT`. Also: `INSERT curation_log(memory_id, content_hash, document_id,
+document_version, action = 'invalidate', invalidation_op)`; **one** `deletion_log` row and **one**
+intent for the whole set (`{subject, kind = invalidate, memory_ids, deleted_at, operation_id,
+prev_operation_id, epoch}`); `UPDATE observations SET stale_write = true, stale_seq = stale_seq + 1`
+for observations whose `observation_inputs` name a hidden fact, and `UPDATE pages SET stale_delete =
+true, stale_seq = stale_seq + 1` for pages whose `page_version_inputs` do (narrow mutable rows);
+outbox `FactInvalidated` (one per hidden fact), `ObservationsMarkedStale`, `PagesMarkedStale`. Commit,
+**then put the intent object**, **re-read the marker** and ack only if it is still present (else
+`UNAVAILABLE`, §5.4.1 step 4), then release the subject lock; a duplicate that finds the row ensures
+the intent exists (put-if-absent). Then `SignalWithStart("ns/{ns}/expunge", ExpungeInput{target =
+MARKERS, …})` — an optimisation, because the unstamped marker is the work list (`materialized_at IS
+NULL`, §5.4.2 step 1) — so Materialize records the `derived_hidden` rows (cause `invalidation`; no
+purge phase) and `Consolidate` is nudged (reason `invalidate`) to rebuild the affected observations
+from visible sources. Visibility flips at commit: the fact disappears from every arm, and every
+observation or page version whose segment names it is hidden by the same predicate. **A twin created
+later** by re-extraction gets its `fact_hidden` row from the lazy `curation_log` re-application at
+`CommitChunk`, stamped with the **same** `invalidation_op`, so a re-extraction of the same content
+stays invalidated and `Restore` still undoes it. Links and mentions are kept (the graph arm requires
+both endpoints visible); `Invalidate` never expires an export snapshot (§5.7); the overlay it feeds
+is computed from the live predicate, so it is correct before Materialize (N145).
+
+**`MemoryService.Restore(memory_id)`** is **exact by stamp** (N162): under the same subject lock and
+help-previous, one fenced write transaction that takes the **exclusive derivation lock** (single 35 s
+attempt; it deletes `derived_hidden` rows and must not interleave with a Materialize) resolves `I =
+fact_hidden(g).invalidation_op` for the named fact `g` (no `invalidate` row for any fact of the
+subject → `NOT_INVALIDATED`; a fact whose invalidation row was purged with its deleted document →
+`NOT_FOUND{DOCUMENT_DELETED}`), then `DELETE FROM fact_hidden WHERE invalidation_op = I` and `DELETE
+FROM derived_hidden WHERE cause_kind = 'invalidation' AND cause_id = ANY ($those_memory_ids)`;
+a `reextract` row is never touched, so `Restore` cannot resurrect a stale extraction (N135). It
+writes `curation_log(action = 'restore')` keyed by the subject, so a later `CommitChunk` does not
+re-apply the restored invalidation, one `deletion_log` row and one intent recording the set it
+removed, marks the observations `stale_write` with `stale_seq + 1` (the belief is re-examined with
+the evidence back), and emits `FactRestored`; then the intent put, the marker re-read and the ack as
+for `Invalidate`. Every `Restore` that passes the `NOT_INVALIDATED` check writes its own row and
+intent (N143); nothing is skipped as a duplicate by subject, only by `intent_key`. Nothing is looked
+up by current hidden state: the set removed is the set the invalidation, and its lazy twins, wrote.
+Tests: `Derivation.tla` `RestoreExact` with `Twin`/`LazyTwin`; `TestInvalidate_RestoreUndoesTwinSet`,
+`TestInvalidate_LazyTwinRestored`, `TestInvalidate_SurvivesChunkPurge`, `TestIntent_SubjectClassNoAlias`,
+`TestIntent_ConcurrentCurationOneChain`, `TestIntent_HelpPrev`, `TestPurge_DropsInvalidateRowsOfDeletedDocument`.
 
 #### 5.4.6 What each event writes, and who sees what
 
@@ -1517,8 +1524,8 @@ once; **restore is exact because nothing else encodes the invalidation**. Tests:
 |---|---|---|---|
 | Replace retires a chunk (`FinalizeVersion`) | `chunk_tombstones(replace)`; `fact_hidden(reextract)` for stale-key facts; `observations.stale_write` | facts and chunks hidden; observations and pages derived from them **stay visible** (a replace is a write) | after a 1 h grace: purge chunk rows and re-extracted facts (`CHUNK_TOMBSTONES`, `REEXTRACTED_FACTS`); the evidence rows stay; rebuilds follow like any other |
 | Explicit document delete | `documents.state = 'deleting'` with summary, context, metadata and tags cleared, `document_tombstones(document_id, up_to_version)`, `deletion_log`, intent object, expired snapshots, cancelled retains | facts, chunks, links to them, entity aliases of the covered versions, every observation and page version whose segment names a covered version: all hidden; `DocumentService` shows the content-free tombstone view; versions of a re-used id above `up_to_version` stay visible | materialize (≤ 15 min), purge (≤ 24 h), `DerivedPurge` stubs and transcripts, index rebuild (≤ 48 h) |
-| Invalidate | `fact_hidden(invalidate)` for the fact and its same-content twin (no foreign key to the fact, N145), `curation_log`, `deletion_log`, intent object, stale marks | the fact and every version whose segment names it hidden | materialize `derived_hidden(invalidation)` (found from `materialized_at IS NULL`); no purge |
-| Restore | the `invalidate` row and `derived_hidden(invalidation)` rows deleted, intent object | exact inverse | — |
+| Invalidate | `fact_hidden(invalidate)` stamped with one `invalidation_op` for every live fact of the subject `(document_id, content_hash)` (no foreign key to the fact, N145, N162), `curation_log`, one `deletion_log` row, one intent object, stale marks | the fact and every version whose segment names it hidden | materialize `derived_hidden(invalidation)` (found from `materialized_at IS NULL`); no purge |
+| Restore | the rows carrying the invalidation's stamp and their `derived_hidden(invalidation)` rows deleted, one intent object | exact inverse | — |
 | Namespace delete | `freeze_delete`, catalog `deleting`, intent object | all reads and writes rejected | `DROP INDEX`, batched purge, blobs, shred key, differential backup |
 
 A replace is a write and a delete is a deletion: `FinalizeVersion` keeps the evidence rows of a
@@ -1590,15 +1597,15 @@ sequenceDiagram
 | Purge starts before an async index consumer caught up | The purge waits for every registered cursor to pass the tombstone's `event_seq`; an `ids_elided` victim is deleted from the external index by `(namespace_id, document_id)` and `document_version <= up_to_version` | the index never returns a row the shard no longer has, and the read join drops non-visible hits anyway |
 | Blob store down during `PurgeBlobs` | `P-blob` retries; rows are already gone; operation stays `RUNNING` at `phase = purge` | eventual |
 | Namespace delete while a move is copying | Rejected at the API (`NAMESPACE_BUSY`); the operator aborts the move first | no interleaving |
-| A move starts while an expunge is pending | `StartMove` sets `move_epoch`; every expunge activity returns `paused`; the markers are copied or reconciled with the namespace and the expunge resumes on the target (§5.5) | the move sees only the rows inserted after its copy began (N124) |
+| A move starts while an expunge is pending | `StartMove` sets `move_epoch`; every expunge activity returns `paused`; the markers are copied with the namespace and the expunge resumes on the target (§5.5) | the copy reads a static source (N160) |
 | Delete of a 100 k-fact document | The marker transaction is the same few statements as for one fact; the purge removes ≈ 100 k facts and ≈ 3 M links in 1,000-row batches paced to 25 MB/s of WAL, then `DerivedPurge` stubs the derived versions | deletable through the API; invisible from the ack; the WAL stays inside the RTO term |
 | `GetDocument`, `ListDocuments(include_deleting)` or `GetDocumentVersion` on a `DELETING` document | The marker cleared summary, context, metadata and tags; the first two return `{document_id, state, deleted_at, up_to_version, operation_id}` only, the third `NOT_FOUND{DOCUMENT_DELETED}` | no content from a deleted document after the ack (`TestDocument_TombstoneView`, `TestVisibility_AllSurfaces`) |
 | A prompt bump re-extracts a document, then the document is deleted | Old-key facts were purged after 1 h but their evidence rows remain, so the delete's predicate and `Materialize` find every derived version | the derived text is hidden at ack and stubbed later |
 | `DerivedPurge` meets a version a page still cites | The stub keeps the version row (`text = ''`, `stub = true`) and the permanent `derived_hidden` row, so the page's fail-closed predicate still reports it hidden | no version row is ever missing (`Derivation_PurgeDropsStub` must fail) |
-| Primary fails right after a delete ack | The intent object exists; the promoted or restored shard comes up `frozen/restore` and replays every intent newer than `replay_floor − 10 min` (the minimum restore target ever recorded and never raised, N134, read as `min(catalog, restore markers in blob storage)`, N146) before reads reopen (§5.5.5) | RPO 0 for acknowledged deletes (N122) |
+| Primary fails right after a delete ack | The intent object exists; the promoted or restored shard comes up `frozen/restore` and replays every intent newer than `replay_floor − 10 min` (the minimum restore target ever recorded and never raised, N134, read as `min(catalog, restore markers in blob storage)`, N163) before reads reopen (§5.5.5) | RPO 0 for acknowledged deletes (N122) |
 | The `Invalidate` signal is lost, or a move terminated the expunge singleton | The invalidation is committed but `materialized_at` is NULL; the `purge-sweep` schedule finds it on its next tick and `SignalWithStart`s the expunge | at most one tick of delay; the read predicate hid the derived text throughout (`TestExpunge_SweeperFindsUnmaterialized`) |
 | An `Invalidate`d fact's chunk is purged (REPLACE then 1 h, or re-extraction) | The `fact_hidden(invalidate)` row has no foreign key to the fact and stays; the derived versions it hid stay hidden and `Restore` still finds its row | an acknowledged invalidation is not erased by a purge (`TestInvalidate_SurvivesChunkPurge`) |
-| `Invalidate` of a fact whose re-extraction twin is visible | The marker transaction resolves the twin through `curation_log` and `facts` and hides both rows under the subject lock; `Restore` mirrors it | the user curated what they saw (`TestInvalidate_ResolvesTwin`) |
+| `Invalidate` of a fact whose re-extraction twin is visible | The twin is part of the subject: one marker transaction hides both under one lock with one stamp, and the lazy re-application hides a later twin with the same stamp; `Restore` removes the stamped set | the user curated what they saw (`TestInvalidate_RestoreUndoesTwinSet`, `TestInvalidate_LazyTwinRestored`) |
 | Invalidate, then the observation is rebuilt, then Restore | The rebuild wrote a new root version without the fact; Restore deleted the marker and the `derived_hidden(invalidation)` rows; the older hidden versions are visible again at their `as_of` | curation is reversible and exact |
 | `StreamSnapshot(version = n − 1)` after the ack | The version is `expired` → `PreconditionFailed{SNAPSHOT_EXPIRED}`; the client applies the next delta (with delete records) or takes a full snapshot | no acknowledged delete served through an old export |
 | Retain into the deleted document id | Allowed at once (see the retain row above); a second delete of the re-used id inserts a second tombstone with a higher `up_to_version` (it is part of the key); the first expunge deletes the `documents` row only if no higher tombstone is open and no version row remains | no new row is ever covered by an older tombstone; the second tombstone materializes (`TestDelete_ReuseDocumentID`) |
@@ -1611,312 +1618,200 @@ the outbox already tells every consumer what was deleted.
 ### 5.5 Shard move
 
 This expands D5 into the workflow `Move`, id `move/{namespace_id}/{epoch}` where `{epoch}` is the
-*target* epoch `e + 1`, on task queue **`shard-{target}`** (N2). The protocol is **dirty copy →
-pre-freeze verification → freeze → reconcile by insertion sequence → cutover with a `ready` state
-and a catalog CAS as the point of no return** (N124, N125, N137). It works because the namespace's
-tables fall into three classes, tagged by `COMMENT ON TABLE` and rendered from one list (§3.1,
-N113, N137): *insert-only* tables only gain rows, each stamped with an `ins_seq`, and lose rows only
-through the expunge, which is paused for the namespace from `Plan` to `done`; *mutable* tables are
-small enough for a full content diff inside the freeze; *expiring or derived* tables are excluded
-and re-derived on the target. After a dirty copy the difference between source and target in the
-insert-only class is exactly the rows whose `ins_seq` lies above the copy's start, whatever ids
-they carry. The move never reads the outbox. The sequence is **per shard**, so a move keeps it
-monotone across the hop: the target's `engram_ins_seq` is advanced past the source's at `Plan` and
-again at (b′), every floor a move uses is a **source value passed as a number** and never evaluated
-on the target, and exports and the consolidation watermark of a namespace moved in less than ten
-minutes ago are deferred (N147).
+*target* epoch `e + 1`, on task queue **`shard-{target}`** (N2). The protocol is **freeze, then
+copy, then verify, then cut over** (N160, N161): `Plan` (with a blob pre-warm) → `Freeze` → `Drain`
+→ one sequence advance → `FrozenCopy` → `VerifyFrozen` → `BuildIndexes` under the freeze → wait
+for the outbox consumers → cutover with a `ready` state and a catalog CAS as the point of no return
+→ cleanup after 24 h and a post-activation backup. A move is an operator tool for rebalancing:
+rare, allowed to take hours, and the namespace is **read-only for the whole window** (reads
+continue, writes get `NamespaceFrozen{retry_after, frozen_until_estimate}`). Every row is therefore
+copied from a **static** source, verification is equality on a static set, and nothing is ever
+merged into a target that has served writes. The tables fall into the three classes of N137
+(*insert-only*, *mutable*, *expiring or derived*, tagged by `COMMENT ON TABLE`, §3.1); the copy
+treats the first two alike, the third is re-derived on the target. The move never reads the outbox.
+The insertion sequence is **per shard**: the target's `engram_ins_seq` is advanced past the
+source's final value once, at the start of the copy, and `ins_seq` is copied verbatim (N147).
 
 The worker that runs the move holds its normal pool to the target shard and opens a second,
-move-scoped pool to the source with the `engram_move` role, which has **no `BYPASSRLS`** (N91):
-on the **source**, `SELECT` on the namespace's rows (RLS applies; the mover sets
-`engram.namespace_id`), and the ownership edges it owns (`start_move`, `abort_move`, `freeze_move`,
-`thaw_move`, and cutover (c) `frozen/move → moved_out`, §3.3.1 and N101) — nothing else: **the
-mover cannot write a data row on the source**. On the **target** it has DML only on the namespace
-tables, loaded as described in step 2 under `ns_isolation`. The source's rows are deleted at
-cleanup by the `engram_migrate`-owned `SECURITY DEFINER` function `engram_cleanup_namespace(ns,
-batch)` (N93).
-
-**Why the target queue.** Every write of the move lands on the target; the source is often the
-overloaded shard being evacuated; after cutover every restarted workflow runs on the target queue,
-so `Restart` is a local `ExecuteWorkflow`. There is **one Temporal cluster per cell** (N71): a
-cross-cell move (phase 3) restarts operations from the source `operations` rows through the
-operations-table restart path of N97, with no cross-cluster protocol. Rejected: the source queue
-(the orchestrator would outlive the source's role) and a `control` queue (every worker would need
-every shard's credentials).
+move-scoped pool to the source with the `engram_move` role, which has **no `BYPASSRLS`** (N91): on
+the **source**, `SELECT` on the namespace's rows (RLS applies; the mover sets `engram.namespace_id`)
+and the ownership edges it owns (`start_move`, `abort_move`, `freeze_move`, `thaw_move`, cutover
+(c) `frozen/move → moved_out`, §3.3.1, N101) — **the mover cannot write a data row on the source**.
+On the **target** it has DML only on the namespace tables. The source's rows are deleted at cleanup
+by the `engram_migrate`-owned `SECURITY DEFINER` function `engram_cleanup_namespace(ns, batch)`
+(N93). **Why the target queue.** Every write of the move lands on the target, and after cutover
+every restarted workflow runs on the target queue, so `Restart` is a local `ExecuteWorkflow`; there
+is one Temporal cluster per cell (N71), so a cross-cell move (phase 3) restarts operations from the
+source `operations` rows (N97) with no cross-cluster protocol.
 
 #### 5.5.1 Steps
 
 1. **`Plan`** (catalog tx + target tx + source tx; one of the three activities allowed to call the
-   catalog, D4): catalog `INSERT namespace_moves(move_id, namespace_id, tenant_id, source_shard_id,
-   target_shard_id, from_epoch = e, to_epoch = e + 1, state = 'planned', created_by)` — refused by
-   the partial unique index on active moves (`MovePrecondition`, non-retryable);
-   `namespaces.state = 'moving'`; `NOTIFY`. Target: the `plan_target` edge inserts
-   `namespace_ownership(…, epoch = e + 1, state = 'incoming', move_id)`; a namespace that once
-   lived on the target has a permanent `moved_out` row there (N93), advanced by the `return_move`
-   edge `moved_out → incoming` (a strictly greater epoch and no data rows of the namespace
-   present). Source: `start_move` sets `move_id` and `move_epoch = e +
-   1`, which **pauses the expunge and every shard-wide scheduler for the namespace** (they join
-   `namespace_ownership` and act only on `active` rows without `move_epoch`). Plan records in
-   `namespace_moves` the source's `pg_control_system().system_identifier` and
-   `pg_control_checkpoint().timeline_id` (`source_system_id`, `source_timeline_id`) and **`t_copy` =
-   `now()` on the source**; it then calls **`engram_seq_advance(W_plan)`** on the target, where
-   `W_plan` is the source's `nextval('engram_ins_seq')` at that moment (`setval` to `greatest(its
-   last_value, W_plan) + 1`, then `engram_seq_sample()`; it only moves forward, N147); the cutover steps stamp `frozen_at`, `ready_at`, `moved_out_at` and
-   `activated_at`; every later activity
-   on the source re-reads them on its session and fails `MoveFenced` on mismatch (N123). It also
-   fixes the freeze watchdog, `max(120 s, 60 s + 1 s per 10,000 live facts)`, capped at 15 min, and
-   refuses unless the per-table column-list hashes of source and target match (step 2). Catalog
-   `state = 'copying'`.
-2. **`BulkCopy`** (`StartToClose` 12 h; heartbeat every 10 s with `CopyProgress{table, last_key,
-   rows_done, table_index, blob_token}`). **Dirty copy**: `READ COMMITTED` key
-   ranges of ≤ 100,000 rows ordered by primary key, restartable at `(table, last_key)`, so source
-   `xmin` is never pinned and a crashed copy resumes at the first range without a completion mark.
-   Each range is `COPY (SELECT <cols> FROM t WHERE namespace_id = $1 AND <pk> > $k ORDER BY <pk>
-   LIMIT n) TO STDOUT BINARY` into a session `TEMP` table on the target, then `INSERT INTO t SELECT
-   <cols> FROM tmp ON CONFLICT (<pk>) DO UPDATE SET <mutable cols>` in **one target transaction
-   per range** that runs `engram_try_ns_fence($1)`, aborts unless the ownership row is `('incoming',
-   e + 1)`, and sets `session_replication_role = replica` (N91; the ownership trigger is `ENABLE
-   ALWAYS` and RLS still applies, so a foreign `namespace_id` fails). `<cols>` is generated on both
-   sides from `pg_attribute WHERE attgenerated = '' AND NOT attisdropped ORDER BY attname`, and
-   includes `ins_seq` (copied verbatim). Tables in dependency order (the class of each is its
-   `COMMENT ON TABLE` tag, which `engramlint sql` requires and §3.1 renders; this list is not a
-   class list): `documents, document_versions, ingest_ledger, chunks, document_version_chunks,
-   entities, entity_aliases, facts, fact_vectors, chunk_vectors, entity_mentions, fact_links,
-   observations, observation_versions, observation_version_vectors, observation_version_meta,
-   observation_sources, observation_inputs, observation_version_sources, consolidation_batches,
-   consolidation_proposals, consolidation_applied, fact_consolidation, consolidation_state, pages,
-   page_versions, page_version_vectors, page_version_meta, page_version_inputs, page_sources,
-   document_tombstones, chunk_tombstones, fact_hidden, curation_log, derived_hidden,
-   expunge_progress, operations, idempotency_keys, token_usage_events, token_usage, quota_counters,
-   namespace_stats, namespace_models, batch_jobs, blob_tombstones, export_snapshots, deletion_log`.
-   `facts` ranges copy in up to 4 parallel streams. The target has **no partial HNSW for the
-   namespace** during the copy (its vector tables carry only the B-tree and BM25 maintenance), so
-   the rate is bounded by those inserts; after `PreVerify` the mover requests the namespace's partial
-   indexes from the **index runner** and waits for them (step 2c, N153), and `VerifyFK`
-   (`engram_verify_fk(ns)`, an anti-join count of orphans per foreign key, must be 0) runs inside
-   `PreVerify`, outside the freeze. **Blobs are owner-keyed
-   (N104), so the blob check is one key per copied row:** every key referenced by a copied row
-   (`ingest_ledger.body_blob_key`, `document_versions.body_key`, `page_versions.markdown_blob_key`,
-   export manifests and parts) is copied (server-side copy when available), skipping keys whose
-   target etag and size match; the caches `xcache`, `ecache`, `staging` and `consolidate/` are
-   **not** copied (N100 recomputes them). Planning rate: to be measured in M0.6 on the real image;
-   "a 1 M-fact namespace moves in < 2 h" stays only if the measurement supports it (M1.5 records
-   it).
-2b. **`PreVerify`** (the namespace is still `active`; move pool + target pool; no writer is
-   blocked). **It copies first and checks a range the copy closed** (N148). Take `W_pre =
-   nextval('engram_ins_seq')` and `T_pre = now()` on the source, then, in this order:
-   (a) take `t_c = clock_timestamp()` and `F_c = engram_seq_floor(t_c)` on the source (every floor is
-   a source value, passed to the target as a number, N147);
-   (b) **one catch-up copy** of every insert-only table for `ins_seq ≥ F_copy`, `F_copy =
-   engram_seq_floor(T_copy)`, that is everything inserted since the bulk copy began (idempotent
-   upserts by primary-key ranges);
-   (c) **only then** the whole-namespace work against the insert-only rows with `ins_seq < F_c` on
-   **both** sides: per table `count(*)` and `bit_xor(hashtextextended(pk::text, 0))` (tables of ≤ 2 M
-   rows of the namespace), `VerifyFK`, and the blob existence checks.
-   Every row below `F_c` was drawn before `t_c − 10 min` and committed before `t_c` (the 60 s
-   writer bound), so it was visible to the bulk copy or to the catch-up that started at `t_c`; the
-   checked range is fixed by `F_c`, never by `now()`, so a long catch-up does not widen it. A
-   mismatch below a closed floor is a real copy defect, not activity: the activity runs **one more
-   round** (new `t_c`, catch-up, check) and fails only on a second mismatch, after which the move
-   rolls back before it ever freezes. `nextval` is assigned at insert, not commit, so `ins_seq` is
-   commit-ordered only within the 60 s writer lifetime; the shard-local ring `engram_seq_log(sampled_at,
-   seq)`, sampled every minute, gives `engram_seq_floor(ts)` = the sample at or before `ts − 10 min`
-   (the UUIDv7-floor idea on the right key; `created_at` and entity ids are not re-copy keys: they
-   are not commit-ordered either, and rows written under old ids would be missed). Checking before
-   the catch-up rolled back every namespace that was written during the bulk copy
-   (`ShardMove_VerifyBeforeCatchUp` must fail `MoveTerminatesActive`; `TestMove_ActiveBacklog`).
-2c. **`AwaitIndexes`** (N153; the namespace is still `active`). After `PreVerify` and before
-   `Freeze` the mover requests the namespace's partial indexes on the target (`vector_indexes`
-   rows for every `(vector table, current model)` with ≥ 2,000 copied vectors, built by the **index
-   runner**, which serves move-target requests at priority and regardless of `purgeable_namespaces`)
-   and waits until each is `ready` with `rows_at_build ≥ 0.99 ×` the verified count, bounded by the
-   `P-db` 12 h `StartToClose`; a `failed` build is requested once more, then the move rolls back.
-   Building under the freeze would add 5–6 min per vector table to the watchdog window, and serving
-   from the whole-namespace exact path meanwhile would be an IOPS outage (≈ 2.7 s and 2 GB per arm at
-   1 M vectors), so `ReadyTarget` (b′) re-checks the precondition on the rows; the rows re-copied
-   under the freeze insert into the built graphs. The same wait applies to the PITR recovery move
-   (N123) and to `ReconcileIn` (N149). `TestMove_CutoverWaitsForIndexes`: a 300 k-vector namespace
-   uses the HNSW at its first recall after activation.
-3. **`Freeze`** (catalog tx + source tx via the move pool; catalog-allowed): catalog
-   `namespaces.state = 'frozen'`, `namespace_moves.state = 'frozen'`, `NOTIFY`; source: the
-   exclusive fence `engram_ns_fence_exclusive` with **one attempt and `lock_timeout = 35 s`**
-   (longer than any legal 30 s writer; no 5 s retry storm), then the `freeze_move` edge `active →
-   frozen/move` at epoch `e`. The exclusive request queues behind the writers in flight when it
-   asked, and later writers are refused at once by their try-lock, so **after `Freeze` returns no
-   write transaction exists on the source**; the only in-flight work is activities between
-   transactions (LLM calls, blob puts), all idempotent. New source writes fail `NamespaceFrozen`
-   (the API retries ≤ 30 s); **reads continue** (`frozen/move` is the only readable frozen state).
-   The mover compares its session's timeline with the catalog (N123). The workflow arms the
-   **freeze watchdog**; it stays armed until the catalog CAS (a″) commits.
-4. **`Reconcile`** (state `RECONCILING`; move pool + target pool; the whole correctness argument
-   lives here, both sides are static and no source write transaction exists):
-   - *Insert-only class*: re-copy the rows with `ins_seq ≥ F_pre = engram_seq_floor(T_pre)`, a
-     source value passed as a number (idempotent upserts on the primary key). Rows written under old ids (stamps, re-embeds, new versions of
-     old observations) carry a fresh `ins_seq` and are caught; the 10 min margin of the floor
-     exceeds the writer lifetime (`statement_timeout + idle_in_transaction_session_timeout =
-     60 s`), so every row missing from the dirty copy and the pre-freeze catch-up lies in the
-     re-copied range. Then verify only that range: `count(*)` and `bit_xor(hashtextextended(pk::text,
-     0))` over `ins_seq ≥ engram_seq_floor(T_pre)` must match on both sides, and `VerifyFK` on the
-     target restricted to the same range.
-   - *Mutable class*: stream `(pk, md5(row minus updated_at))` from both sides ordered by pk,
-     merge-diff, **upsert** rows that differ or are missing on the target and **delete** target rows
-     absent on the source (set semantics, uniformly; this also reproduces source-side deletes such
-     as the 24 h `idempotency_keys` sweep). Vectors are compared by `sha256(embedding::bytea)`,
-     never rendered through `row_to_json`.
-   - *Excluded class*: `count(*)` on the target ≤ the source's for `token_usage_events` (copied
-     once; its 30-day sweep joins `purgeable_namespaces` and therefore pauses during a move);
-     `vector_indexes`, `namespace_stats` and the caches are re-derived on the target.
-   - *Blobs:* existence check of every key referenced by a row of the re-copied range (parallel
-     64); copy the missing; **refuse cutover while any is missing**.
-   - *Relay drain:* wait until every source consumer cursor passed the namespace's final
-     `max(seq)` (final, since frozen); the bound is **120 s**, twice the gap horizon, else
-     `Rollback`. The move never touches `outbox_cursors`.
-   Any mismatch → `Rollback`. **Freeze work = the rows inserted since `T_pre − 10 min` plus the
-   namespace's mutable rows**: no whole-namespace scan and no 100 k blob `HEAD`s run under the
-   freeze. M1.5 measures it (< 30 s for ≤ 1 M-fact namespaces) on a namespace with a consolidation
-   backlog and `APPEND` re-embeds (`TestMove_ActiveBacklog`).
-5. **`Drain`** (move pool + Temporal client, **reconciled against the `operations` table, not
-   Temporal visibility**, N97): read the in-flight operations from the source `operations` rows in
-   `RUNNING`, `PENDING` and `DEFERRED` (never from `ListWorkflow`, whose lag could hide a workflow
-   started 0.5 s before the freeze; `RetainBackfill` parents have such a row, §5.1.6); add the
-   namespace singletons (`Consolidate`, `PageRefresh`, `Expunge`) by id; wait up to
-   `move.drain_wait` (default 15 s, max 60 s) while any has a pending activity (a cost
-   optimisation only: an `ExtractChunk` that finishes writes its cache entry); record each
-   `{workflow_id, workflow_type, operation_id}` into `namespace_moves.terminated_workflows`;
-   `TerminateWorkflow(reason = "move:{move_id}")` each. Every write that could reach the source is
-   therefore either committed and reconciled, or belongs to a workflow that has been terminated and
-   will be re-executed from its original input on the target, where durable per-chunk / per-op /
-   per-version state skips finished work.
-6. **Cutover** — activities with their own `P-cutover` retry policy. **The point of no return is
-   the catalog CAS (a″)**, taken after the target is `ready`; rollback is possible at every step
-   before it (N125):
-   **Every step is a compare-and-set on the exact rows it verified** (N143,
-   `ShardMove_UnfencedSteps`): before each step the activity reads the source and target
-   `namespace_ownership` rows and the catalog row, and the step's statement repeats what it read in
-   its `WHERE` (`state`, `freeze_reason`, `epoch`, `move_id`, and for (a″) also the shards, epochs,
-   source timeline and the catalog `namespaces` row `(source, e, frozen)`); zero rows means the
-   world changed since verification, the step stops with `MoveFenced` and re-verifies, it never
-   writes on a stale read.
-   - (a) `CutoverBegin` (catalog): `namespace_moves.state = 'cutover'` — records intent, not the
-     point of no return.
-   - (b′) `ReadyTarget`: target `incoming → ready` (edge `ready_target`, `engram_move`), with two
-     preconditions re-checked on the rows: **`engram_seq_advance(W_final)`** has run on the target,
-     `W_final` being the source's final `nextval` under the freeze (recorded as `namespace_moves.w_final`; `w_plan` at `Plan`),
-     so copied rows sort below every row the target inserts after cutover (`CopiedBelowTargetSeq`);
-     and **every partial index of the namespace is `ready`** (step 2c; the target's ownership trigger refuses `ready` without `engram_move_indexes_ready`). **Nothing routes to
-     `ready`**: writers and readers get the retryable `NamespaceNotReady`.
+   catalog, D4). Catalog `INSERT namespace_moves(…, state = 'planned')` — refused by the partial
+   unique index on live moves (`MovePrecondition`, non-retryable); `namespaces.state = 'moving'`;
+   `NOTIFY`. Target: the `plan_target` edge inserts `namespace_ownership(…, epoch = e + 1, state =
+   'incoming', move_id)`; a target that once held the namespace has a permanent `moved_out` row,
+   advanced by `return_move` (`moved_out → incoming`: strictly greater epoch, no data rows
+   present). Source: `start_move` sets `move_id` and `move_epoch = e + 1`, which **pauses the
+   expunge and every shard-wide scheduler for the namespace**. Plan records the source's
+   `system_identifier`/`timeline_id` (every later source activity fails `MoveFenced` on mismatch,
+   N123), refuses unless the per-table column-list hashes of source and target match, and computes
+   the **window estimate** `W_est = rows / R_copy + vectors / R_build + verify + blob delta` from
+   `namespace_stats` (planning rates `R_copy` ≈ 1,000 facts/s, all tables, and `R_build` ≈ 3,000
+   vectors/s: ≈ 25 min per 1 M live facts; M1.5 replaces both with measurements). The rebalancer
+   starts a move unattended only at `W_est ≤ 10 min` (≈ 250 k facts); above that `StartMove`
+   requires an operator `window` (`MovePrecondition{WINDOW_REQUIRED}` otherwise) and refuses when
+   `W_est > window` (default maximum 4 h); `freeze_not_before` schedules the window. **Blob
+   pre-warm**, the only work before the freeze: the namespace's owner-keyed blobs (`ver/`,
+   `ledger/`) are copied to the target prefix by listing; they are immutable and keyed, so only the
+   per-row existence check under the freeze verifies them. The caches `xcache`, `ecache`, `staging`
+   and `consolidate/` are not copied (N100). Catalog `state = 'planned'`.
+2. **`Freeze`** (catalog tx + source tx; catalog-allowed): catalog `namespaces.state = 'frozen'`,
+   `namespace_moves.state = 'frozen'`, `NOTIFY`; source: the exclusive fence
+   `engram_ns_fence_exclusive` with **one attempt and `lock_timeout = 35 s`** (longer than any legal
+   30 s writer), then `freeze_move` `active → frozen/move` at epoch `e`. The exclusive request
+   queues behind the writers in flight and later writers are refused at once by their try-lock, so
+   **after `Freeze` returns no write transaction exists on the source** and its rows are static
+   until thaw or cleanup. Writes fail `NamespaceFrozen` with `frozen_until_estimate =
+   freeze_deadline`, to which clients and activities back off; reads continue. The **freeze
+   deadline** is `frozen_at + max(1.5 × W_est, W_est + 10 min)`, capped by the window, recorded
+   with `frozen_at` and armed as a workflow timer until the catalog CAS (a″) commits: at the
+   deadline the move **rolls back automatically** (step 11) and `MoveWindowExceeded` pages; the
+   operator re-plans with a larger window.
+3. **`Drain`** (move pool + Temporal client, **reconciled against the `operations` table, not
+   Temporal visibility**, N97): read the in-flight operations from the static source `operations`
+   rows in `RUNNING`, `PENDING` and `DEFERRED` (`RetainBackfill` parents have such a row, §5.1.6),
+   add the namespace singletons (`Consolidate`, `PageRefresh`, `Expunge`) by id, wait up to
+   `move.drain_wait` (default 15 s, max 60 s) while any has a pending activity, record each
+   `{workflow_id, workflow_type, operation_id}` into `namespace_moves.terminated_workflows`, and
+   `TerminateWorkflow(reason = "move:{move_id}")` each. A terminated workflow is re-executed from
+   its original input on the target, where durable per-chunk / per-op / per-version state skips
+   finished work.
+4. **`FrozenCopy`** (`StartToClose` = the remaining window; heartbeat every 10 s with
+   `CopyProgress{table, last_key, rows_done, table_index, blob_token}`). First **one**
+   `engram_seq_advance(W_final)` on the target, `W_final` being the source's `nextval` under the
+   freeze (recorded as `namespace_moves.w_final`; N147). Then **every table of all three classes**
+   is copied from the static source by primary-key ranges of ≤ 100 k rows in up to 4 parallel
+   streams, parents before children in `pg_constraint` order, **WAL-paced** at the shard budget
+   (N119's 25 MB/s). Each range is `COPY (SELECT <cols> … WHERE namespace_id = $1 AND <pk> > $k
+   ORDER BY <pk> LIMIT n) TO STDOUT BINARY` into a session `TEMP` table on the target, then `INSERT
+   … SELECT … ON CONFLICT (<pk>) DO UPDATE` in **one target transaction per range** that runs
+   `engram_try_ns_fence($1)`, aborts unless the ownership row is `('incoming', e + 1)` and sets
+   `session_replication_role = replica` (N91; the ownership trigger is `ENABLE ALWAYS`, RLS still
+   applies). `<cols>` comes from `pg_attribute WHERE attgenerated = '' AND NOT attisdropped ORDER BY
+   attname` and includes `ins_seq`. The source is static, so there is no floor, no catch-up, no
+   merge-diff and no `ins_seq` range anywhere in the move; the excluded class is re-derived on the
+   target (`token_usage_events` is copied once). The target builds **no HNSW during the copy**; a
+   crashed copy resumes at `(table, last_key)` because ranges are idempotent upserts.
+5. **`VerifyFrozen`** on the complete copy: per table `count(*)` and
+   `bit_xor(hashtextextended(pk::text, 0))` over the **whole** namespace on both sides (an
+   index-only pass over the PK, no row cap), `engram_verify_fk(ns)` on the target (an orphan on a
+   complete copy is a copy defect), owner-keyed blob existence per copied row (copy-if-absent), and
+   `count ≤` for the excluded class. A mismatch re-copies the mismatching tables once and
+   re-verifies; a second mismatch rolls back (`MoveVerifyFailed`).
+6. **`BuildIndexes`** under the freeze: `vector_indexes` requests for every `(vector table,
+   current model)` with ≥ 2,000 copied vectors, served by the **index runner** at priority.
+   Readiness is **`indisvalid ∧ indisready` of the index named by `engram_hnsw_ddl`**
+   (`engram_move_indexes_valid(ns)`): an index built on a static copy contains every row by
+   construction. A `failed` build is retried once, then rollback. The same step serves the PITR
+   recovery move (N123) and the re-run of step 10 (N161).
+7. **`AwaitConsumers`**: wait until every source outbox consumer cursor passes the namespace's final
+   `max(seq)` (bound 120 s, else rollback); the move never touches `outbox_cursors`.
+   `namespace_moves.state = 'copied'`.
+8. **Cutover** — activities with their own `P-cutover` policy. **The point of no return is the
+   catalog CAS (a″)**; rollback is possible at every step before it (N125). Every step is a
+   compare-and-set on the exact rows it verified (N143): the activity reads the source and target
+   ownership rows and the catalog row, and the statement repeats what it read in its `WHERE`; zero
+   rows means the world changed, the step stops with `MoveFenced` and re-verifies.
+   - (a) `CutoverBegin` (catalog): `state = 'cutover'` — intent only.
+   - (b′) `ReadyTarget`: target `incoming → ready` (`ready_target`), preconditions re-checked on the
+     rows by the ownership trigger: `engram_move_indexes_valid(ns)` and `(SELECT last_value FROM
+     engram_ins_seq) > w_final` (`CopiedBelowTargetSeq`). **Nothing routes to `ready`**: callers
+     get the retryable `NamespaceNotReady`.
    - (a″) `CommitMove` (catalog): `UPDATE namespace_moves SET state = 'committed' WHERE move_id =
-     $1 AND state = 'cutover' AND …` where `…` repeats the verified source and target shards, the
-     epochs `e` and `e + 1`, `source_system_id`/`source_timeline_id`, and requires the catalog
-     `namespaces` row to still be `(source, e, frozen)` — **the point of no return**, a CAS on the exact ownership state the mover verified (the
-     source `frozen/move` at `e`, the target `ready` at `e + 1`, both with this `move_id`), executed only after the mover
-     re-checked its source timeline against the catalog (N123). A rollback, and the restore or
-     failover reconcile (§5.5.5), take the same row with `cutover → rolled_back`; exactly one of
-     the two CASes succeeds, and the loser stops.
-   - (c) `CutoverSource`: source `frozen/move → moved_out` (edge `cutover_c`) with
-     `target_shard_id` and `target_epoch = e + 1`, **executed only after the mover read
-     `committed`**.
-   - (b″) `ActivateTarget`: target `ready → active` (edge `activate_target`, clears `move_id`),
-     sub-second and retried indefinitely.
+     $1 AND state = 'cutover' AND …`, where `…` repeats the verified shards, epochs, source
+     `system_identifier`/`timeline_id` and requires the catalog `namespaces` row to still be
+     `(source, e, frozen)` — **the point of no return**. A rollback and the restore or failover
+     reconcile (§5.5.5) take the same row with `cutover → rolled_back`; exactly one CAS wins.
+   - **Replicated-LSN wait** (N163(3)): after the CAS commits the mover waits until the catalog
+     standby's `replay_lsn ≥` the CAS's commit LSN (`pg_stat_replication`, bounded 10 s per attempt,
+     retried while the row reads `committed`). If the standby is down the move stalls
+     `committed`-but-unreplicated and stays rollback-able by the arbiter rule of §5.5.5 step 1;
+     `CatalogStandbyDown` pages at 60 s.
+   - (c) `CutoverSource`: source `frozen/move → moved_out` (`cutover_c`) with `target_shard_id` and
+     `target_epoch = e + 1`, **only after the mover read `committed` and the standby replayed it**.
+   - (b″) `ActivateTarget`: target `ready → active` (`activate_target`, clears `move_id`), retried
+     indefinitely; stamps `activated_at`.
    - (d) `CutoverCatalog`: catalog `UPDATE namespaces SET shard_id = target, epoch = e + 1, state =
      'active' WHERE namespace_id AND epoch = e AND state = 'frozen'` + `NOTIFY`, retried forever
-     and idempotently ("catalog already at `(target, e + 1)` for this `move_id`" is the only
-     idempotent success), and not on any read path.
-   **Safety.** The source is `frozen`, then `moved_out`, never `active` during the cutover; the
-   target is `active` only after (c). Between (c) and (b″) there is **no owner at all**, the
-   simplest way to make "at most one writable owner" true; requests that reach the source fail
-   `WrongShardOrEpoch{MOVED_OUT}` carrying the internal `MovedOutHint`, are routed to the target
-   from that hint alone (no catalog read), and meet `NamespaceNotReady` until (b″) commits; both are
-   absorbed by the API's bounded re-resolve loop (≤ 5 s, N52). The arbiter lives in the catalog
-   because that is where the restore reads it (stamping it on the source inside (c) leaves no state
-   the restore can read; `ShardMove_StampAfterCut` must fail). A "cutover in progress > 2 s" alert
-   fires while (a″) has committed and (d) has not, and `FAILED_PRECONDITION` during a move counts
-   against the availability SLI. Order (c) before (d) is what model checking fixed (TLC
-   `ShardMove_D5Order`): with the catalog switched first, a client whose cache says (source, e)
-   would read at a shard that is no longer the owner.
-7. **`Restart`** (Temporal client, N97): for each recorded operation, `ExecuteWorkflow(type, id =
-   ns/{ns}/op/{op}, task_queue = "shard-{target}", input with shard_id = target and epoch = e + 1,
-   WorkflowIDReusePolicy = TERMINATE_IF_RUNNING, memo epoch = e + 1)`; the singletons, and the
-   operation kinds they back (`DELETE_DOCUMENT`, `CONSOLIDATE`, `REFRESH_PAGE`, N136, N157), via `SignalWithStart` only:
-   `Restart` and its reconcile loop skip singleton-backed kinds. `AlreadyStarted` counts as done
-   only if `DescribeWorkflowExecution` shows task queue `shard-{target}` and memo epoch `e + 1`. A
-   **reconcile loop** re-scans the target `operations` (`RUNNING`/`PENDING`/`DEFERRED`) against
-   `DescribeWorkflowExecution` until stable. Because idempotency keys exclude the epoch (D11), a
-   restarted `RetainDocument`'s `PlanChunks` sees the membership rows the source committed and
-   skips them. `namespace_moves.state = 'cleaning'`; the expunge resumes on the target (its pending
-   markers moved with the namespace).
-8. **`Cleanup`**: `workflow.Sleep(24 h)` (or an early signal from `engramctl move cleanup`), **then
-   the cleanup gate: a content check, a timeline check and a cleanup-time `ReconcileIn`, not a backup
-   timestamp alone** (N143, N149, N159; `ShardMove_CleanupNoBackup`, `ShardMove_CleanupTimeGate`,
-   `ShardMove_NoTimelineCheck`): until activation the target had no backup of the moved rows, and
-   the source rows are the only restorable copy of anything a restore of the target to a point
-   before the move-in would need, and a backup that merely postdates activation can be taken from a
-   promoted target that lacks moved rows. In order:
-   1. **`ReconcileIn` at cleanup time** (§5.5.5), always, whether or not a timeline change was
-      recorded: from the intact source it re-copies what the target lacks as `INSERT … ON CONFLICT DO
-      NOTHING`; records `cleanup_reconciled_at`. It is idempotent and cheap when nothing is missing.
-   2. **A full target backup that *started* after `max(activated_at, cleanup_reconciled_at)`**: the
-      `Backup` schedule's next full backup records `target_backup_started_at` / `target_backup_at`
-      (`MoveBackups.RecordTargetBackup`; a forced full backup is requested if none starts within
-      24 h). The early signal shortens only the grace.
-   3. **Content check**, after that backup completed: the source's insert-only rows with `ins_seq <
-      w_final`, less the documents the target has tombstoned since activation (their rows are
-      legitimately purged there), are counted and hashed (`bit_xor(hashtextextended(pk::text, 0))`,
-      the N148 measure) on the static source and on the target; the two must be equal
-      (`source_content_*`, `target_content_*`, `target_content_checked_at`; `MoveBackups.RecordContentCheck`).
-      A mismatch repeats from step 1 once, then pages (`MoveCleanupContentMismatch`) and cleanup
-      stays refused.
-   4. **Timeline check**: the target's last timeline change (`target_timeline_changed_at`,
-      `MoveBackups.RecordTimeline`) is not later than `cleanup_reconciled_at`. A restore or promotion
-      of the target after step 1 restarts the gate from step 1.
+     and idempotently ("already `(target, e + 1)` for this `move_id`" is the only idempotent
+     success).
 
-   The catalog `done` CHECK encodes exactly these four conditions, and `CleanupMove` refuses to run
-   before they hold. The only copy of a row is therefore never deleted while the target may lack rows
-   the source still holds. When the gate passes the last activity calls the `MoveService.CleanupMove` admin RPC, which has the index runner drop
-   the namespace's partial indexes on the source by their deterministic names, runs
-   `engram_cleanup_namespace` in batches (its outer `DELETE` carries `namespace_id`, N131) and
-   deletes the moved-out **rows**, but **never the `namespace_ownership` row**: the `moved_out` row
-   is a permanent fence value that keeps answering with the target hint (a later move back uses
-   `moved_out → incoming`). The source **blob prefix** is deleted only after the 28-day backup
-   window (the RPC records `blob_gc_after = now() + 28 d` on `namespace_moves`; the weekly `blob
-   gc` honours it, N123), and a differential backup of the source follows the row deletes (N119).
-   `namespace_moves.state = 'done'` is written by the same RPC.
-9. **`Rollback`** (any failure before the catalog CAS (a″): a mismatch in `PreVerify` or
-   `Reconcile`, the watchdog, a missing blob, a timeline mismatch, a relay drain that did not
-   finish, or `engramctl move abort`). It first CASes `namespace_moves.state: cutover →
-   rolled_back` when the move was at `cutover` (reading `committed` instead means the move
-   completes, never rolls back). **Before Freeze** → `abort_move` on the source, delete the target
-   rows and ownership row (`rollback_target`); **after Freeze** → `thaw_move`
-   (`frozen/move → active`) first, which is allowed **while the target is unreachable** (a `ready`
-   row accepts nothing and `unready_target` runs at the next contact), then the same; **after (b′)**
-   → `unready_target` (`ready → incoming`), then the same. Rollback and cleanup drop the target's
-   indexes by their deterministic names. Restart any workflows recorded in step 5 on the
-   **source** queue with epoch `e`. After a rollback onto a shard that had a `moved_out` row,
-   `return_abort` (`incoming → moved_out`, restoring the hint from `namespace_moves`) keeps the
-   permanent fence value. Catalog `state = 'active'`, `namespace_moves.state = 'rolled_back'`; the
-   copied blob prefix is deleted in the background. **After (a″) there is no rollback:** the move
-   completes and a reverse move is an ordinary new move.
+   **Safety.** The source is `frozen`, then `moved_out`, never `active` during the cutover; the
+   target is `active` only after (c). Between (c) and (b″) there is **no owner at all**: requests
+   that reach the source fail `WrongShardOrEpoch{MOVED_OUT}` carrying the internal `MovedOutHint`,
+   are routed to the target from that hint alone, and meet `NamespaceNotReady` until (b″) commits;
+   the API's bounded re-resolve loop (≤ 5 s, N52) absorbs both. The arbiter lives in the catalog
+   because that is where the restore reads it. A "cutover in progress > 2 s" alert fires while (a″)
+   has committed and (d) has not. Order (c) before (d) is what model checking fixed (`ShardMove.cfg`):
+   with the catalog switched first, a client whose cache says `(source, e)` would read at a shard
+   that is no longer the owner.
+9. **`Restart`** (Temporal client, N97): for each recorded operation, `ExecuteWorkflow(type, id =
+   ns/{ns}/op/{op}, task_queue = "shard-{target}", input with shard_id = target and epoch = e + 1,
+   WorkflowIDReusePolicy = TERMINATE_IF_RUNNING, memo epoch = e + 1)`; the singletons and the
+   operation kinds they back (`DELETE_DOCUMENT`, `CONSOLIDATE`, `REFRESH_PAGE`) by `SignalWithStart`
+   only. `AlreadyStarted` counts as done only if `DescribeWorkflowExecution` shows task queue
+   `shard-{target}` and memo epoch `e + 1`; a **reconcile loop** re-scans the target `operations`
+   against `DescribeWorkflowExecution` until stable. Idempotency keys exclude the epoch (D11), so a
+   restarted `RetainDocument` skips the membership rows the source committed.
+   `namespace_moves.state = 'cleaning'`; the expunge resumes on the target.
+10. **`Cleanup`** (N161): `workflow.Sleep` until the **gate** holds, then the batches. The gate is
+    exactly: `now() ≥ activated_at + 24 h` **and** a **full** target backup whose `started_at >
+    activated_at` has completed (`target_backup_started_at`, `target_backup_at`, recorded by
+    `catalog.MoveBackups`; a forced full backup is requested if none starts within 24 h). There is
+    **no content check, no timeline check and no comparison of a serving target with the source**:
+    a backup that started after activation contains the complete copy (the copy finished before
+    `ready`), and what the target wrote or deleted since is its own, under the shard's ordinary
+    RPO. The cleanup activity, which holds both shard handles, drops the namespace's partial
+    indexes on the source by their deterministic names and runs `engram_cleanup_namespace` in
+    batches (its outer `DELETE` carries `namespace_id`, N131); it then calls the `CleanupMove`
+    admin RPC (scope `engram.worker`, cell-bound, N167), which checks the gate and records `done`
+    and `blob_gc_after = now() + 28 d`. The `moved_out` ownership row is **never** deleted (a later
+    move back uses `moved_out → incoming`); the source blob prefix goes after the 28-day backup
+    window (N123), and a differential backup of the source follows the row deletes (N119).
+11. **`Rollback`** (any failure before (a″): the freeze deadline, `MoveVerifyFailed`, a failed
+    index build, a missing blob, a consumer wait that did not finish, or `engramctl move abort`;
+    it runs by itself at the deadline). It first CASes `cutover → rolled_back` when the move was at
+    `cutover` (reading `committed` instead means the move completes). **Before Freeze** →
+    `abort_move`, delete the target rows and ownership row (`rollback_target`); **after Freeze** →
+    `thaw_move` (`frozen/move → active`) first, allowed **while the target is unreachable**
+    (a `ready` target accepts nothing; `unready_target` runs at the next contact), then the same;
+    **after (b′)** → `unready_target`, then the same. Rollback drops the target's indexes by their
+    deterministic names, restarts the workflows recorded in step 3 on the **source** queue at epoch
+    `e`, and, onto a shard that had a `moved_out` row, runs `return_abort` (`incoming → moved_out`,
+    restoring the hint). Catalog `state = 'active'`, `namespace_moves.state = 'rolled_back'`; the
+    copied blob prefix is deleted in the background. **After (a″) there is no rollback:** the move
+    completes, and a reverse move is an ordinary new move.
 
 #### 5.5.2 Step table
 
 | Step | Workflow or Activity | Idempotency key | Retry policy | Fencing check | Transaction boundary | Outbox events |
 |---|---|---|---|---|---|---|
-| `Plan` | activity (catalog-allowed) | `move_id`; `ON CONFLICT DO NOTHING` on ownership; `moved_out → incoming` on a re-visited target (N93); `engram_seq_advance(W_plan)` on the target (monotone, N147) | `P-catalog` | partial unique index on active moves | catalog tx; target tx (no fence: the row is being created); source tx (`engram_move`: `start_move`) | catalog event `MovePlanned` |
-| `BulkCopy` | activity | `(move_id, table, last_key)` — resumable key-range copy, no completion mark | `P-db` + `P-blob`, `ScheduleToClose` 24 h | source: none (`READ COMMITTED` reads); target: shared try-lock + `incoming` @ `e + 1` per range as `engram_move` under RLS, replica mode (N91) | source: read ranges; target: one tx per range via a `TEMP` table | — |
-| `Freeze` | activity (catalog-allowed) | state predicates (`active → frozen/move`, N101) | `P-catalog` / `P-db` | exclusive fence, one attempt, `lock_timeout` 35 s; later writers refused by their try-lock; timeline check | catalog tx; source tx | catalog event `NamespaceFrozen` |
-| `PreVerify` | activity | catch-up copy of `ins_seq ≥ F_copy` (idempotent upserts) **first**, then pure recomputation against `ins_seq < F_c` on both sides, `F_c` fixed at the start (N148); one more round on a mismatch | `P-db` + `P-blob`, 1 h | namespace still `active`; nothing blocks writers | target txs per batch; read txs | — |
-| `AwaitIndexes` | activity | `vector_indexes` requests by deterministic name; wait for `ready` with `rows_at_build ≥ 0.99 ×` the verified count; a failed build retries once (N153) | `P-db`, 12 h | namespace still `active`; the index runner holds `engram_migrate` | admin tx (requests) | — |
-| `Reconcile` | activity | pure recomputation; re-copy `ins_seq ≥ engram_seq_floor(T_pre)` (idempotent upserts); mutable merge-diff; excluded `count ≤`; blob existence | `P-db` + `P-blob`, 10 min | both sides static | target txs per batch; read txs | — |
-| `Drain` | activity | `terminated_workflows` upsert by workflow id; terminate idempotent; in-flight set read from `operations` (N97) | `P-db` / `P-temporal` | — | catalog jsonb upsert | — |
-| `CutoverBegin` (a) | activity (catalog-allowed) | `namespace_moves` state predicate | `P-catalog` | `namespace_moves.state = 'frozen'` | catalog tx — intent only | catalog event `NamespaceCutover` |
-| `ReadyTarget` (b′) | activity | state predicate `incoming → ready`; precondition rows: `engram_seq_advance(W_final)` done and every partial index `ready` (N147, N153) | `P-cutover` | target `incoming @ e + 1` | target tx | — |
-| `CommitMove` (a″) | activity (catalog-allowed) | CAS `namespace_moves.state: cutover → committed` (`WHERE move_id AND state = 'cutover'` and the verified shards, epochs, timeline and catalog namespace row, N143) | `P-cutover` | mover re-checked its source timeline against the catalog (N123); loser of the CAS against a rollback or restore stops | catalog tx — **the point of no return** | catalog event `MoveCommitted` |
-| `CutoverSource` (c) | activity | state predicate `frozen/move → moved_out` | `P-cutover` | source `epoch = e`; only after the mover read `committed` | source tx, writes `target_shard_id`/`target_epoch` | — |
-| `ActivateTarget` (b″) | activity | state predicate `ready → active` | `P-cutover`, retried indefinitely | target `ready @ e + 1` | target tx | — |
-| `CutoverCatalog` (d) | activity | catalog `epoch = e AND state = 'frozen'`; success if already `e + 1` for this move | `P-cutover`, retried indefinitely | — | catalog tx + `NOTIFY` | catalog event |
+| `Plan` | activity (catalog-allowed) | `move_id`; `ON CONFLICT DO NOTHING` on ownership; `moved_out → incoming` on a re-visited target (N93); blob pre-warm is copy-if-absent | `P-catalog` / `P-blob` | partial unique index on live moves | catalog tx; target tx (no fence: the row is being created); source tx (`start_move`) | catalog event `MovePlanned` |
+| `Freeze` | activity (catalog-allowed) | state predicates (`active → frozen/move`, N101); the deadline timer is workflow state | `P-catalog` / `P-db` | exclusive fence, one attempt, `lock_timeout` 35 s; later writers refused by their try-lock; timeline check | catalog tx; source tx | catalog event `NamespaceFrozen` |
+| `Drain` | activity | `terminated_workflows` upsert by workflow id; terminate idempotent; in-flight set read from `operations` (N97) | `P-db` / `P-temporal` | source `frozen/move` | catalog jsonb upsert | — |
+| `FrozenCopy` | activity | one `engram_seq_advance(W_final)` (monotone, idempotent); `(move_id, table, last_key)` resumable ranges of idempotent upserts | `P-db` + `P-blob`, `StartToClose` = remaining window | source: none (static); target: shared try-lock + `incoming` @ `e + 1` per range as `engram_move` under RLS, replica mode (N91) | source: read ranges; target: one tx per range via a `TEMP` table | — |
+| `VerifyFrozen` | activity | pure recomputation on both static sides; one re-copy of mismatching tables | `P-db` + `P-blob`, 1 h | source `frozen/move`, target `incoming` | read txs; target txs for the re-copy | — |
+| `BuildIndexes` | activity | `vector_indexes` requests by deterministic name; wait for `indisvalid ∧ indisready` (`engram_move_indexes_valid`); one retry of a failed build | `P-db`, 12 h | the index runner holds `engram_migrate` | admin tx (requests) | — |
+| `AwaitConsumers` | activity | read of consumer cursors against the final `max(seq)` | `P-db`, 120 s | source `frozen/move` | read tx | — |
+| `CutoverBegin` (a) | activity (catalog-allowed) | `namespace_moves` state predicate | `P-catalog` | `state = 'copied'` | catalog tx — intent only | catalog event `NamespaceCutover` |
+| `ReadyTarget` (b′) | activity | state predicate `incoming → ready`; trigger preconditions: indexes valid, `last_value > w_final` | `P-cutover` | target `incoming @ e + 1` | target tx | — |
+| `CommitMove` (a″) | activity (catalog-allowed) | CAS `cutover → committed` on the verified shards, epochs, timeline and catalog namespace row (N143), then the replicated-LSN wait (N163) | `P-cutover` | loser of the CAS against a rollback or restore stops | catalog tx — **the point of no return** | catalog event `MoveCommitted` |
+| `CutoverSource` (c) | activity | state predicate `frozen/move → moved_out` | `P-cutover` | source `epoch = e`; only after reading `committed` replicated | source tx, writes `target_shard_id`/`target_epoch` | — |
+| `ActivateTarget` (b″) | activity | state predicate `ready → active` | `P-cutover`, indefinitely | target `ready @ e + 1` | target tx | — |
+| `CutoverCatalog` (d) | activity | catalog `epoch = e AND state = 'frozen'`; success if already `e + 1` for this move | `P-cutover`, indefinitely | — | catalog tx + `NOTIFY` | catalog event |
 | `Restart` | activity | workflow ids, `TERMINATE_IF_RUNNING`; `AlreadyStarted` ok only on `shard-{target}` and memo epoch `e + 1`; reconcile loop (N97) | `P-temporal` | — | none | — |
-| `ReconcileIn` | activity (restore reconcile, §5.5.5) | `INSERT … ON CONFLICT DO NOTHING` of insert-only rows `ins_seq ≥ F_pre` (source value) and the mutable class from the static source; admin edges `incoming → ready → active` (N149) | `P-db` | catalog move `committed`/`cleaning`; `engram_admin` only | target txs per batch | — |
-| `Cleanup` | timer + activity (admin RPC) | after 24 h **and** the gate of step 8 (cleanup-time `ReconcileIn`, a full target backup started after it, the content check, the timeline check; N143, N149, N159); predicate deletes via `engram_cleanup_namespace`; ownership row kept as `moved_out` (N93); source blob prefix after 28 days (`blob_gc_after`) | `P-db` / `P-blob` | source `moved_out` (`SECURITY DEFINER` function) | admin txs in batches | — |
+| `Cleanup` | timer + activity, then the `CleanupMove` RPC | the gate of step 10; predicate deletes via `engram_cleanup_namespace`; `moved_out` row kept (N93); source blob prefix after 28 days | `P-db` / `P-blob` | source `moved_out` (`SECURITY DEFINER` function) | admin txs in batches | — |
 | `Rollback` | activity | CAS `cutover → rolled_back`; state predicates (`abort_move`, `thaw_move`, `unready_target`, `rollback_target`, `return_abort`) | `P-catalog` / `P-db` | only before (a″); `thaw_move` allowed while the target is unreachable | catalog tx; source tx; target txs | catalog event `MoveRolledBack` |
 
 #### 5.5.3 Sequence
@@ -1931,191 +1826,174 @@ sequenceDiagram
   participant DST as target shard T
   participant TMP as Temporal
   participant API as engram-api
-  OP->>CAT: MoveService.StartMove ns, target
+  OP->>CAT: MoveService.StartMove ns, target, window
   CAT->>TMP: ExecuteWorkflow move/{ns}/{e+1} on shard-T
   TMP->>M: Move
-  M->>CAT: Plan - namespace_moves planned, namespaces moving
+  M->>CAT: Plan - namespace_moves planned, W_est computed, namespaces moving
   M->>DST: ownership incoming @ e+1 (or moved_out to incoming, N93)
-  M->>SRC: start_move - expunge and schedulers paused, record timeline and T_copy
-  M->>DST: engram_seq_advance W_plan - the target sequence moves past the source
-  loop every table in READ COMMITTED key ranges of at most 100k rows, dirty copy (N124)
+  M->>SRC: start_move - expunge and schedulers paused
+  M->>DST: blob pre-warm - owner-keyed blobs by listing
+  M->>CAT: Freeze - namespaces frozen, freeze_deadline, NOTIFY
+  M->>SRC: exclusive fence one attempt 35 s, freeze_move active to frozen/move
+  Note over API: writes get NamespaceFrozen with frozen_until_estimate, reads continue, rollback at the deadline
+  M->>SRC: Drain - read operations RUNNING PENDING DEFERRED, never visibility (N97)
+  M->>TMP: record workflow ids, terminate
+  M->>DST: engram_seq_advance W_final - once
+  loop every table in primary-key ranges of at most 100k rows, WAL-paced, static source
     M->>SRC: COPY range TO STDOUT under RLS
     M->>DST: COPY into TEMP table, INSERT SELECT ON CONFLICT under RLS, replica mode, incoming @ e+1 per range (N91)
   end
-    M->>DST: blobs referenced by copied rows (one key per row)
-  M->>SRC: PreVerify while active - W_pre, then catch-up copy by ins_seq first, then counts and hashes below the closed floor F_c, VerifyFK, blobs
-  M->>DST: AwaitIndexes - partial HNSW indexes requested from the index runner, wait until ready
-  M->>CAT: Freeze - namespaces frozen, NOTIFY
-  M->>SRC: exclusive fence one attempt 35 s, freeze_move active to frozen/move - watchdog armed until step c
-  Note over API: writes get NamespaceFrozen and are retried up to 30 s, reads continue
-    M->>DST: Reconcile - re-copy ins_seq above the floor of T_pre, mutable merge-diff, excluded count check, blobs, relay drain 120 s, VerifyFK on the range
-  M->>SRC: Drain - read operations RUNNING PENDING DEFERRED, never visibility (N97)
-  M->>TMP: record workflow ids, terminate
+  M->>DST: VerifyFrozen - count and PK hash per table on both sides, VerifyFK, blobs
+  M->>DST: BuildIndexes - partial HNSW requested from the index runner, wait until valid
+  M->>SRC: consumer cursors past the final max seq
   M->>CAT: CutoverBegin a - intent only
-  M->>DST: b1 - seq advance W_final, indexes ready, incoming to ready, nothing routes to ready
-    M->>CAT: a2 - CAS cutover to committed - point of no return
-  M->>SRC: c - frozen/move to moved_out with the target hint, only after reading committed
+  M->>DST: b1 - incoming to ready, indexes valid, last_value above w_final
+  M->>CAT: a2 - CAS cutover to committed - point of no return
+  M->>CAT: wait until the standby replayed the commit LSN
+  M->>SRC: c - frozen/move to moved_out with the target hint
   M->>DST: b2 - ready to active, retried indefinitely
   Note over API: between c and b2 there is no owner - requests get MOVED_OUT with the hint, then NamespaceNotReady, bounded loop of 5 s
   M->>CAT: d - shard=T, epoch=e+1, active, NOTIFY - retried indefinitely
   M->>TMP: Restart recorded operations on shard-T, TERMINATE_IF_RUNNING, memo epoch e+1, reconcile loop (N97)
-  Note over M: sleep 24 h
-    M->>API: CleanupMove admin RPC - DROP INDEX by name, engram_cleanup_namespace, keeps the moved_out row (N93), blob prefix after 28 days
+  Note over M: wait for 24 h after activation and a full target backup that started after it
+  M->>API: CleanupMove admin RPC - DROP INDEX by name, engram_cleanup_namespace, keeps the moved_out row (N93), blob prefix after 28 days
 ```
 
 #### 5.5.4 Mover crash at each step
 
-| Crash during | State left behind | On resume (Temporal retries the activity; workflow state is durable) |
+Every activity is an idempotent upsert or a state predicate keyed by `move_id`, so Temporal's retry
+of the activity is the recovery; the table lists only what is not obvious.
+
+| Crash during | State left behind | On resume |
 |---|---|---|
-| `Plan` | some of: catalog row, target ownership row, `move_epoch` | every statement is `ON CONFLICT DO NOTHING` or a state predicate keyed by `move_id` → completes |
-| `BulkCopy` | target holds complete ranges `< k` of table `i` and possibly one loaded range not yet recorded | heartbeat says `(table, last_key)`; resume at the first range without a completion mark — ranges are idempotent upserts, so no delete-and-recopy; skew between ranges is repaired by `PreVerify` and `Reconcile` |
-| `PreVerify` | some catch-up ranges copied; the namespace still `active` | recompute: the catch-up copy is an idempotent upsert, the checks are pure functions of both sides below the closed floor `F_c` |
-| `AwaitIndexes` | some `vector_indexes` requests made, some builds `ready` or `building` | requests are keyed by deterministic name and lease; the wait re-reads the rows; a `failed` build is requested once more, then `Rollback` |
-| `Freeze` | catalog frozen but source row not yet, or vice versa | predicates are idempotent; the watchdog timer is workflow state and still bounds the window |
-| `Reconcile` | some rows re-copied, some mutable rows merged | recompute: re-copy is an idempotent upsert, the merge-diff is a pure function of both sides, both static |
+| `Plan` | some of: catalog row, target ownership row, `move_epoch`, part of the pre-warm | every statement is `ON CONFLICT DO NOTHING` or a state predicate keyed by `move_id`; the pre-warm is copy-if-absent |
+| `Freeze` | catalog frozen but source row not yet, or vice versa | predicates are idempotent; the deadline timer is workflow state and bounds the window |
 | `Drain` | some workflows recorded, some terminated | upsert by workflow id; terminate ignores closed; the set is re-read from `operations` |
-| `CutoverBegin` (a) committed | `namespace_moves = cutover`; ownership rows and catalog unchanged | still rollback-able: nothing routes to the target |
-| `ReadyTarget` (b′) committed | target `ready`, source `frozen/move`, `namespace_moves = cutover` | still rollback-able: the rollback CAS `cutover → rolled_back`, `unready_target`, `thaw_move` (allowed while the target is unreachable), delete target rows; a target outage or watchdog expiry here rolls back |
-| `CommitMove` (a″) committed | `namespace_moves = committed`; source still `frozen/move`, target `ready`, catalog namespace still names the source at `e` | **point of no return**: the move can only complete, by the mover or by the restore or failover reconcile (`reconcile_out`). A failover before this CAS rolls the move back; one after it finishes it |
-| `CutoverSource` (c) committed | source `moved_out` (with `target_shard_id`, `target_epoch`), target `ready`, catalog still names the source at `e` | Requests that reach the source fail `WrongShardOrEpoch{MOVED_OUT}` with the hint and are routed to the target (`NamespaceNotReady` until b″); `ActivateTarget` and `CutoverCatalog` retry at 100 ms → 1 s; beyond 2 s the "cutover in progress" alert fires |
-| `ActivateTarget` (b″) committed | target `active @ e + 1`, catalog still `e` | `CutoverCatalog` retries; a stale caller follows the hint or re-resolves |
-| `CutoverCatalog` (d) committed | catalog points to the target; workflows not restarted | retry of (d): 0 rows but `namespaces.epoch = e + 1` already → success, then `Restart` |
-| `Restart` | some workflows started | `AlreadyStarted` is success only on queue `shard-{target}` with memo epoch `e + 1`; otherwise terminate and restart; the reconcile loop re-compares until stable |
+| `FrozenCopy` | target holds complete ranges `< k` of table `i` and possibly one loaded range not yet recorded | the heartbeat says `(table, last_key)`; resume at the first range without a completion mark; ranges are idempotent upserts and the advance is monotone |
+| `VerifyFrozen`, `BuildIndexes`, `AwaitConsumers` | copy complete; some index requests made | pure recomputation; requests are keyed by deterministic name and lease; a `failed` build is requested once more, then `Rollback` |
+| `CutoverBegin` (a) or `ReadyTarget` (b′) committed | `namespace_moves = cutover`, target maybe `ready`, source `frozen/move` | still rollback-able: the rollback CAS `cutover → rolled_back`, `unready_target`, `thaw_move` (allowed while the target is unreachable), delete target rows; the deadline timer still runs |
+| `CommitMove` (a″) committed | `committed`; source still `frozen/move`, target `ready`, catalog names the source at `e` | **point of no return**: the move can only complete, by the mover or by the restore or failover reconcile (`reconcile_out`); a failover before this CAS rolls the move back, one after it finishes it |
+| catalog primary lost after (a″) before the standby replayed it | the mover waits for the replicated LSN and does not take (c); the promotion reconcile re-derives the move from the shards (N163) | still rollback-able by the arbiter rule of §5.5.5 step 1 if the commit was lost; completes if it survived |
+| `CutoverSource` (c) committed | source `moved_out`, target `ready`, catalog names the source at `e` | requests that reach the source fail `WrongShardOrEpoch{MOVED_OUT}` with the hint and meet `NamespaceNotReady` until (b″); `ActivateTarget` and `CutoverCatalog` retry at 100 ms → 1 s; beyond 2 s the alert fires |
+| `ActivateTarget` (b″) or `CutoverCatalog` (d) committed | target `active @ e + 1`, catalog still `e` (or flipped, workflows not restarted) | retry of (d): 0 rows but `namespaces.epoch = e + 1` already → success, then `Restart`; a stale caller follows the hint or re-resolves |
+| `Restart` | some workflows started | `AlreadyStarted` is success only on queue `shard-{target}` with memo epoch `e + 1`; otherwise terminate and restart; the reconcile loop re-compares |
 | `Cleanup` | partial deletes | predicate deletes; the RPC is idempotent; the `moved_out` row is never deleted |
-| Watchdog fires (freeze > `max(120 s, 60 s + 1 s per 10,000 live facts)`, ≤ 15 min, before (a″)) | frozen namespace | `Rollback`: `unready_target` if (b′) had committed, `thaw_move`, restart recorded workflows on the source, delete target rows |
+| The freeze deadline passes before (a″) | frozen namespace, copy possibly unfinished | `Rollback` by itself: `unready_target` if (b′) had committed, `thaw_move`, restart recorded workflows on the source, delete target rows; `MoveWindowExceeded` pages |
 | Source fails over or restores during the move | session timeline differs from the catalog | `MoveFenced` at the next source activity, at `Freeze` or at (a″): `Rollback`; restore reconciles any open move first (§5.5.5) |
-| Whole worker fleet down | workflow stalls in whatever state | Temporal re-dispatches when a worker returns; a stall in `frozen` is bounded by the watchdog, which also runs as workflow logic |
-| Source fails over between (c) and (d) | the restore or failover reconcile reads `committed` in the catalog and completes (c), (b″) and (d) itself | the move ends on the target (`TestMove_FailoverBetweenCAndD`) |
-| The **target** is restored or promoted after (a″) (state `committed` or `cleaning`, i.e. activated and not yet cleaned) | the target may lack rows written after the restore point, and a backup taken during the copy phase brings back a low `engram_ins_seq` with its rows; the source is static (`frozen/move` or `moved_out`) and intact until cleanup | the reconcile re-runs `engram_seq_advance(W_final)` first, **also when every row is present**, then `ReconcileIn` re-copies from the source, then the intents replay, then the target is brought `incoming → ready → active` (§5.5.5); `Cleanup` is gated on the content check, the timeline check and a cleanup-time `ReconcileIn` (`TestMove_TargetFailoverAfterCommit`, `TestMove_TgtRestoreSeqAdvance`, `TestMove_CleanupWaitsForPostRestoreBackup`, `ShardMove_TgtRestore`) |
-| A second move of a namespace that was moved before | the young target's sequence was advanced past the source's at `Plan` and `ReadyTarget`, so copied rows sort below every later insert and the second move re-copies only the recent range | no whole-namespace re-copy under the freeze (`TestMove_TwiceAndExport`, `ShardMove_NoSeqAdvance` must fail `CopiedBelowTargetSeq`) |
+| Whole worker fleet down | workflow stalls in whatever state | Temporal re-dispatches when a worker returns; the deadline is workflow logic and fires on return |
+| Source fails over between (c) and (d) | the restore or failover reconcile reads `committed` and completes (c), (b″) and (d) itself | the move ends on the target |
+| The **target** is restored or promoted after (a″) | `active` row: restore point after activation. `incoming` or `ready` row: restore point before activation | `active`: ordinary restore, source untouched. `incoming`/`ready`: wipe and re-run the copy from the retained `moved_out` source, never merge (§5.5.5 step 1) |
+| A second move of a namespace that was moved before | the young target's sequence was advanced past the source's | no special case: the copy is whole every time |
 
 **Stale-cache client path.** After (d) the `NOTIFY` invalidates every resolver within
 milliseconds, but a request that resolved earlier may hit the source: the fence returns
 `moved_out` or an epoch mismatch → `errs.WrongShardOrEpoch`. For `moved_out` the router reads the
-internal `MovedOutHint` (the `moved_out` row's `target_shard_id` and `next_epoch`) and routes the
-call to the target, which verifies ownership at its own fence, so neither reads nor writes depend
-on the catalog during the window; an epoch mismatch without a hint re-resolves bypassing the cache
-and retries the handler **once** for a write, a call in the `MOVED_OUT`/`ready` window re-resolves
-in a bounded loop of ≤ 5 s (N52), and a failure past the bound surfaces as `FAILED_PRECONDITION`
-without any shard field. Workers never resolve: a workflow that still runs on the source after
-termination fails its next fenced transaction with the non-retryable error and ends `FAILED`.
+internal `MovedOutHint` and routes the call to the target, which verifies ownership at its own
+fence, so neither reads nor writes depend on the catalog during the window; an epoch mismatch
+without a hint re-resolves bypassing the cache and retries the handler **once** for a write, a call
+in the `MOVED_OUT`/`ready` window re-resolves in a bounded loop of ≤ 5 s (N52), and a failure past
+the bound surfaces as `FAILED_PRECONDITION` without any shard field. Workers never resolve: a
+workflow still running on the source after termination fails its next fenced transaction with the
+non-retryable error and ends `FAILED`.
 
-#### 5.5.5 Restore and failover reconcile against the catalog (N123, N134)
+#### 5.5.5 Restore and failover reconcile against the catalog (N123, N134, N161, N163)
 
-Restoring shard `S` from backup (`engramctl restore --shard S`) or promoting a replica after a
-failover runs this sequence, in order. **Step 0: the catalog itself.** The catalog has one
-synchronous standby (`synchronous_commit = remote_apply`, N146), so a catalog commit that a move
-step, a delete ack or an epoch bump observed survives a catalog failover (RPO 0). A catalog
-**restore from backup** (RPO 60 s, the only lossy path) is followed by `engramctl catalog reconcile
---from-shards` **before the catalog serves writes, after every catalog restore and not only after a
-shard restore** (N159): a move that waits for `committed` after the catalog lost it is completed by
-this repair alone, with no shard fault to trigger a reconcile (`ShardMove_CatalogLossNoShardTruth`,
-`TestCatalog_ReconcileAfterEveryRestore`). The shards' ownership rows are the source of
-truth (a source `moved_out` with a target hint ⇒ the move is at least `committed`; a target `active`
-with `move_epoch` ⇒ `done` or `cleaning`; a target `ready` or `incoming` with a source
-`frozen/move` ⇒ `cutover`, settled by the ordinary CAS; a shard `frozen/delete` ⇒ `deleting`), and
-every namespace's catalog epoch is raised to `max(epoch over its shard rows)` before any restore or
-failover may compute "catalog epoch + 1". Then:
+Restoring shard `S` from backup (`engramctl restore --shard S`) or promoting a replica runs this
+sequence, in order. **Step 0: the catalog.** The catalog runs a primary and **one asynchronous
+hot standby** (`synchronous_standby_names = ''`, N163); **`engramctl catalog reconcile
+--from-shards` runs as the first step of every catalog promotion and every catalog restore, before
+the alias flips to the new primary** (one query per shard, seconds; `engram-api` serves its cache
+meanwhile). It derives from the shards' ownership rows: `namespaces.(shard_id, epoch, state)` from
+the unique `active`/`frozen` row across shards; a source `moved_out` with a target hint ⇒ the move
+is at least `committed`; a target `active` with neither a `frozen/move` nor a `moved_out` source and
+no catalog move ⇒ `done`; no target row and no `moved_out` source ⇒ `rolled_back`; a shard
+`frozen/delete` ⇒ `deleting`; and every namespace's catalog epoch is raised to `max(epoch over its
+shard rows)` before any restore or failover may compute "catalog epoch + 1". A catalog restore from
+backup (RPO 60 s) is the only lossy catalog path and is followed by the same reconcile before the
+catalog serves writes. Then, for the shard:
 
-1. **Reconcile open moves with a CAS arbiter.** For every `namespace_moves` row that names `S` and
-   is not terminal, the catalog row is the arbiter and the reconcile CASes `cutover → rolled_back` (a move
-   that never reached `cutover` is rolled back directly). If the CAS wins, the move is rolled back from the target side and the restored source row is
-   thawed. If it reads `committed`, the move is past the point of no return and the reconcile
-   completes (c), (b″) and (d) itself (the admin edge `reconcile_out`, from any state). Exactly one
-   side wins and the loser stops. **If `S` is the *target* of a move read as `committed` or
-   `cleaning`** (activated and not yet cleaned; it was restored or promoted after the point of no
-   return), the reconcile **first re-runs `engram_seq_advance(W_final)`** on the target (N147, N159;
-   `W_final` from `namespace_moves`): a backup taken during the copy phase holds rows above its
-   then-lower sequence, and a restore to it brings the low sequence back together with the rows, so
-   without the advance an active target would insert below its own rows. This happens whenever the
-   move is `committed` or `cleaning`, **also when every row is present** and neither `ReconcileIn`
-   nor (b″) has anything to do (`ShardMove_TgtRestore`, `TestMove_TgtRestoreSeqAdvance`). Then it runs
-   **`ReconcileIn`** before (b″) (N149): from the source (static, intact until cleanup) it re-copies
-   the insert-only rows with `ins_seq ≥ F_pre` (a source value) and the whole mutable class, both as
-   `INSERT … ON CONFLICT DO NOTHING` (a target row that exists is either the copy or a
-   post-activation write and is kept; a missing one is restored from the source), waits for the
-   namespace's partial indexes (§5.5.1 step 2c, N153), runs the ordinary intent replay (step 4), and
-   then takes the admin edges `reconcile_in: incoming → ready → active` (`engram_admin` only,
-   allowed only while the catalog move is `committed` or `cleaning`). **`cleaning` joins the
-   `reconcile_out` arbiter row explicitly:** a *source* restored to a point before cleanup whose move
-   is `done` or `cleaning` re-runs `engram_cleanup_namespace` for every `moved_out` row whose move is
-   past `committed` (`restore cleanup-moved-out`, part of `restore_done`), so resurrected data rows,
-   including rows of documents deleted on the target since, are removed again
-   (`TestRestore_SourceCleansMovedOut`). Only then does the shard continue.
+1. **Reconcile open moves with a CAS arbiter.** For every non-terminal `namespace_moves` row that
+   names `S`, the catalog row is the arbiter. The reconcile takes `cutover → rolled_back` **only
+   after reading the source and target ownership rows in the same reconcile and finding neither
+   `moved_out` on the source nor `active` at the move's epoch on the target** (a move that never
+   reached `cutover` is rolled back directly); then the move is rolled back from the target side and
+   the restored source row is thawed. Otherwise it re-derives `committed` from the shards and
+   completes (c), (b″) and (d) itself (`reconcile_out`, from any state). Exactly one CAS wins. After
+   (a″), by the restored row of the **target**:
+   - **`active`** (restore point after activation): an **ordinary restore**: freeze
+     `frozen/restore`, epoch bump, intent replay, reopen. The lost writes are post-activation writes
+     within the shard's RPO (retains ≤ 60 s; acknowledged deletes and invalidations are replayed from
+     intents).
+   - **`incoming` or `ready`** (restore point before activation: by `archive_timeout = 60` it
+     happened within the last minute): **wipe and re-run**. `engram_cleanup_namespace` on the target,
+     drop its partial indexes, `rerun_move` (`ready → incoming`, admin edge) if needed, then
+     `FrozenCopy`, `VerifyFrozen` and `BuildIndexes` again from the `moved_out` source (static and
+     intact: cleanup is impossible before a post-activation backup, and that backup is what an
+     ordinary restore uses), then `reconcile_in` (`incoming → ready → active`, admin edges, allowed
+     only while the catalog move is `committed` or `cleaning`), then the intent replay. The other
+     namespaces of the shard reopen at `restore_done` without waiting; only the moved-in namespace
+     stays unavailable for the re-run, so the shard RTO carries no move term.
+   - A target restored to a point before the move-in **after cleanup** is recovered by the recovery
+     move below.
+   - **Never merge.** A target that has served writes has legitimately deleted rows (document
+     expunge, retire purges, `Restore`, key sweeps); "missing on the target" is not "lost". A
+     target that has not served writes has nothing to protect, so wiping and re-copying is exact.
+   - A *source* restored after (a″) is made `moved_out` by shard truth, and a source restored to a
+     point before a completed cleanup re-runs `engram_cleanup_namespace` for every `moved_out` row
+     whose move is past `committed` (`restore cleanup-moved-out`, part of `restore_done`), so
+     resurrected rows, including rows of documents deleted on the target since, are removed again.
 2. **Epoch.** For every namespace the catalog lists on `S` **except** those whose open move is
    `committed` (the move completes at its own epoch) and those whose catalog state is `deleting`
-   (their replay uses the `restore_delete` edge, step 4), a catalog transaction sets `epoch = e +
-   1, state = 'restoring'` (N64) + `NOTIFY` **first**; the shard's `namespace_ownership` is then
-   rewritten to the catalog value and brought up `frozen/restore` (edges `freeze_restore`, then
-   `restore_done` with rule `greater`; `epoch_bump` for a failover without restore; the
-   `move_epoch > epoch` CHECK is moot because the move was already settled). Every execution that
-   started before the restore carries epoch `e` and fails its next fence. `moved_out_at` is
-   informational; the arbiter is the catalog row.
-3. **Timeline.** Promotion writes the new `(system_identifier, timeline_id)` into
-   `catalog.shards` **before** the shard's virtual endpoint flips (N63); the mover compares its
-   session's timeline with the catalog at `Freeze`, at the CAS (a″) and at (c), and the relay every
-   10 s, so a zombie primary can be neither frozen nor cut over.
+   (their replay uses the `restore_delete` edge, step 4), a catalog transaction sets `epoch = e + 1,
+   state = 'restoring'` (N64) + `NOTIFY` **first**; the shard's `namespace_ownership` is then
+   rewritten to the catalog value and brought up `frozen/restore` (`freeze_restore`, then
+   `restore_done` with rule `greater`; `epoch_bump` for a failover without restore). Every execution
+   that started before the restore carries epoch `e` and fails its next fence.
+3. **Timeline.** Promotion writes the new `(system_identifier, timeline_id)` into `catalog.shards`
+   **before** the shard's virtual endpoint flips (N63); the mover compares its session's timeline
+   with the catalog at `Freeze`, at the CAS (a″) and at (c), and the relay every 10 s, so a zombie
+   primary can be neither frozen nor cut over.
 4. **Replay the delete intents** (N122, N134): `engramctl restore replay` first writes
-   `_control/restores/{shard}/{restore_target}.json` (the restore target and the floor it will use) to
-   blob storage, then lists each hosted namespace's intent objects (`_control/deletes/{tenant}/{ns}/`,
-   written per namespace for a tenant delete too) with `deleted_at ≥ replay_floor − 10 min`, where
-   **`replay_floor = min(catalog.shards.replay_floor, the restore markers in
-   _control/restores/{shard}/)`** (catalog columns `replay_floor_mirror` and `replay_floor_effective`) (N146): the catalog value lives outside the restorable shard
-   state, so neither a PITR nor a stale promotion can lose it, and the blob markers make it
-   derivable, so a catalog that lost the lowered value cannot raise it
-   (`TestReplay_FloorFromBlob`). Every restore and failover lowers it with `min()` of its
-   restore target; it is **never raised** while intents are retained (35 days, which also bounds
-   the replay work), because replayed markers are ordinary local commits that the next restore can
-   lose exactly as it lost the originals. The margin (10 min) covers a marker whose transaction started before the restore point and
-   committed after it, bounded by the 30 s statement and idle timeouts (C-14). Each intent is applied **verbatim** — its recorded
-   `up_to_version` or `memory_ids`, never recomputed from restored state — through the admin
-   variant of the marker transaction (same statements, fence bypassed while `frozen/restore`),
-   **per subject in `prev_operation_id` chain order** (a broken chain starts at its oldest present
-   member; order across subjects is irrelevant and no clock-sync bound is needed, so a `Restore`
-   after an `Invalidate` is honoured whichever API host stamped the names), **skipping an intent
-   whose recorded `epoch` is older than the recorded epoch of an entry of the same subject already
-   applied** (the intent carries the namespace epoch it committed under, N143; **a replayed
-   `deletion_log` row stores that recorded epoch, never the shard's current one**, and a new column
-   `applied_epoch` records the epoch it was applied under, informational; so `Invalidate(e)` then
-   `Restore(e)` replay in chain order and both apply, N150; `Durability_NoEpochGuard`,
-   `Durability_ReplayStampsCurrentEpoch`, `TestIntent_EpochGuard`,
-   `TestIntent_ReplayTwoOfSameSubject`), skipping namespace and tenant intents whose catalog row is not
-   `deleting` or `deleted`, and idempotently through the shard `deletion_log`. **A skipped intent is
-   recorded as settled (N159):** the replay inserts its `deletion_log` row under the intent's own
-   `intent_key` with `replay_outcome = 'skipped'` (nothing applied, `applied_epoch` NULL; an applied
-   one gets `'applied'`), and the replay is complete, and `restore_done` may reopen the shard, when
-   **every in-window intent has a row, applied or skipped**; otherwise the reopen would wait for an
-   intent that is never applied (`Durability.tla`, `TestReplay_SkippedIntentSettled`). A repeated
-   `Invalidate` or `Restore` has its own intent and is replayed like any other entry. **The subject
-   is `(class ∈ {document, memory, namespace, tenant}, id)`, independent of the action kind**
-   (`deletion_log_subject_idx` is `(namespace_id, subject_id, deleted_at DESC)`, and the chain
-   lookup for a fact reads the last entry of either kind), and every live marker writer on a subject
-   holds the subject lock until its intent is put and helps the previous entry first, so concurrent
-   calls form one chain without holes (N150, N159; the replay itself runs while the namespace is
-   `frozen/restore`, when no API writer can commit a marker). A namespace or tenant delete replays through the `restore_delete` edge
-   (`frozen/restore → frozen/delete`, `engram_admin`) instead of passing through `active`. The
-   shard listens only on a restricted `listen_addresses` until `restore_done`, and the read fence
-   rejects `frozen/restore`. Intents are kept 35 days (> the 28-day backup window).
+   `_control/restores/{shard}/{restore_target}.json` to blob storage, then lists each hosted
+   namespace's intent objects (`_control/deletes/{tenant}/{ns}/`, written per namespace for a
+   tenant delete too) with `deleted_at ≥ replay_floor − 10 min`, where **`replay_floor =
+   min(catalog.shards.replay_floor, the restore markers listed under _control/restores/{shard}/)`**
+   (N163(4)): the catalog value lives outside the restorable shard state and the blob markers make
+   it derivable, so a catalog that lost the lowered value cannot raise it (`TestReplay_FloorFromBlob`).
+   Every restore and failover lowers it with `min()`; it is **never raised** while intents are
+   retained (35 days). The margin (10 min) covers a marker whose transaction started before the
+   restore point and committed after it (30 s timeouts, C-14). Each intent is applied **verbatim** —
+   its recorded `up_to_version` or `memory_ids`, never recomputed from restored state — through the
+   admin variant of the marker transaction (fence bypassed while `frozen/restore`), **per subject in
+   `prev_operation_id` chain order** (order across subjects is irrelevant and no clock-sync bound is
+   needed), **skipping an intent whose recorded `epoch` is older than the recorded epoch of an entry
+   of the same subject already applied** (a replayed `deletion_log` row stores the recorded epoch,
+   never the shard's current one; `applied_epoch` records the epoch it was applied under, N150), and
+   skipping namespace and tenant intents whose catalog row is not `deleting` or `deleted`. **A
+   skipped intent is recorded as settled** (`replay_outcome = 'skipped'`, N159) and the replay is
+   complete, and `restore_done` may reopen the shard, when every in-window intent has a row, applied
+   or skipped. **The subject is the encoded `(class ∈ {document, memory, namespace, tenant}, key)`**
+   of N162, independent of the action kind: `deletion_log_subject_idx` is `(namespace_id,
+   subject_class, subject_id, ins_seq DESC)` and the chain tip is the last entry **by `ins_seq`**
+   (never `deleted_at`); every live marker writer holds the subject lock until its intent is put and
+   helps the previous entry first, so concurrent calls form one chain without holes (N150, N159). A
+   namespace or tenant delete replays through `restore_delete` (`frozen/restore → frozen/delete`,
+   `engram_admin`). The shard listens only on a restricted `listen_addresses` until `restore_done`,
+   and the read fence rejects `frozen/restore`.
 5. **Restart the in-flight work**: the operations whose ledger rows survived
    (`PENDING|RUNNING|DEFERRED` on the restored shard) are re-submitted at epoch `e + 1` from their
-   `operations` rows (the N97 procedure; singleton-backed kinds by `SignalWithStart`) and the
-   outbox cursors are reset. Work acknowledged after the restore point is lost with the WAL tail
-   and reported as such (§9): retains RPO ≤ 60 s; acknowledged deletes and invalidations RPO 0; a
+   `operations` rows (N97; singleton-backed kinds by `SignalWithStart`) and the outbox cursors are
+   reset. Work acknowledged after the restore point is lost with the WAL tail and reported as such
+   (§9): retains RPO ≤ 60 s; acknowledged deletes and invalidations RPO 0; a
    committed-but-unacknowledged delete may be lost and is re-applied by the client's retry.
-   Because the client's `idempotency_keys` rows were lost too, a client re-submission is accepted,
-   which is the correct outcome.
 
-**PITR to a point before a move-in.** The namespace is recovered by running an ordinary move whose
+**PITR to a point before a move-in.** The namespace is recovered by an ordinary move whose
 **source is a scratch instance restored from the old source's backup** at cutover time (the same
-BulkCopy/Reconcile code), **ending with a replay of the namespace's intents from `cutover_at −
-margin` before `ready`**: the scratch move brings back the state as of the cutover, and the
-deletes acknowledged on the target after the move-in are re-applied from their objects.
-`blob gc --reconcile` skips the prefixes of namespaces the catalog places on the shard until their
-recovery moves are `done`. `CleanupMove` deletes the moved-out rows at 24 h but the source blob
-prefix only after the 28-day backup window (step 8), so the old source's blobs survive the window.
-
-**Kafka: not used.** The move reads rows, not the outbox; a Kafka topic would be a second copy of
-a log the move no longer consumes.
+`FrozenCopy`, `VerifyFrozen` and `BuildIndexes` code), **ending with a replay of the namespace's
+intents from `cutover_at − margin` before `ready`**: the scratch move brings back the state as of
+the cutover, and the deletes acknowledged on the target after the move-in are re-applied from their
+objects. `blob gc --reconcile` skips the prefixes of namespaces the catalog places on the shard
+until their recovery moves are `done`; the source blob prefix survives the 28-day window (step 10).
 
 ---
 
@@ -2312,7 +2190,7 @@ snapshots, not an outbox range.
 | `CommitChunk`, `FinalizeVersion`, `ReembedChunk` (write part), `StoreProposal`, `ApplyBatch`, `CommitPageVersion`, `Materialize`, `PurgeBatch`, `DerivedPurge`, `PurgeBlobs` (tombstone tx), `RecordSnapshot`, `BeginSnapshot` | `P-frozen` (`DocumentBusy`, `FenceBusy`, `NamespaceNotReady` retryable; the exclusive document lock of `FinalizeVersion` and the exclusive derivation lock of `Materialize` and `Restore`: 35 s, one attempt) | 30–60 s | 10 min | — |
 | Blob-only steps (`xcache`/`ecache` get/put, `WriteManifest`, blob copy/delete) | `P-blob` | 60 s | 1 h | 10 s when listing |
 | `PollBatch` | `P-poll` | 30 s | 48 h | — |
-| `WriteFiles`, `BulkCopy` (resumable key ranges, `CopyProgress`), `PreVerify`, `AwaitIndexes` (12 h), `Reconcile`, `ReconcileIn`, `PurgeRows`, `PurgeBlobs` (listing), `ReindexHygiene` (request) | `P-db`/`P-blob` | 2–12 h | 24 h | 10 s, resumable payload |
+| `WriteFiles`, `FrozenCopy` (resumable key ranges, `CopyProgress`), `VerifyFrozen`, `BuildIndexes` (12 h), `AwaitConsumers`, `PurgeRows`, `PurgeBlobs` (listing), `ReindexHygiene` (request) | `P-db`/`P-blob` | 2–12 h | 24 h | 10 s, resumable payload |
 | `Plan`, `Freeze`, `CutoverBegin`, `Rollback`, `MarkDeleted` | `P-catalog` | 30 s | 10 min | — |
 | `ReadyTarget`, `CommitMove`, `CutoverSource`, `ActivateTarget`, `CutoverCatalog` (N52, N125) | `P-cutover` | 5 s | 60 s | — |
 | `DrainWorkflows`, `Restart`, `Drain` | `P-temporal` | 60 s (+ `drain_wait`) | 10 min | 5 s |
@@ -2326,7 +2204,9 @@ snapshots, not an outbox range.
 | `Validation` | input/schema checks | deterministic on the same input |
 | `IntegrityViolation` | unexpected constraint violations (not the designed `ON CONFLICT`s) | a bug; retrying repeats it and hides it |
 | `PermanentLLMError` | gateway 400/404/413/422, content policy | the model will refuse the same input again |
-| `MovePrecondition` | `Plan`/`CutoverBegin`/`CommitMove`/`CutoverCatalog` | the catalog state contradicts the move (another move, wrong epoch, namespace deleting, or a rollback or restore already won the `cutover` CAS) |
+| `MovePrecondition` | `Plan`/`CutoverBegin`/`CommitMove`/`CutoverCatalog` | the catalog state contradicts the move (another move, wrong epoch, namespace deleting, `WINDOW_REQUIRED` or a window shorter than `W_est`, or a rollback or restore already won the `cutover` CAS) |
+| `MoveVerifyFailed` | `VerifyFrozen` | a second mismatch after one re-copy of the mismatching tables is a copy defect; the workflow rolls back |
+| `MoveWindowExceeded` | the freeze-deadline timer | the window is spent; the workflow rolls back and pages, the operator re-plans with a larger window |
 | `MoveFenced` | any source-side move activity | the source's `system_identifier`/timeline differs from the one `Plan` recorded; the move rolls back (N123) |
 | `BatchJobRejected` | `SubmitBatch`/`PollBatch` terminal failure | the job is gone; a new submission is a new key |
 | `InputBlobMissing` | `CommitChunk` (N100) | re-running the commit cannot recreate the purged blob; the *workflow* catches it and re-runs `ExtractChunk` and `EmbedChunk` (≤ 2 re-runs, then `chunk_failed`) |
@@ -2338,16 +2218,11 @@ retryable under the named policies. `NamespaceFrozen` is retryable only under `P
 `P-db` it is treated as non-retryable so that a read-side activity never spins through a freeze
 (reads succeed on `frozen/move` anyway, so the case cannot arise there).
 
-### Round-5 changes
+### Round-6 changes
 
 | Finding | Register | What changed in §5 |
 |---|---|---|
-| C-1, C-11 | N144 | The commit rule decides idempotency first (`commit_key`, `attempt_nonce` per activity execution), then the base compare-and-set with `$expected` for every writer, root rebuilds included; attempt-unique markdown keys and a guarded blob delete; `stale_seq` compare-and-clear for observations (§5.0, §5.2.2, §5.3.2). |
-| C-2, C-10, A-11 | N145 | `fact_hidden` has no foreign key to `facts`; `Materialize` discovers its work from `materialized_at IS NULL` and the open tombstones; `Invalidate` resolves the same-content twin under the subject lock; the export overlay comes from the live predicate with `root_version` (§5.4.2, §5.4.5, §5.7). |
-| C-3 | N146 | Catalog synchronous standby, reconcile from the shards after a catalog restore, replay floor also derivable from `_control/restores/` (§5.5.5). |
-| C-4, P-2, C-5, P-3 | N147, N148 | `engram_seq_advance` at `Plan` and (b′), floors are source values, `PreVerify` copies first and checks below a closed floor (§5.5.1). |
-| C-6, C-12, P-5 | N149, N153 | `ReconcileIn` and the timeline-gated cleanup; `AwaitIndexes` before `Freeze` and a (b′) precondition (§5.5). |
-| C-7, C-8 | N150 | Replay stores the recorded epoch; the subject lock and the subject definition (§5.5.5). |
-| Round 5 model checking | N159 | The subject lock is session-level and held until the intent put, with help-previous (§5.0, §5.4.1, §5.4.5); the target restore reconcile re-runs `engram_seq_advance` (§5.5.5); replay records skipped intents as settled (§5.5.5); the shard-truth catalog repair follows every catalog restore (§5.5.5); every derived writer passes `$expected` (§5.0); the Materialize stamp is written under the exclusive derivation lock (§5.4.2); the cleanup gate is content check + timeline check + cleanup-time `ReconcileIn` (§5.5.1 step 8). |
-| P-4, P-9, P-10 | N152 | Partition-level hygiene by `REINDEX INDEX CONCURRENTLY` (§5.4.2). |
-| A-5, A-10, A-14 | N157 | `REFRESH_PAGE` is singleton-backed; one marker transaction with its `seq` drawn in the final statement and the duplicate returning the existing operation; stub placeholders; covered versions filtered from every `DocumentService` path. |
+| C-1 to C-7, C-14, C-16, P-4 | N160, N161 | §5.5 rewritten as freeze-then-copy; `PreVerify`, `ReconcileIn`, the catch-up copy, the mutable merge-diff and the cleanup content and timeline checks are gone; a target restored after the commit point is an ordinary restore (`active`) or is wiped and re-copied (`incoming`/`ready`), never merged. |
+| C-4, C-8, C-9, C-12 | N162 | The curation subject is `(document_id, content_hash)`; `Restore` removes the rows carrying the invalidation stamp; the chain tip is read by `ins_seq` (§5.4.5, §5.5.5). |
+| P-5, C-7, C-11, C-13 | N163 | Asynchronous catalog standby, reconcile-from-shards on every promotion and restore, a replicated-LSN wait before (c) (§5.5.1 step 8, §5.5.5). |
+| P-1, P-7, P-11 | N164, N165 | Subject leases on their own alias with polled try-locks (§5.0); backfill figure of 67 days at 6 cells (§5.1.6). |

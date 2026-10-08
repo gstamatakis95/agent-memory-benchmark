@@ -1902,22 +1902,7 @@ base (`--against ".git#ref=$(git merge-base origin/claude/engram-implementation-
 the commands are in `proto/README.md`. `main@HEAD~1` (`ref=HEAD~1`) is used **only by the push-to-main
 job**. Every intended break needs a `buf-breaking-exception` label on the pull request and an entry
 in the changelog table below. From `v1.0.0` on the baseline is the latest release tag
-(`.git#tag=proto/v1.0.0,…`), so the gate compares against what clients actually run. Demonstration
-on a scratch copy (four deliberate edits: `RecallRequest.as_of` changed to `string`, `Scores.boost`
-renumbered/renamed/retyped, `BatchGetMemories` renamed, `WaitOperation` made streaming):
-
-```text
-$ buf breaking --against ../proto-baseline
-memory/v1/common.proto:253:3:Field "8" with name "recency_boost" on message "Scores" changed option "json_name" from "boost" to "recencyBoost".
-memory/v1/common.proto:253:3:Field "8" with name "recency_boost" on message "Scores" changed type from "float" to "double".
-memory/v1/common.proto:253:10:Field "8" on message "Scores" changed name from "boost" to "recency_boost".
-memory/v1/memory.proto:40:1:Previously present RPC "BatchGetMemories" on service "MemoryService" was deleted.
-memory/v1/memory.proto:230:3:Field "9" with name "as_of" on message "RecallRequest" changed cardinality from "optional with explicit presence" to "optional with implicit presence".
-memory/v1/memory.proto:230:3:Field "9" with name "as_of" on message "RecallRequest" changed type from "message" to "string".
-memory/v1/operation.proto:76:3:RPC "WaitOperation" on service "OperationService" changed from server unary to server streaming.
-$ echo $?
-100
-```
+(`.git#tag=proto/v1.0.0,…`), so the gate compares against what clients actually run.
 
 **What counts as breaking** (and is therefore forbidden within `memory.v1`):
 

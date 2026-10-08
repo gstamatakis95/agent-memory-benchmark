@@ -1906,8 +1906,8 @@ count, N172) before any restore or failover may compute "catalog epoch + 1". A m
    catalog `(target, e_t + 1, restoring)` first, `incoming|ready|active → frozen/restore`
    (`freeze_restore`), intent replay, `restore_done` at
    `e_t + 1`, and `Restart` fences every execution from `e_t`; nothing is ever merged into a target
-   that served writes. `restore_done` on a row whose `move_id` is set **closes the move** (clears
-   `move_id`, stamps `moved_in_at`) and `engramctl restore` stamps `activated_at`
+   that served writes. `restore_done` on a row whose `move_id` is set **closes the move** (the caller clears
+   `move_id` and `move_epoch` in the same UPDATE; the trigger stamps `moved_in_at`) and `engramctl restore` stamps `activated_at`
    (`MoveStamps.Stamp(activated)`), so the move reaches `cleaning` and `done` through the N170 gate.
    - `engramctl restore --shard T --target <lsn or time>` **refuses** a point below
      `(copy_end_timeline, copy_end_lsn)` of any move-in of `T` at `cutover` or later that is not

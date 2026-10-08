@@ -378,7 +378,7 @@ type NamespaceAdmin interface { // NamespaceService.ListNamespaces / UpdateNames
 	Update(ctx context.Context, ns id.NamespaceID, p NamespacePatch, etag string) (*Entry, error)
 }
 type Moves interface { // the move ledger: every transition is a CAS on the current state (five methods; the rest is MoveStamps, Replication)
-	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID, p PlanParams) (*MoveRow, error) // source_system_id, source_timeline_id, w_est_seconds, window_seconds recorded; refused unless window ≥ max(1.5 × w_est, w_est + 10 min), cap 8 h, or an unattended move exceeds 10 min (PreconditionFailed{MOVE_WINDOW_REQUIRED | MOVE_WINDOW_TOO_SHORT}, N173)
+	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID, p PlanParams) (*MoveRow, error) // records source_system_id, source_timeline_id, w_est_seconds, window_seconds; window rules and archive health: PreconditionFailed{MOVE_WINDOW_REQUIRED | MOVE_WINDOW_TOO_SHORT | MOVE_TARGET_ARCHIVE_UNHEALTHY} (N173, N179)
 	Advance(ctx context.Context, m id.MoveID, from, to fsm.MoveState) error              // stamps frozen_at, freeze_deadline = frozen_at + max(1.5 × w_est, w_est + 10 min) capped by window_seconds, and w_final on planned → frozen
 	Commit(ctx context.Context, p CommitParams) error                                   // (a″) CAS cutover → committed WHERE move_id, state = 'cutover' AND the verified source/target shards, epochs, timeline AND the catalog namespace row (source, e, frozen) (N143): THE point of no return; ErrLost if a rollback or restore won the row (N125) or any verified value changed
 	
@@ -394,11 +394,10 @@ type Replication interface { // catalog_replicated(lsn) and the commit LSN (N171
 	Replicated(ctx context.Context, lsn LSN) (bool, error) // a streaming standby has replay_lsn ≥ lsn
 	CommitLSN(ctx context.Context) (LSN, error)            // pg_current_wal_lsn() after COMMIT, same session
 }
-// catalog.AckAfterReplay decorates the catalog write path (N171(3)): CreateTenant, UpdateTenant, UpdateTenantLimits, DeleteTenant,
-// CreateNamespace, UpdateNamespace, DeleteNamespace's `deleting` row, StartMove, CleanupMove, RollbackMove and the idempotency_keys row each writes
-// ack only after Replicated(CommitLSN); on timeout UNAVAILABLE{RetryInfo 2 s}, the retry idempotent by key. Step-writes do not wait.
+// catalog.AckAfterReplay decorates the client-acknowledged catalog writes (the §4.1.3 list, N171(3), N184): ack only after
+// Replicated(CommitLSN); on timeout UNAVAILABLE{RetryInfo 2 s}, the retry idempotent by request_id. Step-writes do not wait.
 type Reconciler interface { // engramctl catalog reconcile --from-shards: the first step of every catalog promotion and restore (N163)
-	FromShards(ctx context.Context, rows []OwnershipObservation) (*ReconcileReport, error) // the shards' ownership rows are the source of truth (a moved_out source with a hint ⇒ the move is at least committed; no target row and no moved_out source ⇒ rolled_back); raises each epoch to the max over its `active`/`frozen/*` rows (`frozen/restore` included; the higher epoch wins a torn snapshot) and a `moved_out` row's target_epoch (N172, N180); a re-derived `committed` takes its floor from the target row's `floor_lsn`, stamps `reconciled_at` and writes routing only, never activating a shard row (N184); a shard unreadable within 5 s keeps the catalog's rows and pages `ReconcileIncomplete` (N185)
+	FromShards(ctx context.Context, rows []OwnershipObservation) (*ReconcileReport, error) // the shards' ownership rows are the source of truth (a moved_out source with a hint ⇒ the move is at least committed; no target row and no moved_out source ⇒ rolled_back); raises each epoch to the max over its `active`/`frozen/*` rows (`frozen/restore` included; the higher epoch wins a torn snapshot) and a `moved_out` row's target_epoch (N172, N180); a re-derived `committed` takes its floor from the target's `floor_lsn`, stamps `reconciled_at`, writes routing only (N184); an unreadable shard is skipped (`ReconcileIncomplete`, N185)
 }
 type MoveReader interface { // MoveService.GetMove / ListMoves
 	Get(ctx context.Context, m id.MoveID) (*MoveRow, error)
@@ -1259,13 +1258,12 @@ package move
 type Fence struct { Ns id.NamespaceID; Tenant id.TenantID; Source, Target id.ShardID; Epoch id.Epoch /* e; the target holds e+1 */; Move id.MoveID
 	SrcRow, DstRow OwnershipRow /* the exact source and target namespace_ownership rows the activity VERIFIED (state, freeze_reason, epoch, move_id, target hint) */ }
 
-// The source is static from Freeze to thaw or cleanup, so no floor, catch-up or merge exists: the target's sequence is advanced
+// The source is static from Freeze to thaw or cleanup, so no catch-up or merge exists: the target's sequence is advanced
 // past the source's final value W_final ONCE, at the start of FrozenCopy (N147, N160).
-// Activities are split by phase so each interface stays small (≤ 5 methods). Every activity first re-checks the fence
-// against the catalog row and both ownership rows and the source session's system_identifier/timeline (MoveFenced).
-// Every STEP, including the catalog CAS, is then a compare-and-set on the exact rows it verified (N143, ShardMove_UnfencedSteps):
-// each ownership edge is `UPDATE namespace_ownership … WHERE namespace_id AND state, freeze_reason, epoch, move_id = <verified values>`;
-// Moves.Commit adds the verified shards, epochs and timeline; zero rows = MoveFenced, the step stops (TestMove_CatalogCAS).
+// Every activity first re-checks the fence against the catalog row, both ownership rows and the source session's
+// system_identifier/timeline (MoveFenced). Every STEP, including the catalog CAS, is a compare-and-set on the exact rows it
+// verified (N143, ShardMove_UnfencedSteps): `UPDATE namespace_ownership … WHERE namespace_id AND state, freeze_reason, epoch,
+// move_id = <verified values>`; Moves.Commit adds the verified shards, epochs and timeline; zero rows = MoveFenced (TestMove_CatalogCAS).
 type Copier interface {
 	Plan(ctx context.Context, f Fence) (*PlanResult, error)               // plan_target / start_move edges; records system_id, timeline, W_est; pauses expunge; blob pre-warm (the only pre-freeze work)
 	FrozenCopy(ctx context.Context, f Fence) (*CopyResult, error)         // engram_seq_advance(W_final) once, then classes 1 and 2 and token_usage_events once by PK ranges ≤ 100 k rows, 4 streams, WAL-paced; resumable at (table, last_key)
@@ -1273,7 +1271,7 @@ type Copier interface {
 }
 type Readier interface {
 	BuildIndexes(ctx context.Context, f Fence) (*workflowv1.BuildIndexesReport, error) // under the freeze (maintenance_work_mem = min(2.4 KB × v, 24 GB), shm 32g): request the target's partial indexes for every table, wait for engram_move_indexes_valid; a failed build retries once
-	SealCopy(ctx context.Context, f Fence) (*workflowv1.SealCopyResult, error)       // target: pg_switch_wal() → copy_end_lsn; pgbackrest check (archived); shard.Replication.Replayed (standby; vacuous on `single`); then MoveStamps.RecordFloor (N179)
+	SealCopy(ctx context.Context, f Fence) (*workflowv1.SealCopyResult, error)       // pg_switch_wal() → copy_end_lsn; pgbackrest check; shard.Replication.Replayed (vacuous on `single`); MoveStamps.RecordFloor (N179)
 	AwaitConsumers(ctx context.Context, f Fence) error                    // every source outbox consumer cursor past the namespace's final max(seq), bound 120 s
 }
 type Freezer interface {
@@ -1287,19 +1285,19 @@ type Cutover interface {
 }
 type Handover interface { // only after Commit returned; (c) is fenced on the source row and the replicated `committed` only (N169(4))
 	Source(ctx context.Context, f Fence) error         // (c) cutover_c: frozen/move → moved_out + target hint
-	ActivateTarget(ctx context.Context, f Fence) error // (b″) activate_target, unconditional whenever the target row reads `ready` and the move `committed`, whatever `namespaces` says; retried indefinitely; stamps activated_at, clears move_id (N180)
-	Catalog(ctx context.Context, f Fence) error        // (d) shard, epoch, state, NOTIFY — retried indefinitely; success is `shard = target ∧ epoch ≥ e_t + 1`; the end test after (c) reads the target row, not `namespaces` (N180)
+	ActivateTarget(ctx context.Context, f Fence) error // (b″) activate_target, unconditional while the target row reads `ready` and the move `committed`; retried indefinitely; stamps activated_at, clears move_id (N180)
+	Catalog(ctx context.Context, f Fence) error        // (d) shard, epoch, state, NOTIFY — retried indefinitely; success is `shard = target ∧ epoch ≥ e_t + 1`; the end test reads the target row (N180)
 }
 type Closer interface {
 	Restart(ctx context.Context, f Fence, d *DrainResult) error // ns/{ns}/op/{op} on shard-{target}, TERMINATE_IF_RUNNING, memo epoch e+1; singleton-backed kinds by SignalWithStart
-	Cleanup(ctx context.Context, f Fence) error                 // the worker activity that DRIVES the batches once the row reads `cleaning` (N170): DROP INDEX by name, engram_cleanup_namespace on the source; CleanupMove (committed → cleaning) precedes it; it records `done` through Moves.Advance after one more zero-row engram_cleanup_namespace; the source blob prefix at finished_at + 28 d; the moved_out row stays
-	Rollback(ctx context.Context, f Fence, why string) error   // only before (a″): wins the cutover → rolled_back CAS, waits for it to replicate (the actor ends otherwise), then thaws; run at the freeze deadline (MoveWindowExceeded); after (a″) the page MoveFrozenPastDeadline instead (N171); see the table
+	Cleanup(ctx context.Context, f Fence) error                 // drives the batches once the row reads `cleaning` (CleanupMove, N170): DROP INDEX by name, engram_cleanup_namespace; records `done` via Moves.Advance after one more zero-row call (N184); blob prefix at finished_at + 28 d; the moved_out row stays
+	Rollback(ctx context.Context, f Fence, why string) error   // only before (a″): wins the cutover → rolled_back CAS, waits for it to replicate, then thaws; run at the freeze deadline (MoveWindowExceeded); after (a″) the page MoveFrozenPastDeadline instead (N171)
 }
 type Orchestrator interface { // MoveService (api imports move, N157)
 	Start(ctx context.Context, ns id.NamespaceID, target id.ShardID, o StartOptions) (*Ref, error) // o.EstimateOnly returns Ref.WindowEstimate without planning
 	Status(ctx context.Context, m id.MoveID) (*Status, error)
 	Abort(ctx context.Context, m id.MoveID) error // rollback before (a″), else an error
-	Cleanup(ctx context.Context, m id.MoveID) (*CleanupResult, error) // MoveService.CleanupMove: takes `committed → cleaning` only (the schema trigger refuses before activated_at + 24 h); Closer.Cleanup drives the batches and records `done` (N167, N170, N184)
+	Cleanup(ctx context.Context, m id.MoveID) (*CleanupResult, error) // MoveService.CleanupMove: takes `committed → cleaning` only (the trigger refuses before activated_at + 24 h); Closer.Cleanup does the rest (N167, N170, N184)
 }
 ```
 
@@ -1311,8 +1309,8 @@ type Orchestrator interface { // MoveService (api imports move, N157)
 | `ReadyTarget` (b′), `Begin` (a) | the CAS `cutover → rolled_back`, `unready_target` (at next contact if the target is down), then `thaw_move` and the above |
 | `Commit` (a″) onward | none: the move completes forward (by the mover or by the restore reconcile); a reverse move is an ordinary new move |
 
-A target restored or failed over after the seal is an ordinary restore bounded below by the floor `(copy_end_timeline, copy_end_lsn)` (N179); `restore cleanup-moved-out` handles `cleaning` and `done` moves (N184). `shard.Replication{Replayed(ctx, lsn pg.LSN) (bool, error)}` (`internal/store`, `engram_standby_replayed`) is the seam of the seal's standby wait. `StartOptions` carries `Window` (default 4 h, cap 8 h, at least max(1.5 × `W_est`, `W_est` + 10 min); required above 10 min, ≈ 350 k facts, except for the rebalancer), `FreezeNotBefore`, `EstimateOnly`, `DrainWait` (15 s, max 60 s), `CopyRangeRows` 100 000, `CopyStreams` 4 and the cutover retry. `W_est` (≈ 27 min per 1 M live facts) is §5.5's (N173). *Test seam:* a model-based test from
-`ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: writers refused `NamespaceFrozen` and resumed on the target with nothing lost or duplicated (`TestMove_FrozenCopy`), a dropped range detected (`TestMove_VerifyFrozenCatchesFault`, `TestMove_VerifyPerRange`), indexes for every table (`TestMove_IndexesRequestedForEveryTable`), rollback at the deadline (`TestMove_WindowDeadlineRollback`), a short window refused (`TestMove_PlanRefusesOversizedWindow`), no thaw before the abort replicated (`TestMove_RollbackWaitsForReplicatedAbort`), a restore racing `Commit`, the cut waiting for the sealed copy (`TestMove_CutWaitsForSealedCopy`) and the replicated commit (`TestMove_CutWaitsForReplicatedCommit`), a target restored after the seal (`TestMove_TargetRestoredAfterSeal`), a PITR or failover below the floor refused (`TestMove_TargetPITRBelowFloor`, `TestMove_FailoverBelowFloorRefused`), activation after a catalog promotion (`TestMove_ActivateAfterCatalogPromotion`), expunge paused from Plan to activation (`TestMove_ExpungeStaysPaused`), `cleaning` refused before 24 h (`TestMove_CleanupGateAtEntry`); chaos: `TestMove_FailoverBetweenCAndD`.
+A target restored or failed over after the seal is an ordinary restore bounded below by the floor `(copy_end_timeline, copy_end_lsn)` (N179); `restore cleanup-moved-out` handles `cleaning` and `done` moves (N184). `shard.Replication{Replayed(ctx, lsn pg.LSN) (bool, error)}` (`internal/store`) is the seam of the seal's standby wait. `StartOptions` carries `Window`, `FreezeNotBefore`, `EstimateOnly`, `DrainWait`, `CopyRangeRows`, `CopyStreams` and the cutover retry; `Window` and `W_est` (≈ 27 min per 1 M) are §5.5's (N173). *Test seam:* a model-based test from
+`ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: nothing lost or duplicated (`TestMove_FrozenCopy`), a dropped range detected (`TestMove_VerifyFrozenCatchesFault`, `TestMove_VerifyPerRange`), indexes for every table (`TestMove_IndexesRequestedForEveryTable`), rollback at the deadline (`TestMove_WindowDeadlineRollback`), no thaw before the abort replicated (`TestMove_RollbackWaitsForReplicatedAbort`), the cut waiting for the sealed copy (`TestMove_CutWaitsForSealedCopy`) and the replicated commit (`TestMove_CutWaitsForReplicatedCommit`), restores and failovers around the seal and floor (`TestMove_TargetRestoredAfterSeal`, `TestMove_TargetPITRBelowFloor`, `TestMove_FailoverBelowFloorRefused`, `TestMove_ActivateAfterCatalogPromotion`), expunge paused to activation (`TestMove_ExpungeStaysPaused`), `cleaning` refused before 24 h (`TestMove_CleanupGateAtEntry`); chaos: `TestMove_FailoverBetweenCAndD`.
 
 #### 2.2.20 `internal/export` — snapshots for local agentic search (phase 3)
 
@@ -1688,7 +1686,7 @@ type).
 | Consolidation | route 8 facts per call; ≤ 100 facts per round; one write call per touched observation; ≤ 50 root rebuilds per round; one round in flight per namespace; rebuilds only while markers are pending | `Consolidate` workflow (singleton id), `config.Consolidation` | D12, N121 |
 | Expunge | one per namespace, at most two per shard; purge in 1,000-row batches paced to ≤ 25 MB/s of WAL behind the consumer-cursor check; SLAs materialize ≤ 15 min, purge ≤ 24 h, index ≤ 48 h; `ExpungeMaterializeSlow` pages at 900 s | `expunge.Expunger`, `engram_expunge_oldest_pending_seconds` | N119 |
 | Reflect | ≤ 10 iterations, ≤ 100 k context tokens, ≤ 300 s, tool deadline 10 s, ≤ 4 concurrent reflects per namespace; one `Reserve` per iteration | `reflectagent.Caps`, api semaphore | D12, N130 |
-| Move | freeze, then copy every table from the static source in primary-key ranges of ≤ 100,000 rows, 4 parallel streams, WAL-paced at 25 MB/s; `VerifyFrozen`, the index build and the seal under the freeze; freeze deadline `frozen_at + max(1.5 × W_est, W_est + 10 min)` capped by the operator window (default 4 h, cap 8 h), automatic rollback at the deadline; `SealCopy` before the cut; catalog CAS as the point of no return; ≤ 4 moves per cell, one per namespace; cutover (b″) and (d) retried indefinitely | `move.StartOptions` | N160, N161, N125 |
+| Move | freeze, copy every table from the static source in ≤ 100,000-row PK ranges (4 streams, 25 MB/s WAL pace), `VerifyFrozen`, index build and `SealCopy` under the freeze; freeze deadline `frozen_at + max(1.5 × W_est, W_est + 10 min)` capped by the window (default 4 h, cap 8 h), automatic rollback; catalog CAS as the point of no return; ≤ 4 moves per cell, one per namespace; (b″) and (d) retried indefinitely | `move.StartOptions` | N160, N161, N125 |
 | Fence acquisition | writers never wait (`pg_try_advisory_xact_lock_shared`, refusal → `NamespaceFrozen{200 ms}`); exclusive takers (fence, document lock, derivation lock) make one attempt with `lock_timeout` 35 s; role defaults 2 s (`engram_app`), 10 s (`engram_move`, `engram_admin`), 30 s statement and idle timeouts on every outbox-writing role | `store.Store.InNamespace`, role defaults | N82: no pooled connection waits behind a queued freeze |
 | Derivation lock | shared by every writer of derived versions; exclusive for `Materialize` and `Restore`, one 35 s attempt | `store.Derived` | N120 |
 | Subject lock | every marker writer takes the session-level `engram_subject_lock_key(ns, subject)` (subject `class:key`, N162) on a direct `engram_subject` connection before its marker transaction and holds it until the intent put and the marker re-read; polled try-lock ≤ 3 s; help-previous under it | `store.SubjectLocker`, `intent.HelpPrevious` | N150, N159 |
@@ -1702,9 +1700,6 @@ type).
 
 | Register | What changed in this section |
 |---|---|
-| N179 | `Readier.SealCopy`; `W_est` ≈ 27 min per 1 M |
-| N180 | (b″) unconditional on `ready` + `committed`; the end test reads the target row; (d) success `epoch ≥ e_t + 1` |
-| N182 | `TenantDelete` fences every namespace, then stamps `acknowledged_at` |
-| N184 | `catalog.MoveStamps{Stamp, RecordFloor, RecordReplicated}`; `CleanupMove` is one transition; every non-derived column has one writer; `RollbackMove` waits for replication |
-| N185 | `Reconciler` skips unreadable shards (`ReconcileIncomplete`) |
-| N186 | connection list 55 + 2P = 63 at P = 4 |
+| N179, N180 | `Readier.SealCopy`; (b″) unconditional; the end test reads the target row; `W_est` ≈ 27 min per 1 M |
+| N182, N184, N185 | `TenantDelete` stamps `acknowledged_at`; `catalog.MoveStamps`; `CleanupMove` one transition; one writer per column; unreadable shards skipped |
+| N186 | connections 55 + 2P = 63 at P = 4 |

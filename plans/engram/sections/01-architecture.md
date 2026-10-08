@@ -573,10 +573,9 @@ orphan intent would delete content acknowledged later).
 
 A namespace move is **freeze, then copy, then verify, then cut over** (D5, N160, N161): `Plan` (with a blob pre-warm) →
 `Freeze` → `Drain` → one sequence advance → copy **every table** from the now-static source by primary-key ranges, WAL-paced →
-`VerifyFrozen` (count and primary-key hash per table, equality on a static set) → `BuildIndexes` under the freeze → `SealCopy` (the target's WAL archived and standby-replayed through `copy_end_lsn`, the floor of any restore or failover of the target, N179) → wait for the
+`VerifyFrozen` (count and primary-key hash per table, equality on a static set) → `BuildIndexes` under the freeze → `SealCopy` (the target's WAL archived and standby-replayed through `copy_end_lsn`, the restore and failover floor, N179) → wait for the
 outbox consumers → cutover with a `ready` state and a catalog CAS as the point of no return, with a rollback at every step
-before it. A move is an operator tool for rebalancing: rare, allowed to take hours, and the namespace is read-only for the
-whole window (reads continue; writes get `NamespaceFrozen{retry_after, frozen_until_estimate}`). Plan computes a window
+before it. A move is a rare operator tool: the namespace is read-only for the whole window (reads continue; writes get `NamespaceFrozen{retry_after, frozen_until_estimate}`). Plan computes a window
 estimate (≈ 27 min per 1 M live facts at the planning rates); the rebalancer starts a move unattended only at 10 min or less (≈ 350 k facts),
 larger ones need an operator-scheduled window of at least max(1.5 × estimate, estimate + 10 min) (default 4 h, cap 8 h), and a move that has not passed the CAS by its freeze
 deadline rolls back by itself. Nothing is ever merged into a target that has served writes.
@@ -615,7 +614,7 @@ not a statement on the source, because the arbiter must sit where the restore re
 standby is asynchronous (N163), every shard action on an arbiter outcome (the cut, the thaw, the rollback) waits until the standby has replayed it and re-reads the row (N171). The mover compares its
 session's timeline with the catalog at `Freeze`, at the CAS and at (c), so a zombie primary can be neither frozen nor cut over
 (N123). Restore and failover first settle every open move against the catalog, then bring the shard up `frozen/restore` and
-replay the delete intents (N122, N123, N134; §5.5.5). A target restored after the CAS is an ordinary restore (`incoming`, `ready` or `active → frozen/restore`) that may not go below the seal's floor (N179); one that restores an activated target closes the move (N180); the source is cleaned up 24 h after activation (N170). The full step list, step table and crash table are §5.5.
+replay the delete intents (N122, N123, N134; §5.5.5). A target restored after the CAS is an ordinary restore (`incoming`, `ready` or `active → frozen/restore`) not below the seal's floor (N179); cleanup follows 24 h after activation (N170). Steps and crashes: §5.5.
 
 ### 1.7 Where every shard-scoped resource lives
 

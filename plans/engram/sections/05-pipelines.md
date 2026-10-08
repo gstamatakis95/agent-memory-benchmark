@@ -1783,7 +1783,7 @@ restarted workflow runs there, hence the target queue.
 11. **`Rollback`** (any failure before (a″): the freeze deadline, `MoveVerifyFailed`, a failed
     index build or seal, a missing blob, a consumer wait that did not finish, or `engramctl move abort`;
     it runs by itself at the deadline). It first CASes `cutover → rolled_back` when the move was at
-    `cutover` (reading `committed` instead means the move completes), then **waits
+    `cutover` (`committed` means it completes), then **waits
     `catalog_replicated` and re-reads the row** before any shard action (the actor ends otherwise,
     N171). **Before Freeze** → `abort_move`, delete the target rows and ownership row
     (`rollback_target`) and both blob prefixes; **after Freeze** → `thaw_move` (`frozen/move →

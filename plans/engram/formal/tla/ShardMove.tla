@@ -493,11 +493,14 @@ Failover(s) ==
   /\ FailoverChecksFloor => ~BelowFloor(s, sb[s])
   /\ RestoreCore(s, sb[s], TRUE)
 
-\* The standby replays the primary up to now.  Enabled while a failover can still happen, and for the seal's wait.
+\* The standby replays the primary up to now, or is rebuilt from the base backup and starts again from there (N179(3)).  Enabled
+\* while a failover can still happen, and for the seal's wait.
 StandbyReplay(s) ==
-  /\ own[s].st \notin {"restoring", "replaying"} /\ sb[s] # Snap(s)
-  /\ nRestore < MaxRestore \/ (s = tgt /\ mp = "built")
-  /\ sb' = [sb EXCEPT ![s] = Snap(s)]
+  /\ own[s].st \notin {"restoring", "replaying"}
+  /\ \/ /\ sb[s] # Snap(s) /\ (nRestore < MaxRestore \/ (s = tgt /\ mp = "built"))
+        /\ sb' = [sb EXCEPT ![s] = Snap(s)]
+     \/ /\ nRestore < MaxRestore /\ sb[s] # bak[s]                     \* the standby is rebuilt from the base backup (PG8-8)
+        /\ sb' = [sb EXCEPT ![s] = bak[s]]
   /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, flr, mv>>
 
 \* N171(2), N163(3): the catalog promotion loses an arbiter outcome that the standby has not replayed; the promotion

@@ -1311,3 +1311,61 @@ the wrong way.
 - **Live Hindsight.** Behaviour beyond `reference/hindsight-notes.md`.
 - **Twin interpretation.** Whether "Go twin" in §8.4.6 could mean a model test without the real package. If so,
   A-3's first half becomes a wording fix: §8.4.6 says "the fix disabled by a `faultinject` knob".
+
+---
+
+## Disposition (all 47 findings)
+
+Every finding maps to a register row (`00-decision-register.md`; D24 holds N144 to N157, rewritten rows keep their ids and carry "(rev. D24)": D3, D4, D16, D17, N54, N114, N115, N122, N124, N125, N134, N135, N137, N138, N139, N143). The overlapping findings were resolved once: `ins_seq` across moves (C-4, P-2 → N147), PreVerify order (C-5, P-3 → N148), the hot set (A-2, P-6, P-14 → N154), the catalog (C-3 → N146), the target after commit (C-6, C-12 → N149), the epoch guard and per-subject chains (C-7, C-8 → N150), the filtered plan (P-1, P-7, P-8, P-12 → N151), hygiene (P-4, P-9, P-10 → N152), the overlay (C-10, A-11 → N145). Nothing is rejected outright; where a recommended alternative was not taken, the Note says why. Each spec-kinder-than-SQL finding names a spec change and a configuration that must fail (N144 to N150, N152).
+
+**Judgement calls.** Shard target lowered to 6.5 M live facts / 10 M cap on the same 128 GB instance, with covering link indexes so hops are index-only; M0.6 may restore 8 M by measurement (N154). The catalog gets one synchronous standby, the only one in the system (N146). `ins_seq` stays per shard and is advanced across a move (N147). The semantic plan is cost-based with θ ≈ 50 k and an exact fallback (N151).
+
+| Finding | Disposition | Register id | Note |
+|---|---|---|---|
+| C-1 | Accepted | N144, N143(1) | Idempotency by `commit_key` before the CAS; CAS with `$expected` for root rebuilds; attempt-unique blob keys, deletion only of a key no committed row names. `Derivation_CasBeforeIdem` must fail `NoPhantomVersion`; `TestPageRefresh_CommitRetry`. |
+| C-2 | Accepted | N145, N135(2), N115 | FK cascade dropped; `materialized_at` makes the owed Materialize durable and sweeper-discoverable; `Invalidate` also marks the visible twin. Purge-waits-for-Materialize rejected (couples purge pacing to the derivation lock). `Derivation_CascadeHidden` and `_MatSignalOnly` must fail. |
+| C-3 | Accepted | N146, D4, N134, N122 | Synchronous catalog standby (RPO 0 on failover); catalog restore repaired from shard ownership rows; replay floor also in blob storage. `Durability_CatalogLossNoBlobFloor`, `ShardMove_CatalogLossNoShardTruth` must fail; §7.1 states the assumption. |
+| C-4 | Accepted | N147, N137, N125 | `engram_seq_advance` at Plan and (b′); floors computed on the source and passed as numbers; exports and the watermark deferred 10 min after a move-in. `ShardMove_NoSeqAdvance` must fail; `TestMove_TwiceAndExport`. |
+| C-5 | Accepted | N148, N124 | Catch-up first, then checks below `F_c` taken at catch-up start; one retry round, then rollback. `ShardMove_VerifyBeforeCatchUp` must fail `MoveTerminatesActive`. |
+| C-6 | Accepted | N149, N143(5), N125 | `ReconcileIn` from the intact source before (b″); admin edges `incoming → ready → active`; cleanup gated on a backup after the target's last timeline change. Whole-namespace hash before every cleanup rejected (target legitimately diverges). `ShardMove_CleanupTimeGate` must fail. |
+| C-7 | Accepted | N150, N143(3) | Replayed rows keep the recorded epoch; guard compares recorded epochs only. `Durability_ReplayStampsCurrentEpoch` must fail `IntentOrderLastWins`; `TestIntent_ReplayTwoOfSameSubject`. |
+| C-8 | Accepted | N150 | Per-fact advisory lock in every marker transaction; subject independent of kind; index re-keyed. `Durability_NoSubjectLock` must fail. |
+| C-9 | Accepted | N157 | Statements generated from the DDL; `expired_reason`; DDL kinds; stub placeholders documented as never dereferenced. |
+| C-10 | Accepted | N145(4), N126 | Overlay from the live predicate, bounded to markers newer than the manifest; `root_version` shipped and compared; export rule aligned with N117. |
+| C-11 | Accepted | N144 | `observations.stale_seq` with the page compare-and-clear rule; root rebuilds compare the version they read. |
+| C-12 | Accepted | N149(3) | `cleaning` named in the arbiter; a restored source re-runs `engram_cleanup_namespace` for `moved_out` rows past `committed`. |
+| C-13 | Accepted | N157 | "Retire purge" defined; a retired-target write re-routes its facts rather than stamping `done`. |
+| C-14 | Accepted | N134, N157 | Margin sentence corrected; the value is unchanged. |
+| P-1 | Accepted | N151, N138(1), N114 | Cost-based path, θ ≈ 50 k, scan cap never below 20 k, exact fallback on exhaustion up to 4 θ, `fact_type` and hidden fraction in the estimate; filtered-arm rows and the ≤ 20 % assumption in N114; correlated-filter test. |
+| P-2 | Accepted | N147 | Same row as C-4. Re-stamping with a carried source value rejected (every cross-side comparison changes). |
+| P-3 | Accepted | N148 | Same row as C-5. |
+| P-4 | Accepted | N152, N138(3) | Partition is the hygiene unit; all touched graphs rebuilt before one partition vacuum; weekly partition hygiene; fraction-dependent repair ratio stated. `Storage_PerIndexHygiene` must fail `RebuildBeforeRepair`. |
+| P-5 | Accepted | N153, N125 | Indexes built after PreVerify, `ready` before the freeze; precondition of (b′); runner serves move targets at priority. |
+| P-6 | Accepted, modified | N154, D3, N114 | Both link indexes counted (covering, index-only hops); target lowered to 6.5 M rather than more RAM; M0.6 measures the resident set and may restore 8 M. |
+| P-7 | Accepted | N151(3) | `enable_bitmapscan = off, enable_sort = off` on the HNSW path; `MATERIALIZED` CTE on the exact path; `EXPLAIN` pins at θ ± 20 %. |
+| P-8 | Accepted | N151(4) | Array constant up to 500 documents, `IN (SELECT unnest($1))` above. |
+| P-9 | Accepted | N152(5) | Old-snapshot guard filtered to client backends, VACUUM and walsenders excluded, starvation alert. |
+| P-10 | Accepted | N152 | Relative trigger with the 2 k floor below 200 k rows; `rebuild` action is `REINDEX INDEX CONCURRENTLY` with `_ccnew` cleanup; rebuild WAL paced; §9.2 example restated. |
+| P-11 | Accepted | N157 | Differential-backup trigger moves to a shard-level WAL watcher; `BulkCopy` WAL-paced. |
+| P-12 | Accepted | N151(5) | Per-tag observation counts in `namespace_stats`; tags on `observation_version_vectors`; cost rule applied to the arm. |
+| P-13 | Accepted | N157 | Version retention `H = 90 days` with stub compaction by DerivedPurge; history cost stated in N114. |
+| P-14 | Accepted | N154, D3 | `ins_seq` indexes ≈ 12 %; footprint restated (132 GB at target, 203 GB at cap). |
+| P-15 | Accepted | N157 | Sweeper hourly and incremental from `ins_seq`; only `engram_seq_sample()` on the minute. |
+| A-1 | Accepted | N155, N114, N54, D3 | Pool re-derived from QPS × Σ arm time: `engram_app` pool 40, per-process 20, per-process arm semaphore 16; explicit pool-wait term, 216 → 220 ms. Capping arms at 3 rejected (+60 ms on the path). |
+| A-2 | Accepted, modified | N154, D3, N114 | Same row as P-6: both indexes and the heap accounted; heap taken off the hot path by covering indexes; target lowered. |
+| A-3 | Accepted | N156, D17, N141 | M0.7 re-scoped to spec-side work including the converter (now committed, out of F.1); twins costed in the milestones that build their subjects; M1.2's exit after M0.6; Gantt redrawn. |
+| A-4 | Accepted | N157, N139 | PRs compare against the merge target; `HEAD~1` only on push-to-main. |
+| A-5 | Accepted | N157 | `REFRESH_PAGE` singleton-backed everywhere; §4.1.3 row corrected. |
+| A-6 | Accepted | N157 | Coverage check generated as (RPC → interface method); missing methods behind new ≤ 5-method interfaces; `move.Orchestrator` in `Deps`. |
+| A-7 | Accepted | N157 | `catalog.MoveBackups` split out; `store.Tx.Txn()`; method-count lint in the M0.1 vet. |
+| A-8 | Accepted | N157 | Services take `id.Scope` + `Caller` and `store.Store`; leaf-permitted modules named; two edges listed. |
+| A-9 | Accepted | N157 | `ReadTx.Derived()` for served observations and pages; split to stay at five. |
+| A-10 | Accepted | N157 | One marker transaction (§3's), `seq` drawn in the final statement, duplicate on `deleting` returns the existing operation, `expires_at` as the proto source. |
+| A-11 | Accepted | N145(4) | Same row as C-10. |
+| A-12 | Accepted | N157 | Quota and isolation paths `engram.operator`-only; tenant lifecycle stays tenant-bound on the tenant-facing listener. |
+| A-13 | Accepted | N157 | `DocumentTagsUpdated` event, `documents` part in the delta, retain rule stated, `tag_counts` table, M1.6 at 0.5 ew. |
+| A-14 | Accepted | N157 | Covered versions filtered everywhere; tombstones never match non-empty filters; one generated state table; examples ack `RUNNING`. |
+| A-15 | Accepted | N157, D16 | Proto behaviour kept: `GetMemory` and `BatchGetMemories` return the fact with `invalidated_at`. |
+| A-16 | Accepted | N157 | §7.4's test column generated from §8.4.6; orphan names replaced; three tests added to §8. |
+| A-17 | Accepted | N157 | Full generated MCP tool set with gates and an allow-list; non-goal row for omissions. |
+| A-18 | Accepted | N157, D17 | All drift items fixed; D17 regenerated from §10. |

@@ -274,12 +274,17 @@ type Submitter interface { Submit(ctx context.Context, sc authz.RequestScope, re
 // conditional (N143): after the intent put the handler RE-READS the marker (a plain read of the tombstone or
 // fact_hidden row and its deletion_log row) and acks only if it is still present; if a restore or failover removed
 // it in between, the request returns UNAVAILABLE and the client retries (TestIntent_AckRereadsMarker).
+// N159: every method takes the SUBJECT lock (SubjectLocker, session level, direct connection) BEFORE its marker
+// transaction and releases it only AFTER the intent put and that re-read, on every exit path; under the lock it first
+// runs help-previous (intent.HelpPrevious: put the intent of the subject's latest deletion_log entry if absent), so a
+// crash between a predecessor's commit and put never leaves a hole in the prev_operation_id chain
+// (Durability_NoHelpPrev, TestIntent_HelpPrev).
 type Deleter interface {
 	DeleteDocument(ctx context.Context, sc authz.RequestScope, doc id.DocumentID, o DeleteOptions) (*memoryv1.DeleteDocumentResponse, error) // DeleteOptions{OperationID, ExpectedVersion id.DocVersion (compared inside the marker tx)}
 	DeleteNamespace(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirmName string) (*memoryv1.DeleteNamespaceResponse, error) // keeps the client's operation_id
 	DeleteTenant(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirm id.TenantID) (*adminv1.DeleteTenantResponse, error)       // acks after the catalog row and the tenant intent; fences asynchronously
-	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // per-fact lock (N150); also hides the same-content twin (engram_invalidation_twins, N145); a second Invalidate changes no visibility but still writes its own deletion_log row and intent (N143)
-	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // exclusive derivation lock: 40 s deadline cap; a repeated Restore also writes its own row and intent (N143)
+	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // subject lock held until the intent put + help-previous (N150, N159); also hides the same-content twin (engram_invalidation_twins, N145); a second Invalidate changes no visibility but still writes its own deletion_log row and intent (N143)
+	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // subject lock + help-previous (N159), then the exclusive derivation lock: 40 s deadline cap; a repeated Restore also writes its own row and intent (N143)
 }
 
 // OperationWaiter implements WaitOperation: park on Temporal's workflow-result long-poll (≤ MaxOpenWaits per
@@ -343,7 +348,7 @@ Owns the `engram_catalog` tables (D4) and the in-process `Resolver` (LRU 100 k, 
 5 s, `LISTEN catalog_changes`; existing namespaces are served indefinitely while the catalog is
 unreachable, only misses fail `UNAVAILABLE` — F-21). The catalog database has **one synchronous standby**
 (`synchronous_commit = remote_apply`, N146): a commit a move step, a delete ack or an epoch bump observed survives a
-catalog failover, and a catalog restore from backup is followed by `engramctl catalog reconcile --from-shards` before it
+catalog failover, and a catalog restore from backup is followed by `engramctl catalog reconcile --from-shards` (after every catalog restore, N159) before it
 serves writes. *Pattern: Repository for the control plane,
 split by capability so no interface passes five methods; the Resolver is a read-through cache.*
 
@@ -375,6 +380,8 @@ type Moves interface { // the move ledger: every transition is a CAS on the curr
 type MoveBackups interface { // what Cleanup's gate reads (N143, N149)
 	RecordTargetBackup(ctx context.Context, m id.MoveID, startedAt, completedAt time.Time) error // sets target_backup_started_at / target_backup_at, only for a full backup that STARTED after activated_at and after the last timeline change
 	RecordTimeline(ctx context.Context, m id.MoveID, activated, changedAt *time.Time) error      // activated_timeline, target_timeline_changed_at, reconciled_in_at
+	RecordCleanupReconcile(ctx context.Context, m id.MoveID, at time.Time) error                  // cleanup_reconciled_at: the cleanup-time ReconcileIn completed (N159)
+	RecordContentCheck(ctx context.Context, m id.MoveID, c ContentCheck) error                    // source/target content rows + hash, target_content_checked_at; refused unless taken after target_backup_at (N159)
 }
 type Reconciler interface { // engramctl catalog reconcile --from-shards (N146)
 	FromShards(ctx context.Context, rows []OwnershipObservation) (*ReconcileReport, error) // the shards' ownership rows are the source of truth; raises each epoch to max over its shard rows
@@ -551,6 +558,20 @@ type DirectConn interface {
 	Cursors() CursorRepo                                                         // outbox_cursors: guarded UPDATE, gap watchlist
 	Close() error
 }
+// SubjectLocker (N150, N159) is the second interface the Store implementation satisfies (Store itself stays at five methods).
+// Lock takes the SESSION-level subject lock pg_advisory_lock(engram_subject_lock_key(ns, subject)) on a dedicated direct
+// connection (a small pool: 2 per API process per shard, so ≈ 57 of max_connections 100 with N155's ≈ 53), with lock_timeout
+// 3 s and one attempt (refusal → retryable UNAVAILABLE). The marker writer holds the lease from before its marker transaction
+// until the intent put and the marker re-read are done; Release is called on every exit path and a crashed handler's lease
+// dies with its connection. The lease is outside the pgbouncer pool, because session locks do not survive transaction pooling.
+type SubjectLocker interface {
+	Lock(ctx context.Context, ns id.NamespaceID, subject string) (SubjectLease, error)
+}
+type ContentCheck struct { SourceRows, TargetRows int64; SourceHash, TargetHash []byte; CheckedAt time.Time } // N159: insert-only rows with ins_seq < w_final, less target-tombstoned documents
+type SubjectLease interface {
+	Latest(ctx context.Context) (DeletionRecord, bool, error) // the subject's last deletion_log entry of either kind, read while the lease is held (help-previous input)
+	Release()
+}
 // Stores is the per-shard directory the API's Deps needs: a process serves up to 32 shards (D3).
 type Stores interface { For(s id.ShardID) (Store, bool); Local() []id.ShardID }
 
@@ -677,7 +698,7 @@ type GraphReader interface {
 type Markers interface {
 		TombstoneDocument(ctx context.Context, t DocumentTombstone) (DeletionRecord, error)                       // document_tombstones 'pending' covering (document, t.UpToVersion = highest version assigned, N133c); event_seq is NULL until the final statement, WITH s AS (INSERT INTO outbox … RETURNING seq) UPDATE document_tombstones SET event_seq = s.seq (A-10)
 	TombstoneChunks(ctx context.Context, reason ChunkReason, cs []id.ChunkID) error                            // 'replace' | 'reextract'
-	Hide(ctx context.Context, f id.FactID, cause HideCause, reason string) (rec DeletionRecord, changed bool, err error) // fact_hidden keyed (memory_id, cause), no FK to facts (N145): 'invalidate' | 'reextract'; under the per-fact lock (engram_doc_lock_keys(ns, memory_id), N150) it also hides the same-content twin (rec.MemoryIDs); a second invalidate is changed = false and a success (N139), but it still inserts its own deletion_log row (N143)
+	Hide(ctx context.Context, f id.FactID, cause HideCause, reason string) (rec DeletionRecord, changed bool, err error) // fact_hidden keyed (memory_id, cause), no FK to facts (N145): 'invalidate' | 'reextract'; under the subject lock that the caller holds until its intent is put (engram_subject_lock_key(ns, memory_id::text), SubjectLocker, N150, N159) it also hides the same-content twin (rec.MemoryIDs); a second invalidate is changed = false and a success (N139), but it still inserts its own deletion_log row (N143)
 	Unhide(ctx context.Context, f id.FactID) (rec DeletionRecord, changed bool, err error)                    // deletes the 'invalidate' row(s) only, the twin's too; a 'reextract' row is never touched (N135); works after the fact's own purge (N145)
 	Expunge() ExpungeRepo                                                                                      // expunge_progress, derived_hidden, consumer-cursor check
 }
@@ -741,8 +762,8 @@ explicit document, namespace or tenant delete under the admin role (§5.4.2), ne
 
 **Locks.** The per-document lock is `DocumentWriter.Lock` (shared try-lock for `CommitChunk`, exclusive
 for `FinalizeVersion` and the delete marker transaction: one 35 s attempt), the derivation lock is on
-`Derived`, the per-fact lock `engram_doc_lock_keys(ns, memory_id)` (same two-argument form, taken by `Hide`/`Unhide` before the chain predecessor is read, N150), the exclusive fence on `AdminTx.Ownership().FenceExclusive` (`Freeze`, delete freeze, restore:
-one 35 s attempt). Key spaces are disjoint (N113): namespace fence, derivation lock, document lock.
+`Derived`, the **subject lock** `engram_subject_lock_key(ns, subject_id)` (one-argument, seed 2; `store.SubjectLocker`, session level on a dedicated direct connection, `lock_timeout` 3 s, held by the marker writers from before the marker transaction until the intent put and the marker re-read, N150, N159), the exclusive fence on `AdminTx.Ownership().FenceExclusive` (`Freeze`, delete freeze, restore:
+one 35 s attempt). Key spaces are disjoint (N113): namespace fence, derivation lock, document lock, subject lock.
 
 Roles: `engram_app` (API and worker alike; there is no worker role) runs `lock_timeout = 2 s`, `engram_move` and `engram_admin`
 10 s, all with `synchronous_commit = local`, and every outbox-writing role (`engram_admin` and
@@ -1242,9 +1263,9 @@ type Handover interface { // only after Commit returned (the mover read `committ
 }
 type Closer interface {
 	Restart(ctx context.Context, f Fence, d *DrainResult) error // ns/{ns}/op/{op} on shard-{target}, TERMINATE_IF_RUNNING, memo epoch e+1; singleton-backed kinds (DELETE_DOCUMENT, CONSOLIDATE, REFRESH_PAGE) by SignalWithStart; reconcile loop
-		Cleanup(ctx context.Context, f Fence) error                  // after 24 h AND a full target backup STARTED (target_backup_started_at) after activation and after the last timeline change (target_timeline_changed_at vs activated_timeline) or ReconcileIn (reconciled_in_at); else ErrBackupPending, retried (N143, N149): DROP INDEX by name, engram_cleanup_namespace, the moved-out ROWS; the source blob prefix only after the 28-day window; the moved_out row stays
+		Cleanup(ctx context.Context, f Fence) error                  // after 24 h AND the N159 gate: a cleanup-time ReconcileIn (cleanup_reconciled_at), a full target backup STARTED after it and after activation, the content check (count + hash of the source's insert-only rows below w_final, less target-tombstoned documents, equal on the target, taken after the backup completed) and the timeline check (target_timeline_changed_at ≤ cleanup_reconciled_at); else ErrBackupPending / ErrGateOpen, retried (N143, N149, N159): DROP INDEX by name, engram_cleanup_namespace, the moved-out ROWS; the source blob prefix only after the 28-day window; the moved_out row stays
 		Rollback(ctx context.Context, f Fence, why string) error     // only before (a″): wins the cutover → rolled_back CAS first; see the table
-	ReconcileIn(ctx context.Context, f Fence) (*workflowv1.ReconcileInReport, error) // restore/failover of the TARGET after (a″): from the static source, INSERT … ON CONFLICT DO NOTHING of ins_seq ≥ F_pre and the mutable class, await indexes, intent replay, then admin edges incoming → ready → active (N149)
+	ReconcileIn(ctx context.Context, f Fence) (*workflowv1.ReconcileInReport, error) // restore/failover of the TARGET after (a″), and once more at cleanup time (N159): FIRST engram_seq_advance(W_final) whenever the move is committed/cleaning (also when every row is present), then from the static source, INSERT … ON CONFLICT DO NOTHING of ins_seq ≥ F_pre and the mutable class, await indexes, intent replay, then admin edges incoming → ready → active (N149)
 }
 type Orchestrator interface { // MoveService
 	Start(ctx context.Context, ns id.NamespaceID, target id.ShardID, o StartOptions) (*Ref, error)
@@ -1262,7 +1283,7 @@ type Orchestrator interface { // MoveService
 | `Commit` (a″) onward | none: the move completes forward (by the mover or by the restore reconcile); a reverse move is an ordinary new move |
 
 `catalog.MoveBackups` records the backup and timeline facts `Cleanup` reads; a source restored before cleanup re-runs `engram_cleanup_namespace` for `moved_out` rows of a move past `committed` (`restore cleanup-moved-out`). `StartOptions` carries `DrainWait` (15 s, max 60 s), `FreezeWatchdog(liveFacts)` (`max(120 s, 60 s + 1 s per
-10 k facts)`, ≤ 15 min), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h (source cleanup also waits for a full target backup started after activation, N143), `SourceBlobGrace` 28 d and the
+10 k facts)`, ≤ 15 min), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h (source cleanup also waits for the content + timeline gate and a cleanup-time `ReconcileIn`, N143, N159), `SourceBlobGrace` 28 d and the
 cutover retry (100 ms ×1.5 → 1 s within 60 s; (b″) and (d) unlimited). *Test seam:* a model-based test from
 `ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: concurrent retain, consolidate and delete during the
 copy, rows inserted under old ids and mutable rows deleted on the source (`TestMove_ActiveBacklog`), a row committed
@@ -1442,6 +1463,11 @@ type Log interface {
 	RestoreFloor(ctx context.Context, shard id.ShardID) (time.Time, error)             // min over the shard's restore markers; the replay floor is min(catalog.ReplayFloor.Get, this)
 }
 
+// HelpPrevious (N159) runs under the subject lock, before the caller's own marker transaction: if the subject's latest deletion_log
+// entry (either kind; rebuilt from the row's effect, epoch, operation_id, prev_operation_id and deleted_at) has no intent object, it
+// puts it (put-if-absent under that entry's own name). It reports whether it had to put.
+func HelpPrevious(ctx context.Context, l Log, latest Intent) (put bool, err error)
+
 // Order returns the replay order: per subject in Prev-chain order (a broken chain starts at its oldest present member),
 // subjects in any order. It reads no clock, so no clock-sync bound is needed (C-16, P-13).
 func Order(in []Intent) []Intent
@@ -1454,10 +1480,10 @@ epoch; **replay skips an intent older than an already-applied entry of the same 
 repeated `Invalidate` or `Restore` of the same fact writes its own `deletion_log` row and intent. Restore and failover replay a namespace's intents with
 `deleted_at ≥ replay_floor − 10 min`, where the floor is `catalog.ReplayFloor` (lowered by every restore, never raised
 while intents are retained), applying each **verbatim** — never recomputing `up_to_version` from restored state —
-through the admin variant of the marker transaction, idempotently through the shard `deletion_log` (the marker transactions of one subject serialise on the per-fact or document lock, so concurrent curation forms one chain, N150), and skipping
-namespace and tenant intents whose catalog row is not `deleting` or `deleted`. A tenant delete writes one intent per
+through the admin variant of the marker transaction, idempotently through the shard `deletion_log` (the marker writers of one subject serialise on the subject lock, held until the intent is put, so concurrent curation forms one chain without holes, N150, N159), and skipping
+namespace and tenant intents whose catalog row is not `deleting` or `deleted`. **A skipped intent is recorded as settled** (N159): the replay inserts its `deletion_log` row with `replay_outcome = 'skipped'` (an applied one with `'applied'`), and `restore replay` is complete when every in-window intent has a row, so reopening never waits on a skipped one (`TestReplay_SkippedIntentSettled`). A tenant delete writes one intent per
 namespace as the workflow fences it, so the per-namespace listing reaches it. *Test seam:* `Durability.tla` model-based
-tests; `TestIntent_AckImpliesIntent`, `TestIntent_DuplicateAttempt`, `TestIntent_AckRereadsMarker`, `TestIntent_EpochGuard`, `TestRestore_ChainOrder`, `TestRestore_FloorInCatalog`.
+tests; `TestIntent_AckImpliesIntent`, `TestIntent_DuplicateAttempt`, `TestIntent_AckRereadsMarker`, `TestIntent_EpochGuard`, `TestIntent_HelpPrev`, `TestReplay_SkippedIntentSettled`, `TestRestore_ChainOrder`, `TestRestore_FloorInCatalog`.
 
 #### 2.2.29 `internal/expunge` — the asynchronous half of a delete (N119)
 
@@ -1638,7 +1664,7 @@ type).
 | Move | dirty copy in key ranges of ≤ 100,000 rows, 4 parallel streams, the writer path stays live, catch-up first, then whole-namespace checks below a closed floor before the freeze (`PreVerify`, N148), and the target's indexes ready before it (`AwaitIndexes`, N153); catalog CAS as the point of no return; freeze watchdog `max(120 s, 60 s + 1 s per 10 k facts)`, ≤ 15 min; ≤ 4 moves per cell, one per namespace; cutover (b″) and (d) retried indefinitely | `move.StartOptions` | N124, N125 |
 | Fence acquisition | writers never wait (`pg_try_advisory_xact_lock_shared`, refusal → `NamespaceFrozen{200 ms}`); exclusive takers (fence, document lock, derivation lock) make one attempt with `lock_timeout` 35 s; role defaults 2 s (`engram_app`), 10 s (`engram_move`, `engram_admin`), 30 s statement and idle timeouts on every outbox-writing role | `store.Store.InNamespace`, role defaults | N82: no pooled connection waits behind a queued freeze |
 | Derivation lock | shared by every writer of derived versions; exclusive for `Materialize` and `Restore`, one 35 s attempt | `store.Derived` | N120 |
-| Per-fact lock | `Invalidate`, `Restore` and duplicate attempts take `engram_doc_lock_keys(ns, memory_id)` before reading `prev_operation_id` | `store.Markers` | N150 |
+| Subject lock | every marker writer takes the session-level `engram_subject_lock_key(ns, subject_id)` on a direct connection before its marker transaction and holds it until the intent put and the marker re-read; `lock_timeout` 3 s; help-previous under it | `store.SubjectLocker`, `intent.HelpPrevious` | N150, N159 |
 | Per-document lock | `CommitChunk` shared try-lock (`DocumentBusy`, 100 ms); `FinalizeVersion` and the delete marker exclusive, one 35 s attempt | `store.DocumentWriter.Lock` | N83 |
 | Outbox event size | ≤ 256 ids and ≤ 16 KiB per event; elided above 4,096 ids | `outbox.Writer`, `outbox.Group` | N80; the CHECK is a backstop |
 | Catalog resolver | LRU 100 k entries; single-flight per key; LISTEN reconnect backoff 1 s → 30 s | `catalog.ResolverOptions` | D4 |
@@ -1650,9 +1676,10 @@ type).
 | Register | What changed in this section |
 |---|---|
 | N144 | `InsertVersion` and `pages.Writer` look up `commit_key` first, then run the compare-and-set with `$expected` for every writer; attempt-unique markdown keys |
-| N145, N150 | `Hide`/`Unhide` take the per-fact lock, resolve the twin and outlive the fact; `Materialize` works from the marker set; `Overlay` uses the live predicate; `intent` keeps recorded epochs and the subject class |
+| N145, N150 | `Hide`/`Unhide` run under the subject lock, resolve the twin and outlive the fact; `Materialize` works from the marker set; `Overlay` uses the live predicate; `intent` keeps recorded epochs and the subject class |
 | N146 | catalog synchronous standby; `catalog.Reconciler`; `intent.Log.PutRestore/RestoreFloor` make the replay floor derivable |
 | N147 to N149, N153 | `Copier.AwaitIndexes`, `PreVerify` copy-first, floors as source values, `Closer.ReconcileIn`, `catalog.MoveBackups` |
+| N159 | `store.SubjectLocker` (session-level subject lock held until the intent put) and `intent.HelpPrevious`; `intent` replay records skipped intents as settled; `Closer.ReconcileIn` re-runs `engram_seq_advance` and runs at cleanup time; `catalog.MoveBackups.RecordCleanupReconcile/RecordContentCheck` (content + timeline gate); every derived writer passes `$expected`; the Materialize stamp under the exclusive derivation lock |
 | N151, N152 | cost-based `Plan` (θ 50 k, exact fallback, 500-document constant), partition-level hygiene |
 | N154, N155, N54 | pool 20/40, arm semaphore 16, 220 ms critical path |
 | N157 | ≤ 5-method split: `catalog.Moves`/`MoveBackups`, `store.Tx` with `Txn()`, `ReadTx` with `Derived()`; `NamespaceAdmin`, `OperationReader`, `FactLister`, `DocumentTags`, `DocumentBodies`, `pages.Admin`, `SnapshotLister`; `move.Orchestrator` in `api.Deps`; services take `id.Scope` and `id.Caller`; leaf-permitted modules and two edges; (RPC → method) coverage; `REFRESH_PAGE` singleton-backed |

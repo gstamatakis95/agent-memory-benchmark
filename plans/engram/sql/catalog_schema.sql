@@ -217,7 +217,10 @@ CREATE TRIGGER namespaces_touch BEFORE UPDATE ON namespaces
 -- There is no outbox position here: the move never reads or replays the outbox (N124).
 -- Every step, the CAS above included, is a compare-and-set on the exact ownership rows the mover verified (N143): the
 -- CAS adds the verified shards, from_epoch, source_system_id / source_timeline_id and requires the namespaces row to
--- still be (source, from_epoch, 'frozen'). Cleanup of the source needs 'done', which needs target_backup_at (N143).
+-- still be (source, from_epoch, 'frozen'). Cleanup of the source needs 'done', which needs the N159 gate: a cleanup-time ReconcileIn,
+-- a full target backup that STARTED after it, a content check (the source's insert-only rows below W_final, less the documents
+-- the target has tombstoned, are all on the target: count and hash equal) taken after that backup completed, and a timeline
+-- check (the target's last timeline change is not later than the ReconcileIn). A backup timestamp alone is not the gate.
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespace_moves (
   move_id                uuid PRIMARY KEY,
@@ -249,7 +252,13 @@ CREATE TABLE namespace_moves (
   target_timeline_changed_at timestamptz,           -- N149: the target's last timeline change (restore or promotion) after activation, NULL if none (catalog.MoveBackups.RecordTimeline)
   reconciled_in_at       timestamptz,               -- N149: ReconcileIn completed (the target was repaired from the source)
   target_backup_started_at timestamptz,             -- N149: start of the FULL target backup that gates cleanup
-  target_backup_at       timestamptz,               -- N143: completion of a FULL target backup that STARTED after activated_at (and, N149, after the target's last timeline change and ReconcileIn); source cleanup waits for it and for the 24 h grace
+  target_backup_at       timestamptz,               -- N143: completion of a FULL target backup that STARTED after activated_at and after cleanup_reconciled_at (N159); source cleanup waits for it and for the 24 h grace
+  cleanup_reconciled_at  timestamptz,               -- N159: the cleanup-time ReconcileIn (always run, even with no recorded timeline change) completed
+  source_content_rows    bigint,                    -- N159: content check, source side: insert-only rows with ins_seq < w_final, less documents the target tombstoned
+  source_content_hash    bytea,                     --   bit_xor(hashtextextended(pk::text, 0)) over the same rows
+  target_content_rows    bigint,                    -- N159: the same measure on the target; must equal the source's
+  target_content_hash    bytea,
+  target_content_checked_at timestamptz,            -- N159: taken after target_backup_at; with the timeline check it makes the backup content-complete
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
   CHECK (to_epoch = from_epoch + 1),
@@ -258,12 +267,19 @@ CREATE TABLE namespace_moves (
   CHECK (state NOT IN ('committed', 'cleaning', 'done') OR committed_at IS NOT NULL),
   CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL),
   CHECK (ready_at IS NULL OR w_final IS NOT NULL),                                     -- N147: no 'ready' before the target's sequence passed W_final
-  CHECK (state <> 'done' OR (activated_at IS NOT NULL AND target_backup_at IS NOT NULL AND target_backup_at >= activated_at)),
-  -- N149: the cleanup gate is content-recoverable: the target's last timeline change is either absent or followed by a
-  -- ReconcileIn, and the gating backup STARTED after the later of activation, the timeline change and the reconcile
-  CHECK (state <> 'done' OR (target_backup_started_at IS NOT NULL
-         AND (target_timeline_changed_at IS NULL OR reconciled_in_at >= target_timeline_changed_at)
-         AND target_backup_started_at >= greatest(activated_at, target_timeline_changed_at, reconciled_in_at)))
+  -- N149, N159: the cleanup gate is content check + timeline check + a cleanup-time ReconcileIn, not a backup timestamp alone:
+  --   (1) ReconcileIn from the intact source ran at cleanup time; (2) a FULL target backup STARTED after it and after activation;
+  --   (3) after that backup completed, the content check found the target holding every source row (count and hash equal);
+  --   (4) the target's last timeline change is not later than (1), so no restore or promotion happened between (1) and (3).
+  CHECK (state <> 'done' OR (
+         activated_at IS NOT NULL AND cleanup_reconciled_at IS NOT NULL
+         AND target_backup_started_at IS NOT NULL AND target_backup_at IS NOT NULL
+         AND target_backup_started_at >= greatest(activated_at, cleanup_reconciled_at)
+         AND target_backup_at >= target_backup_started_at
+         AND target_content_checked_at IS NOT NULL AND target_content_checked_at >= target_backup_at
+         AND source_content_rows IS NOT NULL AND source_content_hash IS NOT NULL
+         AND target_content_rows = source_content_rows AND target_content_hash = source_content_hash
+         AND (target_timeline_changed_at IS NULL OR target_timeline_changed_at <= cleanup_reconciled_at)))
 );
 
 CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)

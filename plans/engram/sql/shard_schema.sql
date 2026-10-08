@@ -91,6 +91,11 @@
 --     namespace fence      one-argument  pg_*_advisory_*lock(hashtextextended(ns::text, 0))
 --     derivation lock      one-argument  pg_*_advisory_*lock(hashtextextended(ns::text, 1))   (N120)
 --     document lock        two-argument  pg_*_advisory_*lock(hashtext(ns::text), hashtext(doc))
+--     subject lock         one-argument  pg_advisory_lock(hashtextextended(ns::text || ':' || subject_id, 2))   (N150, N159)
+--   The SUBJECT lock is SESSION-level, taken by the API handler on a dedicated direct connection BEFORE a marker
+--   transaction and released only after the intent put and the marker re-read; it is a different key from the
+--   per-document lock the marker transaction itself takes inside (a pooled transaction would otherwise wait for its
+--   own caller). Order: subject lock -> fence -> document / derivation lock.
 --   One- and two-argument advisory locks are different lock tags (objsubid 1 vs 2), so no
 --   cross-kind collision exists. FOR SHARE is used on no row (immutable facts cannot be locked
 --   meaningfully; compatible row lockers churn multixacts).
@@ -200,6 +205,23 @@ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT hashtextextended(ns::te
 
 CREATE FUNCTION engram_doc_lock_keys(ns uuid, doc text) RETURNS TABLE (k1 integer, k2 integer)
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT hashtext(ns::text), hashtext(doc) $$;
+
+-- N150, N159: the per-SUBJECT lock key of the marker writers (document | memory | namespace | tenant subject_id). The handler
+-- takes pg_advisory_lock(engram_subject_lock_key(ns, subject)) (session level, direct connection, lock_timeout 3 s, one attempt)
+-- before the marker transaction and releases it after the intent put and the marker re-read; under it the handler first puts the
+-- missing intent of the subject's latest deletion_log entry (help-previous). A crash drops the connection and so the lock.
+CREATE FUNCTION engram_subject_lock_key(ns uuid, subject text) RETURNS bigint
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT hashtextextended(ns::text || ':' || subject, 2) $$;
+
+-- N159: does THIS backend hold the EXCLUSIVE derivation lock of ns (pg_advisory_xact_lock(engram_ns_derivation_key(ns)))?
+-- Used by the Materialize stamp guard below.
+CREATE FUNCTION engram_holds_derivation_exclusive(ns uuid) RETURNS boolean
+LANGUAGE sql STABLE STRICT AS $$
+  SELECT EXISTS (SELECT 1 FROM pg_locks l
+                  WHERE l.locktype = 'advisory' AND l.granted AND l.pid = pg_backend_pid() AND l.mode = 'ExclusiveLock'
+                    AND l.objsubid = 1
+                    AND ((l.classid::bigint << 32) | l.objid::bigint) = engram_ns_derivation_key(ns))
+$$;
 
 -- Writers' fence acquisition (N82): never waits. false -> NamespaceFrozen{retry_after = 200 ms}.
 CREATE FUNCTION engram_try_ns_fence(ns uuid) RETURNS boolean
@@ -773,7 +795,7 @@ CREATE TABLE outbox_skipped (
 -- object `_control/deletes/{tenant}/{ns}/{deleted_at}-{operation_id}.json`, which the API puts AFTER the
 -- marker commits and BEFORE the ack; the name is derived from this row, so it is the idempotency key and
 -- `engramctl restore replay` re-applies each intent at most once. prev_operation_id is the subject's
--- previous entry read under the document lock: replay applies a subject's intents in chain order, never
+-- previous entry read under the SUBJECT lock (N150, N159): replay applies a subject's intents in chain order, never
 -- by clock. effect is the marker's exact effect, so a duplicate attempt that finds the subject already
 -- deleted re-puts the committed marker's own intent (put-if-absent). Insert-only.
 -- epoch (N143): the namespace epoch the marker committed under, copied into the intent object. Replay applies a
@@ -784,8 +806,16 @@ CREATE TABLE outbox_skipped (
 -- N150: epoch is ALWAYS the intent's recorded epoch (a replay keeps it; the guard compares recorded epochs only);
 -- applied_epoch is the epoch a replay committed under (informational). The subject is (class, id) independent of the
 -- action kind (document | memory = invalidate and restore | namespace | tenant), so the chain of a fact reads the last
--- entry of either kind; every marker transaction on a fact first takes pg_advisory_xact_lock(engram_doc_lock_keys(ns,
--- memory_id::text)) so concurrent calls form one chain.
+-- entry of either kind; every marker writer on a subject first takes the SESSION-level subject lock
+-- (engram_subject_lock_key(ns, subject_id)) and HOLDS it until its intent is put and the marker re-read (N159), so concurrent
+-- calls form one chain and a successor cannot commit or put while its predecessor's put is in flight. Under the lock the
+-- writer first puts the intent of the subject's latest entry if that object is absent (help-previous): effect, epoch,
+-- operation_id, prev_operation_id and deleted_at of this row are exactly the intent's body, so a crash between a commit and
+-- its put never leaves a hole in the prev_operation_id chain (Durability_NoHelpPrev).
+-- replay_outcome (N159): a replay inserts a row for EVERY intent it settles, 'applied' (effect applied, applied_epoch set) or
+-- 'skipped' (older recorded epoch than an applied entry of its subject, or a namespace/tenant intent whose catalog row is
+-- not deleting|deleted; nothing applied, applied_epoch NULL). `restore replay` is complete, and the shard reopens, when every
+-- in-window intent has a row, so a skipped intent is never waited on. NULL = a live marker transaction.
 CREATE TABLE deletion_log (
   namespace_id  uuid NOT NULL,
   tenant_id     text NOT NULL,
@@ -794,12 +824,15 @@ CREATE TABLE deletion_log (
   subject_id    text NOT NULL,                     -- document_id | memory_id::text | namespace_id::text | tenant_id
   epoch         bigint NOT NULL,                   -- the intent's RECORDED epoch (N150), never the shard's current one
   applied_epoch bigint CHECK (applied_epoch IS NULL OR applied_epoch >= epoch),   -- N150: informational, set by a replay
+  replay_outcome text CHECK (replay_outcome IS NULL OR replay_outcome IN ('applied', 'skipped')),   -- N159: settled by a replay
   operation_id  uuid,
   prev_operation_id uuid,
   effect        jsonb NOT NULL CHECK (jsonb_typeof(effect) = 'object'),   -- {up_to_version} | {memory_ids}
   deleted_at    timestamptz NOT NULL DEFAULT now(),
   ins_seq       bigint NOT NULL DEFAULT nextval('engram_ins_seq'),
-  PRIMARY KEY (namespace_id, intent_key)
+  PRIMARY KEY (namespace_id, intent_key),
+  CHECK (replay_outcome IS DISTINCT FROM 'skipped' OR applied_epoch IS NULL),
+  CHECK (replay_outcome IS DISTINCT FROM 'applied' OR applied_epoch IS NOT NULL)
 );
 
 CREATE INDEX deletion_log_subject_idx ON deletion_log (namespace_id, subject_id, deleted_at DESC);   -- N150: the subject's last entry of either kind
@@ -1681,6 +1714,26 @@ CREATE TABLE fact_hidden (
 CREATE INDEX fact_hidden_unmaterialized_idx ON fact_hidden (namespace_id, hidden_at)
   WHERE cause = 'invalidate' AND materialized_at IS NULL;                 -- the sweeper's and Materialize's worklist (N145)
 
+-- N159: the Materialize STAMP (fact_hidden.materialized_at, document_tombstones.materialized_at) is written only by a
+-- transaction that holds the EXCLUSIVE derivation lock. A stamp written without it (an invalidation that nothing cites, a
+-- batch that did not wait for the shared holders) lets a writer that verified before the Invalidate commit a version citing
+-- the fact after the stamp, and the owed derived hiding is then never done (MaterializeComplete).
+CREATE FUNCTION engram_materialize_stamp_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.materialized_at IS NULL AND NEW.materialized_at IS NOT NULL
+     AND NOT engram_holds_derivation_exclusive(NEW.namespace_id) THEN
+    RAISE EXCEPTION 'materialize stamp on %.% requires the exclusive derivation lock (N159)', TG_TABLE_NAME, NEW.namespace_id
+      USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER fact_hidden_stamp_guard BEFORE UPDATE OF materialized_at ON fact_hidden
+  FOR EACH ROW EXECUTE FUNCTION engram_materialize_stamp_guard();
+CREATE TRIGGER document_tombstones_stamp_guard BEFORE UPDATE OF materialized_at ON document_tombstones
+  FOR EACH ROW EXECUTE FUNCTION engram_materialize_stamp_guard();
+
 -- curation_log (A-16), INSERT-ONLY: every Invalidate / Restore with the fact's content_hash and
 -- document. CommitChunk re-applies the LAST action per (document_id, content_hash) to the new facts
 -- of a re-extracted twin (of the document's current life: document_version >= documents.life_start),
@@ -2128,7 +2181,10 @@ $$;
 --       It is the last check before the version rows are inserted:
 --         UPDATE observations SET current_version = $expected + 1 WHERE ... AND current_version = $expected
 --       EVERY writer passes the version it READ (root rebuilds included; $expected = the current_version at LoadPage /
---       the read of the batch): there is no blind write and no "advance whatever it holds" branch. A delta or merge
+--       the read of the batch; 0 for a root that has no version yet): there is no blind write and no "advance whatever it
+--       holds" branch. A NULL expectation is refused, and NULL comes back only when no row advanced (the compare lost, or
+--       the root row does not exist). NoPhantomVersion is "the current version row exists" (a stub counts, N136); the order
+--       idempotency lookup -> CAS -> version insert preserves it (N144, N159). A delta or merge
 --       (p_check_visible) additionally requires the base version to be VISIBLE; a root rebuild is written from live
 --       sources only and may start from a hidden current version. NULL (zero rows) means the writer lost: ROLLBACK,
 --       discard the rendered result, and delete only a blob this execution minted that no page_versions row names.
@@ -2507,7 +2563,7 @@ $$;
 
 -- N145: the subjects of an Invalidate/Restore of p_memory beyond itself: the visible same-content_hash TWIN in the same
 -- document (the re-extraction twin), found through facts, or through curation_log when the named fact was already purged.
--- The marker transaction writes fact_hidden for the fact and for each row returned, under the per-fact lock (N150).
+-- The marker transaction writes fact_hidden for the fact and for each row returned, under the subject lock (N150, N159).
 CREATE FUNCTION engram_invalidation_twins(p_ns uuid, p_memory uuid) RETURNS SETOF uuid
 LANGUAGE sql STABLE AS $$
   WITH m AS (SELECT engram_doc_tomb(p_ns) AS d, engram_chunk_tomb(p_ns) AS c),

@@ -1655,7 +1655,7 @@ DONE, ROLLED_BACK` (`CATCHING_UP` reserved; the pre-freeze verification and the 
 target's partial indexes, N148 and N153, run inside `COPYING`),
 `cutover_step` (`READY_TARGET`, `CATALOG_COMMIT`, `MOVED_OUT_SOURCE`, `ACTIVE_TARGET`,
 `CATALOG_FLIP`), `past_point_of_no_return`, `source_blobs_gc_after` (the source blob prefix is kept
-for the 28-day backup window, N123; the source rows are deleted only after the 24 h grace, a full target backup taken after activation and the timeline gate of N149, whose inputs `target_backup_at` and `reconciled_in_at` the `Move` shows) and `MoveProgress{rows_copied, rows_catchup_copied,
+for the 28-day backup window, N123; the source rows are deleted only after the 24 h grace and the N159 cleanup gate (a cleanup-time `ReconcileIn`, a target backup started after it, a content check of the namespace on the target, and a timeline check), whose inputs `target_backup_at` and `reconciled_in_at` the `Move` shows) and `MoveProgress{rows_copied, rows_catchup_copied,
 rows_recopied, mutable_rows_reconciled, blobs_reconciled, copy_started_at, freeze_watchdog,
 indexes_requested, indexes_ready, restarted_operation_ids, tables_done}`; `copy_start_seq`, `applied_seq` and the replay lag fields
 are reserved, and `Move.operation_id` is reserved (a move is not an operation, N127). Full file

@@ -18,7 +18,7 @@ idempotency before the base compare-and-set** and no commit is blind (N144, §5.
 is **independent of the fact row** and is discovered from its marker, not from a signal (N145,
 §5.4.5); a move **copies before it checks, advances the target's sequence, waits for the target's
 indexes** and repairs a target restored after the point of no return (N147 to N149, N153, §5.5); and
-replay keeps recorded epochs under a per-subject lock (N150, §5.5.5).
+replay keeps recorded epochs under a per-subject lock that is **held until the intent is put**, and records skipped intents as settled (N150, N159, §5.4.1, §5.5.5).
 
 ### 5.0 Conventions shared by every pipeline
 
@@ -65,10 +65,20 @@ epoch=$2`.
   nothing.
 - **Lock key spaces are disjoint (N113):** namespace fence `hashtextextended(ns, 0)`, derivation
   lock `hashtextextended(ns, 1)` (used only by writers of derived versions, N120), document lock
-  `(hashtext(ns), hashtext(doc))`, and the **per-fact lock** `engram_doc_lock_keys(ns, memory_id)`
-  (the same two-argument form, taken by every `Invalidate` and `Restore` before it reads
-  `prev_operation_id`, so concurrent curation of one fact forms one chain, N150). One- and
-  two-argument advisory locks are distinct lock tags, so no cross-kind collision exists.
+  `(hashtext(ns), hashtext(doc))`, and the **subject lock** `engram_subject_lock_key(ns, subject_id)`
+  (one-argument, seed 2; N150, N159). It is taken by every marker writer (document delete,
+  `Invalidate`, `Restore`, namespace and tenant delete) at **session level on a dedicated direct
+  connection** (`store.SubjectLocker`, `lock_timeout` 3 s, one attempt, refusal → retryable
+  `UNAVAILABLE`) **before** its marker transaction, and is released only **after the intent put and
+  the marker re-read** (§5.4.1 steps 1a and 4); a crashed handler's lock dies with its
+  connection. Holding it across the put is what makes the chain safe: a successor cannot commit, or
+  put, while its predecessor's put is in flight (`Durability_NoSubjectLock`). Under it the writer
+  first runs **help-previous**: if the latest `deletion_log` entry of the subject has no intent
+  object, it puts that intent from the row (§5.4.1 step 1a). The key differs from the per-document
+  lock the marker transaction takes inside (a pooled transaction would otherwise wait for its own
+  caller). Lock order is subject → fence → document or derivation lock, and nothing takes the
+  subject lock while holding another. Different keys, seeds and arities are different lock tags, so
+  no cross-kind collision exists.
 - Every write transaction runs with `statement_timeout = idle_in_transaction_session_timeout =
   30 s` and its outbox `INSERT` is the **last statement** before `COMMIT`, one multi-row
   statement when it emits several events (invariant A-F1, D6): a drawn `seq` is committed or
@@ -116,7 +126,12 @@ in one *derivation transaction*:
    `current_version` the writer read when it loaded the root (`LoadPage`, the batch's candidate
    read), and `engram_derivation_base_cas($expected, check_visible)` has no "advance whatever it holds"
    branch, so a rebuild never overwrites a version that landed meanwhile and `current_version`
-   never names a row that does not exist (`NoPhantomVersion`). The same transaction clears the
+   never names a row that does not exist (`NoPhantomVersion`, stated as "the current
+   version row exists": a stub counts, N136). **Every writer passes `$expected` (N159):** a root rebuild
+   passes the version it **observed** when it loaded the root (0 for a root with no version yet),
+   never NULL; a NULL expectation is refused, and the function returns NULL, as for a lost compare,
+   when no row advanced (the root row is absent or has moved on), so no path advances "whatever it
+   holds". The same transaction clears the
    stale flags only with `WHERE stale_seq = $captured` (N37), never unconditionally;
 5. on any failure (zero rows included) `ROLLBACK`, discard the rendered result and re-derive from current evidence (a
    root rebuild for observations, `page_full/v1` for pages); the writer never "repairs" a result by
@@ -1105,7 +1120,11 @@ set of affected rows and no walk: what a delete hides is computed by the read pr
 - *Durability:* an **acknowledged** delete or invalidation has RPO 0, because an ack implies a
   committed marker and its intent object, and restore and failover replay the intents (N122,
   §5.5.5). A **committed but unacknowledged** one (a crash between the marker commit and the put)
-  may be lost by a restore; the client, which saw an error, retries and re-applies it.
+  may be lost by a restore; the client, which saw an error, retries and re-applies it. **No crash
+  leaves a hole in a subject's chain (N159):** the writer holds the subject lock until its intent is
+  put, and the next writer on the subject, under the same lock, first puts the missing intent of the
+  latest `deletion_log` entry (help-previous), so `prev_operation_id` never names an entry whose
+  intent does not exist (`Durability_NoHelpPrev`, `TestIntent_HelpPrev`).
 - *Invalidate/Restore:* visibility flips at commit of the marker row; `Restore` is exact because
   it deletes the `invalidate` row and the rows that carry its cause, and nothing else encodes the
   invalidation. The `invalidate` row has no foreign key to the fact and outlives its purge (N145), so
@@ -1118,6 +1137,16 @@ set of affected rows and no walk: what a delete hides is computed by the read pr
 1. **Validate and authorise** (scope `memory.write`, deadline present; delete-class RPCs and
    `Restore` cap at 40 s because the marker waits for the exclusive document lock in one 35 s
    attempt, N139).
+1a. **Subject lock and help-previous (N150, N159).** Before the marker transaction the handler takes
+   the session-level **subject lock** for `(document, document_id)` (§5.0: direct connection,
+   `lock_timeout` 3 s, one attempt; the 40 s cap of step 1 therefore still holds, 3 s + 35 s) and keeps
+   it until step 4 has decided the ack. Under it, **help-previous**: one indexed read
+   (`deletion_log_subject_idx`) of the subject's latest entry of either kind; if its intent object is
+   absent (a `HEAD` of the key derived from the row), the handler puts it from the row's own
+   `{subject, kind, effect, deleted_at, operation_id, prev_operation_id, epoch}` (put-if-absent, under
+   that entry's name). A crash between a predecessor's commit and put therefore never leaves the
+   `prev_operation_id` chain with a missing link for replay to treat as satisfied. The cost is one
+   `HEAD` per marker and one extra `put` after a crash.
 2. **Marker transaction** (fenced write tx, `synchronous_commit = local`), statement order:
    1. fence prelude at the caller's epoch.
    2. the exclusive per-document advisory lock, one 35 s attempt: it waits for every in-flight
@@ -1137,7 +1166,7 @@ set of affected rows and no walk: what a delete hides is computed by the read pr
    5. `UPDATE document_versions SET status = 'deleted' WHERE namespace_id AND document_id AND
       status <> 'deleted'` (including an `ingesting` version, whose workflow is cancelled below;
       versions of an earlier, already deleted life are `deleted` and stay so).
-   6. Read the subject's last `deletion_log` entry (still under the document lock) as
+   6. Read the subject's last `deletion_log` entry (under the subject lock of step 1a, and the document lock) as
       `prev_operation_id`, then `INSERT document_tombstones(namespace_id, tenant_id, document_id,
       up_to_version, deleted_at, operation_id, expunge_state = 'pending', event_seq = NULL)`
       (`event_seq` is nullable until step 9) with `up_to_version =
@@ -1161,7 +1190,7 @@ set of affected rows and no walk: what a delete hides is computed by the read pr
       `statement_timeout` of being drawn, which the 60 s gap watchlist assumes; the marker is a
       mutable row and `engram_consumers_passed` reads `event_seq` (P-15). `COMMIT`. Milliseconds at
       any document size.
-3. **Put the intent object**, after the commit and before the ack:
+3. **Put the intent object**, after the commit and before the ack, **still holding the subject lock**:
    `_control/deletes/{tenant}/{ns}/{deleted_at_rfc3339}-{operation_id}.json` recording the marker's
    **exact effect** `{subject, kind, up_to_version, deleted_at, operation_id, prev_operation_id, epoch}`
    (N122): shard-independent key (it follows the namespace across moves); the intent also records the namespace `epoch` the marker committed under (N143, `deletion_log.epoch`), strongly consistent,
@@ -1183,7 +1212,9 @@ set of affected rows and no walk: what a delete hides is computed by the read pr
    marker the shard no longer has, so the request returns `UNAVAILABLE` and the client retries
    (the retry finds no marker and runs the marker transaction again; `Durability_AckNoRecheck`,
    `TestIntent_AckRereadsMarker`). The same re-read precedes the ack of `Invalidate`, `Restore`
-   and the namespace and tenant deletes.
+   and the namespace and tenant deletes. **The subject lock is released after this re-read, on every
+   exit path** (ack, `UNAVAILABLE`, any error; a crash releases it with the connection), never
+   between the commit and the put (N159).
 5. **Ack path**: `SignalWithStart("ns/{ns}/expunge", ExpungeInput{target = MARKERS,
    operation_id})`; `CancelWorkflow` for the cancelled retain operations; return `Operation{RUNNING}`
    with `deleted_at` and `ExpungeSla`. If the API dies between the put and the signal, the
@@ -1241,7 +1272,14 @@ role. **A run is per tombstone `(document_id, up_to_version)`:** every predicate
    (N145): the partial index `fact_hidden WHERE cause = 'invalidate' AND materialized_at IS NULL`
    and the open tombstones are the work list, and the batch that writes the
    `derived_hidden(invalidation, f)` rows stamps `fact_hidden.materialized_at` in the same
-   transaction. The per-shard `purge-sweep` schedule (N28) `SignalWithStart`s the expunge of every
+   transaction. **The stamp (this one and the document tombstone's `materialized_at`) is written only
+   under the exclusive derivation lock (N159):** the batch takes the lock, re-reads the marker sets,
+   finds every version citing the victim (which waits for the shared holders), inserts the rows and
+   stamps, all in that transaction; a stamp written without the lock, for an invalidation that
+   nothing cites, lets a writer that verified before the `Invalidate` commit a version citing the fact
+   after the stamp, with the owed hiding never done. The shard enforces it:
+   `engram_materialize_stamp_guard` rejects a `materialized_at` update from a backend that does not
+   hold the lock (`TestMaterialize_StampUnderLock`). The per-shard `purge-sweep` schedule (N28) `SignalWithStart`s the expunge of every
    namespace with an unstamped invalidation or a pending tombstone, so a lost signal, or a move that
    terminated the singleton, costs at most one tick (`Derivation_MatSignalOnly.cfg` must fail
    `MaterializeComplete`). For each pending marker: find every observation version and page version whose
@@ -1419,10 +1457,13 @@ work inside the deadline).
 
 #### 5.4.5 Soft invalidate / restore
 
-**`MemoryService.Invalidate(memory_id, reason)`**: one fenced write transaction (no derivation
-lock): fence prelude; the **per-fact lock** `pg_advisory_xact_lock(engram_doc_lock_keys(ns,
-memory_id))` (two-argument form, N150), taken before the chain predecessor is read, so concurrent
-`Invalidate` and `Restore` calls on one fact form one chain; **resolve the subject** (N145): the
+**`MemoryService.Invalidate(memory_id, reason)`**: first the **subject lock** for `(memory,
+memory_id)` (session level, direct connection, N150, N159), held until the intent is put and the
+marker re-read below, and under it **help-previous** as in §5.4.1 step 1a (the latest `deletion_log`
+entry of the fact, of either kind, gets its missing intent put); then one fenced write transaction
+(no derivation lock): fence prelude; the chain predecessor is read (the subject's last entry of
+either kind; safe because the subject lock is held), so concurrent `Invalidate` and `Restore` calls
+on one fact form one chain; **resolve the subject** (N145): the
 fact `f` and, if the same document holds a visible fact `f'` with the same `content_hash` (the re-extraction twin, found by `engram_invalidation_twins` over `curation_log` and `facts`), `f'` too; `INSERT fact_hidden(memory_id,
 cause = 'invalidate', reason)` for each — a conflict leaves visibility unchanged and succeeds (a
 double `Invalidate` hides nothing new), but it is **not silent** (N143): it still inserts its own
@@ -1438,8 +1479,8 @@ stale_seq + 1` for pages whose `page_version_inputs` name the fact (narrow mutab
 `FactInvalidated` (one per hidden fact), `ObservationsMarkedStale`, `PagesMarkedStale`. Commit,
 **then put the intent object** with the marker's exact effect `{subject, kind = invalidate,
 memory_ids, deleted_at, operation_id, prev_operation_id, epoch}`, **re-read the marker** and ack only
-if it is still present (else `UNAVAILABLE`, §5.4.1 step 4); a duplicate that finds the row ensures
-the intent exists (put-if-absent), as in §5.4.1. Then `SignalWithStart("ns/{ns}/expunge",
+if it is still present (else `UNAVAILABLE`, §5.4.1 step 4), then release the subject lock; a
+duplicate that finds the row ensures the intent exists (put-if-absent), as in §5.4.1. Then `SignalWithStart("ns/{ns}/expunge",
 ExpungeInput{target = MARKERS, …})` — an optimisation, because the unstamped marker is the work
 list (`materialized_at IS NULL`, §5.4.2 step 1) — so Materialize records the `derived_hidden` rows
 (cause `invalidation`; there is no purge phase for an invalidation) and `Consolidate` is nudged
@@ -1452,9 +1493,10 @@ requires both endpoints visible); pruning them on invalidate (Hindsight) would m
 rebuild links. `Invalidate` never expires an export snapshot (§5.7); the overlay it feeds is
 computed from the live predicate, so it is correct before Materialize (N145).
 
-**`MemoryService.Restore(memory_id)`**: one fenced write transaction that takes the **exclusive
-derivation lock** (single 35 s attempt; it deletes `derived_hidden` rows and must not interleave
-with a Materialize) and the per-fact lock (N150), and mirrors the twin rule: `DELETE FROM
+**`MemoryService.Restore(memory_id)`**: under the same **subject lock and help-previous** (taken
+first, N159), one fenced write transaction that takes the **exclusive derivation lock** (single 35 s
+attempt; it deletes `derived_hidden` rows and must not interleave with a Materialize), and mirrors
+the twin rule: `DELETE FROM
 fact_hidden WHERE memory_id = ANY($f_and_twin) AND cause = 'invalidate'` (absent → `NOT_INVALIDATED`;
 a `reextract` row is never touched, so `Restore` cannot resurrect a stale extraction next to its
 re-extracted twin, N135; the row it needs exists even after the fact's own purge, N145),
@@ -1467,7 +1509,7 @@ including one that follows a second `Invalidate` of the same fact (N143); nothin
 duplicate by subject, only by `intent_key`. Versions with no remaining cause are visible again at
 once; **restore is exact because nothing else encodes the invalidation**. Tests: `RestoreExact` in
 `Derivation.tla`; the T3 v1/v2/v3 interleaving; invalidate-twice; `TestInvalidate_SurvivesChunkPurge`,
-`TestInvalidate_ResolvesTwin`, `TestIntent_ConcurrentCurationOneChain`.
+`TestInvalidate_ResolvesTwin`, `TestIntent_ConcurrentCurationOneChain`, `TestIntent_HelpPrev`.
 
 #### 5.4.6 What each event writes, and who sees what
 
@@ -1556,7 +1598,7 @@ sequenceDiagram
 | Primary fails right after a delete ack | The intent object exists; the promoted or restored shard comes up `frozen/restore` and replays every intent newer than `replay_floor − 10 min` (the minimum restore target ever recorded and never raised, N134, read as `min(catalog, restore markers in blob storage)`, N146) before reads reopen (§5.5.5) | RPO 0 for acknowledged deletes (N122) |
 | The `Invalidate` signal is lost, or a move terminated the expunge singleton | The invalidation is committed but `materialized_at` is NULL; the `purge-sweep` schedule finds it on its next tick and `SignalWithStart`s the expunge | at most one tick of delay; the read predicate hid the derived text throughout (`TestExpunge_SweeperFindsUnmaterialized`) |
 | An `Invalidate`d fact's chunk is purged (REPLACE then 1 h, or re-extraction) | The `fact_hidden(invalidate)` row has no foreign key to the fact and stays; the derived versions it hid stay hidden and `Restore` still finds its row | an acknowledged invalidation is not erased by a purge (`TestInvalidate_SurvivesChunkPurge`) |
-| `Invalidate` of a fact whose re-extraction twin is visible | The marker transaction resolves the twin through `curation_log` and `facts` and hides both rows under the per-fact lock; `Restore` mirrors it | the user curated what they saw (`TestInvalidate_ResolvesTwin`) |
+| `Invalidate` of a fact whose re-extraction twin is visible | The marker transaction resolves the twin through `curation_log` and `facts` and hides both rows under the subject lock; `Restore` mirrors it | the user curated what they saw (`TestInvalidate_ResolvesTwin`) |
 | Invalidate, then the observation is rebuilt, then Restore | The rebuild wrote a new root version without the fact; Restore deleted the marker and the `derived_hidden(invalidation)` rows; the older hidden versions are visible again at their `as_of` | curation is reversible and exact |
 | `StreamSnapshot(version = n − 1)` after the ack | The version is `expired` → `PreconditionFailed{SNAPSHOT_EXPIRED}`; the client applies the next delta (with delete records) or takes a full snapshot | no acknowledged delete served through an old export |
 | Retain into the deleted document id | Allowed at once (see the retain row above); a second delete of the re-used id inserts a second tombstone with a higher `up_to_version` (it is part of the key); the first expunge deletes the `documents` row only if no higher tombstone is open and no version row remains | no new row is ever covered by an older tombstone; the second tombstone materializes (`TestDelete_ReuseDocumentID`) |
@@ -1803,19 +1845,34 @@ every shard's credentials).
    restarted `RetainDocument`'s `PlanChunks` sees the membership rows the source committed and
    skips them. `namespace_moves.state = 'cleaning'`; the expunge resumes on the target (its pending
    markers moved with the namespace).
-8. **`Cleanup`**: `workflow.Sleep(24 h)` (or an early signal from `engramctl move cleanup`), **and
-   then wait for a full backup of the target taken after activation and after the target's last
-   timeline change** (N143, N149, `ShardMove_CleanupNoBackup`, `ShardMove_CleanupTimeGate`): until activation the target had no backup of the moved rows, and
+8. **`Cleanup`**: `workflow.Sleep(24 h)` (or an early signal from `engramctl move cleanup`), **then
+   the cleanup gate: a content check, a timeline check and a cleanup-time `ReconcileIn`, not a backup
+   timestamp alone** (N143, N149, N159; `ShardMove_CleanupNoBackup`, `ShardMove_CleanupTimeGate`,
+   `ShardMove_NoTimelineCheck`): until activation the target had no backup of the moved rows, and
    the source rows are the only restorable copy of anything a restore of the target to a point
-   before the move-in would need. The `Backup` schedule's next full backup that *started* after
-   `activated_at` records its completion in `namespace_moves.target_backup_at`
-   (`MoveBackups.RecordTargetBackup`); the workflow polls it (a forced full backup is requested if none
-   starts within 24 h); the early signal shortens only the grace, and `CleanupMove` refuses to run
-   before `target_backup_at` is set. **The gate is content-recoverable (N149):** besides the grace
-   and `target_backup_at`, the target's timeline must equal `namespace_moves.activated_timeline` (`target_timeline_changed_at` unset; `MoveBackups.RecordTimeline`), **or** the target was repaired
-   by `ReconcileIn` (§5.5.5), `reconciled_in_at` later than `target_timeline_changed_at`; in either case
-   the full target backup must have *started* (`target_backup_started_at`) after `max(activated_at, reconciled_in_at)`. The only
-   copy of a row is therefore never deleted while the target may lack rows the source still holds. When both are done the last activity calls the `MoveService.CleanupMove` admin RPC, which has the index runner drop
+   before the move-in would need, and a backup that merely postdates activation can be taken from a
+   promoted target that lacks moved rows. In order:
+   1. **`ReconcileIn` at cleanup time** (§5.5.5), always, whether or not a timeline change was
+      recorded: from the intact source it re-copies what the target lacks as `INSERT … ON CONFLICT DO
+      NOTHING`; records `cleanup_reconciled_at`. It is idempotent and cheap when nothing is missing.
+   2. **A full target backup that *started* after `max(activated_at, cleanup_reconciled_at)`**: the
+      `Backup` schedule's next full backup records `target_backup_started_at` / `target_backup_at`
+      (`MoveBackups.RecordTargetBackup`; a forced full backup is requested if none starts within
+      24 h). The early signal shortens only the grace.
+   3. **Content check**, after that backup completed: the source's insert-only rows with `ins_seq <
+      w_final`, less the documents the target has tombstoned since activation (their rows are
+      legitimately purged there), are counted and hashed (`bit_xor(hashtextextended(pk::text, 0))`,
+      the N148 measure) on the static source and on the target; the two must be equal
+      (`source_content_*`, `target_content_*`, `target_content_checked_at`; `MoveBackups.RecordContentCheck`).
+      A mismatch repeats from step 1 once, then pages (`MoveCleanupContentMismatch`) and cleanup
+      stays refused.
+   4. **Timeline check**: the target's last timeline change (`target_timeline_changed_at`,
+      `MoveBackups.RecordTimeline`) is not later than `cleanup_reconciled_at`. A restore or promotion
+      of the target after step 1 restarts the gate from step 1.
+
+   The catalog `done` CHECK encodes exactly these four conditions, and `CleanupMove` refuses to run
+   before they hold. The only copy of a row is therefore never deleted while the target may lack rows
+   the source still holds. When the gate passes the last activity calls the `MoveService.CleanupMove` admin RPC, which has the index runner drop
    the namespace's partial indexes on the source by their deterministic names, runs
    `engram_cleanup_namespace` in batches (its outer `DELETE` carries `namespace_id`, N131) and
    deletes the moved-out **rows**, but **never the `namespace_ownership` row**: the `moved_out` row
@@ -1859,7 +1916,7 @@ every shard's credentials).
 | `CutoverCatalog` (d) | activity | catalog `epoch = e AND state = 'frozen'`; success if already `e + 1` for this move | `P-cutover`, retried indefinitely | — | catalog tx + `NOTIFY` | catalog event |
 | `Restart` | activity | workflow ids, `TERMINATE_IF_RUNNING`; `AlreadyStarted` ok only on `shard-{target}` and memo epoch `e + 1`; reconcile loop (N97) | `P-temporal` | — | none | — |
 | `ReconcileIn` | activity (restore reconcile, §5.5.5) | `INSERT … ON CONFLICT DO NOTHING` of insert-only rows `ins_seq ≥ F_pre` (source value) and the mutable class from the static source; admin edges `incoming → ready → active` (N149) | `P-db` | catalog move `committed`/`cleaning`; `engram_admin` only | target txs per batch | — |
-| `Cleanup` | timer + activity (admin RPC) | after 24 h **and** `target_backup_at` set (a full target backup started after activation and after the last timeline change or `ReconcileIn`, N143, N149); predicate deletes via `engram_cleanup_namespace`; ownership row kept as `moved_out` (N93); source blob prefix after 28 days (`blob_gc_after`) | `P-db` / `P-blob` | source `moved_out` (`SECURITY DEFINER` function) | admin txs in batches | — |
+| `Cleanup` | timer + activity (admin RPC) | after 24 h **and** the gate of step 8 (cleanup-time `ReconcileIn`, a full target backup started after it, the content check, the timeline check; N143, N149, N159); predicate deletes via `engram_cleanup_namespace`; ownership row kept as `moved_out` (N93); source blob prefix after 28 days (`blob_gc_after`) | `P-db` / `P-blob` | source `moved_out` (`SECURITY DEFINER` function) | admin txs in batches | — |
 | `Rollback` | activity | CAS `cutover → rolled_back`; state predicates (`abort_move`, `thaw_move`, `unready_target`, `rollback_target`, `return_abort`) | `P-catalog` / `P-db` | only before (a″); `thaw_move` allowed while the target is unreachable | catalog tx; source tx; target txs | catalog event `MoveRolledBack` |
 
 #### 5.5.3 Sequence
@@ -1929,7 +1986,7 @@ sequenceDiagram
 | Source fails over or restores during the move | session timeline differs from the catalog | `MoveFenced` at the next source activity, at `Freeze` or at (a″): `Rollback`; restore reconciles any open move first (§5.5.5) |
 | Whole worker fleet down | workflow stalls in whatever state | Temporal re-dispatches when a worker returns; a stall in `frozen` is bounded by the watchdog, which also runs as workflow logic |
 | Source fails over between (c) and (d) | the restore or failover reconcile reads `committed` in the catalog and completes (c), (b″) and (d) itself | the move ends on the target (`TestMove_FailoverBetweenCAndD`) |
-| The **target** is restored or promoted after (a″) (state `committed` or `cleaning`) | the target may lack rows written after the restore point; the source is static (`frozen/move` or `moved_out`) and intact until cleanup | `ReconcileIn` re-copies from the source, then the intents replay, then the target is brought `incoming → ready → active` (§5.5.5); `Cleanup` is gated on a backup that postdates the timeline change (`TestMove_TargetFailoverAfterCommit`, `TestMove_CleanupWaitsForPostRestoreBackup`) |
+| The **target** is restored or promoted after (a″) (state `committed` or `cleaning`, i.e. activated and not yet cleaned) | the target may lack rows written after the restore point, and a backup taken during the copy phase brings back a low `engram_ins_seq` with its rows; the source is static (`frozen/move` or `moved_out`) and intact until cleanup | the reconcile re-runs `engram_seq_advance(W_final)` first, **also when every row is present**, then `ReconcileIn` re-copies from the source, then the intents replay, then the target is brought `incoming → ready → active` (§5.5.5); `Cleanup` is gated on the content check, the timeline check and a cleanup-time `ReconcileIn` (`TestMove_TargetFailoverAfterCommit`, `TestMove_TgtRestoreSeqAdvance`, `TestMove_CleanupWaitsForPostRestoreBackup`, `ShardMove_TgtRestore`) |
 | A second move of a namespace that was moved before | the young target's sequence was advanced past the source's at `Plan` and `ReadyTarget`, so copied rows sort below every later insert and the second move re-copies only the recent range | no whole-namespace re-copy under the freeze (`TestMove_TwiceAndExport`, `ShardMove_NoSeqAdvance` must fail `CopiedBelowTargetSeq`) |
 
 **Stale-cache client path.** After (d) the `NOTIFY` invalidates every resolver within
@@ -1950,7 +2007,10 @@ failover runs this sequence, in order. **Step 0: the catalog itself.** The catal
 synchronous standby (`synchronous_commit = remote_apply`, N146), so a catalog commit that a move
 step, a delete ack or an epoch bump observed survives a catalog failover (RPO 0). A catalog
 **restore from backup** (RPO 60 s, the only lossy path) is followed by `engramctl catalog reconcile
---from-shards` **before the catalog serves writes**: the shards' ownership rows are the source of
+--from-shards` **before the catalog serves writes, after every catalog restore and not only after a
+shard restore** (N159): a move that waits for `committed` after the catalog lost it is completed by
+this repair alone, with no shard fault to trigger a reconcile (`ShardMove_CatalogLossNoShardTruth`,
+`TestCatalog_ReconcileAfterEveryRestore`). The shards' ownership rows are the source of
 truth (a source `moved_out` with a target hint ⇒ the move is at least `committed`; a target `active`
 with `move_epoch` ⇒ `done` or `cleaning`; a target `ready` or `incoming` with a source
 `frozen/move` ⇒ `cutover`, settled by the ordinary CAS; a shard `frozen/delete` ⇒ `deleting`), and
@@ -1963,7 +2023,13 @@ failover may compute "catalog epoch + 1". Then:
    thawed. If it reads `committed`, the move is past the point of no return and the reconcile
    completes (c), (b″) and (d) itself (the admin edge `reconcile_out`, from any state). Exactly one
    side wins and the loser stops. **If `S` is the *target* of a move read as `committed` or
-   `cleaning`** (it was restored or promoted after the point of no return), the reconcile runs
+   `cleaning`** (activated and not yet cleaned; it was restored or promoted after the point of no
+   return), the reconcile **first re-runs `engram_seq_advance(W_final)`** on the target (N147, N159;
+   `W_final` from `namespace_moves`): a backup taken during the copy phase holds rows above its
+   then-lower sequence, and a restore to it brings the low sequence back together with the rows, so
+   without the advance an active target would insert below its own rows. This happens whenever the
+   move is `committed` or `cleaning`, **also when every row is present** and neither `ReconcileIn`
+   nor (b″) has anything to do (`ShardMove_TgtRestore`, `TestMove_TgtRestoreSeqAdvance`). Then it runs
    **`ReconcileIn`** before (b″) (N149): from the source (static, intact until cleanup) it re-copies
    the insert-only rows with `ins_seq ≥ F_pre` (a source value) and the whole mutable class, both as
    `INSERT … ON CONFLICT DO NOTHING` (a target row that exists is either the copy or a
@@ -2014,12 +2080,19 @@ failover may compute "catalog epoch + 1". Then:
    `Restore(e)` replay in chain order and both apply, N150; `Durability_NoEpochGuard`,
    `Durability_ReplayStampsCurrentEpoch`, `TestIntent_EpochGuard`,
    `TestIntent_ReplayTwoOfSameSubject`), skipping namespace and tenant intents whose catalog row is not
-   `deleting` or `deleted`, and idempotently through the shard `deletion_log`. A repeated
+   `deleting` or `deleted`, and idempotently through the shard `deletion_log`. **A skipped intent is
+   recorded as settled (N159):** the replay inserts its `deletion_log` row under the intent's own
+   `intent_key` with `replay_outcome = 'skipped'` (nothing applied, `applied_epoch` NULL; an applied
+   one gets `'applied'`), and the replay is complete, and `restore_done` may reopen the shard, when
+   **every in-window intent has a row, applied or skipped**; otherwise the reopen would wait for an
+   intent that is never applied (`Durability.tla`, `TestReplay_SkippedIntentSettled`). A repeated
    `Invalidate` or `Restore` has its own intent and is replayed like any other entry. **The subject
    is `(class ∈ {document, memory, namespace, tenant}, id)`, independent of the action kind**
    (`deletion_log_subject_idx` is `(namespace_id, subject_id, deleted_at DESC)`, and the chain
-   lookup for a fact reads the last entry of either kind), and every marker transaction on a fact
-   takes the per-fact lock first, so concurrent calls form one chain (N150). A namespace or tenant delete replays through the `restore_delete` edge
+   lookup for a fact reads the last entry of either kind), and every live marker writer on a subject
+   holds the subject lock until its intent is put and helps the previous entry first, so concurrent
+   calls form one chain without holes (N150, N159; the replay itself runs while the namespace is
+   `frozen/restore`, when no API writer can commit a marker). A namespace or tenant delete replays through the `restore_delete` edge
    (`frozen/restore → frozen/delete`, `engram_admin`) instead of passing through `active`. The
    shard listens only on a restricted `listen_addresses` until `restore_done`, and the read fence
    rejects `frozen/restore`. Intents are kept 35 days (> the 28-day backup window).
@@ -2270,10 +2343,11 @@ retryable under the named policies. `NamespaceFrozen` is retryable only under `P
 | Finding | Register | What changed in §5 |
 |---|---|---|
 | C-1, C-11 | N144 | The commit rule decides idempotency first (`commit_key`, `attempt_nonce` per activity execution), then the base compare-and-set with `$expected` for every writer, root rebuilds included; attempt-unique markdown keys and a guarded blob delete; `stale_seq` compare-and-clear for observations (§5.0, §5.2.2, §5.3.2). |
-| C-2, C-10, A-11 | N145 | `fact_hidden` has no foreign key to `facts`; `Materialize` discovers its work from `materialized_at IS NULL` and the open tombstones; `Invalidate` resolves the same-content twin under the per-fact lock; the export overlay comes from the live predicate with `root_version` (§5.4.2, §5.4.5, §5.7). |
+| C-2, C-10, A-11 | N145 | `fact_hidden` has no foreign key to `facts`; `Materialize` discovers its work from `materialized_at IS NULL` and the open tombstones; `Invalidate` resolves the same-content twin under the subject lock; the export overlay comes from the live predicate with `root_version` (§5.4.2, §5.4.5, §5.7). |
 | C-3 | N146 | Catalog synchronous standby, reconcile from the shards after a catalog restore, replay floor also derivable from `_control/restores/` (§5.5.5). |
 | C-4, P-2, C-5, P-3 | N147, N148 | `engram_seq_advance` at `Plan` and (b′), floors are source values, `PreVerify` copies first and checks below a closed floor (§5.5.1). |
 | C-6, C-12, P-5 | N149, N153 | `ReconcileIn` and the timeline-gated cleanup; `AwaitIndexes` before `Freeze` and a (b′) precondition (§5.5). |
 | C-7, C-8 | N150 | Replay stores the recorded epoch; the subject lock and the subject definition (§5.5.5). |
+| Round 5 model checking | N159 | The subject lock is session-level and held until the intent put, with help-previous (§5.0, §5.4.1, §5.4.5); the target restore reconcile re-runs `engram_seq_advance` (§5.5.5); replay records skipped intents as settled (§5.5.5); the shard-truth catalog repair follows every catalog restore (§5.5.5); every derived writer passes `$expected` (§5.0); the Materialize stamp is written under the exclusive derivation lock (§5.4.2); the cleanup gate is content check + timeline check + cleanup-time `ReconcileIn` (§5.5.1 step 8). |
 | P-4, P-9, P-10 | N152 | Partition-level hygiene by `REINDEX INDEX CONCURRENTLY` (§5.4.2). |
 | A-5, A-10, A-14 | N157 | `REFRESH_PAGE` is singleton-backed; one marker transaction with its `seq` drawn in the final statement and the duplicate returning the existing operation; stub placeholders; covered versions filtered from every `DocumentService` path. |

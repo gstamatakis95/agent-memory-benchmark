@@ -617,6 +617,13 @@ message Move {
   // (decision N149).
   google.protobuf.Timestamp target_backup_at = 17;
   google.protobuf.Timestamp reconciled_in_at = 18;
+  // The cleanup gate (decisions N149, N159) is a cleanup-time ReconcileIn, a
+  // full target backup that started after it, a content check (the source's
+  // insert-only rows below w_final are all on the target, count and hash
+  // equal) taken after that backup completed, and a timeline check; a backup
+  // timestamp alone is not the gate. These two are the gate's inputs.
+  google.protobuf.Timestamp cleanup_reconciled_at = 19;
+  google.protobuf.Timestamp target_content_checked_at = 20;
 
   reserved 100 to 199;
 }

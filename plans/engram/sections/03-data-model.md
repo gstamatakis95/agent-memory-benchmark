@@ -139,8 +139,10 @@ CREATE TABLE namespace_moves (
   committed_at timestamptz,    -- (a'') the catalog CAS cutover -> committed: the point of no return
   moved_out_at timestamptz,    -- (c) on the source; informational
   activated_at timestamptz,    -- (b'') target ready -> active
-  activated_timeline integer, target_timeline_changed_at timestamptz, reconciled_in_at timestamptz,   -- N149: cleanup needs no unreconciled timeline change
-  target_backup_started_at timestamptz, target_backup_at timestamptz, -- a FULL target backup STARTED after max(activated_at, timeline change, reconciled_in_at) (N143, N149); cleanup also waits 24 h
+  activated_timeline integer, target_timeline_changed_at timestamptz, reconciled_in_at timestamptz,   -- N149: restore-time ReconcileIn
+  cleanup_reconciled_at timestamptz,                                  -- N159: the cleanup-time ReconcileIn completed (always run)
+  target_backup_started_at timestamptz, target_backup_at timestamptz, -- a FULL target backup STARTED after max(activated_at, cleanup_reconciled_at) (N143, N159); cleanup also waits 24 h
+  source_content_rows bigint, source_content_hash bytea, target_content_rows bigint, target_content_hash bytea, target_content_checked_at timestamptz,   -- N159: content check, taken after target_backup_at
   finished_at timestamptz
 );
 CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)
@@ -350,13 +352,13 @@ paged as consecutive events with `page`/`page_count`, and above 4,096 ids the ev
 only with `ids_elided = true` (consumers then delete by the indexed `(namespace_id, document_id)`
 query, N119). The `CHECK` is the backstop. A delete is **one O(1) marker event**
 (`DocumentDeleted`), not a per-id list. The outbox `INSERT` is the last statement of every write
-transaction (A-F1). `deletion_log(namespace_id, intent_key, kind, subject_id, epoch, applied_epoch,
+transaction (A-F1). `deletion_log(namespace_id, intent_key, kind, subject_id, epoch, applied_epoch, replay_outcome,
 operation_id, prev_operation_id, effect, deleted_at)` is the shard-local "already applied" record of
 marker transactions, written in the marker transaction; its key is the **name of the intent object**
 (N122), so `engramctl restore replay` applies each intent at most once. `prev_operation_id` is the
 subject's previous entry (the replay chain; the subject is `(class, id)` whatever the kind, so an `Invalidate` and a `Restore` of one fact share a chain, and
 `deletion_log_subject_idx` is `(namespace_id, subject_id, deleted_at DESC)`) and `effect` the marker's exact effect, from which a
-duplicate attempt re-puts the intent. `epoch` is the intent's recorded epoch, kept by a replay; `applied_epoch` is informational (N150). The intent is put after the commit and before the ack.
+duplicate attempt re-puts the intent. `epoch` is the intent's recorded epoch, kept by a replay; `applied_epoch` is informational (N150). `replay_outcome` (`applied` | `skipped`, NULL for a live marker) is written by a replay for **every** intent it settles, so a skipped intent counts as handled and the reopen never waits on it (N159). The intent is put after the commit and before the ack, and the writer holds the session-level **subject lock** from before the marker transaction until the put and the marker re-read are done; under it, it first puts the missing intent of the subject's latest entry (help-previous, N159).
 
 #### 3.3.3 Ingest ledger, documents, versions
 
@@ -618,8 +620,8 @@ and `page_full/v1`) commits in one transaction that (0) **first** asks `engram_d
 nothing: no CAS, no blob delete), then (1) try-locks the derivation lock shared, (2) re-verifies every rendered input in a fresh statement (`engram_facts_all_visible` for fact
 inputs against all open tombstones, `chunk_tomb` and `fact_hidden` of both causes; `engram_obs_version_hidden(…, engram_doc_tomb(ns, false))` for observation-version inputs),
 (3) checks its base by **compare-and-set at commit**: `engram_derivation_base_cas(ns, kind, id, $expected[, check_visible])` runs `UPDATE … SET current_version = $expected + 1 WHERE … AND
-current_version = $expected` for **every** writer (a root rebuild passes the version it read and skips only the visibility test; a `NULL` expectation is refused, there is no blind
-write); zero rows rolls back and discards, and the rollback branch deletes only the blob this execution minted and only `WHERE NOT EXISTS (SELECT 1 FROM page_versions WHERE markdown_blob_key = $key)`,
+current_version = $expected` for **every** writer (a root rebuild passes the version it **observed** (0 for a root with no version yet) and skips only the visibility test; a `NULL` expectation is refused, there is no blind
+write, and `NULL` comes back only when no row advanced; `NoPhantomVersion` is "the current version row exists", a stub counts, N159); zero rows rolls back and discards, and the rollback branch deletes only the blob this execution minted and only `WHERE NOT EXISTS (SELECT 1 FROM page_versions WHERE markdown_blob_key = $key)`,
 (4) on any failure rolls back and re-derives from current evidence. `observations.stale_seq` is bumped by every writer that sets a stale flag; a rewrite captures it and clears the flags only
 if unchanged (the page rule, N37). The lock is never held across an LLM call. Executed on the applied schema: commit, then a retry with the same key returns version 2 and leaves `current_version = 2`,
 one blob, two rows; a stale or `NULL` expectation returns `NULL`.
@@ -669,7 +671,7 @@ CREATE TABLE fact_hidden (namespace_id uuid, tenant_id text, memory_id uuid, hid
   'deleting'` with the content columns cleared (summary blob to `blob_tombstones`), one `document_tombstones` row
   (`up_to_version`; `event_seq` stamped by the final outbox statement), one `deletion_log` row, one outbox event, commit; **then** the intent put,
   then the ack. A duplicate attempt finds the document `deleting`, returns the **existing operation** (never `NOT_FOUND`) and re-puts the marker's own intent. Nothing else is touched.
-- `Invalidate(f)` = the per-fact lock `engram_doc_lock_keys(ns, f)` (N150), `INSERT fact_hidden (cause 'invalidate')` for `f` **and** for the visible same-`content_hash`
+- `Invalidate(f)` = under the subject lock `engram_subject_lock_key(ns, f)` held by the caller until the intent is put (N150, N159), `INSERT fact_hidden (cause 'invalidate')` for `f` **and** for the visible same-`content_hash`
   twin of the same document (`engram_invalidation_twins`, found through `facts` or `curation_log`, N145) + `curation_log` + `deletion_log` + outbox; `Restore(f)` = the same lock, the
   exclusive derivation lock, `DELETE fact_hidden WHERE cause = 'invalidate'` for the `memory_ids` of the last `Invalidate` entry, `DELETE derived_hidden WHERE cause = ('invalidation', f)`,
   `curation_log` row. **Restore is exact because nothing else encodes the invalidation, and the row survives the purge of its fact** (executed: the `invalidate` rows remain after
@@ -1149,7 +1151,7 @@ operation; `$ik` the intent object name, derived from `deleted_at` and `$op`). T
 the ack (N122). This is the one `DELETE_DOCUMENT` marker transaction (§5.4.1); it was executed against the DDL, and a second call on the same document returned the first call's operation and wrote nothing:
 
 ```sql
--- DeleteDocument
+-- DeleteDocument (the caller holds the session-level subject lock engram_subject_lock_key($1, $2) from before BEGIN until the intent is put and the marker re-read, and has put the previous entry's missing intent: N159)
 SELECT pg_advisory_xact_lock(k.k1, k.k2) FROM engram_doc_lock_keys($1, $2) AS k;     -- exclusive document lock: waits for in-flight CommitChunks
 SELECT state, current_version, tags FROM documents WHERE namespace_id = $1 AND document_id = $2 FOR UPDATE;   -- no row: NOT_FOUND; expected_version is compared HERE (C-17); $old_tags
 -- state = 'deleting' (duplicate attempt or retry): SELECT operation_id, intent_key FROM document_tombstones WHERE namespace_id = $1 AND document_id = $2
@@ -1171,7 +1173,7 @@ VALUES ($1, $t, $ik, 'document', $2, $e, $op, (SELECT l.operation_id FROM deleti
 WITH s AS (INSERT INTO outbox (event_type, payload) VALUES ('DocumentDeleted', $proto) RETURNING seq)   -- the LAST statement draws the seq: bounded by one statement_timeout (A-F1)
 UPDATE document_tombstones t SET event_seq = s.seq FROM s WHERE t.namespace_id = $1 AND t.document_id = $2 AND t.up_to_version = $up;
 COMMIT;                                                                                               -- then: put the intent object, then ack
--- Invalidate(f):  pg_advisory_xact_lock(engram_doc_lock_keys($1, $f::text)) (N150); $prev = the last deletion_log entry of subject $f of EITHER kind;
+-- Invalidate(f):  the caller already holds pg_advisory_lock(engram_subject_lock_key($1, $f::text)) (session level, direct connection, released after the intent put, N150, N159) and has helped the previous entry's intent; $prev = the last deletion_log entry of subject $f of EITHER kind;
 --                 INSERT fact_hidden (cause 'invalidate') for $f and for each engram_invalidation_twins($1, $f) (N145) + curation_log ('invalidate') + deletion_log (effect {memory_ids})
 --                 + outbox FactInvalidated (a double Invalidate changes no visibility but still inserts its own deletion_log row and intent, N143)
 -- Restore(f):     the same lock; exclusive derivation lock; DELETE FROM fact_hidden WHERE memory_id = ANY ($ids of the last Invalidate entry) AND cause = 'invalidate';
@@ -1263,6 +1265,7 @@ SELECT i.namespace_id, i.tenant_id, 'observation', i.observation_id, ov.root_ver
 ON CONFLICT DO NOTHING;                                              -- invalidation causes: the same with i.fact_id = $f and cause ('invalidation', $f)
 -- pages: the same INSERT over page_version_inputs: fact inputs by document_id, observation inputs through the rows just written
 UPDATE observations SET stale_delete = true, stale_since = coalesce(stale_since, now()) WHERE (namespace_id, observation_id) IN (…);   -- nudge Consolidate (root rebuilds) and PageRefresh
+-- the two stamps below are written inside this exclusive-derivation-lock transaction only (N159): triggers fact_hidden_stamp_guard / document_tombstones_stamp_guard reject them otherwise
 UPDATE document_tombstones SET expunge_state = 'materialized', materialized_at = now() WHERE namespace_id = $1 AND document_id = $victim AND up_to_version = $up_to;
 UPDATE fact_hidden SET materialized_at = now() WHERE namespace_id = $1 AND cause = 'invalidate' AND materialized_at IS NULL AND memory_id = ANY ($batch);   -- worklist: fact_hidden_unmaterialized_idx (N145)
 ```
@@ -1314,7 +1317,7 @@ Freeze work = rows inserted since `T_pre − 10 min` + the mutable rows (M1.5 me
 `drop` statements of `engram_hnsw_ddl` (by their deterministic names; rollback does the same on the target), then `SELECT
 engram_cleanup_namespace($1, 10000)` in a loop until it returns 0 (the outer `DELETE` carries `namespace_id`, P-19), as `engram_move`,
 once the row is `moved_out`. `CleanupMove` deletes the moved-out rows only after the 24 h grace **and** a full target backup that started after activation and after the target's last timeline change
-(`target_backup_started_at ≥ greatest(activated_at, target_timeline_changed_at, reconciled_in_at)`, N143, N149), with a `ReconcileIn` when a timeline change occurred: the only copy is never deleted while the target may lack
+(N143, N149), and the gate is **content check + timeline check + a cleanup-time `ReconcileIn`**, not a backup timestamp alone (N159): `ReconcileIn` always runs at cleanup time (`cleanup_reconciled_at`), the full target backup starts after it (`target_backup_started_at ≥ greatest(activated_at, cleanup_reconciled_at)`), the count/hash of the source's insert-only rows below `w_final` (less documents the target tombstoned) equals the target's (`target_content_checked_at ≥ target_backup_at`), and the target's last timeline change is not later than `cleanup_reconciled_at`; the catalog `done` CHECK encodes these: the only copy is never deleted while the target may lack
 rows the source holds. `ReconcileIn` (target restored or promoted after (a″)) re-copies insert-only rows `ins_seq ≥ $F_pre` and the mutable class from the static source as `INSERT … ON CONFLICT DO NOTHING`, replays intents, then runs the admin edges.
 The source blob prefix goes only after the 28-day backup window.
 
@@ -1364,7 +1367,7 @@ admin RPC, D4). The **stats sweeper** refreshes `namespace_stats` (visible-fact 
 - Every read path (recall arms, GetMemory, ListMemories, Reflect and MCP tools, GetPage/SearchPages, DocumentService's tombstone view) applies the 3.8 visibility predicate; the export follows N126 (expiry plus `hidden_overlay`);
   recall passes `doc_tomb`, `doc_pending` and `chunk_tomb` to every arm and tests `fact_hidden` per candidate. `GetMemory` returns an invalidated fact with `invalidated_at` set (N157).
 - The fence is the try-lock over `engram_ns_fence_key`, the derivation lock `engram_ns_derivation_key`, the document lock `engram_doc_lock_keys`; exclusive takers make one 35 s attempt (3.3); marker transactions take no lock beyond the shared fence
-  (a fact marker also takes its per-fact lock, N150). The ownership SQL of §5.5 is generated from `ownership_transitions` (including `ready`, `unready_target`, `return_abort`, `reconcile_out`, `reconcile_in`); moves do not read the outbox.
+  (every marker writer holds the session-level subject lock, N150, N159, taken outside the transaction). The ownership SQL of §5.5 is generated from `ownership_transitions` (including `ready`, `unready_target`, `return_abort`, `reconcile_out`, `reconcile_in`); moves do not read the outbox.
 - Section 9: the shard image runs `engramctl index` (3.3.4), the one process holding `engram_migrate` at run time (`maintenance_work_mem = 2.4 KB × vectors`, `shm_size = 8g`); shard roles run `synchronous_commit = local`, the catalog has a synchronous standby (N146);
   `pick_shard` derives `namespaces_count`; DSNs, pools (per process 20, N155) and 30 s timeouts are in §9.1; restore and failover follow 3.3.1; `shard_meta` carries `shard_id`, inserted before the first namespace.
 - Intent objects are written by the API **after** the marker transaction commits and before the ack (3.6); `engramctl restore replay` reads them from `replay_floor_effective − 10 min`; the catalog has no delete log. DocumentService returns the
@@ -1377,7 +1380,8 @@ admin RPC, D4). The **stats sweeper** refreshes `namespace_stats` (visible-fact 
 | C-1, C-11 | N144 | `commit_key` on both version tables, `engram_derivation_commit_seen` before `engram_derivation_base_cas($expected)` for every writer; attempt-unique page blob keys; `observations.stale_seq` |
 | C-2, C-10 | N145 | `fact_hidden` without FK, `materialized_at` and its worklist index, `engram_invalidation_twins` |
 | C-3, C-4, C-5, P-2, P-3 | N146 to N148 | catalog synchronous standby, `replay_floor_mirror`; `engram_seq_advance`, `w_plan`, `w_final`, `moved_in_at`; PreVerify order |
-| C-6, C-7, C-8, C-12 | N149, N150 | `reconcile_in` edges and cleanup-gate columns; `deletion_log.applied_epoch`, subject index, per-fact lock |
+| C-6, C-7, C-8, C-12 | N149, N150 | `reconcile_in` edges and cleanup-gate columns; `deletion_log.applied_epoch`, subject index, subject lock |
+| Round 5 model checking | N159 | `engram_subject_lock_key` (session-level, held until the intent put); `deletion_log.replay_outcome`; `engram_holds_derivation_exclusive` and the Materialize stamp guard triggers; the cleanup-gate columns and `done` CHECK of `namespace_moves` (cleanup-time `ReconcileIn`, content check, timeline check); `engram_derivation_base_cas` comment (`$expected` for every writer, `NoPhantomVersion`) |
 | P-1, P-4 to P-10, P-12 | N151 to N153 | `fact_count_by_type`, `hidden_fraction`, `observations_by_tag`, `obs_tags`, `engram_eligible_facts`; partition hygiene, `rebuild`; `engram_move_indexes_ready` |
 | A-1, A-2, P-6, P-14 | N154, N155 | covering link indexes; 6.5 M / 10 M and §3.7 restated; pool figures |
 | A-10, C-9, A-13 to A-15, P-13, P-15 | N157 | one `DELETE_DOCUMENT` marker transaction (`event_seq` in the final statement, duplicate path), stub placeholders, `tag_counts`, `tag_generation` |

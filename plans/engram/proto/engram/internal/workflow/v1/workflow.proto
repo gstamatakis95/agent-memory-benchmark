@@ -1175,6 +1175,15 @@ message ReconcileInReport {
   int64 f_pre = 3;
   // Delete intents replayed on the target afterwards (decision N122).
   int32 intents_replayed = 4;
+  // engram_seq_advance(w_final) was re-run on the target first (decision
+  // N159): a target restored to a backup taken during the copy phase brings
+  // back a low sequence together with its rows, also when every row is present
+  // and nothing was re-copied. The value the sequence was advanced past.
+  bool seq_advanced = 5;
+  int64 seq_advanced_past = 6;
+  // True for the ReconcileIn the Cleanup gate runs at cleanup time, whether or
+  // not a timeline change was recorded (decision N159).
+  bool cleanup_time = 7;
 }
 
 // ReconcileReport is the Reconcile activity's result (decisions N124, N137).

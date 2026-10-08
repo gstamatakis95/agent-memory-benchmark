@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 81 and seed -1558827122631062054 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 3014] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 40 and seed -1271038847415845934 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26525] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Consolidation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,16 +10,17 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Consolidation
-Starting... (2026-10-08 00:03:47)
+Starting... (2026-10-08 03:38:57)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 00:03:47.
-Progress(9) at 2026-10-08 00:03:50: 441,573 states generated (441,573 s/min), 120,109 distinct states found (120,109 ds/min), 77,095 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 03:38:57.
+Progress(9) at 2026-10-08 03:39:00: 578,821 states generated (578,821 s/min), 160,461 distinct states found (160,461 ds/min), 99,005 states left on queue.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
   calculated (optimistic):  val = 1.1E-6
-  based on the actual fingerprints:  val = 5.9E-7
+  based on the actual fingerprints:  val = 1.7E-7
 10864684 states generated, 2426544 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 18.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 30 and the 95th percentile is 4).
-Finished in 56s at (2026-10-08 00:04:43)
+Finished in 47s at (2026-10-08 03:39:44)
+elapsed 48s rc=0

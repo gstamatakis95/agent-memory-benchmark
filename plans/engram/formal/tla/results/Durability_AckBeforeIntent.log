@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 42 and seed -7011965890490482825 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 918] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 113 and seed 8347290462367203325 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 18011] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Durability.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
@@ -8,60 +8,165 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module Durability
-Starting... (2026-10-07 23:43:16)
+Starting... (2026-10-08 01:59:47)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-07 23:43:16.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 01:59:48.
 Error: Invariant AckImpliesIntent is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
-/\ rp = 0
-/\ ops = << [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
-   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
-   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nRestore = 0
+/\ dbq = <<>>
+/\ sst = "active"
 /\ nIssued = 0
+/\ cn = 0
 /\ t = 0
+/\ ep = 1
 /\ intents = {}
+/\ fl = 8
+/\ ops = << [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ] >>
+
+State 2: <Issue line 109, col 3 to line 116, col 61 of module Durability>
+/\ nRestore = 0
 /\ dbq = <<>>
-/\ nRestore = 0
 /\ sst = "active"
-
-State 2: <Issue line 65, col 3 to line 71, col 53 of module Durability>
-/\ rp = 0
-/\ ops = << [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "new", ct |-> 0],
-   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
-   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
 /\ nIssued = 1
+/\ cn = 0
 /\ t = 0
+/\ ep = 1
 /\ intents = {}
-/\ dbq = <<>>
-/\ nRestore = 0
-/\ sst = "active"
+/\ fl = 8
+/\ ops = << [ ep |-> 0,
+     ph |-> "new",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ] >>
 
-State 3: <Commit line 80, col 3 to line 84, col 57 of module Durability>
-/\ rp = 0
-/\ ops = << [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "committed", ct |-> 0],
-   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
-   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+State 3: <Commit line 121, col 3 to line 134, col 61 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<[op |-> 1, eff |-> {0}]>>
+/\ sst = "active"
 /\ nIssued = 1
+/\ cn = 1
 /\ t = 0
+/\ ep = 1
 /\ intents = {}
-/\ dbq = <<1>>
-/\ nRestore = 0
-/\ sst = "active"
+/\ fl = 8
+/\ ops = << [ ep |-> 1,
+     ph |-> "committed",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 1,
+     eff |-> {0},
+     prev |-> 0,
+     obs |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ] >>
 
-State 4: <Ack line 87, col 3 to line 90, col 62 of module Durability>
-/\ rp = 0
-/\ ops = << [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "acked", ct |-> 0],
-   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
-   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+State 4: <Ack line 151, col 3 to line 154, col 70 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<[op |-> 1, eff |-> {0}]>>
+/\ sst = "active"
 /\ nIssued = 1
+/\ cn = 1
 /\ t = 0
+/\ ep = 1
 /\ intents = {}
-/\ dbq = <<1>>
-/\ nRestore = 0
-/\ sst = "active"
+/\ fl = 8
+/\ ops = << [ ep |-> 1,
+     ph |-> "acked",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 1,
+     eff |-> {0},
+     prev |-> 0,
+     obs |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0 ] >>
 
-410 states generated, 308 distinct states found, 237 states left on queue.
-The depth of the complete state graph search is 6.
-The average outdegree of the complete state graph is 5 (minimum is 1, the maximum 10 and the 95th percentile is 9).
-Finished in 00s at (2026-10-07 23:43:17)
+346 states generated, 213 distinct states found, 152 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 10 and the 95th percentile is 9).
+Finished in 00s at (2026-10-08 01:59:48)
+elapsed 1s rc=0

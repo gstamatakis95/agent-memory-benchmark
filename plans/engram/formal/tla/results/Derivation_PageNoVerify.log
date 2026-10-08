@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 54 and seed 8553918032829984337 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 28850] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 120 and seed -2817843328276656897 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 28998] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,9 +10,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 04:09:03)
+Starting... (2026-10-08 04:09:08)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 04:09:03.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 04:09:08.
 Error: Invariant NoDeletedDerivationServed is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -24,14 +24,14 @@ State 1: <Initial predicate>
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = (o1 :> <<>>)
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
-/\ hw = (o1 :> 0)
+/\ hw = (o1 :> 0 @@ p1 :> 0)
 /\ props = {}
 /\ born = {}
 /\ matV0 = {}
@@ -53,16 +53,16 @@ State 2: <Ingest line 153, col 3 to line 156, col 54 of module Derivation>
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = (o1 :> <<>>)
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
-/\ hw = (o1 :> 0)
+/\ hw = (o1 :> 0 @@ p1 :> 0)
 /\ props = {}
-/\ born = {3}
+/\ born = {1}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -82,16 +82,16 @@ State 3: <Propose line 216, col 3 to line 225, col 48 of module Derivation>
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = (o1 :> <<>>)
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}]}
-/\ born = {3}
+/\ hw = (o1 :> 0 @@ p1 :> 0)
+/\ props = {[n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}]}
+/\ born = {1}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -102,25 +102,25 @@ State 3: <Propose line 216, col 3 to line 225, col 48 of module Derivation>
         p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
 /\ budget = 1
 
-State 4: <Propose line 216, col 3 to line 225, col 48 of module Derivation>
+State 4: <DeleteDocument line 159, col 3 to line 162, col 48 of module Derivation>
 /\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "none"]
-/\ nDel = 0
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
 /\ matDocs = {}
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = (o1 :> <<>>)
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ tomb = [d1 |-> 1, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}]}
-/\ born = {3}
+/\ hw = (o1 :> 0 @@ p1 :> 0)
+/\ props = {[n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}]}
+/\ born = {1}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -129,223 +129,225 @@ State 4: <Propose line 216, col 3 to line 225, col 48 of module Derivation>
   w2 :>
       [ ph |-> "idle",
         p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
+/\ budget = 1
 
 State 5: <Pick line 228, col 3 to line 231, col 59 of module Derivation>
 /\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "none"]
-/\ nDel = 0
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
 /\ matDocs = {}
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = (o1 :> <<>>)
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ tomb = [d1 |-> 1, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}]}
-/\ born = {3}
+/\ hw = (o1 :> 0 @@ p1 :> 0)
+/\ props = {[n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}]}
+/\ born = {1}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
       [ ph |-> "picked",
         p |->
-            [n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}] ] @@
+            [n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}] ] @@
   w2 :>
       [ ph |-> "idle",
         p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
+/\ budget = 1
 
-State 6: <Verify line 242, col 3 to line 247, col 59 of module Derivation>
+State 6: <MatBegin line 301, col 3 to line 306, col 128 of module Derivation>
 /\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "none"]
-/\ nDel = 0
-/\ matDocs = {}
-/\ matSnap = {}
-/\ gone = {}
-/\ dh = {}
-/\ ctomb = {}
-/\ vers = (o1 :> <<>>)
-/\ hidRe = {}
-/\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 0]
-/\ hidden = {}
-/\ matPhase = "idle"
-/\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}]}
-/\ born = {3}
-/\ matV0 = {}
-/\ matTodo = {}
-/\ wr = ( w1 :>
-      [ ph |-> "verified",
-        p |->
-            [n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}] ] @@
-  w2 :>
-      [ ph |-> "idle",
-        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
-
-State 7: <DeleteDocument line 159, col 3 to line 162, col 48 of module Derivation>
-/\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "pending"]
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
 /\ nDel = 1
-/\ matDocs = {}
+/\ matDocs = {"d1"}
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = (o1 :> <<>>)
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 1]
-/\ hidden = {}
-/\ matPhase = "idle"
-/\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}]}
-/\ born = {3}
-/\ matV0 = {}
-/\ matTodo = {}
-/\ wr = ( w1 :>
-      [ ph |-> "verified",
-        p |->
-            [n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}] ] @@
-  w2 :>
-      [ ph |-> "idle",
-        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
-
-State 8: <MatBegin line 301, col 3 to line 306, col 128 of module Derivation>
-/\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "pending"]
-/\ nDel = 1
-/\ matDocs = {"d2"}
-/\ matSnap = {}
-/\ gone = {}
-/\ dh = {}
-/\ ctomb = {}
-/\ vers = (o1 :> <<>>)
-/\ hidRe = {}
-/\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 1]
+/\ tomb = [d1 |-> 1, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "running"
 /\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}]}
-/\ born = {3}
-/\ matV0 = {3}
+/\ hw = (o1 :> 0 @@ p1 :> 0)
+/\ props = {[n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}]}
+/\ born = {1}
+/\ matV0 = {1, 4}
+/\ matTodo = {o1, p1}
+/\ wr = ( w1 :>
+      [ ph |-> "picked",
+        p |->
+            [n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
+
+State 7: <MatScan line 310, col 3 to line 316, col 128 of module Derivation>
+/\ nCur = 0
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
+/\ matDocs = {"d1"}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
+/\ tomb = [d1 |-> 1, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "scanned"
+/\ lockX = TRUE
+/\ hw = (o1 :> 0 @@ p1 :> 0)
+/\ props = {[n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}]}
+/\ born = {1}
+/\ matV0 = {1, 4}
+/\ matTodo = {o1}
+/\ wr = ( w1 :>
+      [ ph |-> "picked",
+        p |->
+            [n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
+
+State 8: <MatWrite line 319, col 3 to line 322, col 133 of module Derivation>
+/\ nCur = 0
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
+/\ matDocs = {"d1"}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
+/\ tomb = [d1 |-> 1, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "running"
+/\ lockX = FALSE
+/\ hw = (o1 :> 0 @@ p1 :> 0)
+/\ props = {[n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}]}
+/\ born = {1}
+/\ matV0 = {1, 4}
+/\ matTodo = {o1}
+/\ wr = ( w1 :>
+      [ ph |-> "picked",
+        p |->
+            [n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
+
+State 9: <Verify line 242, col 3 to line 247, col 59 of module Derivation>
+/\ nCur = 0
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
+/\ matDocs = {"d1"}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = (o1 :> <<>> @@ p1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
+/\ tomb = [d1 |-> 1, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "running"
+/\ lockX = FALSE
+/\ hw = (o1 :> 0 @@ p1 :> 0)
+/\ props = {[n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}]}
+/\ born = {1}
+/\ matV0 = {1, 4}
 /\ matTodo = {o1}
 /\ wr = ( w1 :>
       [ ph |-> "verified",
         p |->
-            [n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}] ] @@
+            [n |-> p1, base |-> 0, mode |-> "root", cf |-> {1}, co |-> {}] ] @@
   w2 :>
       [ ph |-> "idle",
         p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
-
-State 9: <MatScan line 310, col 3 to line 316, col 128 of module Derivation>
-/\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "pending"]
-/\ nDel = 1
-/\ matDocs = {"d2"}
-/\ matSnap = {}
-/\ gone = {}
-/\ dh = {}
-/\ ctomb = {}
-/\ vers = (o1 :> <<>>)
-/\ hidRe = {}
-/\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 1]
-/\ hidden = {}
-/\ matPhase = "scanned"
-/\ lockX = TRUE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}]}
-/\ born = {3}
-/\ matV0 = {3}
-/\ matTodo = {}
-/\ wr = ( w1 :>
-      [ ph |-> "verified",
-        p |->
-            [n |-> o1, base |-> 0, mode |-> "root", cf |-> {3}, co |-> {}] ] @@
-  w2 :>
-      [ ph |-> "idle",
-        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
+/\ budget = 1
 
 State 10: <Commit line 263, col 3 to line 282, col 43 of module Derivation>
 /\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "pending"]
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
 /\ nDel = 1
-/\ matDocs = {"d2"}
+/\ matDocs = {"d1"}
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = ( o1 :>
+/\ vers = ( o1 :> <<>> @@
+  p1 :>
       << [ root |-> 1,
-           finp |-> {3},
+           finp |-> {1},
            oinp |-> {},
-           gfinp |-> {3},
+           gfinp |-> {1},
            goinp |-> {},
            st |-> "live",
-           eff |-> 2,
+           eff |-> 1,
            base |-> 0 ] >> )
 /\ hidRe = {}
 /\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 1]
-/\ hidden = {}
-/\ matPhase = "scanned"
-/\ lockX = TRUE
-/\ hw = (o1 :> 1)
-/\ props = {}
-/\ born = {3}
-/\ matV0 = {3}
-/\ matTodo = {}
-/\ wr = ( w1 :>
-      [ ph |-> "idle",
-        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] @@
-  w2 :>
-      [ ph |-> "idle",
-        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
-
-State 11: <MatWrite line 319, col 3 to line 322, col 133 of module Derivation>
-/\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "pending"]
-/\ nDel = 1
-/\ matDocs = {"d2"}
-/\ matSnap = {}
-/\ gone = {}
-/\ dh = {}
-/\ ctomb = {}
-/\ vers = ( o1 :>
-      << [ root |-> 1,
-           finp |-> {3},
-           oinp |-> {},
-           gfinp |-> {3},
-           goinp |-> {},
-           st |-> "live",
-           eff |-> 2,
-           base |-> 0 ] >> )
-/\ hidRe = {}
-/\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 1]
+/\ tomb = [d1 |-> 1, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "running"
 /\ lockX = FALSE
-/\ hw = (o1 :> 1)
+/\ hw = (o1 :> 0 @@ p1 :> 1)
 /\ props = {}
-/\ born = {3}
-/\ matV0 = {3}
+/\ born = {1}
+/\ matV0 = {1, 4}
+/\ matTodo = {o1}
+/\ wr = ( w1 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
+
+State 11: <MatScan line 310, col 3 to line 316, col 128 of module Derivation>
+/\ nCur = 0
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
+/\ matDocs = {"d1"}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = ( o1 :> <<>> @@
+  p1 :>
+      << [ root |-> 1,
+           finp |-> {1},
+           oinp |-> {},
+           gfinp |-> {1},
+           goinp |-> {},
+           st |-> "live",
+           eff |-> 1,
+           base |-> 0 ] >> )
+/\ hidRe = {}
+/\ nRet = 0
+/\ tomb = [d1 |-> 1, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "scanned"
+/\ lockX = TRUE
+/\ hw = (o1 :> 0 @@ p1 :> 1)
+/\ props = {}
+/\ born = {1}
+/\ matV0 = {1, 4}
 /\ matTodo = {}
 /\ wr = ( w1 :>
       [ ph |-> "idle",
@@ -353,35 +355,74 @@ State 11: <MatWrite line 319, col 3 to line 322, col 133 of module Derivation>
   w2 :>
       [ ph |-> "idle",
         p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
+/\ budget = 1
 
-State 12: <MatEnd line 325, col 3 to line 328, col 133 of module Derivation>
+State 12: <MatWrite line 319, col 3 to line 322, col 133 of module Derivation>
 /\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "materialized"]
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
+/\ matDocs = {"d1"}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = ( o1 :> <<>> @@
+  p1 :>
+      << [ root |-> 1,
+           finp |-> {1},
+           oinp |-> {},
+           gfinp |-> {1},
+           goinp |-> {},
+           st |-> "live",
+           eff |-> 1,
+           base |-> 0 ] >> )
+/\ hidRe = {}
+/\ nRet = 0
+/\ tomb = [d1 |-> 1, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "running"
+/\ lockX = FALSE
+/\ hw = (o1 :> 0 @@ p1 :> 1)
+/\ props = {}
+/\ born = {1}
+/\ matV0 = {1, 4}
+/\ matTodo = {}
+/\ wr = ( w1 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
+
+State 13: <MatEnd line 325, col 3 to line 328, col 133 of module Derivation>
+/\ nCur = 0
+/\ ms = [d1 |-> "materialized", d2 |-> "none"]
 /\ nDel = 1
 /\ matDocs = {}
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = ( o1 :>
+/\ vers = ( o1 :> <<>> @@
+  p1 :>
       << [ root |-> 1,
-           finp |-> {3},
+           finp |-> {1},
            oinp |-> {},
-           gfinp |-> {3},
+           gfinp |-> {1},
            goinp |-> {},
            st |-> "live",
-           eff |-> 2,
+           eff |-> 1,
            base |-> 0 ] >> )
 /\ hidRe = {}
 /\ nRet = 0
-/\ tomb = [d1 |-> 0, d2 |-> 1]
+/\ tomb = [d1 |-> 1, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
-/\ hw = (o1 :> 1)
+/\ hw = (o1 :> 0 @@ p1 :> 1)
 /\ props = {}
-/\ born = {3}
+/\ born = {1}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -390,10 +431,10 @@ State 12: <MatEnd line 325, col 3 to line 328, col 133 of module Derivation>
   w2 :>
       [ ph |-> "idle",
         p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
-/\ budget = 0
+/\ budget = 1
 
-4780 states generated, 1525 distinct states found, 528 states left on queue.
-The depth of the complete state graph search is 12.
-The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 5 and the 95th percentile is 4).
-Finished in 01s at (2026-10-08 04:09:04)
-elapsed 1s rc=0
+40841 states generated, 11067 distinct states found, 3089 states left on queue.
+The depth of the complete state graph search is 14.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 3).
+Finished in 02s at (2026-10-08 04:09:10)
+elapsed 3s rc=0

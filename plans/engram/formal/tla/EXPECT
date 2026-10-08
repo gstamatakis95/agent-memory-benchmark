@@ -46,7 +46,7 @@ ShardMove.cfg	pass
 ShardMove_Live.cfg	pass
 ShardMove_ActiveWriters.cfg	pass
 ShardMove_ZeroMargin.cfg	pass
-ShardMove_UnfencedSteps.cfg	pass
+ShardMove_UnfencedSteps.cfg	violates NoLossNoDup
 ShardMove_NoTimelineCheck.cfg	pass
 ShardMove_NoReady.cfg	violates RollbackPossibleBeforeC
 ShardMove_RestoreNoReconcile.cfg	violates RestoreReconciles

@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 75 and seed 687750132800099007 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 32728] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 120 and seed 6281119298961492028 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26299] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Outbox.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,9 +10,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Outbox
-Starting... (2026-10-07 23:39:35)
+Starting... (2026-10-08 03:38:17)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-07 23:39:36.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 03:38:17.
 Error: Invariant NoLossSafety is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -141,7 +141,8 @@ State 9: <Commit line 100, col 3 to line 104, col 80 of module Outbox>
   w2 :> [st |-> "idle", seq |-> 2, ns |-> a, age |-> 0] @@
   w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
 
-233325 states generated, 113111 distinct states found, 83649 states left on queue.
+195431 states generated, 97616 distinct states found, 72945 states left on queue.
 The depth of the complete state graph search is 9.
 The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 9 and the 95th percentile is 8).
-Finished in 01s at (2026-10-07 23:39:37)
+Finished in 01s at (2026-10-08 03:38:18)
+elapsed 2s rc=0

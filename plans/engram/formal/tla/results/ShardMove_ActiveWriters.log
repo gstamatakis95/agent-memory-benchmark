@@ -1,0 +1,32 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 85 and seed -3828568295542573238 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 27611] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module ShardMove
+Starting... (2026-10-08 03:47:55)
+Implied-temporal checking--satisfiability problem has 1 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-08 03:47:55.
+Checking temporal properties for the current state space with 37105 total distinct states at (2026-10-08 03:47:58)
+Finished checking temporal properties in 00s at 2026-10-08 03:47:58
+Progress(11) at 2026-10-08 03:47:58: 152,496 states generated (152,496 s/min), 37,105 distinct states found (37,105 ds/min), 17,978 states left on queue.
+Progress(24) at 2026-10-08 03:48:10: 1,549,719 states generated, 255,952 distinct states found, 0 states left on queue.
+Checking temporal properties for the complete state space with 255952 total distinct states at (2026-10-08 03:48:10)
+Finished checking temporal properties in 04s at 2026-10-08 03:48:15
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.8E-8
+  based on the actual fingerprints:  val = 4.1E-9
+1549719 states generated, 255952 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 24.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 10 and the 95th percentile is 3).
+Finished in 20s at (2026-10-08 03:48:15)
+elapsed 20s rc=0

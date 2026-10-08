@@ -1,0 +1,104 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 52 and seed -1651011240862956337 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26894] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Storage.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Storage
+Starting... (2026-10-08 03:40:21)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-08 03:40:21.
+Error: Invariant RebuildBeforeRepair is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ idx = {}
+/\ ingested = {}
+/\ repairs = 0
+/\ payload = <<0, 0, 0>>
+/\ marked = {}
+/\ vec = {}
+/\ content = {}
+/\ cur = 1
+/\ pc = 0
+/\ snap = {}
+
+State 2: <Insert line 50, col 3 to line 52, col 68 of module Storage>
+/\ idx = {}
+/\ ingested = {1}
+/\ repairs = 0
+/\ payload = <<0, 0, 0>>
+/\ marked = {}
+/\ vec = {}
+/\ content = {1}
+/\ cur = 1
+/\ pc = 0
+/\ snap = {}
+
+State 3: <Mark line 65, col 3 to line 67, col 79 of module Storage>
+/\ idx = {}
+/\ ingested = {1}
+/\ repairs = 0
+/\ payload = <<0, 0, 0>>
+/\ marked = {1}
+/\ vec = {}
+/\ content = {1}
+/\ cur = 1
+/\ pc = 0
+/\ snap = {}
+
+State 4: <EmbedRow line 55, col 3 to line 57, col 82 of module Storage>
+/\ idx = {}
+/\ ingested = {1}
+/\ repairs = 0
+/\ payload = <<0, 0, 0>>
+/\ marked = {1}
+/\ vec = {<<1, 1>>}
+/\ content = {1}
+/\ cur = 1
+/\ pc = 0
+/\ snap = {}
+
+State 5: <IndexAdd line 79, col 16 to line 80, col 95 of module Storage>
+/\ idx = {<<1, 1>>}
+/\ ingested = {1}
+/\ repairs = 0
+/\ payload = <<0, 0, 0>>
+/\ marked = {1}
+/\ vec = {<<1, 1>>}
+/\ content = {1}
+/\ cur = 1
+/\ pc = 0
+/\ snap = {}
+
+State 6: <Purge line 70, col 3 to line 74, col 69 of module Storage>
+/\ idx = {<<1, 1>>}
+/\ ingested = {1}
+/\ repairs = 0
+/\ payload = <<0, 0, 0>>
+/\ marked = {1}
+/\ vec = {}
+/\ content = {}
+/\ cur = 1
+/\ pc = 1
+/\ snap = {}
+
+State 7: <AutoRepairDrop line 82, col 22 to line 83, col 92 of module Storage>
+/\ idx = {}
+/\ ingested = {1}
+/\ repairs = 1
+/\ payload = <<0, 0, 0>>
+/\ marked = {1}
+/\ vec = {}
+/\ content = {}
+/\ cur = 1
+/\ pc = 1
+/\ snap = {}
+
+1080 states generated, 492 distinct states found, 312 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 6 and the 95th percentile is 5).
+Finished in 00s at (2026-10-08 03:40:21)
+elapsed 1s rc=0

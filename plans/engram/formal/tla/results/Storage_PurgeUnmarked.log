@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 59 and seed -8762133243048603085 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 2312] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 12 and seed -203572231447500212 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26853] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Storage.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
@@ -8,42 +8,49 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module Storage
-Starting... (2026-10-07 23:50:27)
+Starting... (2026-10-08 03:40:19)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-07 23:50:27.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 03:40:20.
 Error: Invariant PurgeNeedsMarker is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ idx = {}
 /\ ingested = {}
+/\ repairs = 0
 /\ payload = <<0, 0, 0>>
 /\ marked = {}
 /\ vec = {}
 /\ content = {}
 /\ cur = 1
+/\ pc = 0
 /\ snap = {}
 
-State 2: <Insert line 44, col 3 to line 46, col 55 of module Storage>
+State 2: <Insert line 50, col 3 to line 52, col 68 of module Storage>
 /\ idx = {}
 /\ ingested = {1}
+/\ repairs = 0
 /\ payload = <<0, 0, 0>>
 /\ marked = {}
 /\ vec = {}
 /\ content = {1}
 /\ cur = 1
+/\ pc = 0
 /\ snap = {}
 
-State 3: <Purge line 64, col 3 to line 67, col 60 of module Storage>
+State 3: <Purge line 70, col 3 to line 74, col 69 of module Storage>
 /\ idx = {}
 /\ ingested = {1}
+/\ repairs = 0
 /\ payload = <<0, 0, 0>>
 /\ marked = {}
 /\ vec = {}
 /\ content = {}
 /\ cur = 1
+/\ pc = 0
 /\ snap = {}
 
-23 states generated, 21 distinct states found, 11 states left on queue.
-The depth of the complete state graph search is 4.
-The average outdegree of the complete state graph is 5 (minimum is 4, the maximum 6 and the 95th percentile is 6).
-Finished in 00s at (2026-10-07 23:50:27)
+18 states generated, 18 distinct states found, 10 states left on queue.
+The depth of the complete state graph search is 3.
+The average outdegree of the complete state graph is 4 (minimum is 4, the maximum 4 and the 95th percentile is 4).
+Finished in 00s at (2026-10-08 03:40:20)
+elapsed 1s rc=0

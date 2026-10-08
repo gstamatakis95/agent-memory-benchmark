@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 126 and seed -4980319397463424487 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 655] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 72 and seed 3074405108908134133 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26387] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Consolidation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,9 +10,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Consolidation
-Starting... (2026-10-07 23:41:55)
+Starting... (2026-10-08 03:38:20)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-07 23:41:55.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 03:38:20.
 Error: Invariant ExactlyOnceEffect is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -388,7 +388,8 @@ State 5: <ApplyEffectOnly line 164, col 3 to line 171, col 95 of module Consolid
 /\ live = 1..4
 /\ mem = <<>>
 
-523 states generated, 424 distinct states found, 321 states left on queue.
+1136 states generated, 719 distinct states found, 536 states left on queue.
 The depth of the complete state graph search is 5.
 The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 31 and the 95th percentile is 6).
-Finished in 00s at (2026-10-07 23:41:55)
+Finished in 00s at (2026-10-08 03:38:20)
+elapsed 1s rc=0

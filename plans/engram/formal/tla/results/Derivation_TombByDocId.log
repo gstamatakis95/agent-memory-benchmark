@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 60 and seed -166004966106815907 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30124] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 11 and seed -7433272850250591798 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 28924] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,9 +10,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-07 23:18:08)
+Starting... (2026-10-08 04:09:05)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-07 23:18:08.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 04:09:06.
 Error: Invariant NoOverHiding is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -23,23 +23,28 @@ State 1: <Initial predicate>
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
-/\ vers = (o1 :> <<>> @@ o2 :> <<>>)
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
 /\ born = {}
+/\ matV0 = {}
+/\ matTodo = {}
 /\ wr = ( w1 :>
-      [ n |-> o1,
-        ph |-> "idle",
-        mode |-> "root",
-        cf |-> {},
-        co |-> {},
-        sf |-> {},
-        so |-> {} ] )
-/\ budget = 5
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
 
-State 2: <Ingest line 131, col 3 to line 133, col 110 of module Derivation>
+State 2: <Ingest line 153, col 3 to line 156, col 54 of module Derivation>
 /\ nCur = 0
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
@@ -47,23 +52,28 @@ State 2: <Ingest line 131, col 3 to line 133, col 110 of module Derivation>
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
-/\ vers = (o1 :> <<>> @@ o2 :> <<>>)
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
 /\ born = {1}
+/\ matV0 = {}
+/\ matTodo = {}
 /\ wr = ( w1 :>
-      [ n |-> o1,
-        ph |-> "idle",
-        mode |-> "root",
-        cf |-> {},
-        co |-> {},
-        sf |-> {},
-        so |-> {} ] )
-/\ budget = 5
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
 
-State 3: <DeleteDocument line 136, col 3 to line 138, col 100 of module Derivation>
+State 3: <DeleteDocument line 159, col 3 to line 162, col 48 of module Derivation>
 /\ nCur = 0
 /\ ms = [d1 |-> "pending", d2 |-> "none"]
 /\ nDel = 1
@@ -71,23 +81,28 @@ State 3: <DeleteDocument line 136, col 3 to line 138, col 100 of module Derivati
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
-/\ vers = (o1 :> <<>> @@ o2 :> <<>>)
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
 /\ tomb = [d1 |-> 1, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
 /\ born = {1}
+/\ matV0 = {}
+/\ matTodo = {}
 /\ wr = ( w1 :>
-      [ n |-> o1,
-        ph |-> "idle",
-        mode |-> "root",
-        cf |-> {},
-        co |-> {},
-        sf |-> {},
-        so |-> {} ] )
-/\ budget = 5
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
 
-State 4: <Ingest line 131, col 3 to line 133, col 110 of module Derivation>
+State 4: <Ingest line 153, col 3 to line 156, col 54 of module Derivation>
 /\ nCur = 0
 /\ ms = [d1 |-> "pending", d2 |-> "none"]
 /\ nDel = 1
@@ -95,23 +110,29 @@ State 4: <Ingest line 131, col 3 to line 133, col 110 of module Derivation>
 /\ matSnap = {}
 /\ gone = {}
 /\ dh = {}
-/\ vers = (o1 :> <<>> @@ o2 :> <<>>)
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
 /\ tomb = [d1 |-> 1, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
 /\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
 /\ born = {1, 2}
+/\ matV0 = {}
+/\ matTodo = {}
 /\ wr = ( w1 :>
-      [ n |-> o1,
-        ph |-> "idle",
-        mode |-> "root",
-        cf |-> {},
-        co |-> {},
-        sf |-> {},
-        so |-> {} ] )
-/\ budget = 5
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |-> [n |-> o1, base |-> 0, mode |-> "root", cf |-> {}, co |-> {}] ] )
+/\ budget = 1
 
-106 states generated, 74 distinct states found, 48 states left on queue.
+69 states generated, 46 distinct states found, 26 states left on queue.
 The depth of the complete state graph search is 6.
-The average outdegree of the complete state graph is 3 (minimum is 1, the maximum 6 and the 95th percentile is 6).
-Finished in 00s at (2026-10-07 23:18:08)
+The average outdegree of the complete state graph is 3 (minimum is 1, the maximum 4 and the 95th percentile is 4).
+Finished in 00s at (2026-10-08 04:09:06)
+elapsed 1s rc=0

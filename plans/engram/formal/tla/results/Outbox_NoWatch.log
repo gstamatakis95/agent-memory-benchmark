@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 130 and seed 6227433528065770432 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 32676] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 102 and seed -7788859920730260155 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26262] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Outbox.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,9 +10,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Outbox
-Starting... (2026-10-07 23:39:34)
+Starting... (2026-10-08 03:38:15)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-07 23:39:34.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 03:38:16.
 Error: Invariant NoLossSafety is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -46,7 +46,7 @@ State 2: <Draw line 91, col 3 to line 96, col 76 of module Outbox>
 State 3: <Draw line 91, col 3 to line 96, col 76 of module Outbox>
 /\ aborted = {}
 /\ log = (index :> <<>> @@ kafka :> <<>>)
-/\ nsOf = <<a, b, NoNs, NoNs, NoNs>>
+/\ nsOf = <<a, a, NoNs, NoNs, NoNs>>
 /\ declared = {}
 /\ cursor = 0
 /\ committed = {}
@@ -54,13 +54,13 @@ State 3: <Draw line 91, col 3 to line 96, col 76 of module Outbox>
 /\ nextSeq = 3
 /\ watch = <<>>
 /\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> a, age |-> 0] @@
-  w2 :> [st |-> "holding", seq |-> 2, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "holding", seq |-> 2, ns |-> a, age |-> 0] @@
   w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
 
 State 4: <Commit line 100, col 3 to line 104, col 80 of module Outbox>
 /\ aborted = {}
 /\ log = (index :> <<>> @@ kafka :> <<>>)
-/\ nsOf = <<a, b, NoNs, NoNs, NoNs>>
+/\ nsOf = <<a, a, NoNs, NoNs, NoNs>>
 /\ declared = {}
 /\ cursor = 0
 /\ committed = {2}
@@ -68,13 +68,13 @@ State 4: <Commit line 100, col 3 to line 104, col 80 of module Outbox>
 /\ nextSeq = 3
 /\ watch = <<>>
 /\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> a, age |-> 0] @@
-  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> a, age |-> 0] @@
   w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
 
 State 5: <WatchGap line 160, col 3 to line 163, col 88 of module Outbox>
 /\ aborted = {}
 /\ log = (index :> <<>> @@ kafka :> <<>>)
-/\ nsOf = <<a, b, NoNs, NoNs, NoNs>>
+/\ nsOf = <<a, a, NoNs, NoNs, NoNs>>
 /\ declared = {}
 /\ cursor = 0
 /\ committed = {2}
@@ -82,13 +82,13 @@ State 5: <WatchGap line 160, col 3 to line 163, col 88 of module Outbox>
 /\ nextSeq = 3
 /\ watch = <<0>>
 /\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> a, age |-> 0] @@
-  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> a, age |-> 0] @@
   w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
 
 State 6: <DeclareAborted line 169, col 3 to line 175, col 70 of module Outbox>
 /\ aborted = {}
 /\ log = (index :> <<>> @@ kafka :> <<>>)
-/\ nsOf = <<a, b, NoNs, NoNs, NoNs>>
+/\ nsOf = <<a, a, NoNs, NoNs, NoNs>>
 /\ declared = {1}
 /\ cursor = 1
 /\ committed = {2}
@@ -96,13 +96,13 @@ State 6: <DeclareAborted line 169, col 3 to line 175, col 70 of module Outbox>
 /\ nextSeq = 3
 /\ watch = << >>
 /\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> a, age |-> 0] @@
-  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> a, age |-> 0] @@
   w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
 
 State 7: <Commit line 100, col 3 to line 104, col 80 of module Outbox>
 /\ aborted = {}
 /\ log = (index :> <<>> @@ kafka :> <<>>)
-/\ nsOf = <<a, b, NoNs, NoNs, NoNs>>
+/\ nsOf = <<a, a, NoNs, NoNs, NoNs>>
 /\ declared = {1}
 /\ cursor = 1
 /\ committed = {1, 2}
@@ -110,10 +110,11 @@ State 7: <Commit line 100, col 3 to line 104, col 80 of module Outbox>
 /\ nextSeq = 3
 /\ watch = << >>
 /\ wr = ( w1 :> [st |-> "idle", seq |-> 1, ns |-> a, age |-> 0] @@
-  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> a, age |-> 0] @@
   w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
 
-5526 states generated, 3721 distinct states found, 3004 states left on queue.
+9199 states generated, 5945 distinct states found, 4744 states left on queue.
 The depth of the complete state graph search is 7.
 The average outdegree of the complete state graph is 5 (minimum is 0, the maximum 9 and the 95th percentile is 9).
-Finished in 00s at (2026-10-07 23:39:35)
+Finished in 00s at (2026-10-08 03:38:16)
+elapsed 1s rc=0

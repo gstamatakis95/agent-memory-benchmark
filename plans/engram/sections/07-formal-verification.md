@@ -1,412 +1,368 @@
 ## 7. Formal verification
 
-Scope: the six TLA+ specifications under `formal/tla/` and the four Lean 4 modules under
-`formal/lean/Engram/`; what TLC actually reported on them; how the Go code is kept faithful to
-them; what is not formalised; how it is wired into CI. Four specs are new in the round-3
-redesign and model its protocols (`Derivation`, `ShardMove`, `Durability`, `Storage`); two
-survive from before because D22 left their protocols intact (`Outbox`, `Consolidation`). Every
-number below is copied from a log in `formal/tla/results/` (summary in `RESULTS.md`).
+Scope: the six TLA+ specifications under `formal/tla/` and the four Lean 4 modules under `formal/lean/Engram/`;
+what TLC reported on them after the round-4 rewrite (D23, N141); how the Go code is kept faithful to them; what is
+not formalised; how it is wired into CI. Every number below is copied from a log in `formal/tla/results/` (summary
+in `RESULTS.md`, which also holds the full table).
 
-Tooling: TLC 2.18 (`de.hhu.stups:tlatools:1.1.0`), OpenJDK 21, 4 workers, 10 GB heap, 4 cores,
-30-minute cap per configuration. Lean 4 is not available in the planning environment; the Lean
-files are marked "not type-checked".
+Tooling: TLC 2.18 (`de.hhu.stups:tlatools:1.1.0`), OpenJDK 21, 4 workers, 10 GB heap, 4 cores, 30-minute cap per
+configuration. Lean 4 is not available in the planning environment; the Lean files and the Lake skeleton are
+**not type-checked**.
 
 ### 7.1 What is modelled, and the convention
 
-| Spec | Register | Question the model answers |
-|---|---|---|
-| `Derivation.tla` | N113, N115 to N118, N120, N133, D9 | Can a deleted or invalidated fact reach a reader through a fact, an observation version or a page version, at any `as_of`, with the markers as the only synchronous write, and is nothing else hidden? |
-| `ShardMove.tla` | D5, N123 to N125 | Dirty copy, freeze, reconcile by set difference, cutover through `ready`, rollback before (c), restore and failover during a move: one writer, no loss, no duplicate, a started move ends. |
-| `Durability.tla` | N122 | Is every acknowledged delete or invalidation still in force when reads reopen after a restore or failover? |
-| `Storage.tla` | N111 to N113 | Content rows never change after insert, an embedding-model flip never exposes a row without a vector, the index converges after a purge. |
-| `Outbox.tla` | D6, N80 | No committed event is lost through sequence gaps; per-namespace order; the 2 x timeout watch horizon. |
-| `Consolidation.tla` | N43, N121 | A round's decisions are applied exactly once under at-least-once activities and crashes. |
+| Spec | Register | Question the model answers | Prose mechanisms this spec omits (C-21) |
+|---|---|---|---|
+| `Derivation.tla` | N113, N115 to N121, N133, N135, N136 | Can a deleted, invalidated or superseded fact reach a reader through a fact, an observation version or a page version, at any `as_of`, with the markers as the only synchronous write, and is nothing else hidden? | LLM text (a version's text is its evidence set plus its base's); `proof_count` and retirement; the marker-set size alerts; `stale_write`/`stale_delete` flags; the pacing of Materialize and Purge; one fact per chunk; the consolidation scheduler |
+| `ShardMove.tla` | D5, N123 to N125, N137 | Dirty copy, freeze, reconcile by insertion sequence, the catalog CAS as point of no return, cleanup, restore and failover during a move: one owner, no loss, no duplicate, a started move completes. | One namespace; blob copy and `return_abort`; reads at `frozen/move`; drain of workflows; the relay's cursor wait; the 24 h timer (cleanup is an action); the timeline check is a guard, not a model of a zombie primary; PITR to before a move-in (C-22) |
+| `Durability.tla` | N122, N134 | Is every acknowledged delete or invalidation still in force when reads reopen after a restore or failover, and is no unacknowledged effect applied over a later acknowledged write? | Tenant and namespace intents (one subject kind per config); the catalog `deleting` edge; the 35-day retention; intent content is a set of versions, not `up_to_version` arithmetic |
+| `Storage.tla` | N111 to N113, N138 | Content rows never change after insert, a model flip never exposes a row without a vector, dead index entries leave only through a rebuild, the index converges. | HNSW internals and recall; the index runner's lease; partition layout |
+| `Outbox.tla` | D6, N80 | No committed event is lost through sequence gaps; per-namespace order; the 2 x timeout watch horizon. | Kafka, consumer lag, batching |
+| `Consolidation.tla` | N43, N121 | A round's decisions are applied exactly once under at-least-once activities and crashes. | The persisted-proposal `attempt` key and the all-skip stamp (C-11) are tested, not modelled; `Derivation.tla` carries the base check |
 
-Each spec has a *design* configuration (every knob at the register's value) that must end with
-"No error has been found", and *must-fail* configurations in which one knob is set to the
-plausible simplification; each must end with the invariant named in the configuration's first
-comment line violated. A design that passes only because the simplification was never tried is
-not evidence, so the must-fail configurations are part of the deliverable and run in CI. A spec
-whose bounds do not let TLC finish is not a gate: the bounds below were sized until every design
-configuration completes in under 20 minutes.
+Each spec has *design* configurations (every knob at the register's value) that must end with "No error has been
+found", and *must-fail* configurations in which one knob is set to the plausible simplification or to the round-4
+reviewer's variant; each must end with exactly the invariant named in its first comment line violated, and lists
+only that invariant. A design that passes only because the simplification was never tried is not evidence, so the
+must-fail configurations are part of the deliverable and run in CI (N141). Bounds were shrunk until every design
+configuration finished in under 30 minutes (the longest, `Derivation.cfg`, `ShardMove.cfg` and `Storage.cfg`, take between five and six minutes).
 
 ### 7.2 The specifications
 
 #### 7.2.1 `Derivation.tla`: visibility of derived data
 
-*Model.* Facts are `f1 = (d1, v1)`, `f2 = (d1, v2)` (the document id re-used right after the
-delete, N133) and `f3 = (d2, v1)`, mentioned at 1, 3, 2. State: `tomb[d]` (the tombstone's
-`up_to_version`; a fact is deleted iff `version <= tomb[d]`, and a document is re-ingested at
-`tomb[d] + 1`), `hidden` (`fact_hidden`), versions of observations and pages with
-`root_version` and inputs (fact ids; one observation version for pages), `derived_hidden` rows
-`(node, root_version, from_version)`, the derivation lock, and one writer. A writer is the
-two-stage path: *Route* (stage 1, no lock) picks a target and candidate inputs; *Verify* takes the
-shared derivation lock and keeps only visible inputs (an update also needs a visible previous
-version); *Commit* inserts the version and releases the lock. Markers (`DeleteDocument`,
-`Invalidate`) take no lock and may land between any two writer steps; `Restore` takes the lock
-exclusively. The expunge is `MatStart` (exclusive lock, snapshot of the versions whose segment names
-a victim), `MatWrite` (insert `derived_hidden`, document `materialized`, release) and `Purge`
-(delete the victims' facts **and the evidence rows that name them**). Visibility is exactly N117:
-`(n, v)` is visible iff no fact of its segment's real evidence is deleted or hidden, no
-`derived_hidden` row covers it, and (pages) every cited observation version is visible. A *ghost*
-copy of the evidence survives `Purge` so the invariants can say what is true after the real rows are
-gone. Recall at `T` serves, per node, the latest visible version with `effective_at <= T` (the
-model's reading of D9 plus N117).
+*Model.* Facts `f1 = (d1, v1)` (with a re-extraction twin `f4`), `f2 = (d1, v2)` (the id re-used right after the
+delete), `f3 = (d2, v1)`. State: tombstones `tomb[d]`, `fact_hidden` split by cause (`hidden` = invalidate, `hidRe` =
+reextract), `chunk_tombstones`, observation and page versions with `root_version`, evidence rows (no foreign key to
+facts, N135) and status `live | stub | absent`, cause-tagged `derived_hidden` rows, the exclusive derivation lock,
+persisted proposals with `base_version`, and two writers. Actions: `Ingest`, `DeleteDocument`, `Invalidate`,
+`Restore` (exclusive lock, deletes its own cause-tagged rows), `Replace`, `ChunkPurge`, `Reextract`,
+`ReextractPurge`; writers `Propose` (stage 2, stored), `Pick`, `Verify` (shared lock; every rendered input and the
+base re-checked; on failure the proposal is discarded), `Commit` (base compare-and-set), crash `AbortW`; expunge
+`MatBegin`, per-node `MatScan`/`MatWrite` batches (each under the exclusive lock, each re-reading `fact_hidden`),
+`MatEnd`, `Purge`, `DerivedPurge` (stubs). `Served(T)` is the SQL rule of N117: the version current at `T`, served
+only if visible. A ghost copy of each version's real derivation (its inputs plus its base's) states the truth the
+invariants are checked against.
 
-*Invariants.* `NoDeletedDerivationServed`, `NoInvalidatedDerivationServed` (no served fact or
-version has a deleted or hidden fact anywhere in its derivation, ghost included);
-`RestoreExact` (a version with no currently hidden fact is visible exactly as if no invalidation
-had happened); `NoOverHiding` (a fact or version with no victim is visible: the blast-radius
-guard, and the re-used document id is not hidden by the old tombstone); `AsOfNoLeak` (served at
-`T` implies every fact in the derivation was mentioned at or before `T`); `MaterializeComplete` (once
-a document is `materialized`, `derived_hidden` covers every committed version whose derivation
-names one of its victims); liveness `ExpungeCompletes` (a pending tombstone is eventually purged,
-under weak fairness of the writer and expunge steps).
+*Invariants.* `NoDeletedDerivationServed`, `NoInvalidatedDerivationServed`, `RestoreExact`, `NoOverHiding`,
+`AsOfNoLeak`, `MaterializeComplete`, and the round-4 additions `EvidenceOutlivesFacts`, `BaseCurrentAtCommit`,
+`NoLostRebuild`, `NoVictimTextAfterPurge`, `FailClosed`, `ReextractKeepsDerivedVisible`; liveness
+`ExpungeCompletes`.
 
-*Bounds.* Version-sequence products dominate the state space, so two design configurations cover
-the two levels. `Derivation.cfg`: observations only, 2 observations x up to 3 versions, 2 deletes,
-2 curation operations (Invalidate or Restore), 5 routed writes, symmetry on observations.
-`Derivation_Page.cfg`: 1 observation x 2 versions and 1 page x 2 versions (a page cites at most one
-observation version), 2 deletes, 2 curation operations, 5 routed writes. `Derivation_Live.cfg`:
-liveness at 1 observation x 2 versions, 4 routed writes, no symmetry. One writer, one fact per
-version (two in `Derivation_EffCited.cfg`, which needs a shown-but-uncited fact).
+*Configurations.* Design: `Derivation.cfg` (1 observation x 3 versions, 2 writers, 3 proposals, REPLACE or
+re-extraction once, invalidate and restore, one delete), `Derivation_Page.cfg` (adds a page x 2 versions;
+REPLACE and re-extraction are left to the first), `Derivation_Live.cfg`. Must-fail, one per round-4 bug:
 
-*Results.* `Derivation.cfg`: 7,659,307 generated / 2,133,161 distinct, depth 29, 01 min 35s. `Derivation_Page.cfg`: 81,273,512 generated / 22,215,959 distinct, depth 28, 16 min 53s.
-`Derivation_Live.cfg` (safety and `ExpungeCompletes`): 314,063 generated / 87,830 distinct, depth 24, 11s.
+| Config | Knob | Violates | Finding |
+|---|---|---|---|
+| `_CascadeEvidence` | evidence rows die with their fact | `NoDeletedDerivationServed` | C-1: REPLACE, chunk purge, delete: the derived version survives |
+| `_PageNoVerify` | `CommitPageVersion` re-verifies nothing | `NoDeletedDerivationServed` | C-2 |
+| `_StaleProposal` | stored update applied without its base | `NoDeletedDerivationServed` | C-3 |
+| `_ReextractHides` | derived versions hidden by cause `reextract` | `ReextractKeepsDerivedVisible` | C-6 |
+| `_RestoreNoLock` | `Restore` without the exclusive lock | `RestoreExact` | C-7: scan, Restore, write leaves a permanent row |
+| `_MatOnce` | Materialize reads `fact_hidden` once | `RestoreExact` | C-7: the per-batch re-read is load-bearing |
+| `_PurgeDropsStub` | `DerivedPurge` deletes the row | `FailClosed` | N136: the version number is reused |
+| `_NoLock`, `_EffCited`, `_TombByDocId` | no lock; `effective_at` of cited facts only; tombstone by document id | `NoDeletedDerivationServed`, `AsOfNoLeak`, `NoOverHiding` | kept from D22 |
 
-*Must-fail.*
-`Derivation_NoLock.cfg` (writers and Materialize ignore each other) violates
-`NoDeletedDerivationServed` at depth 9: a writer verifies `f3` visible, the delete
-marker commits, Materialize runs and finds no version to cover, the writer commits a version citing
-`f3`, `Purge` deletes the evidence row, and the version is served. This is the race N120 exists
-for; with the lock the writer holds the shared lock across its commit so Materialize waits and
-sees the version. `Derivation_MatInvalid.cfg` (Materialize also writes permanent rows for
-invalidated facts) violates `RestoreExact` at depth 11: after `Restore` the
-version stays hidden. `Derivation_EffCited.cfg` (`effective_at` over cited facts only) violates
-`AsOfNoLeak` at depth 6. `Derivation_TombByDocId.cfg` (a tombstone hides the
-whole document id, the pre-N133 rule) violates `NoOverHiding` at depth 4:
-the re-ingested `f2` is invisible. `Derivation_RestoreNoLock.cfg` removes the exclusive lock from
-`Restore` and is **expected to pass**, and does: 8,115,973 generated / 2,159,112 distinct, depth 29, 01 min 34s. The lock on `Restore` (N133)
-is therefore not needed for any property stated here; it is kept as the register decided and is
-a candidate for removal if it ever shows up as contention.
+*What the model changed or showed.*
 
-#### 7.2.2 `ShardMove.tla`: dirty copy, freeze, reconcile, cutover, rollback, restore
+1. **The cause-tagged design is the design, and the `Restore` lock is load-bearing** (C-7). The D22 conclusion
+   that the lock is "a candidate for removal" came from a spec in which Materialize wrote cause-less rows; with
+   cause-tagged rows and batches `_RestoreNoLock` and `_MatOnce` fail.
+2. **Evidence must outlive facts** (C-1). With the old foreign key `_CascadeEvidence` reaches a served derived
+   version in ten steps; REPLACE keeps the derived version visible by design, so only the evidence can tell a
+   later delete about it.
+3. **The derivation lock is needed because the read predicate looks only at pending tombstones** (N117). Evidence
+   now survives `Purge`, so a late writer's version stays hidden while the tombstone is `pending` and is exposed
+   exactly when it becomes `materialized`; `_NoLock` and `_PageNoVerify` fail at that edge.
+4. **Shared-lock holders do not serialise each other, so the base check must be a compare-and-set inside the
+   insert** (found by the design run). With the base verified in `Verify` only, two writers that picked proposals
+   against version 1 both verify and both commit; the second update lands on a base that a first commit has
+   already superseded (`BaseCurrentAtCommit` failed on the design configuration until `Commit` re-evaluated the
+   base). N120(3) must be written as `UPDATE observations SET current_version = v + 1 WHERE current_version =
+   base_version` (zero rows: discard), not as a read before the lock.
+5. Two checks that came out of building the model, not of a counterexample: a writer whose proposal was applied by
+   another writer must release the lock (the unique key refuses it), and a stub keeps `FailClosed` only if
+   version numbers are never reused.
 
-*Model.* One namespace, two shards, a catalog row `(shard, epoch)`, `namespace_moves.state` (`mp`),
-and an ownership row per shard (`none`, `incoming`, `ready`, `active`, `frozen`, `moved_out`,
-`restoring`, `replaying`). Clients cache `(shard, epoch)`; a write takes the shared fence at an
-`active` shard at its cached epoch, holds it for at most `Life` ticks, inserts an immutable row
-and sets one mutable cell. The mover: `Plan` (target `incoming` at epoch + 1), `CopyRange` (any
-non-empty part of what the source has and the target lacks, concurrent with writes), `CopyMut`
-(possibly stale), `Freeze` (exclusive fence: no holder), `Reconcile` (re-copy rows with
-`created_at + Margin >= T_copy`, merge the mutable cell in full), verify (the source and target row
-sets and cells must match, else only `Rollback` stays enabled), (b') `incoming -> ready`, (c)
-source `frozen -> moved_out` (point of no return), (b'') `ready -> active`, (d) catalog flip.
-`Rollback` is enabled in every state before (c). Restore and failover (`Restore`, `Reconcile_`,
-`RestoreDone`): the shard reverts to its backup (rows after it are an RPO loss, recorded in a ghost
-set), comes up `restoring`, reconciles the open move against `namespace_moves` (before (c): roll
-back, thaw the source; after (c): the source becomes `moved_out`, a restored target is re-filled
-from the source that still holds the data), bumps the catalog epoch when it is the owner, then
-`replaying` (Durability.tla), then its final row. A failover also bumps the source timeline; the
-mover compares its session timeline at Freeze and (c). Every mover step is conditional on the
-rows it observed (`UPDATE ... WHERE state = expected`); `ShardMove_UnfencedSteps.cfg` drops that.
+#### 7.2.2 `ShardMove.tla`: dirty copy, freeze, reconcile, cutover, restore
 
-*Invariants.* `SingleWriter` (at most one shard `active`, and a write holder only at an `active`
-shard, so `ready`, `incoming`, `frozen`, `moved_out` and `restoring` accept nothing);
-`NoLossNoDup` (the row set and the cell the target is activated with equal what was frozen at the
-source; the PK makes duplicates impossible, so this is the loss check); `RollbackPossibleBeforeC`
-(before (c) the source is the owner and holds every committed row, so rollback loses nothing);
-`NoWriteToTargetBeforeC`; `NoRouteToTargetBeforeC` (the catalog never names the target before (c)
-and (b'')); `ZombieCannotCutOver` (a session on a stale timeline never executed Freeze or (c));
-`RestoreReconciles` (a restored shard never ends `active` while another shard is `active` or `ready`
-for the namespace, and never at an epoch below the catalog's); liveness `MoveTerminates` (a started
-move ends `done` or `rolled_back`, with fairness on the forward steps, recovery and client commits, and on
-rollback only when the verify failed).
+*Model.* Source `s1` and target `s2`; per shard a set of insert-only rows (each carries an `ins_seq` drawn at
+`Begin` and, for `old` rows, a created-at/entity key from before the copy), a set of mutable keys (idempotency
+keys, swept by the source at any time) and a counter for the expiring class (its sweep pauses while a move is
+open). The catalog carries the move row `cm` (`open`, `committed`, `rolled_back`, `done`) and the namespace
+`(shard, epoch)`. Mover: `Plan`, `CopyRange`/`CopyMk`/`CopyEx` (any part, any order), `EndCopy` (pre-freeze
+verification, `T_pre`), `Freeze`, `Reconcile` (re-copy insert-only rows with `ins_seq >= T_pre - Margin`,
+merge-diff the mutable class including deletes, `count <=` for the expiring class, then the count/hash
+`Verified`), `MakeReady` (b'), `CommitCAS` (the catalog CAS, a''), `Cut` (c, only after `committed`), `Activate`
+(b''), `CatFlip` (d, `WHERE epoch = e`), `Cleanup` (needs a post-activation backup of the target), `Rollback`
+(abort CAS `open -> rolled_back`), `SrcDelete` and `SweepEx`, writers with a bounded lifetime. Recovery: `Restore`
+(to the last backup, or lossless failover), `Reconcile_` (open: abort CAS and roll back; `committed`: complete
+(c), (b''), (d) and skip the epoch bump; no move: owner bump), `RestoreDone`.
 
-*Bounds.* `ShardMove.cfg`: 3 rows, 2 clients (symmetry), writer lifetime 1 tick, margin 1,
-3 ticks, epochs up to 4, 1 restore or failover of either shard, 1 extra backup.
-`ShardMove_Live.cfg`: 2 rows, 2 ticks, no symmetry, liveness.
+*Invariants.* `SingleWriter`, `NoLossNoDup`, `RollbackPossibleBeforeC`, `NoWriteToTargetBeforeC`,
+`NoRouteToTargetBeforeC`, `ZombieCannotCutOver`, `RestoreReconciles`, and the round-4 additions `OneOwner`,
+`CatalogNamesOwnerAfterDone`, `CleanupSafe`; liveness `MoveTerminates` (done or rolled back) and
+`MoveTerminatesActive` (done, with writers, sweeps and old-id inserts but no restore and no voluntary abort).
 
-*Results.* `ShardMove.cfg`: 88,022,416 generated / 16,472,880 distinct, depth 28, 03 min 57s. `ShardMove_Live.cfg` (safety and `MoveTerminates`):
-2,760,289 generated / 578,804 distinct, depth 25, 31s. `ShardMove_ZeroMargin.cfg` (margin 0 **with** the verify: a short margin
-may cost a rollback, never a row; safety and `MoveTerminates`): 2,780,467 generated / 582,960 distinct, depth 25, 30s.
+*Configurations.* Design: `ShardMove.cfg` (2 rows, 2 clients, writer lifetime 1, margin 1, 2 ticks, 1 restore or
+failover, 1 extra backup), `_Live`, and **`_ActiveWriters`** (every started move completes). Experiments that must
+pass: `_ZeroMargin` (margin 0 with the verify can only cost a rollback) and `_NoTimelineCheck`.
+Must-fail: `_NoReady`, `_RestoreNoReconcile`, `_NoVerify` (kept), `_UnfencedSteps` (now fails, item 4), and
 
-*Must-fail.* `ShardMove_NoReady.cfg` (target goes straight to `active` before (c), the catalog
-may flip first) violates `RollbackPossibleBeforeC` at depth 9: the target accepts a
-write, and the only rollback left would discard it. `ShardMove_RestoreNoReconcile.cfg` (restore
-trusts its backup row, bumps the epoch and ignores the open move: the old "epoch bump during a move") violates
-`RestoreReconciles` at depth 8: the source returns `active` at epoch e + 1
-while the target is `ready` at e + 1. `ShardMove_NoVerify.cfg` (margin 0 and no count/hash verify)
-violates `NoLossNoDup` at depth 10: a row begun one tick before `T_copy` and committed
-after it is neither in the dirty copy nor in the re-copy. There is no must-fail configuration
-for `ZombieCannotCutOver`: `ShardMove_NoTimelineCheck.cfg` (no timeline comparison) and
-`ShardMove_UnfencedSteps.cfg` (no row compare-and-set in the mover) are experiments that are expected to pass
-and do (7.2.6 items 3 and 5): 90,507,928 generated / 16,472,880 distinct, depth 28, 03 min 55s; 142,521,064 generated / 21,636,679 distinct, depth 28, 05 min 49s.
+| Config | Knob | Violates | Finding |
+|---|---|---|---|
+| `_IdKeyedRecopy` | re-copy by created_at / entity id | `MoveTerminatesActive` | C-8, P-1: rows inserted under old ids are missed, the verify rolls the move back every time |
+| `_MergeNoDeletes` | mutable class merged by upserts | `MoveTerminatesActive` | C-8a: a swept key stays on the target |
+| `_SweepNotPaused` | expiring-class sweep runs during a move | `MoveTerminatesActive` | C-8a |
+| `_StampAfterCut` | (c) first, the catalog stamped afterwards | `OneOwner` | C-10: a failover between them rolls back a target whose source is already `moved_out`: no owner |
+| `_CleanupNoBackup` | cleanup without a post-activation backup of the target | `CleanupSafe` | C-21: after a restore of the target to an older backup the moved rows exist only on the source; cleanup then deletes the last copy |
+
+*What the model showed.*
+
+1. **Safety does not depend on the re-copy key; completion does.** `_IdKeyedRecopy`, `_MergeNoDeletes` and
+   `_SweepNotPaused` never lose a row (the count/hash verify blocks (b')); they roll back deterministically, which
+   `MoveTerminates` hides and `MoveTerminatesActive` exposes. The ins_seq key with a margin of at least the writer
+   lifetime is what makes the active-writer move complete (`_ActiveWriters`).
+2. **The catalog CAS before (c) is what makes a restore during cutover decidable.** With the stamp after (c)
+   (`_StampAfterCut`) the restore reads `open` for a source that is already `moved_out` and has no legal edge back.
+   With the CAS the reconcile either aborts (`open -> rolled_back`) or completes the move itself (`committed`),
+   without the epoch bump that would leave the catalog naming the source.
+3. **Cleanup is only safe after a backup that contains the moved rows** (`_CleanupNoBackup`; N125 and §5.5.1 say
+   "24 h after done"; they must also say "and after a differential backup of the target taken after activation").
+4. **The row-state guard on every mover step became load-bearing** (a change from D22, where `_UnfencedSteps`
+   passed). With the catalog CAS completing a `committed` move on restore, a mover that ignores the ownership rows it
+   acts on can finish its copy from a source that was restored after Freeze and lost a row; recovery then completes
+   the move with that smaller set (`NoLossNoDup`). Every step, the CAS included, must be a compare-and-set on the
+   source and target rows it verified (`WHERE state = expected`). The count/hash verify stays load-bearing
+   (`_NoVerify` loses a row; `_ZeroMargin` only rolls back); `_NoTimelineCheck` still changes no result, so the
+   timeline comparison stays as the register decided and the case it covers is outside the model.
 
 #### 7.2.3 `Durability.tla`: acknowledged deletes survive restore and failover
 
-*Model.* Operations on two subjects: `inv` and `res` on a fact (`fact_hidden`, last state wins) and `del`
-on a document. One subject has at most one operation in flight; an operation that errors closes its
-subject (its intent may still take effect, as documented). Steps: `PutIntent` (durable blob object),
-`Commit` (the marker transaction, a local commit, refused while the shard is not `active`, abandoned
-after `Lat` ticks), `Ack`. `dbq` is the sequence of marker transactions the shard has applied.
-`Restore(p)` keeps only commits with commit time <= p and comes up `restoring`; `Replay` applies, in name
-order, each intent with `deleted_at + Margin >= floor` that is not applied (replayed commits get a new
-commit time); `Reopen` returns to `active`. Up to two restores, so a restore can hit before, during or after
-a replay.
+*Model.* Operations come from a fixed shape: on a document, delete, a duplicate delete and a retain (which revives
+the document); on a fact, invalidate, restore, invalidate. The write path is `Commit` (the marker, a local commit
+that a restore may lose) then `PutIntent` (after the commit; a duplicate that finds the committed marker re-puts
+that marker's own intent) then `Ack` (after re-reading the marker); failures: `Abort`, `CrashBeforePut`,
+`LostAck`. The intent records the marker's effect (the set of versions a delete covers), `prev_operation_id` and the
+epoch. `RestoreTo(p)` keeps commits up to `p`, lowers the replay floor (held in the catalog, outside the restorable
+state, never raised), bumps the epoch; `Replay` applies in-window intents verbatim in chain order; `Reopen` waits
+for replay. Hosts' clocks may skew the recorded `deleted_at` by one tick.
 
-*Invariants.* `AckImpliesIntent`; `AckedDeleteSurvives` (while the shard serves, a document whose last
-operation was acked is tombstoned); `IntentOrderLastWins` (the same for the `inv`/`res` fact: an acked
-Restore is not undone by an older Invalidate); `RestoreReplaysIntents` (when reads reopen after a restore,
-every acked in-window intent is applied).
+*Invariants.* `AckImpliesIntent`, `AckedDeleteSurvives`, `IntentOrderLastWins`, `NoUnackedEffectOnLaterAck`.
 
-*Bounds.* 3 operations, 5 ticks, `Lat` 2, `Margin` 2, 2 restores.
+*Configurations.* Design: `Durability.cfg` (document subject, `MaxT = 7`, 2 restores, margin 1, latency 1),
+`Durability_Chain.cfg` (fact subject, clocks skewed by one tick, `MaxT = 4`). Must-fail: `_IntentBeforeCommit`
+(C-5), `_RaiseOnReopen` (C-4), `_ClockOrder` (C-16), `_DupNoReput`, `_AckNoRecheck`, `_NoEpochGuard`, and from D22
+`_RetargetRestore`, `_ReopenEarly`, `_AckBeforeIntent`, `_NarrowWindow`, `_UnorderedReplay`.
 
-*Results.* `Durability.cfg`: 117,776,042 generated / 26,113,068 distinct, depth 25, 04 min 26s.
+*What the model changed or showed.*
 
-*Must-fail.* `Durability_AckBeforeIntent.cfg` (the ack may precede the intent put) violates
-`AckImpliesIntent` at depth 4. `Durability_ReopenEarly.cfg` (reads reopen before the replay
-finishes) violates `AckedDeleteSurvives` at depth 9. `Durability_UnorderedReplay.cfg` (replay in any order)
-violates `IntentOrderLastWins` at depth 14 (an acked Restore and then an acked
-Invalidate, both lost, replayed Invalidate first: the Restore is applied last and the fact comes back). `Durability_NarrowWindow.cfg` (`Margin` 0 below `Lat` 2) violates `AckedDeleteSurvives`
-at depth 11. `Durability_RetargetRestore.cfg` (each restore recomputes the replay floor
-from its own target) violates `AckedDeleteSurvives` at depth 11; this one is a flaw in the register as
-written, 7.2.6 item 1.
+1. **C-4 and C-5 reproduced and fixed as the register says**: the floor lives in the catalog and is only lowered
+   (`_RaiseOnReopen`, `_RetargetRestore`); the intent follows the commit (`_IntentBeforeCommit`: an orphan intent
+   or a concurrent duplicate is replayed over a later acknowledged write); a retry after a crash between commit
+   and put must re-put the marker's intent (`_DupNoReput`, the register's second point beyond the advice;
+   Go twin `TestIntent_DuplicateAttempt`).
+2. **The ack must re-read the marker after the put** (`_AckNoRecheck`, a flaw of N122 as written). A restore can
+   land between the commit and the put; replay then runs, the shard reopens, the late put succeeds and the delete
+   is acknowledged although no replay will ever see its intent. One indexed read of the marker after the put (ack
+   only if it is still committed; else error, the client retries) closes it; the register and §5.4.1 step 4 gain
+   that sentence.
+3. **Replay must compare epochs, and `Invalidate`/`Restore` must always write their marker** (`_NoEpochGuard`,
+   found by the design run). An unacknowledged `Restore` whose commit a restore lost can have its intent put after
+   the reopen. A later acknowledged `Invalidate` that finds the fact already hidden returns success with no marker
+   of its own (A-10's no-op); a second restore then replays the older `Restore` intent over it. The design:
+   intents carry the namespace epoch, replay skips an intent whose epoch is older than an applied entry of its
+   subject, and a double `Invalidate` (or `Restore`) still inserts its `deletion_log` row and puts its own intent
+   (`fact_hidden` stays a no-op). Duplicate document deletes keep the D23 rule (re-put the observed marker's
+   intent), since their effect is a fixed set of versions.
+4. **The margin must exceed the longest commit latency plus the clock skew** (`_NarrowWindow`); chain order
+   removes the need for synchronised clocks (`_ClockOrder`, `_UnorderedReplay`).
 
-#### 7.2.4 `Storage.tla`: insert-only content, vector generations, index convergence
+#### 7.2.4 `Storage.tla`: insert-only content, vector generations, index hygiene
 
-*Model.* Content rows are inserted once; `Purge` is the only later change and needs an expunge marker.
-Vectors are insert-only rows `(row, generation)`; the namespace's current generation flips only
-when every live row has a next-generation vector and the index holds it (`ReembedNamespace`); old
-generations are expunged afterwards; the index follows the vector table asynchronously.
-*Invariants.* `ContentImmutable`, `PurgeNeedsMarker`, `VectorGenerationConsistent` (every row live at the
-last flip and still live has a current-generation vector), liveness `IndexConvergence` (the index's
-current-generation entries eventually equal the vector table's). Bounds: 3 rows, 3 generations.
-*Results.* `Storage.cfg`: 12,872,199 generated / 1,478,807 distinct, depth 36, 06 min 40s. Must-fail: `Storage_Update.cfg` (in-place rewrite) violates
-`ContentImmutable` (depth 3); `Storage_FlipEarly.cfg` (flip without waiting) violates
-`VectorGenerationConsistent` (depth 3); `Storage_PurgeUnmarked.cfg` violates
-`PurgeNeedsMarker` (depth 3).
+Content rows are never rewritten and are purged only under a marker; a model flip waits for the next generation's
+vectors; the index follows the vector table. New in D23 (N138): the purge counts the dead entries it leaves
+(`pc = purged_since_build`), a rebuild at the threshold is the only thing that removes them
+(`vacuum_index_cleanup = off`), and `AutoRepair` models autovacuum cleaning the graph in place. Invariants
+`ContentImmutable`, `PurgeNeedsMarker`, `VectorGenerationConsistent`, `RebuildBeforeRepair`, `DeadCounted`,
+liveness `IndexConvergence`. Must-fail: `Storage_Update`, `_FlipEarly`, `_PurgeUnmarked`, and `_AutoRepair`
+(`RebuildBeforeRepair`).
 
 #### 7.2.5 `Outbox.tla` and `Consolidation.tla`
 
-D22 changed neither protocol's state machine, so both models are kept; what changed is the text
-around them. `Outbox.tla` (D6): writers draw `seq` inside their transaction, commit out of order,
-and a relay with a persisted cursor and a gap watchlist declares a missing `seq` aborted after
-`Watch` ticks; assumption A-F1 now holds without a caveat because every role runs
-`synchronous_commit = local` (N122), so a commit cannot hang on a standby, and moves no longer replay
-the outbox (N124). Invariants `NoLossSafety`, `PerNamespaceOrder`, `OnlyCommittedDelivered`,
-`IdempotentConsumerState`, liveness `NoLossLive`. `Outbox.cfg`: 3 writers, 2 namespaces, 2 consumers, 5 seqs,
-timeout 2, watch 4, 1 relay crash: 17,243,719 generated / 5,557,863 distinct, depth 39, 01 min 35s. `Outbox_Live.cfg`: 1,342,866 generated / 486,937 distinct, depth 31, 38s. Must-fail:
-`Outbox_NoWatch.cfg` (no watchlist) and `Outbox_Watch1x.cfg` (horizon = 1 x timeout) violate `NoLossSafety`
-at depth 7 and depth 9.
+Unchanged by D23 and re-run. `Outbox.tla` (D6): writers draw `seq` in their transaction and commit out of order; a
+relay with a persisted cursor and a gap watchlist declares a missing `seq` aborted after `Watch` ticks
+(invariants `NoLossSafety`, `PerNamespaceOrder`, `OnlyCommittedDelivered`, `IdempotentConsumerState`, liveness
+`NoLossLive`); `Outbox_NoWatch` and `Outbox_Watch1x` (horizon 1 x timeout) violate `NoLossSafety`.
+`Consolidation.tla` (D12, N43, N121): stage 1's decisions are persisted write-once under `batch_key`, each op's
+effect and its `op_key` row are one transaction, the worker may crash anywhere; invariants `ExactlyOnceEffect`,
+`ObservationHasSources`, liveness `RoundTerminates`; `_VolatileProposal` and `_NonAtomicKey` violate
+`ExactlyOnceEffect`. The proposal lifecycle of C-11 (`(batch_key, attempt)` keys, no `DELETE`, batch `applied`
+state) is below the model's abstraction and is covered by `TestConsolidation_*` (8.4.6).
 
-`Consolidation.tla` (D12, N43, N121): a round's batch is bisected on failure; stage 1's decisions are
-persisted write-once under `batch_key`; each op's effect and its `op_key` row are one transaction;
-the worker may crash anywhere and Temporal re-runs the activity. The model abstracts the text-writing
-call (stage 2); it checks that a persisted decision list yields one effect per `op_key` and that the
-version written cites only facts of the round. D22 changed one thing here: a delete is a marker and
-no longer rewrites observation sources (no trigger), so the old "observation never cites a retired
-fact" invariant is replaced by `ObservationHasSources` (a written version cites at least one fact of
-the round) and the delete-versus-write race moved to `Derivation.tla`. Invariants `ExactlyOnceEffect`,
-`ObservationHasSources`, liveness `RoundTerminates`. `Consolidation.cfg` (3 facts, 1 observation,
-2 crashes, 1 delete; the 4-fact and the 2-observation variants were stopped after about ten minutes with the queue still growing, and are not gates): 10,864,684 generated / 2,426,544 distinct, depth 18, 56s. `Consolidation_Live.cfg`: 65,555 generated / 20,404 distinct, depth 12, 02s.
-Must-fail: `Consolidation_VolatileProposal.cfg` (the proposal is not persisted before apply) and
-`Consolidation_NonAtomicKey.cfg` (effect and key in separate transactions) violate `ExactlyOnceEffect` at
-depth 6 and depth 5.
+#### 7.2.6 Boundaries of the results
 
-#### 7.2.6 What the models found
-
-Item 1 is a change to the register (N122); the others confirm, bound or relax a register claim.
-
-1. **The replay window of N122 loses acknowledged deletes on a second restore.** "Intents with
-   `deleted_at >= restore_point - 10 min`" is anchored at the latest restore's target. A second
-   restore or failover before the first replay has finished (an operator retries or retargets a failed
-   restore, or the promoted standby fails again) moves the anchor later and skips intents the first
-   restore lost; replayed markers also carry new commit times, so a restore after a partial replay
-   loses them again. The shortest counterexample (`Durability_RetargetRestore.cfg`) is the retry: an
-   acked Invalidate is lost, the shard is restored again to a later point, and reopens without it.
-   With a **monotone floor** (the minimum over every restore since the oldest retained backup, persisted
-   next to `restore_done`; replay is idempotent through the shard `deletion_log`, and intents are kept
-   35 days, so the window is bounded) `Durability.cfg` passes.
-2. **What the margin must exceed.** `Durability_NarrowWindow.cfg` loses an acked delete when the replay
-   margin is below the longest time between the intent put and the marker commit. The register's
-   10 minutes against a 30 s statement timeout is a wide factor; the model fixes what the number has to
-   stay above (statement and idle timeouts plus pool wait), which is a constraint on any later change
-   to either.
-3. **The count/hash verify is load-bearing; the row-state compare-and-set is not.** The copy margin
-   must be at least the writer lifetime: with margin 0 and no verify a row begun before `T_copy` and
-   committed after it is lost (`ShardMove_NoVerify.cfg`); with the verify the same margin can only
-   cost a rollback (`ShardMove_ZeroMargin.cfg`, safety and `MoveTerminates` hold). Conversely, letting
-   mover steps ignore the ownership rows they act on (`ShardMove_UnfencedSteps.cfg`) changes no result
-   while the verify is there (the unfenced model admits more interleavings and still passes). The `WHERE state = expected` guard on each step stays, since it removes
-   interleavings the recovery path would otherwise have to undo, but the safety argument rests on the verify.
-4. **A restore of a non-owner during a move needs the catalog arbiter too.** Restoring the target
-   before (c) must roll the move back and thaw the source; after (c) it must re-fill the target from
-   the source that still holds the data (the `moved_out` row's data survives until cleanup). Without
-   `namespace_moves` as arbiter (`ShardMove_RestoreNoReconcile.cfg`) a restored source returns
-   `active` next to a `ready` target at the same epoch. N123 says this; the model shows both
-   directions are needed.
-5. **Two guards are not load-bearing in this abstraction.** Removing the timeline comparison at
-   Freeze and (c) (`ShardMove_NoTimelineCheck.cfg`) changes no result: a restored or promoted shard
-   rejects Freeze and (c) through its ownership row (`restoring`) until recovery has run, and
-   `namespace_moves` arbitrates. Removing the exclusive derivation lock from `Restore`
-   (`Derivation_RestoreNoLock.cfg`) changes no result either. Both stay as the register decided; the
-   case the timeline check covers (a zombie primary still serving a mover session and client writes)
-   is outside the model (7.5), so there is no must-fail configuration for `ZombieCannotCutOver`.
-6. **The derivation lock is needed exactly because `Purge` deletes the evidence.** The lock-free
-   configuration fails only after `Purge` (`Derivation_NoLock.cfg`); before it the read-time check still
-   sees the victim, and `MaterializeComplete` already fails at the late commit. The model confirms the
-   lock is sufficient (`Derivation.cfg`, `Derivation_Page.cfg`).
+1. **Abstractions that matter.** One namespace, one fact per chunk, two to three writers, version caps of one to
+   three; restores are "revert to the last backup" or lossless failover, not PITR; the mutable and expiring
+   classes are sets and a counter. A bound bump is a spec change reviewed as such.
+2. **Experiments that pass by design** (`_ZeroMargin`, `_NoTimelineCheck`) are not gates for the property they name:
+   they document that the verify, not a larger margin or the timeline check, carries the move's safety in this
+   abstraction.
+3. **`Derivation_Page.cfg` leaves REPLACE and re-extraction out** (the product with a page ran past 30 minutes);
+   `Derivation.cfg` covers both on observations only, and the page path is the same `Commit`.
+4. **Liveness runs forbid writer crashes** (`AllowAbortW = FALSE`): with crashes a writer can starve Materialize
+   by re-taking the shared lock forever, which the 35 s single attempt and the retry make a latency issue, not a
+   safety one.
 
 ### 7.3 Lean 4 theorems
 
-Files under `formal/lean/Engram/`, Lean 4 core only (no Mathlib). None is type-checked; the
-statuses are honest about what is written out and what is `sorry`. Each file ends with
-`example ... := by decide` checks that double as the table test of its Go counterpart.
-`TagMatch.lean`: the six tag modes of D10, decidability, `anyStrict_imp_any`, `allStrict_imp_all`,
-`exact_imp_allStrict`, monotonicity of the strict modes (written), non-monotonicity of ANY and ALL
-(`decide` witness). `RRF.lean`: the fused score is invariant under arm reordering (`score_perm`,
-written), per-arm monotonicity (`contribOf_le_of_improves`, written), `score_mono` and
-`score_le_bound` (`sorry`), `contribNat_antitone` (needs `0 < k`, which is why D10 fixes k = 60,
-written). `Packer.lean`: `pack_total_le`, `pack_sublist`, `keep_count`, `keep_append`,
-`keep_skip_oversize` (written), `kept_fits` (`sorry`). `TemporalWindow.lean`: overlap symmetry,
-containment order, `distanceTo` non-negativity, monotonicity and 1-Lipschitz (written; overlap
-non-transitivity by `decide`). Three `sorry` in total (the checked-in baseline).
+Files under `formal/lean/Engram/`, Lean 4 core only (no Mathlib), **not type-checked**. `lakefile.lean`,
+`lean-toolchain` and `SORRY_BASELINE` (value 3) form the Lake skeleton (N142). `TagMatch.lean`: the six tag modes
+of D10, decidability, `anyStrict_imp_any`, `allStrict_imp_all`, `exact_imp_allStrict`, monotonicity of the strict
+modes, non-monotonicity of ANY and ALL (`decide`). `RRF.lean`: the fused score is invariant under arm reordering,
+per-arm monotonicity, `contribNat_antitone` (needs `0 < k`, which is why D10 fixes k = 60); `score_mono` and
+`score_le_bound` are `sorry`. `Packer.lean`: `pack_total_le`, `pack_sublist`, `keep_count`, `keep_append`,
+`keep_skip_oversize`; `kept_fits` is `sorry`. `TemporalWindow.lean`: overlap symmetry, containment order,
+`distanceTo` non-negativity, monotonicity, 1-Lipschitz. Three `sorry` in total, the checked-in baseline.
 
 ### 7.4 Conformance: how the Go code stays faithful
 
 A spec that is not tied to a test is documentation. Three mechanisms for every spec.
 
-**(a) Model tests.** For each spec there is an in-memory Go model of its state and actions and a
-`pgregory.net/rapid` state machine that runs generated action sequences against the model and
-against the real implementation on a `testcontainers` Postgres, checking the spec's invariants after every
-step with the TLC constants as generator bounds. Invariant code is written once in
-`internal/formal/<spec>/invariants.go`. Section 8.4.6 lists the Go twin of every must-fail configuration
-(the fix disabled by a `faultinject` knob reproduces the flaw; with the fix on it is absent).
+**(a) Model tests.** Each spec has an in-memory Go model of its state and actions and a `pgregory.net/rapid` state
+machine that runs generated action sequences against the model and against the real implementation on a
+`testcontainers` Postgres, checking the spec's invariants after every step with the TLC constants as generator
+bounds. Invariant code is written once in `internal/formal/<spec>/invariants.go`. Section 8.4.6 lists the Go twin
+of every must-fail configuration (the fix disabled by a `faultinject` knob reproduces the flaw; with the fix on it
+is absent).
 
 | Spec | Go package and twin tests |
 |---|---|
-| `Derivation` | `internal/recall` (visibility predicate), `internal/expunge` and `internal/consolidate` (derivation lock): `TestVisibility_AllSurfaces`, `TestVisibility_SegmentHiding`, `TestInvalidate_RestoreExact`, `TestAsOf_*`, `TestExpunge_DerivationLock`, `TestDelete_ReuseDocumentID` |
-| `ShardMove` | `internal/move`: `TestMove_RollbackEveryStep`, `TestMove_ReadyState`, `TestMove_DirtyCopyReconcile`, `TestMove_ZombieFenced`, `TestRestore_OpenMoves`; mover killed at every persisted state |
-| `Durability` | `internal/intent`, `cmd/engramctl restore replay`: `TestIntent_AckImpliesIntent`, `TestRestore_ReplaysIntents`, `TestFailover_ReplaysIntents` (plus a double-restore case for item 1 of 7.2.6) |
-| `Storage` | `internal/store`, `internal/index`: `TestContent_InsertOnly`, `TestVectors_ModelGeneration`, `TestHNSW_PerNamespace` |
+| `Derivation` | `internal/recall`, `internal/expunge`, `internal/consolidate`, `internal/pages`: `TestVisibility_AllSurfaces`, `TestVisibility_SegmentHiding`, `TestInvalidate_RestoreExact`, `TestAsOf_*`, `TestExpunge_DerivationLock`, `TestDelete_ReuseDocumentID`, `TestReplace_ThenDelete` (C-1), `TestPage_CommitReverifies` (C-2), `TestApply_BaseVersionCAS` (C-3), `TestReextract_DerivedStaysVisible` (C-6), `TestMaterialize_BatchRereadsFactHidden` (C-7) |
+| `ShardMove` | `internal/move`: `TestMove_RollbackEveryStep`, `TestMove_ReadyState`, `TestMove_ActiveBacklog`, `TestMove_InsSeqReconcile`, `TestMove_CatalogCAS`, `TestMove_ZombieFenced`, `TestRestore_OpenMoves`; mover killed at every persisted state |
+| `Durability` | `internal/intent`, `cmd/engramctl restore replay`: `TestIntent_AckImpliesIntent`, `TestIntent_DuplicateAttempt` (re-put of the committed marker's intent), `TestIntent_AckRereadsMarker`, `TestIntent_EpochGuard`, `TestRestore_ReplaysIntents`, `TestFailover_ReplaysIntents`, a double-restore case |
+| `Storage` | `internal/store`, `internal/index`: `TestContent_InsertOnly`, `TestVectors_ModelGeneration`, `TestHNSW_PerNamespace`, `TestHNSW_RebuildOnly` |
 | `Outbox` | `internal/outbox`: relay with writers delayed by `pg_sleep`, `TestOutbox_Watch1x` |
 | `Consolidation` | `internal/consolidate`: `TestConsolidation_PersistedProposal`, `_AtomicKey`, `_TwoStage` |
 | Lean modules | `internal/recall` table and `rapid` tests (tags, fusion, packing, temporal window) |
 
-**(b) Trace validation.** Store, relay, expunge, intent and move code paths emit JSON-line decision logs in
-tests (`internal/formal/trace.Logger`, written after the transaction commits). `engramctl formal trace-to-tla
-<spec> <log.jsonl>` emits a module that `EXTENDS` the spec with the trace as a constant sequence; TLC
-checks that the logged behaviour is a behaviour of the spec and that every invariant held along it.
-The Postgres tests of (a) and the chaos suites of section 8 produce the logs.
+**(b) Trace validation.** Store, relay, expunge, intent and move code paths emit JSON-line decision logs in tests
+(`internal/formal/trace.Logger`, written after the transaction commits). `engramctl formal trace-to-tla <spec>
+<log.jsonl>` emits a module that `EXTENDS` the spec with the trace as a constant sequence; TLC checks that the logged
+behaviour is a behaviour of the spec and that every invariant held along it. M0.7 delivers the converter.
 
-**(c) Refinement mapping.** The contract for each model test's state extraction:
+**(c) Refinement mapping.**
 
 | Spec variable | Go / Postgres state |
 |---|---|
 | `Derivation.tomb[d]`, `ms[d]` | `document_tombstones(up_to_version, expunge_state)` |
-| `hidden` | `fact_hidden` rows |
-| `born`, `gone` | `facts` rows (`document_version`); rows removed by the purge |
-| `vers[n][v].root`, `.finp`, `.oinp`, `.eff` | `observation_versions.root_version`; `observation_inputs`; `page_version_inputs(kind='observation')`; `effective_at` |
-| `dh` | `derived_hidden(root_version, from_version)` |
-| `lockX`, writer `verified` | derivation advisory lock `hashtextextended(ns, 1)`, exclusive and shared |
-| `ShardMove.cat`, `mp` | catalog `namespaces(shard_id, epoch)`; `namespace_moves.state` |
-| `own[s]` | `namespace_ownership(state, epoch)` on shard `s` (`restoring`, `replaying` = `frozen/restore`) |
-| `store[s]`, `mut[s]` | the immutable tables and the mutable-table rows of the namespace on `s` |
-| `tl`, `mtl` | `catalog.shards.timeline_id`; the mover session's timeline |
-| `bak[s]` | pgBackRest backup or standby of `s` |
-| `Durability.intents`, `dbq` | `_control/deletes/...` objects; markers applied in order, recorded in the shard `deletion_log` |
-| `rp` (floor) | the restore floor persisted with `restore_done` |
-| `Storage.vec`, `cur`, `idx` | `fact_vectors`; the namespace's current embedding model; the per-namespace partial HNSW fed through `index.Applier` |
-| `Outbox.committed`, `cursor`, `watch` | visible `outbox` rows; `outbox_cursors.last_seq`; the relay's in-memory gaps |
-| `Consolidation.stored`, `applied`, `effectOf` | `consolidation_batches`; `consolidation_applied`; the effect rows |
+| `hidden`, `hidRe`, `ctomb` | `fact_hidden(cause = 'invalidate' / 'reextract')`; `chunk_tombstones` |
+| `born`, `gone` | `facts` rows; rows removed by the purges |
+| `vers[n][v]` | `observation_versions` / `page_versions` (`root_version`, stub flag); `observation_inputs`, `page_version_inputs` (no FK to `facts`); `effective_at` |
+| `dh` | `derived_hidden(root_version, from_version, cause_kind, cause_id)` |
+| `props` | `consolidation_proposals` with `base_version` |
+| `lockX`, writer `verified` | derivation advisory lock, exclusive and shared |
+| `ShardMove.cat`, `cm`, `mp` | catalog `namespaces(shard_id, epoch)`; `namespace_moves.state`; the move workflow |
+| `own[s]` | `namespace_ownership(state, epoch)` on shard `s` |
+| `store`, `mk`, `ex` | insert-only tables (`ins_seq`); mutable-class tables; expiring-class tables |
+| `tl`, `mtl`, `bak` | `catalog.shards.timeline_id`; the mover session's timeline; pgBackRest backup or standby |
+| `Durability.intents`, `dbq`, `fl`, `ep` | `_control/deletes/...` objects; the shard `deletion_log`; `catalog.shards.replay_floor`; the namespace epoch |
+| `Storage.vec`, `cur`, `idx`, `pc` | `fact_vectors`; the namespace's current model; the per-namespace partial HNSW; `vector_indexes.purged_since_build` |
+| `Outbox.*`, `Consolidation.*` | visible `outbox` rows, `outbox_cursors`; `consolidation_batches`, `consolidation_applied` |
 
 ### 7.5 What is not formalised, and why
 
 - **LLM outputs** (extraction, routing, writing, reflect): non-deterministic external input, modelled as
-  unconstrained choices from a small menu. Quality is measured in section 8, not proved.
-- **Ranking quality and HNSW recall**: empirical properties of the index parameters.
-- **Index engines behind `index.Searcher`**: assumed to return candidates that the recall path then filters with
-  the same N116 predicate; engine-side deletion latency is covered only by `Storage.IndexConvergence`.
-- **Temporal's guarantees** (at-least-once activities, determinism, signals): assumed as documented.
-- **Postgres semantics**: snapshot isolation of `REPEATABLE READ`, try-lock behaviour of advisory locks
-  (`TestFence_TryLockRefusedBehindWaiter`), `synchronous_commit = local`, and that a committed transaction is
-  visible to later snapshots. pgbouncer transaction pooling preserves per-transaction affinity.
-- **The blob store's strong consistency** (the intent `put` is visible to a later list, N122): assumed from
-  the brief; `Durability.tla` takes the put as atomic and durable.
-- **Zombie primaries serving client writes**, **instance-level failover** (two instances of one shard) and the
-  relay's 10 s timeline check: the model has one instance per shard and treats the timeline check as a guard
-  (7.2.6 item 5).
-- **Multi-namespace interference in a move** (RLS, the shared outbox, other namespaces' writers): one namespace
-  per model; isolation is tested by the suites of section 8.
-- **Reads during a move**: reads at `frozen/move` and the stale-read window after (c) are not an invariant of
-  `ShardMove.tla`; they are tested by `TestIso_Move_Epoch` and the misroute suites.
-- **Blob copy in a move**, the `return_abort` path of moving back onto a `moved_out` shard, the 24 h cleanup
-  and the expunge pause: tested, not modelled.
-- **Export snapshot expiry (N126), page refresh policy, Reflect, quotas, config inheritance, JWT/authz,
-  Kafka beyond per-partition order**: no interleaving worth a model, or covered by table tests.
-- **Cursor-pass before purge** (N119 step 2): `Purge` is modelled as enabled once `materialized`; the extra
-  precondition only delays it.
+  unconstrained choices. Quality is measured in section 8, not proved.
+- **Ranking quality and HNSW recall**; **index engines behind `index.Searcher`** (candidates are filtered by the
+  same N116 predicate).
+- **Temporal's guarantees**, **Postgres semantics** (snapshot isolation, advisory try-lock, `synchronous_commit =
+  local`), **the blob store's strong consistency**: assumed as documented.
+- **Zombie primaries serving client writes**, instance-level failover and the relay's 10 s timeline check:
+  outside `ShardMove.tla`; `_NoTimelineCheck` passes, so there is no must-fail configuration for
+  `ZombieCannotCutOver`.
+- **Multi-namespace interference in a move**, **reads during a move**, **blob copy**, **`return_abort`**:
+  tested (`TestIso_Move_Epoch`, misroute suites), not modelled.
+- **Export snapshot expiry (N126), page refresh policy, Reflect, quotas, config inheritance, JWT/authz, Kafka
+  beyond per-partition order**: no interleaving worth a model.
 
 ### 7.6 CI integration
 
 - **Nightly `formal-tlc`** (`.github/workflows/formal-nightly.yml`): pins `tla2tools.jar` by SHA-256, runs every
-  `*.cfg` under `formal/tla/` with `-workers auto` and a 30-minute cap per configuration. A design
-  configuration must end with "No error has been found"; a must-fail configuration must end with
-  "Invariant ... is violated" on the invariant named in its first comment line (a different invariant, a parse
-  error or no violation fails the job); `Derivation_RestoreNoLock.cfg`, `ShardMove_ZeroMargin.cfg`, `ShardMove_NoTimelineCheck.cfg` and
-  `ShardMove_UnfencedSteps.cfg` are experiments whose expected outcome is a pass; `formal/tla/EXPECT` lists the
-  expected outcome of every configuration. A **timeout is neither a
-  failure nor a pass**: it is reported INCOMPLETE with the states and depth reached and shown in its own colour.
-  Measured: every design configuration below finishes in under 20 minutes on 4 cores (the longest is
-  `Derivation_Page.cfg`); a bound bump that pushes one over 30 minutes is a spec change reviewed as such.
-- **PR job `formal-quick`**: parses every spec with SANY and runs every must-fail configuration and every
-  design configuration that finishes in under two minutes; the longer ones (`Derivation_Page.cfg`,
-  `Durability.cfg`, `ShardMove.cfg`, `Storage.cfg`, `Consolidation.cfg` and the two long ShardMove
-  experiments) run nightly and on PRs that touch their spec or its mapped Go files.
-- **Lean**: `formal/lean/` is a Lake project; the PR job runs `lake build` and `scripts/sorry-count.sh`, which fails if
-  the `sorry` count exceeds the baseline `formal/lean/SORRY_BASELINE` (currently 3).
-- **Spec and test coupling**: `formal/MANIFEST.md` maps each `.tla` and `.lean` file to its Go test files (the
-  table in 7.4); `scripts/formal-manifest-check.sh` fails a PR that changes a spec without a change in at least one
-  mapped test file, unless it carries the `formal-no-test-change` label with a justification.
-- **Trace validation** runs on the Postgres and chaos tests' traces in the integration job
-  (`-workers 1`, seconds each). The converter and the harnesses are Track F work (section 10).
+  `*.cfg` under `formal/tla/` with `-workers auto` and a 30-minute cap per configuration. A design configuration
+  must end with "No error has been found"; a must-fail configuration must end with "Invariant ... is violated" on
+  the invariant named in its first comment line (or, for a liveness property, "Temporal properties were
+  violated"); anything else fails the job. `formal/tla/EXPECT` lists the expected outcome of every configuration;
+  the experiments `ShardMove_ZeroMargin` and `_NoTimelineCheck` are expected to pass. A **timeout is
+  neither a failure nor a pass**: it is reported INCOMPLETE with the states and depth reached. A bound bump that
+  pushes a design configuration over 30 minutes is a spec change reviewed as such.
+- **PR job `formal-quick`**: parses every spec with SANY and runs every must-fail configuration and every design
+  configuration that finishes in under two minutes; the longer ones (`Derivation.cfg`, `Durability.cfg`,
+  `Durability_Chain.cfg`, `ShardMove.cfg`, `Storage.cfg`, `Consolidation.cfg`) run nightly and on PRs that touch their
+  spec or its mapped Go files.
+- **Lean**: `formal/lean/` is a Lake project (`lakefile.lean`, `lean-toolchain`); the PR job runs `lake build` and
+  `scripts/sorry-count.sh`, which fails if the `sorry` count exceeds `formal/lean/SORRY_BASELINE` (3).
+- **Spec and test coupling**: `formal/MANIFEST.md` maps each `.tla` and `.lean` file to its Go test files (7.4);
+  `scripts/formal-manifest-check.sh` fails a PR that changes a spec without a change in at least one mapped test file,
+  unless it carries the `formal-no-test-change` label with a justification.
+- **Trace validation** runs on the Postgres and chaos tests' traces in the integration job (`-workers 1`).
 
-All results of this section, as run (4 workers, 10 GB heap; times are TLC's own wall-clock):
+All results of this section, as run (4 workers, 10 GB heap; `time` is TLC's own wall-clock; for a violation,
+`generated` and `distinct` are the work done before the counterexample and `depth` is its length):
 
 | config | expected | result | generated | distinct | depth | time |
 |---|---|---|---|---|---|---|
-| `Outbox.cfg` | all hold | PASS | 17,243,719 | 5,557,863 | 39 | 01min 35s |
-| `Outbox_Live.cfg` | all hold | PASS | 1,342,866 | 486,937 | 31 | 38s |
-| `Outbox_NoWatch.cfg` | violates `NoLossSafety` | FAIL as intended: NoLossSafety | 5,526 | 3,721 | 7 | 00s |
-| `Outbox_Watch1x.cfg` | violates `NoLossSafety` | FAIL as intended: NoLossSafety | 233,325 | 113,111 | 9 | 01s |
-| `Consolidation.cfg` | all hold | PASS | 10,864,684 | 2,426,544 | 18 | 56s |
+| `Outbox.cfg` | all hold | PASS | 17,243,719 | 5,557,863 | 39 | 01min 18s |
+| `Outbox_Live.cfg` | all hold | PASS | 1,342,866 | 486,937 | 31 | 32s |
+| `Outbox_NoWatch.cfg` | violates `NoLossSafety` | FAIL: NoLossSafety (as intended) | 9,199 | 5,945 | 7 | 00s |
+| `Outbox_Watch1x.cfg` | violates `NoLossSafety` | FAIL: NoLossSafety (as intended) | 195,431 | 97,616 | 9 | 01s |
+| `Consolidation.cfg` | all hold | PASS | 10,864,684 | 2,426,544 | 18 | 47s |
 | `Consolidation_Live.cfg` | all hold | PASS | 65,555 | 20,404 | 12 | 02s |
-| `Consolidation_VolatileProposal.cfg` | violates `ExactlyOnceEffect` | FAIL as intended: ExactlyOnceEffect | 8,238 | 4,351 | 6 | 01s |
-| `Consolidation_NonAtomicKey.cfg` | violates `ExactlyOnceEffect` | FAIL as intended: ExactlyOnceEffect | 523 | 424 | 5 | 00s |
-| `Storage.cfg` | all hold | PASS | 12,872,199 | 1,478,807 | 36 | 06min 40s |
-| `Storage_Update.cfg` | violates `ContentImmutable` | FAIL as intended: ContentImmutable | 16 | 16 | 3 | 00s |
-| `Storage_FlipEarly.cfg` | violates `VectorGenerationConsistent` | FAIL as intended: VectorGenerationConsistent | 36 | 30 | 3 | 00s |
-| `Storage_PurgeUnmarked.cfg` | violates `PurgeNeedsMarker` | FAIL as intended: PurgeNeedsMarker | 23 | 21 | 3 | 00s |
-| `Derivation.cfg` | all hold | PASS | 7,659,307 | 2,133,161 | 29 | 01min 35s |
-| `Derivation_Page.cfg` | all hold | PASS | 81,273,512 | 22,215,959 | 28 | 16min 53s |
-| `Derivation_Live.cfg` | all hold | PASS | 314,063 | 87,830 | 24 | 11s |
-| `Derivation_RestoreNoLock.cfg` | all hold | PASS | 8,115,973 | 2,159,112 | 29 | 01min 34s |
-| `Derivation_NoLock.cfg` | violates `NoDeletedDerivationServed` | FAIL as intended: NoDeletedDerivationServed | 2,595 | 1,125 | 9 | 01s |
-| `Derivation_MatInvalid.cfg` | violates `RestoreExact` | FAIL as intended: RestoreExact | 9,669 | 3,905 | 11 | 01s |
-| `Derivation_EffCited.cfg` | violates `AsOfNoLeak` | FAIL as intended: AsOfNoLeak | 904 | 449 | 6 | 00s |
-| `Derivation_TombByDocId.cfg` | violates `NoOverHiding` | FAIL as intended: NoOverHiding | 106 | 74 | 4 | 00s |
-| `Durability.cfg` | all hold | PASS | 117,776,042 | 26,113,068 | 25 | 04min 26s |
-| `Durability_AckBeforeIntent.cfg` | violates `AckImpliesIntent` | FAIL as intended: AckImpliesIntent | 410 | 308 | 4 | 00s |
-| `Durability_ReopenEarly.cfg` | violates `AckedDeleteSurvives` | FAIL as intended: AckedDeleteSurvives | 37,706 | 14,919 | 9 | 01s |
-| `Durability_UnorderedReplay.cfg` | violates `IntentOrderLastWins` | FAIL as intended: IntentOrderLastWins | 3,750,201 | 1,131,357 | 14 | 11s |
-| `Durability_NarrowWindow.cfg` | violates `AckedDeleteSurvives` | FAIL as intended: AckedDeleteSurvives | 167,915 | 59,829 | 11 | 02s |
-| `Durability_RetargetRestore.cfg` | violates `AckedDeleteSurvives` | FAIL as intended: AckedDeleteSurvives | 663,981 | 225,321 | 11 | 04s |
-| `ShardMove.cfg` | all hold | PASS | 88,022,416 | 16,472,880 | 28 | 03min 57s |
-| `ShardMove_Live.cfg` | all hold | PASS | 2,760,289 | 578,804 | 25 | 31s |
-| `ShardMove_ZeroMargin.cfg` | all hold | PASS | 2,780,467 | 582,960 | 25 | 30s |
-| `ShardMove_UnfencedSteps.cfg` | all hold | PASS | 142,521,064 | 21,636,679 | 28 | 05min 49s |
-| `ShardMove_NoTimelineCheck.cfg` | all hold | PASS | 90,507,928 | 16,472,880 | 28 | 03min 55s |
-| `ShardMove_NoReady.cfg` | violates `RollbackPossibleBeforeC` | FAIL as intended: RollbackPossibleBeforeC | 29,389 | 8,505 | 9 | 01s |
-| `ShardMove_RestoreNoReconcile.cfg` | violates `RestoreReconciles` | FAIL as intended: RestoreReconciles | 26,869 | 7,923 | 8 | 01s |
-| `ShardMove_NoVerify.cfg` | violates `NoLossNoDup` | FAIL as intended: NoLossNoDup | 587,653 | 159,846 | 10 | 03s |
+| `Consolidation_VolatileProposal.cfg` | violates `ExactlyOnceEffect` | FAIL: ExactlyOnceEffect (as intended) | 7,594 | 3,978 | 6 | 01s |
+| `Consolidation_NonAtomicKey.cfg` | violates `ExactlyOnceEffect` | FAIL: ExactlyOnceEffect (as intended) | 1,136 | 719 | 5 | 00s |
+| `Storage.cfg` | all hold | PASS | 9,687,211 | 1,211,703 | 33 | 05min 22s |
+| `Storage_Update.cfg` | violates `ContentImmutable` | FAIL: ContentImmutable (as intended) | 12 | 12 | 3 | 00s |
+| `Storage_FlipEarly.cfg` | violates `VectorGenerationConsistent` | FAIL: VectorGenerationConsistent (as intended) | 44 | 37 | 3 | 00s |
+| `Storage_PurgeUnmarked.cfg` | violates `PurgeNeedsMarker` | FAIL: PurgeNeedsMarker (as intended) | 18 | 18 | 3 | 00s |
+| `Storage_AutoRepair.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 1,080 | 492 | 7 | 00s |
+| `Derivation.cfg` | all hold | PASS | 59,706,072 | 10,887,594 | 36 | 06min 00s |
+| `Derivation_Page.cfg` | all hold | PASS | 14,364,460 | 2,900,212 | 34 | 01min 41s |
+| `Derivation_Live.cfg` | all hold | PASS | 151,274 | 52,805 | 31 | 06s |
+| `Derivation_NoLock.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 4,780 | 1,525 | 12 | 01s |
+| `Derivation_CascadeEvidence.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 6,826 | 2,675 | 9 | 01s |
+| `Derivation_PageNoVerify.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 40,841 | 11,067 | 13 | 02s |
+| `Derivation_StaleProposal.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 60,556 | 16,259 | 16 | 01s |
+| `Derivation_ReextractHides.cfg` | violates `ReextractKeepsDerivedVisible` | FAIL: ReextractKeepsDerivedVisible (as intended) | 885 | 343 | 7 | 00s |
+| `Derivation_RestoreNoLock.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 800 | 261 | 11 | 00s |
+| `Derivation_MatOnce.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 737 | 246 | 11 | 00s |
+| `Derivation_PurgeDropsStub.cfg` | violates `FailClosed` | FAIL: FailClosed (as intended) | 9,013 | 2,657 | 13 | 01s |
+| `Derivation_EffCited.cfg` | violates `AsOfNoLeak` | FAIL: AsOfNoLeak (as intended) | 135 | 47 | 7 | 00s |
+| `Derivation_TombByDocId.cfg` | violates `NoOverHiding` | FAIL: NoOverHiding (as intended) | 69 | 46 | 4 | 00s |
+| `Durability.cfg` | all hold | PASS | 148,847,658 | 32,742,996 | 25 | 04min 56s |
+| `Durability_Chain.cfg` | all hold | PASS | 28,312,605 | 10,352,781 | 25 | 01min 24s |
+| `Durability_IntentBeforeCommit.cfg` | violates `NoUnackedEffectOnLaterAck` | FAIL: NoUnackedEffectOnLaterAck (as intended) | 877 | 467 | 6 | 00s |
+| `Durability_RaiseOnReopen.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 4,444,259 | 1,175,159 | 13 | 08s |
+| `Durability_RetargetRestore.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 280,846 | 99,618 | 12 | 01s |
+| `Durability_DupNoReput.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 36,424 | 15,883 | 10 | 01s |
+| `Durability_AckNoRecheck.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 13,140 | 5,751 | 10 | 00s |
+| `Durability_ReopenEarly.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 18,776 | 8,211 | 9 | 00s |
+| `Durability_NarrowWindow.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 66,162 | 27,251 | 9 | 01s |
+| `Durability_AckBeforeIntent.cfg` | violates `AckImpliesIntent` | FAIL: AckImpliesIntent (as intended) | 346 | 213 | 4 | 00s |
+| `Durability_ClockOrder.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 1,274,796 | 519,169 | 14 | 04s |
+| `Durability_UnorderedReplay.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 255,857 | 100,249 | 14 | 02s |
+| `Durability_NoEpochGuard.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 12,495,475 | 4,612,704 | 18 | 27s |
+| `ShardMove.cfg` | all hold | PASS | 126,216,549 | 23,255,160 | 30 | 05min 39s |
+| `ShardMove_Live.cfg` | all hold | PASS | 7,653,478 | 1,355,212 | 26 | 01min 48s |
+| `ShardMove_ActiveWriters.cfg` | all hold | PASS | 1,549,719 | 255,952 | 24 | 20s |
+| `ShardMove_ZeroMargin.cfg` | all hold | PASS | 7,140,428 | 1,275,040 | 26 | 01min 21s |
+| `ShardMove_UnfencedSteps.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 3,516,336 | 751,626 | 12 | 10s |
+| `ShardMove_NoTimelineCheck.cfg` | all hold | PASS | 128,404,582 | 23,255,160 | 30 | 05min 40s |
+| `ShardMove_NoReady.cfg` | violates `RollbackPossibleBeforeC` | FAIL: RollbackPossibleBeforeC (as intended) | 667,880 | 174,096 | 10 | 03s |
+| `ShardMove_RestoreNoReconcile.cfg` | violates `RestoreReconciles` | FAIL: RestoreReconciles (as intended) | 173,887 | 47,688 | 9 | 01s |
+| `ShardMove_NoVerify.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 8,121,260 | 1,963,744 | 12 | 20s |
+| `ShardMove_StampAfterCut.cfg` | violates `OneOwner` | FAIL: OneOwner (as intended) | 954,961 | 246,474 | 10 | 04s |
+| `ShardMove_IdKeyedRecopy.cfg` | violates `MoveTerminatesActive` | FAIL: temporal property (as intended) | 147,092 | 35,602 | 11 | 03s |
+| `ShardMove_MergeNoDeletes.cfg` | violates `MoveTerminatesActive` | FAIL: temporal property (as intended) | 1,590,935 | 265,158 | 19 | 18s |
+| `ShardMove_SweepNotPaused.cfg` | violates `MoveTerminatesActive` | FAIL: temporal property (as intended) | 2,796,561 | 418,928 | 19 | 28s |
+| `ShardMove_CleanupNoBackup.cfg` | violates `CleanupSafe` | FAIL: CleanupSafe (as intended) | 154,998 | 38,161 | 15 | 01s |

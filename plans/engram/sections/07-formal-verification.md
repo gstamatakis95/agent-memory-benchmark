@@ -1,9 +1,8 @@
 ## 7. Formal verification
 
 Scope: the six TLA+ specifications under `formal/tla/` and the four Lean 4 modules under `formal/lean/Engram/`;
-what TLC reported on them after the round-6 amendment (D25: N160 to N163, N166(6) and N168, which rewrite
-`ShardMove.tla` for freeze-then-copy, add the twin rule to `Derivation.tla` and the rebuild and vacuum phases to
-`Storage.tla`; N161 and N163 also leave assumption lines in 7.1); how the Go code is kept faithful to them; what is not formalised; how it is wired into CI. Every number below is copied from a log in `formal/tla/results/` (summary
+what TLC reported on them after the round-6 amendment (D25: N160 to N163, N166(6), N168; `ShardMove.tla` is rewritten
+for freeze-then-copy; N161 and N163 also leave assumption lines in 7.1); how the Go code is kept faithful to them; what is not formalised; how it is wired into CI. Every number below is copied from a log in `formal/tla/results/` (summary
 in `RESULTS.md`, which also holds the full table).
 
 Tooling: TLC 2.18 (`de.hhu.stups:tlatools:1.1.0`), OpenJDK 21, 4 workers, 10 GB heap, 4 cores, 30-minute cap per
@@ -15,18 +14,19 @@ configuration. Lean 4 is not available in the planning environment; the Lean fil
 | Spec | Register | Question the model answers | Prose mechanisms this spec omits (C-21) |
 |---|---|---|---|
 | `Derivation.tla` | N113, N115 to N121, N133, N135, N136, N144, N145 | Can a deleted, invalidated or superseded fact reach a reader through a fact, an observation version or a page version, at any `as_of`, with the markers as the only synchronous write, and is nothing else hidden? Does a retried commit leave `current_version` naming a version that exists, does an acknowledged invalidation outlive the purge of its fact, is the owed Materialize found from the markers rather than from a signal, and does `Restore` undo exactly the set an invalidation (and its lazy twins) wrote? | LLM text (a version's text is its evidence set plus its base's); `proof_count` and retirement; the marker-set size alerts; `stale_write`/`stale_delete` flags; the pacing of Materialize and Purge; one fact per chunk; the consolidation scheduler; the attempt-unique markdown blob key and its `NOT EXISTS` deletion rule (N144) and the export `hidden_overlay` (N145(4)) are tested, not modelled |
-| `ShardMove.tla` | D5, N123 to N125, N137, N160 to N163 | Freeze, copy of a static source, verify by equality, one index bit, the catalog CAS as point of no return and the replicated-LSN gate on (c), cleanup, restore and failover of either shard during and after a move, a promoted or restored catalog, a target restored to before its activation (re-run) or after it, deletes on the active target, a second move: one owner, no loss, no duplicate, no resurrected delete, a started move completes. | One namespace; blob pre-warm and copy and `return_abort`; the window estimate, the parallel copy streams and their key ranges; which indexes are requested (the bit, A3); reads at `frozen/move`; drain of workflows; the relay's cursor wait; the 24 h timer (cleanup is an action); the timeline check is a guard, not a model of a zombie primary; PITR to before a move-in (C-22) |
+| `ShardMove.tla` | D5, N123 to N125, N137, N160 to N163 | Freeze, copy of a static source, verify by equality, the index bit, the catalog CAS and the replicated-LSN gate on (c), cleanup, restore and failover of either shard during and after a move, a promoted or restored catalog, a target restored to before its activation (re-run) or after it, deletes on the active target, a second move: one owner, no loss, no duplicate, no resurrected delete, a started move completes. | One namespace; blob pre-warm and copy, `return_abort`; the window estimate and the copy's parallel streams and key ranges; which indexes are requested (A3); reads at `frozen/move`; drain of workflows; the relay's cursor wait; the 24 h timer (cleanup is an action); the timeline check is a guard, not a zombie primary; PITR to before a move-in (C-22) |
 | `Durability.tla` | N122, N134, N146, N150 | Is every acknowledged delete or invalidation still in force when reads reopen after a restore or failover (also after the catalog was restored), and is no unacknowledged effect applied over a later acknowledged write, with overlapping requests on one fact? | Tenant and namespace intents (one subject kind per config); the catalog `deleting` edge; the 35-day retention; intent content is a set of versions, not `up_to_version` arithmetic |
 | `Storage.tla` | N111 to N113, N138, N152, N166(6) | Content rows never change after insert, a model flip never exposes a row without a vector, dead index entries leave only through a rebuild and the hygiene unit is the partition (a vacuum waits until every touched graph on it is rebuilt; a rebuild is snapshot-then-publish and a vacuum start-then-collect, and purges skip the partition from the selection of the rebuild set until the vacuum has started), the index converges. | HNSW internals and recall; the index runner's lease; a partition is a set of per-namespace graphs |
 | `Outbox.tla` | D6, N80 | No committed event is lost through sequence gaps; per-namespace order; the 2 x timeout watch horizon. | Kafka, consumer lag, batching |
 | `Consolidation.tla` | N43, N121 | A round's decisions are applied exactly once under at-least-once activities and crashes. | The persisted-proposal `attempt` key and the all-skip stamp (C-11) are tested, not modelled; `Derivation.tla` carries the base check |
 
 Each spec has *design* configurations (every knob at the register's value) that must end with "No error has been
-found", and *must-fail* configurations in which one knob is set to the plausible simplification or to the round-4
-reviewer's variant; each must end with exactly the invariant named in its first comment line violated, and lists
-only that invariant. A design that passes only because the simplification was never tried is not evidence, so the
-must-fail configurations are part of the deliverable and run in CI (N141). Bounds were shrunk until every design
-configuration finished in under 30 minutes (the longest, `Durability.cfg` (about 26 minutes), `Storage.cfg` (22), `Durability_Chain.cfg` (14) and `ShardMove.cfg` (10); all others take under 10 minutes; D24 raised the state counts of the two `Durability` design configurations by factors of four and six, and the bounds that were reduced elsewhere to stay under the cap are listed in 7.2.6).
+found", and *must-fail* configurations in which one knob is set to the plausible simplification or to a reviewer's
+variant; each must end with exactly the invariant named in its first comment line violated, and lists only that
+invariant. A design that passes only because the simplification was never tried is not evidence, so the must-fail
+configurations are part of the deliverable and run in CI (N141). Bounds were shrunk until every design configuration
+finished in under 30 minutes (the longest: `Durability.cfg` 27.5 minutes, `Durability_Chain.cfg` 13, `ShardMove.cfg` 7; all
+others under 7; the reductions are listed in 7.2.6).
 
 **Assumptions of the D25 models** (what the specs take as given; each is a sentence a reader can falsify):
 
@@ -198,27 +198,25 @@ Must-fail, kept: `_UnfencedSteps`, `_NoReady`, `_RestoreNoReconcile`, `_NoVerify
 
 *What the model showed.*
 
-1. **Freeze-then-copy removes the dirty-copy failures, not the restore ones.** The seven D24 configurations that showed a
-   re-copy key, a merge, a verify order, a margin, a timeline gate or the sequence ring failing are gone with their
-   machinery; the move completes (`MoveTerminates`, `FrozenBounded`). What remains is what a restored shard does to a
-   committed move.
+1. **Freeze-then-copy removes the dirty-copy failures, not the restore ones.** The seven D24 configurations about a
+   re-copy key, a merge, a verify order, a margin, a timeline gate or the sequence ring are gone with their machinery;
+   the move completes (`MoveTerminates`, `FrozenBounded`). What remains is what a restored shard does to a committed move.
 2. **The catalog CAS before (c) and the row-state guard on every mover step stay load-bearing** (`_StampAfterCut`,
    `_UnfencedSteps`, `_RestoreNoReconcile`). `_StampAfterCut` fails only with `ShardTruth = FALSE`; with the re-derivation
    of `cm` from the shards the stamp order is repaired too.
 3. **(c) is the one step that needs the commit to have survived** (`_CutOnUnreplicatedCommit`). After (c) the only
    evidence of the move may be the source's `moved_out` row; a source restored to before (c) with a catalog that lost the
-   commit rolls back and wipes the target's complete copy. With the gate a lost commit is one no shard has acted on. The
-   accounting is explicit: rows lost by a source restore are an RPO loss unless the commit was replicated or (c) has
-   run, and a catalog *restore* withdraws that promise (`rep := FALSE`): it restores from backup, not from the standby.
+   commit rolls back and wipes the target's complete copy. With the gate a lost commit is one no shard has acted on.
+   Accounting: rows a source restore loses are an RPO loss unless the commit was replicated or (c) has run; a catalog
+   *restore* withdraws that promise (`rep := FALSE`), since it restores from backup, not from the standby.
 4. **A catalog restore must be repaired from the shards before any shard fault** (`_CatalogLossNoShardTruth`): after (c)
    the reconcile finds `committed` in the source's `moved_out` or the target's `active` row; without it the shard
    reconcile trusts `open` and rolls back a cut move.
 5. **N161(2) is short by two cases.** A target whose restored row is not `active` at the move's epoch needs the re-run:
    `incoming`, `ready`, and also `none`, a restore point that predates `Plan` (a small namespace moves within the 60 s
-   archive window); without that case the reconcile activates an empty target (`ServedFromIndex`, and the rows are
-   gone). The re-run may also find the source still `frozen` (the target was restored between (a'') and (c)): the
-   mover's (c) needs a `ready` target and would wait forever (`MoveTerminates` fails if `Rerun` demands a `moved_out`
-   source), so `Rerun` takes (c) itself.
+   archive window); without it the reconcile activates an empty target. The re-run may also find the source still
+   `frozen` (the target was restored between (a'') and (c)); the mover's (c) needs a `ready` target and would wait
+   forever (`MoveTerminates` fails if `Rerun` demands a `moved_out` source), so `Rerun` takes (c) itself.
 6. **Nothing is merged** (`_UnionRepair`, `_RerunMerges`): a target that has served writes has legitimately deleted
    rows. Wipe, copy and replay of the acknowledged deletes is exact.
 7. **The cleanup gate is "a full backup that started after activation", nothing more** (`_CleanupNoBackup`,
@@ -319,14 +317,12 @@ vectors; the index follows the vector table. New in D23 (N138): the purge counts
 liveness `IndexConvergence`. Must-fail: `Storage_Update`, `_FlipEarly`, `_PurgeUnmarked`, and `_AutoRepair`
 (`RebuildBeforeRepair`).
 
-New in D24 (N152): the hygiene unit is the **partition**. A partition holds the graphs of several namespaces (`Ns`,
-here one with threshold 1 and one with threshold 2), each with its own purge counter and threshold; `Rebuild(n)` also
-rebuilds every touched graph once one is due, and `Vacuum` of the partition, which reads every graph, runs only when
-each touched graph is rebuilt (`Vacuum(p)` requires `\A i \in idx[p] : dead[i] = 0 \/ rebuilt[i]`). `Storage.cfg` passes with two namespaces
-on the partition (1.65 M distinct states; 22 minutes, mostly the `IndexConvergence` liveness check). `Storage_PerIndexHygiene` rebuilds only the due
-graph and vacuums afterwards, which repairs the other graph's dead entries in place (`RebuildBeforeRepair`, twelve
-steps). `IndexConvergence` now says that every due graph is rebuilt and the current generation's vectors are
-indexed; a graph below its threshold may keep a few dead entries (`DeadCounted` bounds them per namespace).
+D24 (N152): the hygiene unit is the **partition**. A partition holds the graphs of several namespaces (`Ns`, here one
+with threshold 1 and one with threshold 2), each with its own purge counter; the hygiene rebuilds every touched graph
+once one is due, and the partition `Vacuum`, which reads every graph, runs only when each touched graph is rebuilt.
+`Storage_PerIndexHygiene` rebuilds only the due graph and vacuums afterwards, which repairs the other graph's dead
+entries in place (`RebuildBeforeRepair`, fifteen states). `IndexConvergence`: every due graph is rebuilt and the
+current generation's vectors are indexed; a graph below its threshold may keep a few dead entries (`DeadCounted`).
 
 New in D25 (N166(6), P-8): a rebuild and a vacuum are not atomic. `RebuildStart(n)` takes the live vectors of the
 graph and `RebuildPublish(n)` replaces the graph by exactly that snapshot and resets `pc[n]`, so a row purged in
@@ -335,7 +331,8 @@ moment and `VacuumCollect` removes exactly those (a repair, if there were any). 
 `lk` from the selection of the rebuild set until `VacuumStart`, and purge batches (`Purge`, `ExpungeOld`) skip the
 partition while it is held. `Storage_PurgeDuringRebuildSet` (purges ignore the key) fails `RebuildBeforeRepair` in
 thirteen states (`RebuildStart`, `Purge`, `RebuildPublish`, `VacuumStart`, `VacuumCollect`): in the design the key makes
-the dead set empty at `VacuumStart`, and a purge after it is counted by `pc` and waits for the next round.
+the dead set empty at `VacuumStart`, and a purge after it is counted by `pc` and waits for the next round. `Storage.cfg`
+(2 generations, 139 k distinct states, 47 s) and `Storage_Gens.cfg` (3 generations, 55 k) pass.
 
 #### 7.2.5 `Outbox.tla` and `Consolidation.tla`
 
@@ -371,7 +368,7 @@ state) is below the model's abstraction and is covered by `TestConsolidation_*` 
    depth 22 with the queue still growing and was stopped), and the third generation is covered by `Storage_Gens.cfg`
    with one row in each namespace. `ShardMove.cfg` needed no reduction (7 min 18 s: with a static source a move has
    far fewer interleavings than the D24 dirty copy), `_Twice` keeps one row, and `Durability.cfg` keeps its D23
-   bounds (about 26 minutes, the closest to the cap).
+   bounds (27.5 minutes, the closest to the cap).
 
 ### 7.3 Lean 4 theorems
 
@@ -463,8 +460,9 @@ behaviour is a behaviour of the spec and that every invariant held along it. M0.
   neither a failure nor a pass**: it is reported INCOMPLETE with the states and depth reached. A bound bump that
   pushes a design configuration over 30 minutes is a spec change reviewed as such.
 - **PR job `formal-quick`**: parses every spec with SANY and runs every must-fail configuration and every design
-  configuration that finishes in under two minutes; the longer ones (`Derivation.cfg`, `Derivation_Retire.cfg`, `Derivation_Page.cfg`, `Durability.cfg`, `Durability_Chain.cfg`, `ShardMove.cfg`, `ShardMove_Live.cfg`, `ShardMove_TgtRestore.cfg`, `Storage.cfg`, `Consolidation.cfg`) run nightly and on PRs that touch their
-  spec or its mapped Go files.
+  configuration that finishes in under two minutes; the others (`Derivation.cfg`, `_Retire`, `_Page`, `Durability.cfg`,
+  `Durability_Chain.cfg`, `ShardMove.cfg`, `ShardMove_Live.cfg`) run nightly and on PRs that touch their spec or its
+  mapped Go files.
 - **Lean**: `formal/lean/` is a Lake project (`lakefile.lean`, `lean-toolchain`); the PR job runs `lake build` and
   `scripts/sorry-count.sh`, which fails if the `sorry` count exceeds `formal/lean/SORRY_BASELINE` (3).
 - **Spec and test coupling**: `formal/MANIFEST.md` maps each `.tla` and `.lean` file to its Go test files (7.4);
@@ -472,77 +470,80 @@ behaviour is a behaviour of the spec and that every invariant held along it. M0.
   unless it carries the `formal-no-test-change` label with a justification.
 - **Trace validation** runs on the Postgres and chaos tests' traces in the integration job (`-workers 1`).
 
-All results of this section, as run after the D24 amendment (4 workers, 10 GB heap, one configuration at a time; `time` is TLC's own wall-clock; for a violation,
+All results of this section, as run after the D25 amendment (4 workers, 10 GB heap, one configuration at a time; `time` is TLC's own wall-clock; for a violation,
 `generated` and `distinct` are the work done before the counterexample and `depth` is its length):
 
 | config | expected | result | generated | distinct | depth | time |
 |---|---|---|---|---|---|---|
-| `Outbox.cfg` | all hold | PASS | 17,243,719 | 5,557,863 | 39 | 01min 34s |
-| `Outbox_Live.cfg` | all hold | PASS | 1,342,866 | 486,937 | 31 | 39s |
+| `Outbox.cfg` | all hold | PASS | 17,243,719 | 5,557,863 | 39 | 01min 40s |
+| `Outbox_Live.cfg` | all hold | PASS | 1,342,866 | 486,937 | 31 | 41s |
 | `Outbox_NoWatch.cfg` | violates `NoLossSafety` | FAIL: NoLossSafety (as intended) | 9,574 | 6,046 | 7 | 00s |
 | `Outbox_Watch1x.cfg` | violates `NoLossSafety` | FAIL: NoLossSafety (as intended) | 196,197 | 100,073 | 9 | 01s |
-| `Consolidation.cfg` | all hold | PASS | 10,864,684 | 2,426,544 | 18 | 57s |
-| `Consolidation_Live.cfg` | all hold | PASS | 65,555 | 20,404 | 12 | 03s |
+| `Consolidation.cfg` | all hold | PASS | 10,864,684 | 2,426,544 | 18 | 59s |
+| `Consolidation_Live.cfg` | all hold | PASS | 65,555 | 20,404 | 12 | 02s |
 | `Consolidation_VolatileProposal.cfg` | violates `ExactlyOnceEffect` | FAIL: ExactlyOnceEffect (as intended) | 7,535 | 3,970 | 6 | 01s |
 | `Consolidation_NonAtomicKey.cfg` | violates `ExactlyOnceEffect` | FAIL: ExactlyOnceEffect (as intended) | 415 | 344 | 5 | 00s |
-| `Storage.cfg` | all hold | PASS | 15,167,809 | 1,651,471 | 33 | 22min 07s |
-| `Storage_Update.cfg` | violates `ContentImmutable` | FAIL: ContentImmutable (as intended) | 12 | 12 | 4 | 00s |
-| `Storage_FlipEarly.cfg` | violates `VectorGenerationConsistent` | FAIL: VectorGenerationConsistent (as intended) | 39 | 33 | 4 | 00s |
-| `Storage_PurgeUnmarked.cfg` | violates `PurgeNeedsMarker` | FAIL: PurgeNeedsMarker (as intended) | 23 | 21 | 4 | 00s |
-| `Storage_AutoRepair.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 1,323 | 563 | 7 | 00s |
-| `Storage_PerIndexHygiene.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 76,288 | 17,097 | 13 | 01s |
-| `Derivation.cfg` | all hold | PASS | 18,252,454 | 3,077,073 | 34 | 02min 18s |
-| `Derivation_Page.cfg` | all hold | PASS | 41,597,641 | 7,251,558 | 34 | 06min 12s |
-| `Derivation_Retire.cfg` | all hold | PASS | 17,365,950 | 2,845,427 | 30 | 01min 57s |
-| `Derivation_Live.cfg` | all hold | PASS | 390,901 | 117,292 | 31 | 16s |
-| `Derivation_NoLock.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 4,539 | 1,494 | 12 | 01s |
-| `Derivation_CascadeEvidence.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 5,171 | 2,080 | 9 | 01s |
-| `Derivation_PageNoVerify.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 48,214 | 13,056 | 14 | 02s |
-| `Derivation_StaleProposal.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 94,314 | 25,556 | 18 | 02s |
-| `Derivation_ReextractHides.cfg` | violates `ReextractKeepsDerivedVisible` | FAIL: ReextractKeepsDerivedVisible (as intended) | 401 | 187 | 7 | 00s |
-| `Derivation_RestoreNoLock.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,190 | 364 | 12 | 00s |
-| `Derivation_MatOnce.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,169 | 364 | 13 | 00s |
-| `Derivation_PurgeDropsStub.cfg` | violates `FailClosed` | FAIL: FailClosed (as intended) | 8,417 | 2,590 | 13 | 01s |
-| `Derivation_EffCited.cfg` | violates `AsOfNoLeak` | FAIL: AsOfNoLeak (as intended) | 135 | 47 | 9 | 00s |
-| `Derivation_TombByDocId.cfg` | violates `NoOverHiding` | FAIL: NoOverHiding (as intended) | 83 | 51 | 6 | 00s |
-| `Derivation_CasBeforeIdem.cfg` | violates `NoPhantomVersion` | FAIL: NoPhantomVersion (as intended) | 76 | 45 | 8 | 00s |
-| `Derivation_CascadeHidden.cfg` | violates `NoGhostInvalidatedServed` | FAIL: NoGhostInvalidatedServed (as intended) | 1,700 | 604 | 9 | 00s |
-| `Derivation_MatSignalOnly.cfg` | violates `MaterializeComplete` | FAIL: MaterializeComplete (as intended) | 974 | 361 | 9 | 00s |
-| `Durability.cfg` | all hold | PASS | 555,786,086 | 138,507,972 | 27 | 25min 37s |
-| `Durability_Chain.cfg` | all hold | PASS | 237,637,520 | 63,006,042 | 28 | 13min 57s |
+| `Storage.cfg` | all hold | PASS | 673,635 | 139,225 | 30 | 47s |
+| `Storage_Gens.cfg` | all hold | PASS | 270,826 | 54,596 | 35 | 15s |
+| `Storage_Update.cfg` | violates `ContentImmutable` | FAIL: ContentImmutable (as intended) | 12 | 12 | 3 | 00s |
+| `Storage_FlipEarly.cfg` | violates `VectorGenerationConsistent` | FAIL: VectorGenerationConsistent (as intended) | 39 | 33 | 3 | 00s |
+| `Storage_PurgeUnmarked.cfg` | violates `PurgeNeedsMarker` | FAIL: PurgeNeedsMarker (as intended) | 23 | 21 | 3 | 00s |
+| `Storage_AutoRepair.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 2,835 | 1,045 | 7 | 00s |
+| `Storage_PerIndexHygiene.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 136,244 | 32,732 | 15 | 01s |
+| `Storage_PurgeDuringRebuildSet.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 85,592 | 20,307 | 13 | 01s |
+| `Derivation.cfg` | all hold | PASS | 23,840,070 | 4,094,217 | 34 | 03min 49s |
+| `Derivation_Page.cfg` | all hold | PASS | 41,597,641 | 7,251,558 | 34 | 06min 39s |
+| `Derivation_Retire.cfg` | all hold | PASS | 22,613,082 | 3,773,679 | 30 | 02min 45s |
+| `Derivation_Live.cfg` | all hold | PASS | 390,901 | 117,292 | 31 | 17s |
+| `Derivation_NoLock.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 4,531 | 1,489 | 12 | 01s |
+| `Derivation_CascadeEvidence.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 6,481 | 2,580 | 9 | 01s |
+| `Derivation_PageNoVerify.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 49,274 | 13,275 | 13 | 02s |
+| `Derivation_StaleProposal.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 84,133 | 23,152 | 16 | 03s |
+| `Derivation_ReextractHides.cfg` | violates `ReextractKeepsDerivedVisible` | FAIL: ReextractKeepsDerivedVisible (as intended) | 490 | 215 | 7 | 00s |
+| `Derivation_RestoreNoLock.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,296 | 415 | 11 | 00s |
+| `Derivation_MatOnce.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,264 | 409 | 11 | 00s |
+| `Derivation_PurgeDropsStub.cfg` | violates `FailClosed` | FAIL: FailClosed (as intended) | 9,163 | 2,797 | 14 | 01s |
+| `Derivation_EffCited.cfg` | violates `AsOfNoLeak` | FAIL: AsOfNoLeak (as intended) | 135 | 47 | 7 | 00s |
+| `Derivation_TombByDocId.cfg` | violates `NoOverHiding` | FAIL: NoOverHiding (as intended) | 58 | 39 | 4 | 00s |
+| `Derivation_CasBeforeIdem.cfg` | violates `NoPhantomVersion` | FAIL: NoPhantomVersion (as intended) | 82 | 50 | 8 | 00s |
+| `Derivation_CascadeHidden.cfg` | violates `NoGhostInvalidatedServed` | FAIL: NoGhostInvalidatedServed (as intended) | 2,610 | 823 | 9 | 01s |
+| `Derivation_MatSignalOnly.cfg` | violates `MaterializeComplete` | FAIL: MaterializeComplete (as intended) | 740 | 302 | 8 | 00s |
+| `Derivation_RestoreOnlySelf.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 501 | 252 | 6 | 00s |
+| `Derivation_RestoreByVisibleTwin.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 401 | 204 | 5 | 00s |
+| `Durability.cfg` | all hold | PASS | 555,786,086 | 138,507,972 | 27 | 27min 32s |
+| `Durability_Chain.cfg` | all hold | PASS | 237,637,520 | 63,006,042 | 28 | 13min 25s |
 | `Durability_IntentBeforeCommit.cfg` | violates `NoUnackedEffectOnLaterAck` | FAIL: NoUnackedEffectOnLaterAck (as intended) | 771 | 409 | 8 | 00s |
-| `Durability_RaiseOnReopen.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 7,166,940 | 2,185,262 | 16 | 15s |
-| `Durability_RetargetRestore.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 387,625 | 161,986 | 13 | 02s |
+| `Durability_RaiseOnReopen.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 7,166,940 | 2,185,262 | 13 | 15s |
+| `Durability_RetargetRestore.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 387,625 | 161,986 | 10 | 02s |
 | `Durability_DupNoReput.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 41,626 | 17,788 | 11 | 01s |
-| `Durability_AckNoRecheck.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 15,401 | 6,854 | 11 | 00s |
-| `Durability_ReopenEarly.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 15,988 | 6,780 | 11 | 00s |
+| `Durability_AckNoRecheck.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 15,401 | 6,854 | 8 | 00s |
+| `Durability_ReopenEarly.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 15,988 | 6,780 | 10 | 00s |
 | `Durability_NarrowWindow.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 71,542 | 29,544 | 11 | 01s |
-| `Durability_AckBeforeIntent.cfg` | violates `AckImpliesIntent` | FAIL: AckImpliesIntent (as intended) | 329 | 216 | 7 | 00s |
+| `Durability_AckBeforeIntent.cfg` | violates `AckImpliesIntent` | FAIL: AckImpliesIntent (as intended) | 329 | 216 | 4 | 00s |
 | `Durability_ClockOrder.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 1,109,362 | 453,238 | 16 | 05s |
-| `Durability_UnorderedReplay.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 273,853 | 107,330 | 16 | 02s |
-| `Durability_NoEpochGuard.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 12,764,837 | 4,708,469 | 20 | 34s |
-| `Durability_CatalogLossNoBlobFloor.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 47,609 | 20,905 | 10 | 01s |
-| `Durability_ReplayStampsCurrentEpoch.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 6,120,798 | 1,911,045 | 15 | 14s |
+| `Durability_UnorderedReplay.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 273,853 | 107,330 | 14 | 02s |
+| `Durability_NoEpochGuard.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 12,764,837 | 4,708,469 | 18 | 34s |
+| `Durability_CatalogLossNoBlobFloor.cfg` | violates `AckedDeleteSurvives` | FAIL: AckedDeleteSurvives (as intended) | 47,609 | 20,905 | 9 | 01s |
+| `Durability_ReplayStampsCurrentEpoch.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 6,120,798 | 1,911,045 | 14 | 14s |
 | `Durability_NoSubjectLock.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 30,215,391 | 9,242,180 | 16 | 01min 07s |
 | `Durability_NoHelpPrev.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 1,908,812 | 770,234 | 19 | 07s |
-| `ShardMove.cfg` | all hold | PASS | 145,121,412 | 36,807,699 | 30 | 09min 42s |
-| `ShardMove_Live.cfg` | all hold | PASS | 12,028,465 | 2,150,879 | 27 | 03min 41s |
-| `ShardMove_ActiveWriters.cfg` | all hold | PASS | 1,713,087 | 312,230 | 25 | 33s |
-| `ShardMove_Twice.cfg` | all hold | PASS | 636,014 | 202,783 | 35 | 16s |
-| `ShardMove_TgtRestore.cfg` | all hold | PASS | 36,274,924 | 9,688,960 | 29 | 02min 21s |
-| `ShardMove_ZeroMargin.cfg` | all hold | PASS | 12,317,204 | 2,204,243 | 28 | 03min 41s |
-| `ShardMove_UnfencedSteps.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 10,546,663 | 2,134,704 | 13 | 39s |
-| `ShardMove_NoTimelineCheck.cfg` | all hold | PASS | 147,041,839 | 36,807,699 | 30 | 09min 19s |
-| `ShardMove_NoReady.cfg` | violates `RollbackPossibleBeforeC` | FAIL: RollbackPossibleBeforeC (as intended) | 3,106,409 | 782,532 | 11 | 14s |
-| `ShardMove_RestoreNoReconcile.cfg` | violates `RestoreReconciles` | FAIL: RestoreReconciles (as intended) | 980,235 | 267,794 | 10 | 05s |
-| `ShardMove_NoVerify.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 28,568,880 | 6,434,921 | 13 | 01min 42s |
-| `ShardMove_StampAfterCut.cfg` | violates `OneOwner` | FAIL: OneOwner (as intended) | 686,390 | 184,513 | 11 | 05s |
-| `ShardMove_IdKeyedRecopy.cfg` | violates `MoveTerminatesActive` | FAIL: temporal property (as intended) | 4,651,781 | 866,924 | 19 | 01min 07s |
-| `ShardMove_MergeNoDeletes.cfg` | violates `MoveTerminatesActive` | FAIL: temporal property (as intended) | 1,788,977 | 329,000 | 20 | 26s |
-| `ShardMove_SweepNotPaused.cfg` | violates `MoveTerminatesActive` | FAIL: temporal property (as intended) | 3,447,603 | 572,242 | 20 | 53s |
-| `ShardMove_CleanupNoBackup.cfg` | violates `CleanupSafe` | FAIL: CleanupSafe (as intended) | 420,803 | 111,397 | 17 | 03s |
-| `ShardMove_NoSeqAdvance.cfg` | violates `CopiedBelowTargetSeq` | FAIL: CopiedBelowTargetSeq (as intended) | 3,686 | 1,467 | 9 | 01s |
-| `ShardMove_NoSeqAdvanceTwice.cfg` | violates `MoveTerminatesActive` | FAIL: temporal property (as intended) | 411,501 | 126,134 | 27 | 09s |
-| `ShardMove_VerifyBeforeCatchUp.cfg` | violates `MoveTerminatesActive` | FAIL: temporal property (as intended) | 73,641 | 20,469 | 10 | 03s |
-| `ShardMove_CatalogLossNoShardTruth.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 127,749 | 34,056 | 15 | 02s |
-| `ShardMove_CleanupTimeGate.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 2,962,786 | 861,096 | 18 | 12s |
+| `ShardMove.cfg` | all hold | PASS | 112,413,371 | 28,152,715 | 39 | 07min 18s |
+| `ShardMove_Live.cfg` | all hold | PASS | 12,888,037 | 2,267,141 | 38 | 04min 35s |
+| `ShardMove_ActiveWriters.cfg` | all hold | PASS | 125,927 | 23,174 | 29 | 03s |
+| `ShardMove_Twice.cfg` | all hold | PASS | 96,873 | 27,923 | 37 | 04s |
+| `ShardMove_TgtRestore.cfg` | all hold | PASS | 6,309,063 | 1,576,137 | 30 | 28s |
+| `ShardMove_UnfencedSteps.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 1,914,200 | 424,613 | 13 | 09s |
+| `ShardMove_NoReady.cfg` | violates `RollbackPossibleBeforeC` | FAIL: RollbackPossibleBeforeC (as intended) | 375,681 | 86,201 | 11 | 03s |
+| `ShardMove_RestoreNoReconcile.cfg` | violates `RestoreReconciles` | FAIL: RestoreReconciles (as intended) | 201,764 | 45,875 | 10 | 02s |
+| `ShardMove_NoVerify.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 18,768 | 6,750 | 13 | 01s |
+| `ShardMove_StampAfterCut.cfg` | violates `OneOwner` | FAIL: OneOwner (as intended) | 342,707 | 78,293 | 11 | 03s |
+| `ShardMove_SweepNotPaused.cfg` | violates `SourceStaticUnderFreeze` | FAIL: SourceStaticUnderFreeze (as intended) | 1,360 | 391 | 6 | 01s |
+| `ShardMove_CleanupNoBackup.cfg` | violates `CleanupSafe` | FAIL: CleanupSafe (as intended) | 86,349 | 22,748 | 19 | 01s |
+| `ShardMove_NoSeqAdvance.cfg` | violates `CopiedBelowTargetSeq` | FAIL: CopiedBelowTargetSeq (as intended) | 6,799 | 2,319 | 10 | 01s |
+| `ShardMove_CatalogLossNoShardTruth.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 51,684 | 14,554 | 17 | 01s |
+| `ShardMove_UnionRepair.cfg` | violates `NoResurrect` | FAIL: NoResurrect (as intended) | 45,845 | 12,596 | 17 | 02s |
+| `ShardMove_CleanupBackupBeforeActivate.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 532,683 | 147,136 | 20 | 04s |
+| `ShardMove_CopyBeforeFreeze.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 15,311 | 5,222 | 11 | 01s |
+| `ShardMove_RerunMerges.cfg` | violates `NoResurrect` | FAIL: NoResurrect (as intended) | 51,838 | 14,252 | 19 | 01s |
+| `ShardMove_ReadyBeforeIndex.cfg` | violates `ServedFromIndex` | FAIL: ServedFromIndex (as intended) | 232 | 97 | 6 | 00s |
+| `ShardMove_CutOnUnreplicatedCommit.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 53,969 | 15,137 | 17 | 01s |

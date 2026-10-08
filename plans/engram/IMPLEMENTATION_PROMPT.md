@@ -46,12 +46,11 @@ KNOWN STATE OF THE PLAN (read before planning)
   touches (catalog reconcile N163/N172/N180, intent replay N122/N134, failover floor N179) as the
   highest-risk area: the reviewer gets a dedicated "move" lens, M1.5/M1.9 get two review rounds minimum,
   and every ShardMove and Durability must-fail configuration becomes a Go `faultinject` twin test (§8.4.6).
-- The TLC results summary formal/tla/results/RESULTS.md was produced after the round-7 amendment; the raw
-  logs are not shipped. formal/tla/EXPECT is the current manifest (it lists the D27 configurations:
-  `ShardMove_NoFloor`, `_LaggingFailover`, `_RestoreKeepsMove`, `_EndOnRouting`,
-  `Durability_CatalogRestoreInFenceWindow`). §7.6's counts (75 configurations, ShardMove 21) and §7's results
-  table (still names `ShardMove_NoMoveBackup`) are stale against EXPECT. M0.7 re-runs every configuration and
-  regenerates RESULTS.md and the logs; EXPECT wins until then.
+- formal/tla/results/RESULTS.md is current for D27: all 79 configurations in formal/tla/EXPECT end as listed
+  (design configurations pass, every must-fail fails on its named invariant); the raw TLC logs are not shipped. Three
+  bounds were reduced to fit the 30 min cap (§7.2.6), and register N189 records two design rules TLC found in the last
+  pass (a restoring move target is not an owner yet; no lossy restore while a catalog reconcile runs). M0.7 re-runs
+  every configuration in CI and regenerates the logs.
 - The Lean 4 modules were never type-checked (SORRY_BASELINE = 3, toolchain v4.12.0). `lake build` is
   non-gating in CI until Track F.3; do not block M0.1 on it.
 - Register D1 names the Go module `example.com/engram`. This repository uses `github.com/<owner>/engram`
@@ -316,10 +315,10 @@ orchestrator. Commit after every green step; update PROGRESS.md.
 - SCOPE: §10.2 M0.7. `formal/MANIFEST.md` (one row per design and must-fail configuration: invariant it must fail,
   Go twin, `pending(M1.x)` until built); `scripts/formal-manifest-check.sh`; CI wiring (`make formal-quick` < 5 min,
   nightly `make formal` with the 30 min cap, INCOMPLETE reported as such); re-run of every EXPECT configuration with
-  logs written to formal/tla/results/ and RESULTS.md regenerated (the shipped summary predates D27); the invariant
+  logs written to formal/tla/results/ and RESULTS.md regenerated (the shipped summary covers D27); the invariant
   code in `internal/formal/<spec>/invariants.go` (e.g. `Served` equals the SQL rule of §3.8); the trace converter
   `engramctl formal trace-to-tla` + `TraceNext` modules + `internal/formal/trace.Logger`.
-- READ: PLAN.md §7 (all), §8.4.6, §8.1 tier F; register N46, N96, N141, N156, N178, N188; formal/tla/EXPECT, every
+- READ: PLAN.md §7 (all), §8.4.6, §8.1 tier F; register N46, N96, N141, N156, N178, N188, N189; formal/tla/EXPECT, every
   `.tla`/`.cfg`, formal/tla/results/RESULTS.md.
 - TESTS: `make formal-quick` green with every must-fail failing on the invariant its first comment line names; the
   manifest check fails a spec change without its row; the converter replays a TLC trace of each of the six specs.

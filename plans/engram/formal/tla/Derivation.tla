@@ -1,67 +1,79 @@
 --------------------------- MODULE Derivation ---------------------------
 (***************************************************************************)
-(* Engram D22 (N113, N115-N121, N133): visibility of derived data.         *)
-(*                                                                         *)
-(* Mutable state is a handful of markers; everything else is a read-time   *)
-(* predicate over insert-only evidence.                                    *)
-(*   tomb[d]   document_tombstones: versions 1..tomb[d] of document d are  *)
-(*             deleted (up_to_version); a re-used document id starts at    *)
-(*             tomb[d] + 1 and is not hidden by the old tombstone          *)
-(*   hidden    fact_hidden (Invalidate inserts, Restore deletes)           *)
-(*   vers      observation_versions / page_versions with root_version and  *)
-(*             inputs (fact ids; observation versions for pages)           *)
-(*   dh        derived_hidden rows <<node, root_version, from_version>>    *)
-(*   lockX     the derivation lock held exclusively by Expunge.Materialize;*)
-(*             writers of derived versions hold it shared from the         *)
-(*             re-verification to the commit (N120); Restore takes it      *)
-(*             exclusively (N133)                                          *)
+(* Engram D23 (N113, N115-N121, N133, N135, N136): visibility of derived   *)
+(* data.  Mutable state is a handful of markers; everything else is a      *)
+(* read-time predicate over insert-only evidence.                          *)
+(*   tomb[d]   document_tombstones: versions 1..tomb[d] of d are deleted;  *)
+(*             a re-used document id starts at tomb[d] + 1                 *)
+(*   hidden    fact_hidden(cause = invalidate); Restore deletes it         *)
+(*   hidRe     fact_hidden(cause = reextract): a stale-key fact; the fact  *)
+(*             and chunk arms skip it, derived versions do NOT (N135)      *)
+(*   ctomb     chunk_tombstones (REPLACE retires the fact; not a deletion) *)
+(*   vers      observation_versions / page_versions: root_version, the     *)
+(*             evidence rows (fact ids; observation versions for pages;    *)
+(*             no foreign key to facts, N135), st live | stub | absent     *)
+(*   dh        derived_hidden rows <<node, root_version, from_version,     *)
+(*             cause>>, cause "doc" or the invalidated fact id             *)
+(*   props     persisted stage-2 proposals (write-once) with base_version  *)
+(*   lockX     the derivation lock, exclusive: Materialize batch, Restore  *)
+(*             (writers hold it shared from Verify to Commit, N120)        *)
 (* Segment of (n, v) = versions root_version(v)..v; Deriv(n, v) = union of *)
-(* the segment's inputs (two levels: fact -> observation -> page).         *)
+(* the segment's evidence (two levels: fact -> observation -> page).       *)
 (*                                                                         *)
-(* Facts: f1 = (d1, v1), f2 = (d1, v2: the id re-used right after the      *)
-(* delete), f3 = (d2, v1).  A fact is ingested (born) only at version      *)
-(* tomb[d] + 1.                                                            *)
+(* Facts: f1 = (d1, v1) with a re-extraction twin f4, f2 = (d1, v2: the id *)
+(* re-used right after the delete), f3 = (d2, v1).                         *)
 (*                                                                         *)
-(* Expunge: Materialize (MatStart snapshots the covered versions, MatWrite *)
-(* inserts derived_hidden and marks the document materialized), then Purge *)
-(* deletes the victims' facts and the evidence rows naming them.  After    *)
-(* Purge only derived_hidden still hides a derived version, which is why   *)
-(* Materialize must see every committed version.                           *)
+(* Writers (two): a proposal is stored (stage 2 rendered against           *)
+(* base_version = the version it edits); a writer applies it with Verify   *)
+(* (shared lock; every rendered input and the base re-checked; on failure  *)
+(* the proposal is discarded) and Commit.  Pages use the same path.        *)
 (*                                                                         *)
-(* Ghost state: gfinp keeps the evidence that Purge deletes, so the        *)
-(* invariants can state the truth about derivation after the real rows are *)
-(* gone.  The implementation has no ghost.                                 *)
+(* Expunge of a deleted document: Materialize (batches; each batch scans   *)
+(* and writes under the exclusive lock and re-reads fact_hidden), Purge    *)
+(* (the victims' facts), DerivedPurge (versions covered by a document-cause*)
+(* row become content-free stubs).  REPLACE and re-extraction retire facts *)
+(* (ChunkPurge, ReextractPurge delete them later); evidence stays.         *)
 (*                                                                         *)
-(* Knobs (design: UseLock, RestoreLock, TombByVersion, EffAllShown TRUE;   *)
-(* MatInvalid FALSE):                                                      *)
-(*   UseLock = FALSE      writers and Materialize ignore each other        *)
-(*   RestoreLock = FALSE  Restore does not take the derivation lock         *)
-(*   TombByVersion = FALSE a tombstone hides the whole document id         *)
-(*   MatInvalid = TRUE    Materialize also covers invalidated facts        *)
-(*   EffAllShown = FALSE  effective_at counts only cited facts, not shown  *)
+(* Ghost state: gfinp/goinp keep what a version's text was really derived  *)
+(* from (the inputs plus the base version's); the implementation has none. *)
+(*                                                                         *)
+(* Knobs (design: UseLock, RestoreLock, TombByVersion, EffAllShown,        *)
+(* PageVerify, BaseCheck TRUE; the others FALSE):                          *)
+(*   UseLock=FALSE        writers and Materialize ignore each other        *)
+(*   RestoreLock=FALSE    Restore does not take the derivation lock         *)
+(*   TombByVersion=FALSE  a tombstone hides the whole document id           *)
+(*   EffAllShown=FALSE    effective_at counts only cited facts              *)
+(*   CascadeEvidence      evidence rows die with their fact (old FK)        *)
+(*   ReextractHides       derived versions are hidden by cause reextract    *)
+(*   PageVerify=FALSE     CommitPageVersion re-verifies nothing             *)
+(*   BaseCheck=FALSE      an update is applied without checking its base    *)
+(*   MatOnce              Materialize reads fact_hidden once, not per batch *)
+(*   DropStub             DerivedPurge deletes the version row              *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS Docs, Facts, DocOf, FVer, Mentioned,  \* facts are 1..3; tuples of doc, version, time
-          Obs, Pages, MaxVerO, MaxVerP,    \* max versions per observation / page
-          Writers, Budget,                 \* Route actions available in total
-          MaxF,                            \* max fact inputs per version
-          MaxT, MaxDeletes, MaxCuration,   \* time horizon, DeleteDocument count, Invalidate+Restore count
-          UseLock, RestoreLock, TombByVersion, MatInvalid, EffAllShown
+CONSTANTS Docs, Facts, DocOf, FVer, Mentioned, Twin,
+          Obs, Pages, MaxVerO, MaxVerP, Writers, Budget, MaxF,
+          MaxT, MaxDeletes, MaxCuration, MaxRetire,
+          UseLock, RestoreLock, TombByVersion, EffAllShown, CascadeEvidence, ReextractHides,
+          PageVerify, BaseCheck, MatOnce, DropStub
 
-\* Design instance (cfg: DocOf <- DocOfDef, FVer <- FVerDef, Mentioned <- MentionedDef).
-DocOfDef == <<"d1", "d1", "d2">>
-FVerDef == <<1, 2, 1>>
-MentionedDef == <<1, 3, 2>>
+\* Design instance (cfg: DocOf <- DocOfDef, FVer <- FVerDef, Mentioned <- MentionedDef, Twin <- TwinDef).
+DocOfDef == <<"d1", "d1", "d2", "d1">>
+FVerDef == <<1, 2, 1, 1>>
+MentionedDef == <<1, 3, 2, 1>>
+TwinDef == <<4, 0, 0, 0>>
 
 Nodes == Obs \cup Pages
 IsPage(n) == n \in Pages
 MaxVer(n) == IF n \in Pages THEN MaxVerP ELSE MaxVerO
 Pairs == {<<o, v>> : o \in Obs, v \in 1..MaxVerO}
+Twins == {f \in Facts : \E g \in Facts : Twin[g] = f}
 
-VARIABLES tomb, ms, hidden, born, gone, vers, dh, lockX, matPhase, matDocs, matSnap,
-          wr, budget, nDel, nCur
-vars == <<tomb, ms, hidden, born, gone, vers, dh, lockX, matPhase, matDocs, matSnap, wr, budget, nDel, nCur>>
+VARIABLES tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX,
+          matPhase, matDocs, matV0, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet
+vars == <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX,
+          matPhase, matDocs, matV0, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet>>
 
 Max2(a, b) == IF a >= b THEN a ELSE b
 MaxSet(S) == IF S = {} THEN 0 ELSE CHOOSE m \in S : \A x \in S : x <= m
@@ -73,170 +85,280 @@ CurVer(d) == MaxSet({FVer[f] : f \in born \cap FactsOf(d)})
 -----------------------------------------------------------------------------
 (* Derivation and visibility (all pure functions of the state)             *)
 
+Exists(x) == x[2] <= Len(vers[x[1]])
 Versions == UNION {{<<n, v>> : v \in 1..Len(vers[n])} : n \in Nodes}
 Seg(n, v) == vers[n][v].root..v
-DerivF(n, v)  == UNION {vers[n][w].finp  : w \in Seg(n, v)}      \* real rows
-GDerivF(n, v) == UNION {vers[n][w].gfinp : w \in Seg(n, v)}      \* ghost: never purged
+DerivF(n, v)  == UNION {vers[n][w].finp  : w \in Seg(n, v)}      \* real evidence rows
 DerivO(n, v)  == UNION {vers[n][w].oinp  : w \in Seg(n, v)}      \* observation versions a page cites
-GDeriv(n, v)  == GDerivF(n, v) \cup UNION {GDerivF(x[1], x[2]) : x \in DerivO(n, v)}
+GDerivF(n, v) == UNION {vers[n][w].gfinp : w \in Seg(n, v)}      \* ghost: never removed
+GDerivO(n, v) == UNION {vers[n][w].goinp : w \in Seg(n, v)}
+GDeriv(n, v)  == GDerivF(n, v) \cup UNION {GDerivF(x[1], x[2]) : x \in {y \in GDerivO(n, v) : Exists(y)}}
 
 TombTrue(f) == FVer[f] <= tomb[DocOf[f]]                           \* the truth: deleted
 TombImpl(f) == IF TombByVersion THEN TombTrue(f) ELSE tomb[DocOf[f]] > 0   \* what the predicate checks
-Victim(f)  == TombTrue(f) \/ f \in hidden                          \* ghost
-VictimI(f) == TombImpl(f) \/ f \in hidden                          \* implementation
+Victim(f)  == TombTrue(f) \/ f \in hidden                          \* ghost: deleted or invalidated
+VictimD(f) == TombImpl(f) \/ f \in hidden \/ (ReextractHides /\ f \in hidRe)   \* derived-version predicate
+VictimF(f) == TombImpl(f) \/ f \in hidden \/ f \in hidRe \/ f \in ctomb        \* fact and chunk arms
 
 RowCovered(n, v) == \E r \in dh : r[1] = n /\ r[2] = vers[n][v].root /\ r[3] <= v
-Perm(n, v) == RowCovered(n, v) \/ \E x \in DerivO(n, v) : RowCovered(x[1], x[2])
+Perm(n, v) == RowCovered(n, v) \/ \E x \in DerivO(n, v) : Exists(x) /\ RowCovered(x[1], x[2])
 
-\* N117: no victim fact in the segment's real evidence, and no derived_hidden row.
-VisBase(n, v) == ~(\E f \in DerivF(n, v) : VictimI(f)) /\ ~RowCovered(n, v)
-\* A page version is also hidden when a cited observation version is hidden.
-VisN(n, v) == VisBase(n, v) /\ \A x \in DerivO(n, v) : VisBase(x[1], x[2])
+\* N117: a version row exists and is live (fail closed: a stub or missing row means hidden), no victim in the
+\* segment's evidence, no derived_hidden row covers it.
+VisBase(n, v) == /\ v <= Len(vers[n]) /\ vers[n][v].st = "live"
+                 /\ ~(\E f \in DerivF(n, v) : VictimD(f)) /\ ~RowCovered(n, v)
+\* A page version is also hidden when a cited observation version is hidden (or missing).
+VisN(n, v) == VisBase(n, v) /\ \A x \in DerivO(n, v) : Exists(x) /\ VisBase(x[1], x[2])
 
-VisFacts == {f \in born \ gone : ~VictimI(f)}
+VisFacts == {f \in born \ gone : ~VictimF(f)}
 VisPairs == {x \in Versions : x[1] \in Obs /\ VisN(x[1], x[2])}
 
-\* Recall at time T: per node, the latest visible version with effective_at <= T.
+\* Recall at time T (C-14, the SQL rule): per node, the version current at T (the latest with
+\* effective_at <= T); served only if visible, else nothing for that node.
 Served(T) == {x \in Versions :
-                /\ VisN(x[1], x[2]) /\ vers[x[1]][x[2]].eff <= T
-                /\ \A u \in (x[2] + 1)..Len(vers[x[1]]) : ~(VisN(x[1], u) /\ vers[x[1]][u].eff <= T)}
+                /\ vers[x[1]][x[2]].eff <= T
+                /\ \A u \in (x[2] + 1)..Len(vers[x[1]]) : vers[x[1]][u].eff > T
+                /\ VisN(x[1], x[2])}
 ServedFacts(T) == {f \in VisFacts : Mentioned[f] <= T}
 
 -----------------------------------------------------------------------------
-Rec == [root : 1..3, finp : SUBSET Facts, gfinp : SUBSET Facts, oinp : SUBSET Pairs, eff : 0..MaxT]
-IdleW == [ph |-> "idle", n |-> CHOOSE n \in Nodes : TRUE, mode |-> "root",
-          cf |-> {}, co |-> {}, sf |-> {}, so |-> {}]
+Rec == [root : 1..4, finp : SUBSET Facts, gfinp : SUBSET Facts, oinp : SUBSET Pairs, goinp : SUBSET Pairs,
+        eff : 0..MaxT, base : 0..3, st : {"live", "stub", "absent"}]
+Prop == [n : Nodes, mode : {"root", "update"}, cf : SUBSET Facts, co : SUBSET Pairs, base : 0..3]
+IdleW == [ph |-> "idle", p |-> [n |-> CHOOSE n \in Nodes : TRUE, mode |-> "root", cf |-> {}, co |-> {}, base |-> 0]]
 
 TypeOK ==
-  /\ tomb \in [Docs -> 0..2] /\ hidden \subseteq Facts /\ born \subseteq Facts /\ gone \subseteq born
-  /\ ms \in [Docs -> {"none", "pending", "materialized", "purged"}]
+  /\ tomb \in [Docs -> 0..2] /\ hidden \subseteq Facts /\ hidRe \subseteq Facts /\ ctomb \subseteq Facts
+  /\ born \subseteq Facts /\ gone \subseteq born
+  /\ ms \in [Docs -> {"none", "pending", "materialized", "purged", "done"}]
   /\ \A n \in Nodes : \A i \in 1..Len(vers[n]) : vers[n][i] \in Rec
   /\ \A n \in Nodes : Len(vers[n]) <= MaxVer(n)
-  /\ lockX \in BOOLEAN /\ matPhase \in {"idle", "scanned"}
-  /\ budget \in 0..Budget /\ nDel \in 0..MaxDeletes /\ nCur \in 0..MaxCuration
+  /\ lockX \in BOOLEAN /\ matPhase \in {"idle", "running", "scanned"}
+  /\ props \subseteq Prop
+  /\ budget \in 0..Budget /\ nDel \in 0..MaxDeletes /\ nCur \in 0..MaxCuration /\ nRet \in 0..MaxRetire
 
 Init ==
-  /\ tomb = [d \in Docs |-> 0] /\ ms = [d \in Docs |-> "none"] /\ hidden = {} /\ born = {} /\ gone = {}
-  /\ vers = [n \in Nodes |-> << >>] /\ dh = {}
-  /\ lockX = FALSE /\ matPhase = "idle" /\ matDocs = {} /\ matSnap = {}
-  /\ wr = [w \in Writers |-> IdleW]
-  /\ budget = Budget /\ nDel = 0 /\ nCur = 0
+  /\ tomb = [d \in Docs |-> 0] /\ ms = [d \in Docs |-> "none"] /\ hidden = {} /\ hidRe = {} /\ ctomb = {}
+  /\ born = {} /\ gone = {} /\ vers = [n \in Nodes |-> << >>] /\ hw = [n \in Nodes |-> 0] /\ dh = {}
+  /\ lockX = FALSE /\ matPhase = "idle" /\ matDocs = {} /\ matV0 = {} /\ matTodo = {} /\ matSnap = {}
+  /\ wr = [w \in Writers |-> IdleW] /\ props = {}
+  /\ budget = Budget /\ nDel = 0 /\ nCur = 0 /\ nRet = 0
 
 -----------------------------------------------------------------------------
-(* Ingest, and the markers: the only synchronous writes of a delete or     *)
-(* invalidation (N115)                                                     *)
+(* Ingest, and the markers: the only synchronous writes of a delete, an    *)
+(* invalidation, a REPLACE or a re-extraction (N115, N135)                 *)
 
-\* A document (or a re-used id) starts at version tomb[d] + 1.
 Ingest(f) ==
-  /\ f \notin born /\ FVer[f] = tomb[DocOf[f]] + 1
+  /\ f \notin born /\ f \notin Twins /\ FVer[f] = tomb[DocOf[f]] + 1
   /\ born' = born \cup {f}
-  /\ UNCHANGED <<tomb, ms, hidden, gone, vers, dh, lockX, matPhase, matDocs, matSnap, wr, budget, nDel, nCur>>
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur, nRet>>
 
 DeleteDocument(d) ==
-  /\ nDel < MaxDeletes /\ CurVer(d) > tomb[d] /\ ms[d] \in {"none", "purged"}
+  /\ nDel < MaxDeletes /\ CurVer(d) > tomb[d] /\ ms[d] \in {"none", "done"}
   /\ tomb' = [tomb EXCEPT ![d] = CurVer(d)] /\ ms' = [ms EXCEPT ![d] = "pending"] /\ nDel' = nDel + 1
-  /\ UNCHANGED <<hidden, born, gone, vers, dh, lockX, matPhase, matDocs, matSnap, wr, budget, nCur>>
+  /\ UNCHANGED <<hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nCur, nRet>>
 
 Invalidate(f) ==
   /\ f \in born \ gone /\ f \notin hidden /\ nCur < MaxCuration
   /\ hidden' = hidden \cup {f} /\ nCur' = nCur + 1
-  /\ UNCHANGED <<tomb, ms, born, gone, vers, dh, lockX, matPhase, matDocs, matSnap, wr, budget, nDel>>
+  /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nRet>>
 
-\* N133: Restore takes the derivation lock exclusively (waits for shared holders, excludes Materialize).
+\* N133: Restore takes the derivation lock exclusively (waits for shared holders, excludes a Materialize
+\* batch) and deletes the cause-tagged derived_hidden rows.
 Restore(f) ==
   /\ f \in hidden /\ nCur < MaxCuration
   /\ (RestoreLock => ~lockX /\ \A w \in Writers : wr[w].ph # "verified")
-  /\ hidden' = hidden \ {f} /\ nCur' = nCur + 1
-  /\ UNCHANGED <<tomb, ms, born, gone, vers, dh, lockX, matPhase, matDocs, matSnap, wr, budget, nDel>>
+  /\ hidden' = hidden \ {f} /\ dh' = {r \in dh : r[4] # f} /\ nCur' = nCur + 1
+  /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, gone, vers, hw, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nRet>>
+
+\* REPLACE retires a fact's chunk (chunk_tombstones); observations and pages stay visible.
+Replace(f) ==
+  /\ f \in born \ gone /\ f \notin ctomb /\ ~TombTrue(f) /\ nRet < MaxRetire
+  /\ ctomb' = ctomb \cup {f} /\ nRet' = nRet + 1
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur>>
+
+\* Re-extraction is a write: the new-key twin is ingested, the old-key fact gets fact_hidden(reextract).
+Reextract(f) ==
+  /\ f \in born \ gone /\ f \notin hidRe /\ Twin[f] # 0 /\ Twin[f] \notin born /\ ~TombTrue(f) /\ nRet < MaxRetire
+  /\ hidRe' = hidRe \cup {f} /\ born' = born \cup {Twin[f]} /\ nRet' = nRet + 1
+  /\ UNCHANGED <<tomb, ms, hidden, ctomb, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur>>
+
+\* The FK of the old schema: evidence rows of observation versions die with their fact.
+Strip(S) == [n \in Nodes |-> [i \in 1..Len(vers[n]) |->
+               IF CascadeEvidence /\ n \in Obs THEN [vers[n][i] EXCEPT !.finp = @ \ S] ELSE vers[n][i]]]
+
+ChunkPurge(f) ==                    \* grace elapsed: the retired chunk's fact is deleted
+  /\ f \in ctomb /\ f \notin gone
+  /\ gone' = gone \cup {f} /\ vers' = Strip({f})
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur, nRet>>
+
+ReextractPurge(f) ==                \* REEXTRACTED_FACTS: the old-key fact is deleted after 1 h
+  /\ f \in hidRe /\ f \notin gone
+  /\ gone' = gone \cup {f} /\ vers' = Strip({f})
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur, nRet>>
 
 -----------------------------------------------------------------------------
-(* Writers of derived versions: two-stage consolidation / PageRefresh      *)
-(* Route = stage 1 (decisions only, no lock); Verify = stage 2 start       *)
-(* (shared derivation lock, re-verify visibility); Commit inserts the      *)
-(* version and releases the lock.  Markers may land between any two steps. *)
+(* Writers of derived versions (N120, N121): Propose = stage 2 stored      *)
+(* (write-once, with base_version); a writer applies it with Verify (shared*)
+(* lock, every rendered input and the base re-checked) and Commit.  A      *)
+(* writer may crash (AbortW); the stored proposal outlives it.             *)
 
-Route(w) ==
-  /\ wr[w].ph = "idle" /\ budget > 0
+Propose ==
+  /\ budget > 0
   /\ \E n \in Nodes : \E mode \in {"root", "update"} : \E cf \in SmallSubsets(VisFacts, MaxF) :
      \E co \in SmallSubsets(IF IsPage(n) THEN VisPairs ELSE {}, 1) :
        /\ (cf # {} \/ co # {})
-       /\ (mode = "update" => Len(vers[n]) > 0)
-       /\ wr' = [wr EXCEPT ![w] = [ph |-> "routed", n |-> n, mode |-> mode, cf |-> cf, co |-> co,
-                                    sf |-> {}, so |-> {}]]
+       /\ (mode = "update" => Len(vers[n]) > 0 /\ VisN(n, Len(vers[n])))
+       /\ props' = props \cup {[n |-> n, mode |-> mode, cf |-> cf, co |-> co,
+                                base |-> IF mode = "update" THEN Len(vers[n]) ELSE 0]}
   /\ budget' = budget - 1
-  /\ UNCHANGED <<tomb, ms, hidden, born, gone, vers, dh, lockX, matPhase, matDocs, matSnap, nDel, nCur>>
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
+                 matSnap, wr, nDel, nCur, nRet>>
+
+Pick(w) ==
+  /\ wr[w].ph = "idle" /\ props # {}
+  /\ \E p \in props : wr' = [wr EXCEPT ![w] = [ph |-> "picked", p |-> p]]
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
+                 matSnap, props, budget, nDel, nCur, nRet>>
+
+\* Everything the rendered result depends on is still fine: inputs visible, base current and visible.
+InputsOK(p) == IsPage(p.n) /\ ~PageVerify \/ (p.cf \subseteq VisFacts /\ p.co \subseteq VisPairs)
+BaseOK(p) ==
+  p.mode = "update" =>
+    IF BaseCheck THEN Len(vers[p.n]) = p.base /\ VisN(p.n, p.base)
+                 ELSE Len(vers[p.n]) > 0 /\ VisN(p.n, Len(vers[p.n]))
+CheckOK(p) == InputsOK(p) /\ BaseOK(p)
 
 Verify(w) ==
-  /\ wr[w].ph = "routed"
-  /\ ~(UseLock /\ lockX)                       \* try-lock refused while Materialize runs
-  /\ LET r == wr[w] IN LET sf == r.cf \cap VisFacts IN LET so == r.co \cap VisPairs IN
-     /\ (sf # {} \/ so # {})
-     /\ (r.mode = "update" => Len(vers[r.n]) > 0 /\ VisN(r.n, Len(vers[r.n])))
-     /\ wr' = [wr EXCEPT ![w].ph = "verified", ![w].sf = sf, ![w].so = so]
-  /\ UNCHANGED <<tomb, ms, hidden, born, gone, vers, dh, lockX, matPhase, matDocs, matSnap, budget, nDel, nCur>>
+  /\ wr[w].ph = "picked" /\ wr[w].p \in props
+  /\ ~(UseLock /\ lockX)                       \* try-lock refused while a Materialize batch runs
+  /\ CheckOK(wr[w].p)
+  /\ wr' = [wr EXCEPT ![w].ph = "verified"]
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
+                 matSnap, props, budget, nDel, nCur, nRet>>
+
+\* Verification failed: ROLLBACK and discard the stored proposal (never repair it).
+Discard(w) ==
+  /\ wr[w].ph = "picked" /\ wr[w].p \in props
+  /\ ~(UseLock /\ lockX) /\ ~CheckOK(wr[w].p)
+  /\ props' = props \ {wr[w].p} /\ wr' = [wr EXCEPT ![w] = IdleW]
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
+                 matSnap, budget, nDel, nCur, nRet>>
 
 Commit(w) ==
-  /\ wr[w].ph = "verified"
-  /\ LET r == wr[w] IN LET n == r.n IN LET L == Len(vers[n]) IN
+  /\ wr[w].ph = "verified" /\ wr[w].p \in props
+  /\ LET p == wr[w].p IN LET n == p.n IN LET L == Len(vers[n]) IN
      /\ L < MaxVer(n)
-     /\ r.sf \cap gone = {}                                 \* FK: evidence cannot name a purged fact
-     /\ \E cit \in SUBSET r.sf :
-          /\ (EffAllShown => cit = r.sf)
-          /\ (~EffAllShown => (r.sf # {} => cit # {}))
-          /\ LET e == Max2(MaxSet({Mentioned[f] : f \in cit} \cup {vers[x[1]][x[2]].eff : x \in r.so}),
+     /\ \E cit \in SUBSET p.cf :
+          /\ (EffAllShown => cit = p.cf)
+          /\ (~EffAllShown => (p.cf # {} => cit # {}))
+          /\ LET e == Max2(MaxSet({Mentioned[f] : f \in cit} \cup {vers[x[1]][x[2]].eff : x \in p.co}),
                            IF L = 0 THEN 0 ELSE vers[n][L].eff) IN
+             LET upd == p.mode = "update" /\ L > 0 IN
              vers' = [vers EXCEPT ![n] = Append(@,
-                        [root |-> IF r.mode = "root" \/ L = 0 THEN L + 1 ELSE vers[n][L].root,
-                         finp |-> r.sf, gfinp |-> r.sf, oinp |-> r.so, eff |-> e])]
+                        [root |-> IF ~upd THEN L + 1 ELSE vers[n][L].root,
+                         finp |-> p.cf, oinp |-> p.co,
+                         gfinp |-> p.cf \cup (IF upd THEN vers[n][p.base].gfinp ELSE {}),
+                         goinp |-> p.co \cup (IF upd THEN vers[n][p.base].goinp ELSE {}),
+                         eff |-> e, base |-> IF upd THEN p.base ELSE 0, st |-> "live"])]
+     /\ hw' = [hw EXCEPT ![n] = L + 1]
+     /\ props' = props \ {p}
   /\ wr' = [wr EXCEPT ![w] = IdleW]
-  /\ UNCHANGED <<tomb, ms, hidden, born, gone, dh, lockX, matPhase, matDocs, matSnap, budget, nDel, nCur>>
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 budget, nDel, nCur, nRet>>
 
 AbortW(w) ==
   /\ wr[w].ph # "idle"
   /\ wr' = [wr EXCEPT ![w] = IdleW]
-  /\ UNCHANGED <<tomb, ms, hidden, born, gone, vers, dh, lockX, matPhase, matDocs, matSnap, budget, nDel, nCur>>
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
+                 matSnap, props, budget, nDel, nCur, nRet>>
 
 -----------------------------------------------------------------------------
-(* Expunge (N119): Materialize under the exclusive lock, then Purge        *)
+(* Expunge (N119, N136): Materialize in batches, Purge, DerivedPurge       *)
 
-MatStart ==
+\* The derived_hidden rows of one node for victim set V (DV: the tombstoned part of V, cause "doc").
+Cause(f, DV) == IF f \in DV THEN "doc" ELSE f
+HitF(n, w, V) == V \cap (vers[n][w].finp \cup
+                         UNION {DerivF(x[1], x[2]) : x \in {y \in vers[n][w].oinp : Exists(y)}})
+RowsNode(n, V, DV) == {<<n, vers[n][w].root, w, Cause(f, DV)>> : w \in 1..Len(vers[n]), f \in HitF(n, w, V)}
+NeedInv == \E n \in Nodes : RowsNode(n, hidden, {}) \ dh # {}
+
+MatBegin ==
   /\ matPhase = "idle" /\ ~lockX
-  /\ \E d \in Docs : ms[d] = "pending"
-  /\ (UseLock => \A w \in Writers : wr[w].ph # "verified")      \* waits for shared holders
+  /\ (\E d \in Docs : ms[d] = "pending") \/ NeedInv
   /\ LET D == {d \in Docs : ms[d] = "pending"} IN
-     LET V == UNION {Victims(d) : d \in D} \cup (IF MatInvalid THEN hidden ELSE {}) IN
-     /\ matDocs' = D
-     /\ matSnap' = UNION {{<<x[1], vers[x[1]][x[2]].root, w>> :
-                         w \in {u \in Seg(x[1], x[2]) : vers[x[1]][u].finp \cap V # {}}} : x \in Versions}
-  /\ matPhase' = "scanned" /\ lockX' = TRUE
-  /\ UNCHANGED <<tomb, ms, hidden, born, gone, vers, dh, wr, budget, nDel, nCur>>
+     /\ matDocs' = D /\ matV0' = UNION {Victims(d) : d \in D} \cup hidden
+  /\ matTodo' = Nodes /\ matPhase' = "running"
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matSnap, wr, props, budget, nDel, nCur, nRet>>
+
+\* One batch (one node): the scan under the exclusive lock re-reads the open tombstones and fact_hidden.
+MatScan(n) ==
+  /\ matPhase = "running" /\ n \in matTodo /\ ~lockX
+  /\ (UseLock => \A w \in Writers : wr[w].ph # "verified")      \* waits for shared holders
+  /\ LET DV == UNION {Victims(d) : d \in matDocs} IN
+     LET V == IF MatOnce THEN matV0 ELSE DV \cup hidden IN
+     matSnap' = RowsNode(n, V, DV)
+  /\ matTodo' = matTodo \ {n} /\ matPhase' = "scanned" /\ lockX' = TRUE
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, matDocs, matV0, wr, props, budget, nDel, nCur, nRet>>
 
 MatWrite ==
   /\ matPhase = "scanned"
   /\ dh' = dh \cup matSnap
-  /\ ms' = [d \in Docs |-> IF d \in matDocs THEN "materialized" ELSE ms[d]]
-  /\ matPhase' = "idle" /\ lockX' = FALSE /\ matDocs' = {} /\ matSnap' = {}
-  /\ UNCHANGED <<tomb, hidden, born, gone, vers, wr, budget, nDel, nCur>>
+  /\ matPhase' = "running" /\ lockX' = FALSE /\ matSnap' = {}
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, matDocs, matV0, matTodo, wr, props, budget, nDel, nCur, nRet>>
 
-Purge(d) ==
+MatEnd ==
+  /\ matPhase = "running" /\ matTodo = {}
+  /\ ms' = [d \in Docs |-> IF d \in matDocs THEN "materialized" ELSE ms[d]]
+  /\ matPhase' = "idle" /\ matDocs' = {} /\ matV0' = {}
+  /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet>>
+
+Purge(d) ==                         \* the victims' facts; evidence rows stay (no FK)
   /\ ms[d] = "materialized"
   /\ ms' = [ms EXCEPT ![d] = "purged"]
-  /\ gone' = gone \cup (Victims(d) \cap born)
-  /\ vers' = [n \in Nodes |-> [i \in 1..Len(vers[n]) |->
-                 [vers[n][i] EXCEPT !.finp = @ \ Victims(d)]]]
-  /\ UNCHANGED <<tomb, hidden, born, dh, lockX, matPhase, matDocs, matSnap, wr, budget, nDel, nCur>>
+  /\ gone' = gone \cup (Victims(d) \cap born) /\ vers' = Strip(Victims(d))
+  /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap, wr, props,
+                 budget, nDel, nCur, nRet>>
+
+RECURSIVE Trim(_)
+Trim(s) == IF s # << >> /\ s[Len(s)].st = "absent" THEN Trim(SubSeq(s, 1, Len(s) - 1)) ELSE s
+
+DocCovered(n, i) == \E r \in dh : r[4] = "doc" /\ r[1] = n /\ r[2] = vers[n][i].root /\ r[3] <= i
+
+\* Versions covered by a document-cause row become content-free stubs (evidence and text gone, the row stays);
+\* DropStub deletes the row instead, and the next version number is reused.
+DerivedPurge(d) ==
+  /\ ms[d] = "purged"
+  /\ ms' = [ms EXCEPT ![d] = "done"]
+  /\ vers' = [n \in Nodes |->
+               LET s == [i \in 1..Len(vers[n]) |->
+                           IF DocCovered(n, i) /\ vers[n][i].st = "live"
+                             THEN [vers[n][i] EXCEPT !.finp = {}, !.oinp = {}, !.st = IF DropStub THEN "absent" ELSE "stub"]
+                             ELSE vers[n][i]]
+               IN IF DropStub THEN Trim(s) ELSE s]
+  /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, gone, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap, wr,
+                 props, budget, nDel, nCur, nRet>>
 
 -----------------------------------------------------------------------------
-WriterStep == \E w \in Writers : Verify(w) \/ Commit(w) \/ AbortW(w)
-Expunge == MatStart \/ MatWrite \/ \E d \in Docs : Purge(d)
-Next == (\E w \in Writers : Route(w)) \/ WriterStep \/ Expunge
+WriterStep == \E w \in Writers : Pick(w) \/ Verify(w) \/ Discard(w) \/ Commit(w) \/ AbortW(w)
+WriterProgress == \E w \in Writers : Verify(w) \/ Discard(w) \/ Commit(w)
+Expunge == MatBegin \/ (\E n \in Nodes : MatScan(n)) \/ MatWrite \/ MatEnd \/ (\E d \in Docs : Purge(d) \/ DerivedPurge(d))
+Next == Propose \/ WriterStep \/ Expunge
         \/ (\E d \in Docs : DeleteDocument(d))
-        \/ (\E f \in Facts : Ingest(f) \/ Invalidate(f) \/ Restore(f))
+        \/ (\E f \in Facts : Ingest(f) \/ Invalidate(f) \/ Restore(f) \/ Replace(f) \/ Reextract(f)
+                             \/ ChunkPurge(f) \/ ReextractPurge(f))
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(WriterStep) /\ WF_vars(MatStart) /\ WF_vars(MatWrite)
-        /\ WF_vars(\E d \in Docs : Purge(d))
+Spec == Init /\ [][Next]_vars /\ WF_vars(WriterProgress) /\ WF_vars(Expunge)
 
-Symm == Permutations(Obs)
+Symm == Permutations(Writers)
 
 -----------------------------------------------------------------------------
 (* Invariants *)
@@ -250,17 +372,19 @@ NoDeletedDerivationServed ==
 NoInvalidatedDerivationServed ==
   \A T \in 1..MaxT : \A x \in Served(T) : \A f \in GDeriv(x[1], x[2]) : f \notin hidden
 
-\* Invalidate;Restore leaves no trace: a version with no currently hidden fact in its
-\* derivation is visible exactly as if invalidation had never existed.
+\* Invalidate;Restore leaves no trace: a version with no currently hidden fact in its derivation
+\* is visible exactly as if invalidation had never existed.
 RestoreExact ==
-  \A x \in Versions : (\A f \in GDeriv(x[1], x[2]) : f \notin hidden) =>
-      (VisN(x[1], x[2]) <=> \A f \in GDeriv(x[1], x[2]) : ~TombTrue(f))
+  \A x \in Versions : vers[x[1]][x[2]].st = "live" =>
+    ((\A f \in GDeriv(x[1], x[2]) : f \notin hidden) =>
+      (VisN(x[1], x[2]) <=> \A f \in GDeriv(x[1], x[2]) : ~TombTrue(f)))
 
-\* Precision: a version with no victim in its derivation is visible (the blast radius guard,
-\* and the re-used document id is not hidden by the old tombstone).
+\* Precision: a version with no victim in its derivation is visible (the blast radius guard, the re-used
+\* document id is not hidden by the old tombstone); REPLACE and re-extraction hide only the fact arms.
 NoOverHiding ==
-  /\ \A f \in born \ gone : ~Victim(f) => f \in VisFacts
-  /\ \A x \in Versions : (\A f \in GDeriv(x[1], x[2]) : ~Victim(f)) => VisN(x[1], x[2])
+  /\ \A f \in born \ gone : (~Victim(f) /\ f \notin ctomb /\ f \notin hidRe) => f \in VisFacts
+  /\ \A x \in Versions : vers[x[1]][x[2]].st = "live" =>
+       ((\A f \in GDeriv(x[1], x[2]) : ~Victim(f)) => VisN(x[1], x[2]))
 
 \* Served at T => nothing in the derivation was mentioned after T.
 AsOfNoLeak ==
@@ -269,10 +393,42 @@ AsOfNoLeak ==
 \* Once a document is materialized, derived_hidden covers every committed version
 \* with a victim of its tombstone in the derivation.
 MaterializeComplete ==
-  \A d \in Docs : ms[d] \in {"materialized", "purged"} =>
+  \A d \in Docs : ms[d] \in {"materialized", "purged", "done"} =>
     \A x \in Versions : (GDeriv(x[1], x[2]) \cap Victims(d) # {}) => Perm(x[1], x[2])
 
-\* Liveness: a pending tombstone is eventually purged.
-ExpungeCompletes == \A d \in Docs : (ms[d] = "pending") ~> (ms[d] = "purged")
+\* N135(1): evidence outlives the facts it names -- a live version's evidence is everything its text
+\* was derived from.
+EvidenceOutlivesFacts ==
+  \A x \in Versions :
+    (\A w \in Seg(x[1], x[2]) : vers[x[1]][w].st = "live") =>
+      (GDerivF(x[1], x[2]) \subseteq DerivF(x[1], x[2]))
+
+\* N120(3): an update extends the version it was rendered from, which is the version it follows.
+BaseCurrentAtCommit == \A x \in Versions : vers[x[1]][x[2]].base \in {0, x[2] - 1}
+\* ... so no root rebuild lies between an update and its base: stale text never overwrites a rebuild.
+NoLostRebuild ==
+  \A x \in Versions : vers[x[1]][x[2]].base > 0 =>
+    \A u \in (vers[x[1]][x[2]].base + 1)..(x[2] - 1) : vers[x[1]][u].root # u
+
+\* N136: after DerivedPurge no live version holds text derived from the deleted document.
+NoVictimTextAfterPurge ==
+  \A d \in Docs : ms[d] = "done" =>
+    \A x \in Versions : vers[x[1]][x[2]].st = "live" => GDeriv(x[1], x[2]) \cap Victims(d) = {}
+
+\* N135(4), N136: version rows are never deleted (version numbers are not reused), and a stub or missing
+\* row is never served.
+FailClosed ==
+  /\ \A n \in Nodes : Len(vers[n]) = hw[n]
+  /\ \A x \in Versions : vers[x[1]][x[2]].st # "live" => ~VisN(x[1], x[2])
+
+\* N135(2)-(3): a derived version whose derivation holds only re-extracted (reextract-hidden) facts as
+\* hidden ones stays visible.
+ReextractKeepsDerivedVisible ==
+  \A x \in Versions : vers[x[1]][x[2]].st = "live" =>
+    ((GDeriv(x[1], x[2]) \cap hidRe # {} /\ \A f \in GDeriv(x[1], x[2]) : ~Victim(f) /\ ~RowCovered(x[1], x[2]))
+       => VisN(x[1], x[2]))
+
+\* Liveness: a pending tombstone is eventually done.
+ExpungeCompletes == \A d \in Docs : (ms[d] = "pending") ~> (ms[d] = "done")
 
 =============================================================================

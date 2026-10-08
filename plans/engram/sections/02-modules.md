@@ -1,7 +1,7 @@
 ## 2. Module breakdown: the code API
 
 This section presents the Go API as a **small set of interfaces that compose in one obvious way**
-(register N132). Rules every signature follows: Go 1.25, module `example.com/engram` (D1);
+(registers N132, N140). Rules every signature follows: Go 1.25, module `example.com/engram` (D1);
 `context.Context` first and `error` last; optional parameters in `…Options` structs, never in
 variadic option funcs; **one typed id per entity** (`id.FactID`, `id.NamespaceID`, …, never a bare
 `string`); times are UTC `time.Time`; **every interface has at most five methods** (a wider
@@ -15,13 +15,13 @@ Four ideas carry the design; everything else is a detail of one of them.
 
 | Pattern | Where | Why (one line) |
 |---|---|---|
-| **Repository + Unit of Work** | `store.Store.InNamespace(ctx, ns, func(tx Tx) error)`, `store.Tx` and its repositories | one fenced transaction per request means the ownership check, RLS scope and outbox append cannot be forgotten |
+| **Repository + Unit of Work** | `store.Store.InNamespace(ctx, ns, func(tx Tx) error)`, `store.Tx` and its repositories; reads open a `store.ReadSession` whose `Tx` is one short transaction per arm | one fenced transaction per write means the ownership check, RLS scope and outbox append cannot be forgotten; a recall is N read transactions, never one shared connection |
 | **Strategy** | `recall.Arm`, `index.Searcher`, `consolidate.Router`/`Writer`, `gateway` capabilities | each swappable behaviour sits behind a 1–5 method interface chosen at wiring time |
-| **Pipeline** | `pipeline.Step[S]` for recall; the ordered activity groups of retain | a request is a fixed sequence of named steps with per-step timing, deadline and skip rules |
+| **Pipeline** | `pipeline.Step[S]` for the sequential stages of recall (fuse, rerank, boost, pack, stream); the ordered activity groups of retain | a request is a fixed sequence of named steps with per-step timing, deadline and skip rules; the retrieval stage in front of them is a small DAG scheduler (the arms declare `Needs()`, N54) |
 | **State machine** | `fsm.Table` for namespace ownership, operations and moves | legal transitions are data (generated from SQL), so code, SQL and TLA+ share one table |
 | **Adapter** | `adapters/mcp`, `adapters/connect` over the gRPC core | adapters hold a *client* to the core, so they cannot bypass the interceptor (D13) |
 | **Transactional outbox** | `outbox.Writer.Append` as the last statement; `outbox.Relay` | every consumer sees changes without dual writes |
-| **Saga** | `move` and `expunge` as Temporal workflows with compensations | multi-database work is a durable sequence of idempotent steps, each with a defined undo before its point of no return |
+| **Saga** | `move` as a Temporal workflow with compensations (`expunge` and `TenantDelete` are forward-only workflows, not sagas) | multi-database work is a durable sequence of idempotent steps, each with a defined undo before its point of no return (the catalog CAS) |
 
 **A Retain call, through the packages.**
 
@@ -30,14 +30,14 @@ Four ideas carry the design; everything else is a detail of one of them.
    `RequestScope` lands in the context.
 2. `api.MemoryServer.Retain` validates (`errs.Validation`), mints `UUIDv5(operation_id, "item/" ‖ index)`
    for items without a `document_id`, computes `api.RequestHash` and calls `api.Submitter.Submit(ctx, scope, req)`.
-3. `Submit` writes a large body to `blob.Store` (content-addressed), then runs **one unit of work**:
+3. `Submit` writes a large body to `blob.Store` under the `ledger_id` minted for this attempt (owner-keyed, N104), then runs **one unit of work**:
    `store.InNamespace(ctx, ns, func(tx store.Tx) error { … })`. The store opens a transaction, sets
    the RLS GUCs, takes the shared fence try-lock and checks `namespace_ownership` is `active` at the
    epoch.
 4. Inside: `tx.Ops().Idempotency().Begin`, `Ops().Ledger().Append`, `Insert().Documents().BeginVersion`,
    `Ops().Operations().Insert`, then `Ops().Outbox().Append(DocumentVersionStarted)` as the last
    statement. Commit; the ack is now durable.
-5. `workflows.Client.StartRetain` starts `ns/{ns}/op/{op}` on task queue `shard-N`; the handler returns
+5. `workflows.Starter.StartRetain` starts `ns/{ns}/op/{op}` on task queue `shard-N`; the handler returns
    `Operation{PENDING}`.
 6. A worker runs the `RetainDocument` workflow, which is the **pipeline**: `Prepare` activities
    (`LoadItem → Chunk → SummarizeDocument → PlanChunks`), then per chunk the `ChunkPipeline` group
@@ -51,26 +51,35 @@ Four ideas carry the design; everything else is a detail of one of them.
    curation re-applied), then `outbox.Writer.Append(ChunkCommitted)` last. Facts are visible at
    commit.
 9. `outbox.Relay` (one elected per shard) reads `outbox` in `seq` order and drives the `index` and
-   `kafka` sinks; `FinalizeVersion` inserts tombstones; a `Nudge` wakes `consolidate`.
-10. The client calls `WaitOperation`; `api.OperationWaiter` parks on `workflows.Client.WaitResult`.
+   `kafka` sinks; `FinalizeVersion` inserts tombstones and flags the affected observations stale
+   (evidence rows are kept, N135); a `Nudge` wakes `consolidate`.
+10. The client calls `WaitOperation`; `api.OperationWaiter` parks on `workflows.Waiter.WaitResult`.
 
 **A Recall call, through the packages.**
 
-1. Same edge as above → `api.MemoryServer.Recall` (server stream) → `recall.Planner.Recall(ctx, q, sink)`
-   inside `store.ReadNamespace` (no lock; accepts `active` and `frozen/move`).
-2. The planner is a `pipeline.Pipeline[*recall.State]`; its steps run in order and each records a
-   `StageTiming`:
-3. `Embed` — `gateway.Embedder.Embed("search_query: " + text)` (LRU hit skips it).
-4. `Visibility` — `tx.Visible().Sets(ctx)` loads `doc_tomb` (document → `up_to_version`), `chunk_tomb`, `fact_hidden` once
-   (three indexed selects) and resolves the tag filter into an allowed-document set (N116).
-5. `Arms` — runs the configured `[]recall.Arm` (Strategy): lexical and temporal immediately, semantic
-   and chunks when the embedding arrives, graph in two seeded waves; each arm calls
-   `index.Searcher` or a repository with the visibility sets and `as_of` in its predicate, under its
-   own deadline.
-6. `Fuse` — `recall.Fuser` (RRF, k = 60, exact rationals). `Rerank` — `gateway.Reranker` on the top
+1. Same edge as above → `api.MemoryServer.Recall` (server stream) → `store.ReadNamespace` opens a
+   **`ReadSession`** (no transaction yet, no lock) and `recall.Planner.Recall(ctx, q, sink)` runs on it.
+   **A recall is N short read transactions, not one unit of work (N140):** every arm that runs
+   concurrently calls `Session.Tx`, which opens its own pooled connection, sets the scope GUCs, runs the
+   read fence (`active` or `frozen/move`) and the arm's `SET LOCAL`s (`enable_seqscan = off`, no parallel
+   workers, `hnsw.ef_search`, N138). One connection runs one statement at a time, so a shared
+   transaction would serialise the arms and the 216 ms path could not hold.
+2. The planner is a `pipeline.Pipeline[*recall.State]` whose first stage is a DAG scheduler and whose
+   remaining stages run in order; each records a `StageTiming`:
+3. `Retrieve` — a DAG over named nodes. `visibility` loads, once, the two marker sets
+   (`doc_tomb`: document → `up_to_version`, and `chunk_tomb`; two indexed selects, `fact_hidden` is tested
+   per candidate), resolves the tag and metadata filters into an allowed-document set (N116, N139) and
+   estimates the eligible rows for the semantic plan (N138); `embed` calls
+   `gateway.Embedder.Embed("search_query: " + text)` (LRU hit skips it). These are **values** computed once
+   and passed into every arm.
+4. The arms are the other nodes (Strategy): lexical and temporal as soon as `visibility` is done, semantic
+   and chunks when `embed` is done too, graph in two seeded waves; each arm opens its own `Session.Tx`
+   and calls `index.Searcher` or a repository with the marker sets, the allowed documents, the plan
+   and `as_of` in its predicate, under its own deadline.
+5. `Fuse` — `recall.Fuser` (RRF, k = 60, exact rationals). `Rerank` — `gateway.Reranker` on the top
    0/50/150, skipped below the 106 ms reserve. `Boost`, `Pack` (rank 1 always whole).
-7. `Stream` — batches of 10 to the gRPC stream, then `RecallStats` with the stage timings.
-8. Errors travel as `errs.Error` and are rendered once by `errs.ToStatus` / `errs.ToConnect`; a
+6. `Stream` — batches of 10 to the gRPC stream, then `RecallStats` with the stage timings.
+7. Errors travel as `errs.Error` and are rendered once by `errs.ToStatus` / `errs.ToConnect`; a
    `WrongShardOrEpoch{MOVED_OUT}` is caught by `router.Retry`, which follows the internal hint to the
    new owner.
 
@@ -82,34 +91,45 @@ cmd/
 proto/            memory/v1  memory/admin/v1  engram/internal/{errors,workflow,events}/v1
 gen/go/...        buf generate output (committed)
 internal/
-  id/             typed ids and Scope (leaf; N132)
+    id/             typed ids and Scope (leaf; N132; github.com/google/uuid is its one allowed dependency)
   errs/           typed errors + gRPC/Connect/Temporal mapping (leaf; N1)
   pipeline/       generic ordered Step[S] runner (leaf; N132)
   fsm/            transition tables for ownership, operations, moves (leaf; N132)
+  txn/            the capability handle of the caller's open transaction, shared by quota and store (leaf; N133a)
   api/            gRPC service implementations, deadline + request_id enforcement, retain.Submitter
   authz/ catalog/ router/ config/ quota/ telemetry/
   gateway/ blob/ intent/ store/ index/ outbox/ ledger/
-  chunk/ extract/ entity/ link/ recall/ consolidate/ reflect/ pages/ export/
+  chunk/ extract/ entity/ link/ recall/ consolidate/ reflectagent/ pages/ export/
   expunge/ move/ workflows/
 adapters/         mcp/  connect/
 formal/           tla/*.tla  lean/Engram/*.lean
 ```
 
-`internal/id`, `internal/pipeline` and `internal/fsm` are three small leaf packages added to D14 by
-N132 (they contain no I/O and import nothing from `internal/`). `internal/intent` and
-`internal/expunge` are the D22 packages.
+`internal/id`, `internal/pipeline`, `internal/fsm` and `internal/txn` are four small leaf packages added
+to D14 by N132 and N133a (they contain no I/O; a leaf imports only the standard library, the one
+allowed third-party module of `id`, and other leaves). `internal/intent` and `internal/expunge` are the
+D22 packages. `internal/reflect` is `internal/reflectagent` (N140): the old name shadowed the standard
+`reflect` package.
 
 **Dependency rule** (enforced by `go vet` + a `depguard` config in CI):
 
 | Layer | May import | Must not import |
 |---|---|---|
-| leaves (`id`, `errs`, `pipeline`, `fsm`) | the standard library, `gen/go` detail messages (`errs` only) | any other `internal/` package |
-| `internal/api` | `authz, router, recall, pages, export, quota, store, workflows (client only), intent, errs, telemetry`, `gen/go` | adapters, `cmd` |
-| Services (`recall, consolidate, reflect, pages, export, move, expunge, entity, link, extract, chunk`) | `store, index, gateway, blob, intent, config, quota, ledger, errs, telemetry`, `gen/go` | `internal/api`, adapters, `workflows` |
-| Infrastructure (`store, index, gateway, blob, intent, catalog, router, outbox, ledger, config, quota, telemetry`) | leaves, `gen/go`, drivers | any service package, `internal/api` |
+| leaves (`id`, `errs`, `pipeline`, `fsm`, `txn`) | the standard library, `github.com/google/uuid` (`id` only), other leaves, `gen/go` detail messages (`errs` only) | any non-leaf `internal/` package |
+| `internal/api` | `authz, catalog, router, recall, reflectagent, pages, export, quota, config, store, blob, workflows (clients only), intent, errs, telemetry`, `gen/go` | adapters, `cmd` |
+| Services (`recall, consolidate, reflectagent, pages, export, move, expunge, entity, link, extract, chunk`) | `store, index, gateway, blob, intent, config, quota, ledger, errs, telemetry`, `gen/go`; `reflectagent` also `recall`, `pages`; `move` also `catalog` | `internal/api`, adapters, `workflows` |
+| Infrastructure (`store, index, gateway, blob, intent, catalog, router, outbox, ledger, config, quota, telemetry`) | leaves, `gen/go`, drivers, and only the edges named below | any service package, `internal/api` |
 | `internal/workflows` | activity **interfaces** declared in itself, `gen/go/engram/internal/workflow/v1`, the Temporal SDK | concrete service packages (injected in `cmd/engram-worker`) |
 | `adapters/*` | `gen/go` (+ generated clients), `authz` (scope names), `errs` (code mapping) | any other `internal/*` |
 | `cmd/*` | everything | — |
+
+**The import graph is acyclic by construction (N140).** The infrastructure edges are exactly:
+`store → {id, errs, fsm, txn}`; `index → store`; `outbox → store` (the outbox *writer* is a `store`
+interface, so `store` never imports `outbox`); `quota → {txn, gateway}`; `catalog → {fsm, config}`;
+`router → {store, index, blob, catalog}` and it takes an `id.Scope`, never `authz.RequestScope`;
+`authz → {catalog, quota, config}`. The old cycles (`store → outbox → router → store` and
+`router → authz → quota → store → outbox → router`) are gone. `go vet` against a stub module of the §2
+signatures is an M0.1 exit: it catches an import cycle or a method-count regression before any body exists.
 
 Rationale: the rule keeps `internal/api` a thin translation layer, lets every service be tested with
 fakes for store/index/gateway, and guarantees the MCP/Connect adapters cannot bypass the interceptor.
@@ -125,10 +145,20 @@ type DocumentID string    // client-chosen, ≤ 256 bytes
 type ShardID int32
 type Epoch int64
 
-type NamespaceID uuid.UUID  // UUIDv7. FactID, ChunkID, EntityID, ObservationID, PageID, OperationID and MoveID
-type FactID uuid.UUID       // are defined the same way; each has String(), Parse<T>(string) and Bytes() (the
-type ChunkID uuid.UUID      // 16-byte form is what events carry, N80). Versions are typed too:
-type Version int64          // document, observation and page versions; SnapshotVersion for exports.
+type NamespaceID uuid.UUID  // UUIDv7. FactID, ChunkID, EntityID, ObservationID, PageID, LedgerID, OperationID and
+type FactID uuid.UUID       // MoveID are defined the same way; each has String(), Parse<T>(string) and Bytes() (the
+type ChunkID uuid.UUID      // 16-byte form is what events carry, N80).
+
+// Versions are one type per entity (N140): a DocVersion cannot be passed where an ObsVersion is wanted.
+type DocVersion int64; type ObsVersion int64; type PageVersion int64; type SnapshotVersion int64
+
+type CellID string          // a cell (Temporal cluster + its shards)
+type WorkflowID string      // "ns/{ns}/op/{op}" etc.; built only by internal/workflows
+
+// MemoryRef is the typed union of the three things a recall result can be; constructors FactRef, ObservationRef,
+// ChunkRef. It replaces untyped uuid.UUID in index.Hit, recall.Candidate and the citation verifier.
+type MemoryKind uint8       // KindFact | KindObservation | KindChunk
+type MemoryRef struct { Kind MemoryKind; ID uuid.UUID }
 
 // Scope is the fencing token that travels with every request and every workflow input.
 type Scope struct { Tenant TenantID; Namespace NamespaceID; Shard ShardID; Epoch Epoch }
@@ -162,9 +192,25 @@ type Table[S, E ~string] interface {
 }
 ```
 
+```go
+package txn // leaf (N133a, N140): what quota and outbox-adjacent code may do inside the caller's transaction
+
+// Tx is implemented by store.Tx. quota.Meter takes this, never store.Tx, so quota does not import store.
+type Tx interface {
+	Scope() id.Scope
+	Usage() Usage
+}
+type Usage interface {
+	Record(ctx context.Context, key UsageKey, e UsageEvent) (inserted bool, err error) // exactly-once through usage_key (PD-1)
+	Day(ctx context.Context, day time.Time) (tokens, facts int64, err error)           // rollup read for quota.Meter.Remaining
+}
+```
+
 `fsm.OwnershipState` is `incoming | ready | active | frozen/{move,delete,restore} | moved_out`;
-`fsm.OperationState` is `PENDING | RUNNING | DEFERRED | SUCCEEDED | FAILED | CANCELLED` (N35, monotone);
-`fsm.MoveState` is `planned | copying | frozen | reconciling | cutover | cleaning | done | rolled_back`.
+`fsm.OperationState` is `PENDING | RUNNING | DEFERRED | SUCCEEDED | FAILED | CANCELLED` (N35, monotone,
+no `FAILED → PENDING` edge: a retry is a new operation, N139);
+`fsm.MoveState` is `planned | copying | frozen | reconciling | cutover | committed | cleaning | done | rolled_back`
+(`committed` is the catalog CAS, N125).
 
 ### 2.2 Modules
 
@@ -182,17 +228,27 @@ cross-cutting rules (deadline, `request_id`, page tokens, field masks, error ren
 package api
 
 type Options struct {
-	MaxDeadline map[string]time.Duration // full method → cap (N11); over the cap is INVALID_ARGUMENT, never clamped
+	MaxDeadline map[string]time.Duration // full method → cap (N11); over the cap is INVALID_ARGUMENT, never clamped; delete-class RPCs and Restore 40 s (N139)
 	MaxPageSize int32                    // 1000 (200 for ListMemories with text in the mask)
 	RequestIDTTL time.Duration           // 24 h (D1)
 	MaxOpenWaits int                     // 2 000 WaitOperation long-polls per process (N70)
 	ReflectionServices []string          // ["memory.v1"] only, never the admin surface (N71)
 }
-type Deps struct { // every field is an interface (2.3)
-	Router router.ShardRouter; Store store.Store; Recall recall.Planner; Retain Submitter
-	Deleter Deleter; Ops OperationWaiter; Temporal workflows.Client; Pages pages.Reader; Export export.Streamer
-	Intents intent.Log; Quota quota.Limiter; Clock func() time.Time
+type Deps struct { // every field is an interface (2.3); complete for every served RPC (N140)
+	Router router.ShardRouter; Stores store.Stores          // one store.Store per shard of the cell: a process serves up to 32 shards
+	Catalog   catalog.Namespaces; Registry catalog.Registry; Tenants catalog.Tenants; TenantOps catalog.TenantOps
+	Moves     catalog.Moves; MoveReader catalog.MoveReader; Floor catalog.ReplayFloor // NamespaceService, TenantService, ShardService, MoveService
+	Config    config.Resolver                                // GetEffectiveConfig
+	Recall    recall.Planner; Reflect reflectagent.Agent
+	Retain    Submitter; Deleter Deleter; Ops OperationWaiter
+	Start     workflows.Starter; Signal workflows.Signaller; Wait workflows.Waiter
+	Pages     pages.Reader; PageWriter pages.Writer          // PageService, incl. CreatePage/UpdatePage/DeletePage/RefreshPage
+	Snapshots export.Builder; Stream export.Streamer         // ExportService, incl. CreateSnapshot
+	Intents   intent.Log; Quota quota.Limiter; Clock func() time.Time
 }
+// NewServer panics at wiring time if the generated coverage table (`api/deps_coverage_gen.go`, produced from the proto
+// service list by `make gen-docs`) names an RPC with no non-nil dependency path; TestDeps_EveryRPCHasPath asserts
+// the same on every CI run, so a new RPC cannot ship without the dependency that implements it.
 func NewServer(d Deps, o Options) *Server
 func (s *Server) RegisterGRPC(g *grpc.Server)
 func (s *Server) RegisterConnect(mux *http.ServeMux, ic ...connect.Interceptor)
@@ -200,16 +256,21 @@ func (s *Server) RegisterConnect(mux *http.ServeMux, ic ...connect.Interceptor)
 // Submitter is the API half of retain (D16): durable ack, then workflow start (§5.1.1).
 type Submitter interface { Submit(ctx context.Context, sc authz.RequestScope, req *memoryv1.RetainRequest) (*memoryv1.Operation, error) }
 
-// Deleter is the synchronous half of every delete: the intent object, then ONE marker transaction (N115, N122).
+// Deleter is the synchronous half of every delete: ONE marker transaction, then the intent object (put after the
+// commit, before the ack), then the ack (N115, N122). A duplicate attempt that finds the subject already deleted
+// returns the existing operation and first ensures the intent of the marker it found (put-if-absent).
 type Deleter interface {
-	DeleteDocument(ctx context.Context, sc authz.RequestScope, doc id.DocumentID, o DeleteOptions) (*memoryv1.DeleteDocumentResponse, error)
-	DeleteNamespace(ctx context.Context, sc authz.RequestScope, confirmName string) (*memoryv1.DeleteNamespaceResponse, error)
-	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)
-	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)
+	DeleteDocument(ctx context.Context, sc authz.RequestScope, doc id.DocumentID, o DeleteOptions) (*memoryv1.DeleteDocumentResponse, error) // DeleteOptions{OperationID, ExpectedVersion id.DocVersion (compared inside the marker tx)}
+	DeleteNamespace(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirmName string) (*memoryv1.DeleteNamespaceResponse, error) // keeps the client's operation_id
+	DeleteTenant(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirm id.TenantID) (*adminv1.DeleteTenantResponse, error)       // acks after the catalog row and the tenant intent; fences asynchronously
+	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // a second Invalidate is a no-op success
+	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // exclusive derivation lock: 40 s deadline cap
 }
 
 // OperationWaiter implements WaitOperation: park on Temporal's workflow-result long-poll (≤ MaxOpenWaits per
-// process), else poll the operations row every 1 s ± 250 ms; DELETE_NAMESPACE and DELETE_TENANT are served from the catalog, derived from `namespaces.state` / the `tenants` row (N70, N133d).
+// process), else poll the operations row every 1 s ± 250 ms. DELETE_DOCUMENT polls the tombstone (its workflow is the
+// expunge singleton), DELETE_NAMESPACE and DELETE_TENANT are served from the catalog, derived from `namespaces.state`
+// / the `tenants` row (N70, N133d, N136). CancelOperation on a DELETE_* operation is OPERATION_NOT_CANCELLABLE.
 type OperationWaiter interface {
 	Wait(ctx context.Context, sc authz.RequestScope, op id.OperationID, timeout time.Duration) (*memoryv1.Operation, bool /*timedOut*/, error)
 }
@@ -234,7 +295,7 @@ Pipeline of three checks) with a declarative `Policy` table instead of per-handl
 ```go
 package authz
 
-type Scope string // "memory.read" | "memory.write" | "memory.admin" | "tenant.admin"
+type Scope string // "memory.read" | "memory.write" | "memory.admin" | "tenant.admin" (tenant-bound) | "engram.operator" (fleet-wide, own audience; N139)
 
 type Claims struct { Subject string; Tenant id.TenantID; Namespaces []id.NamespaceID /* or ["*"] */; Groups []string; Scopes []Scope; ExpiresAt time.Time }
 
@@ -243,7 +304,7 @@ type TokenVerifier interface { Verify(ctx context.Context, raw string) (*Claims,
 type RequestScope struct { id.Scope; Scopes []Scope; Subject string; RequestID string; Config *config.Resolved }
 
 type MethodPolicy struct {
-	Scope Scope; Target Target /* Namespace | Tenant | Admin */; Bucket quota.Bucket
+	Scope Scope; Target Target /* Namespace | Tenant (token.tenant == request.tenant enforced) | Operator */; Bucket quota.Bucket
 	AllowDeleting bool // only OperationService.GetOperation/WaitOperation (and TenantService.GetTenantOperation): a `deleting` namespace is otherwise FAILED_PRECONDITION (N70, N127)
 }
 type Policy map[string]MethodPolicy // key: "/memory.v1.MemoryService/Recall"
@@ -284,15 +345,34 @@ type Namespaces interface { // the directory
 type Moves interface { // the move ledger: every transition is a CAS on the current state
 	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID) (*MoveRow, error)   // source_system_id, source_timeline_id, t_copy recorded
 	Advance(ctx context.Context, m id.MoveID, from, to fsm.MoveState) error
-	Cutover(ctx context.Context, p CutoverParams) error                                 // step (d) only: shard, epoch, state, NOTIFY
-	Rollback(ctx context.Context, m id.MoveID, reason string) error
+	Commit(ctx context.Context, m id.MoveID) error                                      // (a″) CAS cutover → committed: THE point of no return; ErrLost if a rollback or restore won the row (N125)
+	Cutover(ctx context.Context, p CutoverParams) error                                 // step (d) only: shard, epoch, state, NOTIFY; success also when already (target, e + 1)
+	Rollback(ctx context.Context, m id.MoveID, reason string) error                     // CAS cutover → rolled_back (or any earlier state); ErrCommitted if (a″) won
 }
-type Registry interface { // shards and tenants (admin surface, §9)
+type MoveReader interface { // MoveService.GetMove / ListMoves
+	Get(ctx context.Context, m id.MoveID) (*MoveRow, error)
+	List(ctx context.Context, q MoveQuery) ([]MoveRow, string, error)
+}
+type Registry interface { // shards (admin surface, §9)
 	RegisterShard(ctx context.Context, s Shard) error
+	GetShard(ctx context.Context, s id.ShardID) (*Shard, error)
+	ListShards(ctx context.Context, cell id.CellID) ([]Shard, error)
 	SetShardState(ctx context.Context, s id.ShardID, to ShardState) error
-	ListShards(ctx context.Context, cell string) ([]Shard, error)
-	GetTenant(ctx context.Context, t id.TenantID) (*TenantEntry, error)
-	TenantOperation(ctx context.Context, t id.TenantID, op id.OperationID) (*memoryv1.Operation, error) // DELETE_TENANT lives here, derived from tenants.state / deleted_at (N127, N133d)
+	UpdateShard(ctx context.Context, s id.ShardID, p ShardPatch) error
+}
+type Tenants interface { // tenants (admin surface)
+	Create(ctx context.Context, t TenantEntry) error
+	Get(ctx context.Context, t id.TenantID) (*TenantEntry, error)
+	List(ctx context.Context, q TenantQuery) ([]TenantEntry, string, error)
+	Update(ctx context.Context, t id.TenantID, p TenantPatch) (*TenantEntry, error)
+	BeginDelete(ctx context.Context, t id.TenantID, op id.OperationID) error            // tenants.state = 'deleting' + delete_operation_id: the TENANT_DELETING read barrier (N122)
+}
+type TenantOps interface { // DELETE_TENANT lives in the catalog, derived from tenants.state / deleted_at (N127, N133d)
+	Operation(ctx context.Context, t id.TenantID, op id.OperationID) (*memoryv1.Operation, []*memoryv1.Operation /* per-namespace DELETE_NAMESPACE created so far */, error)
+}
+type ReplayFloor interface { // catalog.shards.replay_floor: outside the restorable shard state (N134)
+	Get(ctx context.Context, s id.ShardID) (time.Time, error)
+	Lower(ctx context.Context, s id.ShardID, restoreTarget time.Time) (time.Time, error) // min(); there is NO method that raises it while intents are retained (35 days)
 }
 type Resolver interface {
 	Resolve(ctx context.Context, ns id.NamespaceID) (*Entry, error)      // never blocks on the catalog with a fresh entry
@@ -302,28 +382,31 @@ type Resolver interface {
 }
 ```
 
-The catalog has no delete log: acknowledged deletes live in the intent log (N122). `Entry`
+The catalog has no delete log: acknowledged deletes live in the intent log (N122); it does hold the
+replay floor, which restore and failover only lower (N134). `Entry`
 carries `embedding_model`/`embedding_dims` (`namespaces` columns) so no worker reads config for
 the vector space. `ResolverOptions` has `MaxEntries` 100 000, `TTL`, `NegativeTTL` and `StaleMax`
 (0 = unbounded). *Test seam:* a rapid
-state-machine test drives random `Plan/Advance/Cutover/Rollback` sequences against the move table
-(no `cutover` without `frozen`; at most one active shard per namespace).
+state-machine test drives random `Plan/Advance/Commit/Cutover/Rollback` sequences against the move table
+(no `cutover` without `frozen`; `Commit` and `Rollback` race on one row and exactly one wins; at most one
+active shard per namespace).
 
 #### 2.2.4 `internal/router` — scope → shard handle
 
 Maps a scope (or a workflow input) to the resources of its shard, built at process start for the
-cell's shard list. *Pattern: Registry of per-shard handles; `Retry` is the one place that encodes
+cell's shard list. It takes the plain `id.Scope`, never `authz.RequestScope`, so `router` does not import
+`authz` (N140); `store.Stores` (the per-shard `store.Store`s the API's `Deps` needs) is built from the same list. *Pattern: Registry of per-shard handles; `Retry` is the one place that encodes
 the move/freeze retry contract.*
 
 ```go
 package router
 
-type ShardHandle struct { Shard id.ShardID; Cell string; Store store.Store; Blob blob.Store; Index index.Searcher; TaskQueue string; Metrics telemetry.ShardLabels }
+type ShardHandle struct { Shard id.ShardID; Cell id.CellID; Store store.Store; Blob blob.Store; Index index.Searcher; TaskQueue string; Metrics telemetry.ShardLabels }
 
 type ShardRouter interface {
-	For(ctx context.Context, sc id.Scope) (*ShardHandle, error)            // local handle or errs.ShardNotLocal(cell)
+		For(ctx context.Context, sc id.Scope) (*ShardHandle, error)            // local handle or errs.ShardNotLocal(cell)
 	ForShard(s id.ShardID) (*ShardHandle, bool)                              // workers carry shard_id in inputs (D4)
-	Forward(ctx context.Context, cell, method string, req, resp proto.Message) error // cross-cell hop (phase 3), at most one (N17)
+	Forward(ctx context.Context, cell id.CellID, method string, req, resp proto.Message) error // cross-cell hop (phase 3), at most one (N17)
 	Local() []id.ShardID
 }
 
@@ -331,7 +414,7 @@ type ShardRouter interface {
 // follows the internal MovedOutHint to the new owner (no catalog read, N93); calls that meet MOVED_OUT,
 // NamespaceNotReady or NamespaceFrozen re-resolve in a bounded loop (≤ 5 s, jittered 50 → 500 ms; writes on
 // NamespaceFrozen up to 30 s). Only handlers that are safe to re-execute call it (all writes are idempotent).
-func Retry(ctx context.Context, r catalog.Resolver, sr ShardRouter, sc authz.RequestScope, fn func(ctx context.Context, h *ShardHandle, sc authz.RequestScope) error) error
+func Retry(ctx context.Context, r catalog.Resolver, sr ShardRouter, sc id.Scope, fn func(ctx context.Context, h *ShardHandle, sc id.Scope) error) error
 ```
 
 `Forwarder` proxies unary calls with `Invoke` and the three server-streaming methods with a gRPC
@@ -372,7 +455,10 @@ client itself does not enforce it, the activities do.
 
 #### 2.2.6 `internal/blob` — blob store, prefix scoping, content addressing
 
-*Pattern: Decorator — `Scoped` wraps any `Store` and rejects keys outside a shard prefix.*
+*Pattern: Decorator — `Scoped` wraps any `Store` and rejects keys outside a shard prefix.* Two key families
+(N104): **content-addressed caches** (`xcache`, `ecache`, `docsum`, `staging`: a loss is a recompute) and
+**owner-keyed blobs** (`ledger/{ledger_id}`, `ver/{document_id}/v{n}`, page markdown, export parts), each with
+exactly one owner row that deletes it in the purge, so no reference check or adoption race exists.
 
 ```go
 package blob
@@ -385,7 +471,9 @@ type Store interface {
 	List(ctx context.Context, prefix string, p ListPage) (*ListResult, error)
 }
 func Scoped(root Store, p Prefix, cred Credential) Store   // rejects any key not under {shard}/{tenant}/{ns}/ (../, absolute, other shard)
-func ContentKey(p Prefix, k Kind, sum [32]byte, ext string) string // "{prefix}{kind}/{hex sha256}[.ext]"; Kind: ledger | xcache | ecache | docsum | consolidate | pages | export | staging | ver
+func ContentKey(p Prefix, k Kind, sum [32]byte, ext string) string // "{prefix}{kind}/{hex sha256}[.ext]"; Kind: xcache | ecache | docsum | staging (content-addressed, 24 h grace on delete)
+func LedgerKey(p Prefix, l id.LedgerID) string                       // "{prefix}ledger/{ledger_id}": owner = the ingest_ledger row, minted per attempt before the put (N7)
+func VersionBodyKey(p Prefix, d id.DocumentID, v id.DocVersion) string // "{prefix}ver/{document_id}/v{n}": owner = the document_versions row (N104)
 
 // Tombstoner makes purges resumable: a blob_tombstones row is inserted first, the object deleted, then the row.
 type Tombstoner interface {
@@ -395,7 +483,8 @@ type Tombstoner interface {
 ```
 
 The expunge deletes `xcache`/`ecache`/`staging` objects only when no visible chunk references the
-hash **and** the object is older than `xcache_grace = 24 h` (`Head` supplies `LastModified`; N100).
+hash **and** the object is older than `xcache_grace = 24 h` (`Head` supplies `LastModified`; N100); an
+owner-keyed object is deleted together with its owner row. A move's blob check is one key per copied row.
 Backups live under `_backups/shard-{id}/`, outside every tenant prefix (N23).
 
 #### 2.2.7 `internal/store` — per-shard Postgres, fencing, repositories
@@ -408,24 +497,47 @@ write, so the fence prelude, RLS scope and outbox append cannot be skipped.*
 ```go
 package store
 
-// Store is the only entry point to a shard. Reads take no lock; writes run the fence prelude (N82).
+// Store is the only entry point to a shard. Reads take no lock; writes run the fence prelude (N82). Five methods.
 type Store interface {
 	// InNamespace runs fn in one WRITE transaction: SET LOCAL engram.namespace_id/tenant_id/epoch and
 	// statement_timeout (30 s = idle_in_transaction_session_timeout, A-F1), engram_try_ns_fence (shared
 	// try-lock, never waits: a refusal is NamespaceFrozen{200 ms}), then a plain SELECT state, epoch FROM
 	// namespace_ownership; abort with WrongShardOrEpoch unless state = 'active' AND epoch = ns.Epoch.
 	InNamespace(ctx context.Context, ns id.Scope, fn func(tx Tx) error) error
-	// ReadNamespace runs fn in one READ transaction: the ownership SELECT only, accepting 'active' and
-	// 'frozen/move', epoch ignored, no lock. 'frozen/delete', 'frozen/restore', 'incoming', 'ready' and
-	// 'moved_out' are refused (a moved_out row also returns the internal MovedOutHint).
-	ReadNamespace(ctx context.Context, ns id.Scope, fn func(tx ReadTx) error) error
-	// Admin runs fn as engram_admin (BYPASSRLS): sweepers that enumerate namespaces, the restore replay.
+	// ReadNamespace opens a ReadSession for a request: no transaction yet, no lock. Each Session.Tx is one
+	// short READ transaction (below); a recall is N of them, not one unit of work (N140).
+	ReadNamespace(ctx context.Context, ns id.Scope, fn func(s ReadSession) error) error
+	// Admin runs fn as engram_admin (BYPASSRLS, 30 s timeouts): sweepers that enumerate namespaces, the
+	// expunge's purge, the restore replay.
 	Admin(ctx context.Context, fn func(tx AdminTx) error) error
-	Shard() id.ShardID
+	// Direct returns a dedicated, non-pooled connection as engram_relay for the outbox relay's advisory-lock
+	// election and ordered outbox reads (N4, N15); outbox.Relay takes a Store and calls this.
+	Direct(ctx context.Context) (DirectConn, error)
 	Close() error
 }
+type DirectConn interface {
+	TryLock(ctx context.Context, key int64) (bool, error)                      // session-level pg_try_advisory_lock; lost when the connection drops
+	ReadOutbox(ctx context.Context, after int64, limit int) ([]OutboxRow, error) // seq order, every namespace
+	Cursors() CursorRepo                                                         // outbox_cursors: guarded UPDATE, gap watchlist
+	Close() error
+}
+// Stores is the per-shard directory the API's Deps needs: a process serves up to 32 shards (D3).
+type Stores interface { For(s id.ShardID) (Store, bool); Local() []id.ShardID }
 
-// Tx groups the repositories by role; every accessor returns an interface of at most five methods.
+// ReadSession is the scope of one request on one shard. It holds no connection; every Tx opens its own, so arms
+// that run concurrently (N54) never share one (a pgx connection executes one statement at a time).
+type ReadSession interface {
+	Scope() id.Scope
+	// Tx runs fn in ONE short READ transaction on its own pooled connection: SET LOCAL scope GUCs, the read fence
+	// (SELECT state FROM namespace_ownership: 'active' and 'frozen/move' are accepted, epoch ignored; 'frozen/delete',
+	// 'frozen/restore', 'incoming', 'ready' and 'moved_out' are refused, a moved_out row also returns the internal
+	// MovedOutHint), then o.SetLocal (enable_seqscan = off, max_parallel_workers_per_gather = 0, hnsw.ef_search, an
+	// arm statement_timeout; N138). Marker sets, $allowed_docs and the plan choice are values passed in, not re-read.
+	Tx(ctx context.Context, o TxOptions, fn func(tx ReadTx) error) error
+}
+
+// Tx groups the repositories by role; every accessor returns an interface of at most five methods. It also
+// satisfies txn.Tx, so quota.Meter can record usage inside the caller's transaction without importing store.
 type Tx interface {
 	Read() ReadTx       // the read side, also usable inside a write transaction
 	Insert() Inserts    // insert-only content writers (N113): no method updates a content row
@@ -441,8 +553,9 @@ type ReadTx interface {
 type AdminTx interface {
 	Ownership() OwnershipRepo  // Get, Transition(edge, …) generated from §3.3.1, FenceExclusive (one 35 s attempt)
 	Sweep() Sweepers           // namespaces with pending facts, stale observations, pending tombstones, deferred operations
-	Restore() RestoreRepo      // apply an intent through the admin variant of the marker transaction (N122)
-	Indexes() IndexRepo        // vector_indexes bookkeeping for engramctl index (N112)
+	Restore() RestoreRepo      // apply an intent verbatim through the admin variant of the marker transaction (N122)
+	Indexes() IndexRepo        // vector_indexes for the index runner: requested → building → ready | failed, lease, purged_since_build (N138)
+	Purge() Purger             // Materialize, purge batches and DerivedPurge as engram_admin (N119, N136)
 }
 ```
 
@@ -453,19 +566,19 @@ type Inserts interface {
 	Documents() DocumentWriter; Chunks() ChunkWriter; Facts() FactWriter; Links() LinkWriter; Entities() EntityWriter
 }
 type DocumentWriter interface {
-	BeginVersion(ctx context.Context, d DocumentDraft) (id.Version, error)   // under the documents row lock (N56): assigns the version and `append_base_version`; refuses a tombstoned document
-	Activate(ctx context.Context, doc id.DocumentID, v id.Version) error
-	MarkDeleting(ctx context.Context, doc id.DocumentID, at time.Time) (current id.Version, err error) // state = 'deleting'; the marker tx (§5.4.1)
-	SetBody(ctx context.Context, doc id.DocumentID, v id.Version, key string, sum [32]byte) error     // WHERE body_key IS NULL (N104)
-	Lock(ctx context.Context, doc id.DocumentID, m LockMode) error  // LockShared = try-lock (errs.DocumentBusy, 100 ms); LockExclusive under lock_timeout 5 s (N83)
+		BeginVersion(ctx context.Context, d DocumentDraft) (id.DocVersion, error) // under the documents row lock (N56): assigns the version (above any tombstone's up_to_version) and `append_base_version`; revives a deleting document at up_to_version + 1 (N133c)
+	Activate(ctx context.Context, doc id.DocumentID, v id.DocVersion) error
+	MarkDeleting(ctx context.Context, doc id.DocumentID, expected id.DocVersion, at time.Time) (current id.DocVersion, err error) // the marker tx (§5.4.1): compares expected under the lock, sets state = 'deleting' and clears summary_blob_key, context, metadata, tags in the same row update (N115, N136)
+	SetBody(ctx context.Context, doc id.DocumentID, v id.DocVersion, key string, sum [32]byte) error // WHERE body_key IS NULL (N104)
+	Lock(ctx context.Context, doc id.DocumentID, m LockMode) error  // LockShared = try-lock (errs.DocumentBusy, 100 ms); LockExclusive = one 35 s attempt, generated from the GUC table (N83, N139)
 }
 type ChunkWriter interface {
 	Insert(ctx context.Context, c ChunkInsert) (id.ChunkID, bool /*inserted*/, error) // ON CONFLICT DO NOTHING; ordinals live in document_version_chunks
 	AddVector(ctx context.Context, c id.ChunkID, v VectorRow) error                  // chunk_vectors keyed with embedding_effective_at; ReembedChunk adds a NEW row (N111)
-	Member(ctx context.Context, doc id.DocumentID, v id.Version, h [32]byte, c id.ChunkID, ordinal int) error
+		Member(ctx context.Context, doc id.DocumentID, v id.DocVersion, h [32]byte, c id.ChunkID, ordinal int) error
 }
 type FactWriter interface {
-	Insert(ctx context.Context, fs []Fact, vs []VectorRow) error  // facts + fact_vectors (document_id, chunk_id, mentioned_at copied); unique (chunk, extraction_key, content_hash)
+		Insert(ctx context.Context, fs []Fact, vs []VectorRow) error  // facts + fact_vectors (document_id, chunk_id, mentioned_at, fact_type copied, N138); unique (chunk, extraction_key, content_hash)
 	Stamp(ctx context.Context, batch [32]byte, fs []id.FactID, note StampNote) error // fact_consolidation, insert-only (N95)
 }
 type LinkWriter interface { Insert(ctx context.Context, ls []Link) error } // ON CONFLICT DO NOTHING in key order; undirected edges once with src < dst
@@ -477,7 +590,7 @@ type EntityWriter interface {
 type DocumentReader interface { Get(ctx context.Context, doc id.DocumentID) (*Document, error); List(ctx context.Context, q DocumentQuery) ([]Document, string, error) }
 type ChunkReader interface {
 	Plan(ctx context.Context, doc id.DocumentID, hashes [][32]byte) ([]ChunkState, error) // member | live | tombstoned | stale_extraction | absent
-	Membership(ctx context.Context, doc id.DocumentID, v id.Version) ([]id.ChunkID, error)
+		Membership(ctx context.Context, doc id.DocumentID, v id.DocVersion) ([]id.ChunkID, error)
 	Get(ctx context.Context, c id.ChunkID) (*Chunk, error)
 }
 type FactReader interface {
@@ -495,15 +608,17 @@ type GraphReader interface {
 
 ```go
 type Markers interface {
-	TombstoneDocument(ctx context.Context, t DocumentTombstone) error                  // document_tombstones 'pending' covering (document, t.UpToVersion = highest version assigned, N133c); intent_key recorded
-	TombstoneChunks(ctx context.Context, reason ChunkReason, cs []id.ChunkID) error    // 'replace' | 'reextract'
-	Hide(ctx context.Context, f id.FactID, cause HideCause, reason, intentKey string) (changed bool, err error) // fact_hidden: 'invalidate' | 'reextract'
-	Unhide(ctx context.Context, f id.FactID) (changed bool, err error)                 // refuses a 'reextract' marker
-	Expunge() ExpungeRepo                                                              // expunge_progress, derived_hidden, consumer-cursor check
+	TombstoneDocument(ctx context.Context, t DocumentTombstone) (DeletionRecord, error)                       // document_tombstones 'pending' covering (document, t.UpToVersion = highest version assigned, N133c); event_seq set from the outbox seq in the same statement as the append (P-15)
+	TombstoneChunks(ctx context.Context, reason ChunkReason, cs []id.ChunkID) error                            // 'replace' | 'reextract'
+	Hide(ctx context.Context, f id.FactID, cause HideCause, reason string) (rec DeletionRecord, changed bool, err error) // fact_hidden keyed (memory_id, cause): 'invalidate' | 'reextract'; a second invalidate is changed = false, a no-op success (N139)
+	Unhide(ctx context.Context, f id.FactID) (rec DeletionRecord, changed bool, err error)                    // deletes the 'invalidate' row only; a 'reextract' row is never touched (N135)
+	Expunge() ExpungeRepo                                                                                      // expunge_progress, derived_hidden, consumer-cursor check
 }
-// Every marker method also inserts the shard-local deletion_log row keyed by the intent name (N122), in the same transaction.
+// Every marker method also inserts the shard-local deletion_log row in the same transaction and returns the marker's exact
+// effect as a DeletionRecord{Subject, Operation, Prev, DeletedAt, UpToVersion, MemoryIDs}: Prev is the subject's last deletion_log
+// entry read under the document lock (the chain predecessor, N122). The intent object is built from that record.
 type MarkerReader interface {
-	Sets(ctx context.Context) (MarkerSets, error)  // doc_tomb and doc_pending ({document → up_to_version}, N133c), chunk_tomb, fact_hidden: three indexed selects (N116)
+	Sets(ctx context.Context) (MarkerSets, error)  // doc_tomb and doc_pending ({document → up_to_version}, N133c) and chunk_tomb: two indexed selects, bounded by expunge lag (N116). fact_hidden is NOT in the set: every arm tests it per candidate by primary-key anti-join
 	Curation(ctx context.Context, doc id.DocumentID, hash [32]byte) (CurationState, error) // last action for a twin, re-applied at CommitChunk
 }
 type Derived interface {
@@ -511,23 +626,37 @@ type Derived interface {
 	TryDerivationLock(ctx context.Context) error       // shared; ErrRefused → retry (N120)
 	DerivationLockExclusive(ctx context.Context) error // Materialize and Restore: one 35 s attempt
 }
+// The derivation commit rule (N120) is two repository calls under the shared lock, in this order: Verify (a fresh statement), then InsertVersion.
 type ObservationRepo interface {
-	InsertVersion(ctx context.Context, v ObservationVersion, inputs []id.FactID, sources []Source) error // root_version, observation_inputs, observation_version_sources, vector, meta.superseded_at
+	Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) // every rendered fact input against the FULL marker sets (all open tombstones, chunk_tomb, fact_hidden of both causes), observation-version inputs with engram_obs_version_hidden against ALL open tombstones, and the base: current_version = base_version and visible (a root rebuild has no base)
+	InsertVersion(ctx context.Context, v ObservationVersion, inputs []id.FactID, sources []Source) error // root_version, observation_inputs, observation_version_sources, vector, meta.superseded_at; no FK to facts (N135)
 	ReplaceSources(ctx context.Context, o id.ObservationID, add, drop []id.FactID) error   // the working set; only under the derivation lock; add before drop (N57)
-	Latest(ctx context.Context, os []id.ObservationID, asOf time.Time) ([]ObservationVersion, error) // latest VISIBLE version with effective_at ≤ asOf (N117)
+	Served(ctx context.Context, os []id.ObservationID, asOf time.Time) ([]ObservationVersion, error) // the version CURRENT at asOf if visible, nothing if hidden; zero visible sources are not served; fail closed (N117, N135)
 	MarkStale(ctx context.Context, os []id.ObservationID, k StaleKind) error                // narrow mutable row; hides nothing
-	Hidden(ctx context.Context, o id.ObservationID, v id.Version) (bool, error)             // engram_obs_version_hidden
 }
 ```
 
-`PageRepo` (`InsertVersion`, `SetSources`, `Latest`, `MarkStale`, `Hidden`), `ConsolidationRepo`
-(`Watermark`, `Advance`, `Proposals`, `Applied`, `Batches`) and `ExpungeRepo` (`Next`, `Record`,
-`Materialize`, `ConsumersPassed`, `Finish`) follow the same shape.
+`PageRepo` (`Verify`, `InsertVersion`, `SetSources`, `Served`, `MarkStale`; `InsertVersion` also writes
+`text` and the `page_version_vectors` row) follows the same shape. `ConsolidationRepo` (`Watermark`,
+`Advance`, `Proposals`, `Applied`, `Batches`): proposals are insert-only keyed `(batch_key, attempt)`
+and a discard or a capacity retry writes the next attempt (nothing is deleted); `Batches` holds
+`state ∈ {routed, stored, applied, discarded, capacity}` and `applied` is written in the same transaction as the `done` stamps; the
+watermark guard is the relay's last seen `seq`, not an id timestamp (N95, C-19). `ExpungeRepo` (`Next`,
+`Record`, `ConsumersPassed`, `Finish`) is the bookkeeping and `Purger` (`Materialize`, `Batch`, `Derived`)
+runs as `engram_admin`: `Batch` deletes rows, vectors and owner-keyed blobs but never evidence rows (N135),
+`Derived` replaces each covered observation or page version by a content-free stub in one transaction (N136).
 
 **Operations and metering:**
 
 ```go
-type Ops interface { Operations() OperationRepo; Idempotency() IdempotencyRepo; Ledger() LedgerRepo; Usage() UsageRepo; Outbox() outbox.Writer }
+type Ops interface { Operations() OperationRepo; Idempotency() IdempotencyRepo; Ledger() LedgerRepo; Usage() txn.Usage; Outbox() OutboxWriter }
+
+// OutboxWriter is the writer half of the transactional outbox (D6). It lives in store so that store does not import
+// outbox (N140); internal/outbox holds the relay, cursors and sinks and imports store.
+type OutboxWriter interface { // inside the same transaction as the state change; Append is the LAST statement of every write transaction
+	Append(ctx context.Context, ev *eventsv1.Event) (seq int64, err error)
+	AppendAll(ctx context.Context, evs []*eventsv1.Event) ([]int64, error) // ONE multi-row INSERT: still the last statement
+}
 type OperationRepo interface {
 	Insert(ctx context.Context, o OperationRow) error
 	Transition(ctx context.Context, op id.OperationID, from, to fsm.OperationState, r Result) error // monotone; fsm-checked
@@ -538,21 +667,24 @@ type OperationRepo interface {
 ```
 
 `Idempotency` (`Begin`, `Commit`: the stored response returns on a replay within 24 h), `Ledger`
-(`Append`, `Get`; no update or delete exists, a trigger rejects both), `Usage` (`Record`, `Day`;
-exactly-once through `usage_key`, PD-1) are the same size. Ledger rows are deleted only by an
+(`Append`, `Get`; no update or delete exists, a trigger rejects both) and `txn.Usage` (`Record`, `Day`;
+exactly-once through `usage_key`, PD-1) are the same size. Ids a repository inserts are minted per attempt inside the
+transaction (C-19, N139). Ledger rows are deleted only by an
 explicit document, namespace or tenant delete under the admin role (§5.4.2), never by a replace.
 
 **Locks.** The per-document lock is `DocumentWriter.Lock` (shared try-lock for `CommitChunk`, exclusive
-for `FinalizeVersion` and the delete marker transaction), the derivation lock is on `Derived`, the
-exclusive fence on `AdminTx.Ownership().FenceExclusive` (`Freeze`, delete freeze, restore: one 35 s
-attempt). Key spaces are disjoint (N113): namespace fence, derivation lock, document lock.
+for `FinalizeVersion` and the delete marker transaction: one 35 s attempt), the derivation lock is on
+`Derived`, the exclusive fence on `AdminTx.Ownership().FenceExclusive` (`Freeze`, delete freeze, restore:
+one 35 s attempt). Key spaces are disjoint (N113): namespace fence, derivation lock, document lock.
 
 Roles: `engram_app` (API and worker alike; there is no worker role) runs `lock_timeout = 2 s`, `engram_move` and `engram_admin`
-10 s, all with `synchronous_commit = local`. *Test seam:* testcontainers Postgres with the real
+10 s, all with `synchronous_commit = local`, and every outbox-writing role (`engram_admin` and
+`engram_move` included) with the 30 s statement and idle timeouts that invariant A-F1 relies on (N133e). *Test seam:* testcontainers Postgres with the real
 migrations — RLS (a query without `SET LOCAL` returns nothing), the append-only ledger,
 `TestContent_InsertOnly` (N113: a test-only trigger raises on any `UPDATE` of a content row),
 `TestFence_TryLockRefusedBehindWaiter`, `TestFence_PoolNotExhausted`,
-`TestDocLock_NoStarvation`, `TestIso_Ownership_Transitions`, and the property test that every event
+`TestDocLock_NoStarvation`, `TestIso_Ownership_Transitions`, `TestReadSession_ConcurrentArms` (N arms
+run on N connections, none "conn busy"), and the property test that every event
 type at its maxima encodes to ≤ 16 KiB (N80).
 
 #### 2.2.8 `internal/index` — search index abstraction
@@ -566,30 +698,43 @@ package index
 
 type Filter struct {
 	AsOf *time.Time              // mentioned_at ≤ AsOf inside the predicate; chunk arm also embedding_effective_at ≤ AsOf (N85)
-	FactTypes []memoryv1.FactType
-	AllowedDocs []id.DocumentID  // the tag filter, resolved once (N116)
-	Markers store.MarkerSets     // doc_tomb (document → up_to_version) / chunk_tomb / fact_hidden: applied to EVERY hit, also an external engine's (N44, N116)
+	FactTypes []memoryv1.FactType // copied onto fact_vectors, so the type filter runs inside the scan (N138)
+	AllowedDocs []id.DocumentID  // the tag and metadata filters, resolved once at document level (N116, N139)
+	Markers store.MarkerSets     // doc_tomb (document → up_to_version) and chunk_tomb arrays, applied to EVERY hit, also an external engine's (N44, N116); fact_hidden is an anti-join per candidate, never an array
 }
-type Hit struct { ID uuid.UUID; Kind Kind; Score float64 /* arm-local; normalised per query by the planner (N67) */; MentionedAt time.Time }
+type Hit struct { Ref id.MemoryRef; Score float64 /* arm-local; normalised per query by the planner (N67) */; MentionedAt time.Time }
 
+// Every method takes the ReadSession and opens its own short transaction(s) with s.Tx: arms run concurrently (N140).
 type Searcher interface {
-	SearchSemantic(ctx context.Context, tx store.ReadTx, q SemanticQuery) ([]Hit, error)
-	SearchLexical(ctx context.Context, tx store.ReadTx, q LexicalQuery) ([]Hit, error)
-	SearchChunks(ctx context.Context, tx store.ReadTx, q ChunkQuery) ([]Hit, error)
-	SearchPages(ctx context.Context, tx store.ReadTx, q ChunkQuery) ([]Hit, error)  // BM25 ∪ HNSW over visible page_versions (N73)
-	Plan(ctx context.Context, tx store.ReadTx) (SemanticPlan, error)                // PlanExact | PlanHNSW
+	SearchSemantic(ctx context.Context, s store.ReadSession, q SemanticQuery) ([]Hit, error)
+	SearchLexical(ctx context.Context, s store.ReadSession, q LexicalQuery) ([]Hit, error)
+	SearchChunks(ctx context.Context, s store.ReadSession, q ChunkQuery) ([]Hit, error)
+	SearchPages(ctx context.Context, s store.ReadSession, q PageQuery) ([]Hit, error)  // BM25 over page_versions.text ∪ HNSW over page_version_vectors, visible versions only (N73, N139)
+	Plan(ctx context.Context, s store.ReadSession, f Filter) (SemanticPlan, error)    // the selectivity estimate and the plan, chosen in Go (N138): PlanExact | PlanHNSW{MaxScanTuples}
 }
 type Applier interface { Apply(ctx context.Context, events []*eventsv1.Event) error } // Async only; idempotent by (namespace_id, seq)
 ```
 
-`SemanticPlan` (N112): **exact scan below 2,000 vectors** of the namespace's current embedding model
-(≤ 3.2 MB, never truncated), otherwise the namespace's own **partial HNSW**
-(`engram_vector_index_plan` decides, `engram_hnsw_ddl` generates the `CREATE INDEX CONCURRENTLY`
-that `engramctl index` runs as the owner role; `plan_cache_mode = force_custom_plan`, `ef_search` =
-the arm cap). One index per namespace and model; nothing is shared across namespaces. Neither `engram-api` nor
-`engram-worker` runs DDL. Under `Filter.AsOf` a chunk hit's header is empty. Tag semantics exist once
-(`index/tags.go`, mirrored by the Lean decision procedure). *Test seam:* the same retrieval golden set on all
-implementations; `as_of` and visibility leakage tests assert zero hidden or future hits per arm.
+`SemanticPlan` (N112, N138) is **selectivity-aware and chosen in Go before the arm runs**. `Plan` estimates
+the eligible rows: the sum of `document_versions.fact_count` over the current versions of `Filter.AllowedDocs`,
+or the per-namespace monthly `mentioned_at` histogram (stats sweeper) under `AsOf`. **Below θ eligible rows**
+(starting at 5 k, fixed by M0.6's sweep over tag selectivities 100/20/5/2/1 % and `as_of` deciles) the arm runs
+the **exact path**, driven from `facts_doc_idx` or `facts_mentioned_idx` and joined to the vector table by
+primary key, `ORDER BY distance LIMIT cap`; **above θ** it uses the namespace's own **partial HNSW** (built
+by the index runner; `plan_cache_mode = force_custom_plan`, `ef_search` = the arm cap) as an iterative scan
+with `hnsw.max_scan_tuples = min(4 × ef_search / s, 100 k)` and sets `RecallStats.partial` when the scan is
+exhausted. A namespace below 2,000 vectors has no index at all and always takes the exact path. The arm's
+transaction forbids a partition scan (`enable_seqscan = off`, no parallel workers); the chunk and observation
+arms follow the same plan. One index per namespace and model; nothing is shared across namespaces. **Index DDL
+has one owner (N138):** the index runner, an `engramctl index` daemon on the control host holding
+`engram_migrate`, fed by `vector_indexes` requests (`requested → building → ready | failed`, with a lease); it
+refuses to start a build while any `backend_xmin` is older than 5 min, serialises builds per shard
+(`maintenance_work_mem = 2.4 KB × vectors`, ≤ 5 GB), checks `pg_index.indisvalid` and drops an invalid index
+first, and drops by the deterministic `engram_hnsw_ddl` names. Neither `engram-api` nor `engram-worker` runs
+DDL. Under `Filter.AsOf` a chunk hit's header is empty. Tag semantics exist once (`index/tags.go`, mirrored by
+the Lean decision procedure). *Test seam:* the same retrieval golden set on all implementations; `as_of` and
+visibility leakage tests assert zero hidden or future hits per arm; `TestRecall_FilteredArm` (property 6 of
+§8.2) checks that a filtered arm returns `min(cap, |visible|)` on the real image.
 
 #### 2.2.9 `internal/chunk` — heading-anchored content-defined chunker
 
@@ -696,43 +841,48 @@ type LinkBudget struct { TemporalPerFact, SemanticK, EntityPerFact, MaxPerFact i
 #### 2.2.13 `internal/recall` — arms, fusion, rerank, boosts, packing, planner
 
 The whole D10 read path with zero generative calls. *Patterns: **Strategy** (`Arm`) for what is
-searched and **Pipeline** (`pipeline.Step[*State]`) for the order of the stages; the planner is the
-composition and nothing else.*
+searched, a small **DAG scheduler** for the retrieval stage (nodes declare `Needs()`, so lexical and
+temporal overlap the embedding round-trip, N54: a purely sequential `Pipeline` cannot express that) and
+**Pipeline** (`pipeline.Step[*State]`) for the stages after it; the planner is the composition and nothing
+else.*
 
 ```go
 package recall
 
 type Query struct {
-	Scope authz.RequestScope; Text string; Vector []float32 /* nil: dense arms skipped */
-	Budget Budget; Filter index.Filter; QueryTimestamp *time.Time; Window *TemporalWindow; MaxTokens int; Deadline time.Time
+	Scope id.Scope; Text string; Vector []float32 /* nil: dense arms skipped */
+	Budget Budget; Filter index.Filter; Plan index.SemanticPlan; QueryTimestamp *time.Time; Window *TemporalWindow; MaxTokens int; Deadline time.Time
 }
-type Candidate struct { ID uuid.UUID; Kind index.Kind; Arm string; Rank int; ArmScore float64; MentionedAt time.Time; Provenance Provenance }
+type Candidate struct { Ref id.MemoryRef; Arm string; Rank int; ArmScore float64; MentionedAt time.Time; Provenance Provenance }
 
-// Arm is the Strategy: one retrieval method. The planner schedules by Needs().
+// Arm is the Strategy: one retrieval method. The planner schedules by Needs(). Each Run opens its own short read
+// transaction(s) on the session; Filter, Plan and the marker sets arrive in q as values computed once (N140).
 type Arm interface {
 	Name() string // semantic | lexical | graph | temporal | chunks
 	Needs() Needs // NeedsNone | NeedsVector | NeedsSeeds (the graph arm runs two seeded waves, N54)
-	Run(ctx context.Context, tx store.ReadTx, q *Query, seeds []Candidate, capN int) ([]Candidate, error)
+	Run(ctx context.Context, s store.ReadSession, q *Query, seeds []Candidate, capN int) ([]Candidate, error)
 }
 type Fuser interface    { Fuse(lists [][]Candidate, k int) []Fused }     // RRF k = 60 in math/big.Rat: permutation-invariant exactly (N67)
 type Reranker interface { Rerank(ctx context.Context, query string, in []Fused, top int) ([]Ranked, error) } // top 0/50/150 (N53); bge-reranker-base
 type Packer interface   { Pack(in []Ranked, maxTokens int) PackResult }  // greedy; skip, never truncate; rank 1 always whole (N129)
 type Planner interface  { Recall(ctx context.Context, q *Query, sink Sink) error }
 
-// The steps of the planner, in order; each is a pipeline.Step[*State].
-//   Embed → Visibility (marker sets + allowed documents, N116) → Arms → Fuse → Rerank → Boost → Pack → Stream
+// The planner is a small DAG scheduler followed by sequential pipeline steps (N140):
+//   Retrieve = DAG{ visibility (marker sets, allowed documents, plan estimate: N116, N138), embed, arms by Needs() } →
+//   Fuse → Rerank → Boost → Pack → Stream      (each of the last five is a pipeline.Step[*State])
 ```
 
 `Booster` (`Boost`, recency ≤ +10 %, temporal ≤ +10 %, proof ≤ +5 %, clamp [0.75, 1.25]) and `Sink`
 (`Batch`, `Stats`) are the two remaining one-method interfaces. Scheduling (§1.5, N54):
-`NeedsNone` arms start immediately and overlap the embedding round-trip, `NeedsVector` arms when the
+`NeedsNone` arms start as soon as `visibility` is done and overlap the embedding round-trip, `NeedsVector` arms when the
 embedding arrives, the graph arm in two waves of 30 ms from the lexical and semantic top-20. Every
 other arm gets `min(ArmDeadline, remaining − rerankReserve − packReserve)`. **Rerank is skipped when
 the remaining deadline is below 106 ms** (= rerank p95 90 + pack 3 + stream 5 + 8, N106); at client
 deadlines ≥ 300 ms a skip counts against the rerank-skip SLO (N53), below 300 ms it is by design. The
 critical path is 216 ms p95 at MID. While markers are `pending` the observation and page arms pay a
 per-candidate lookup and the skip SLO is suspended for the namespace (N119). Under `as_of` the chunk
-arm adds `embedding_effective_at ≤ T`, headers are empty, entity names are suppressed. *Test seam:* rapid properties mirror the Lean theorems (RRF permutation invariance, packing
+arm adds `embedding_effective_at ≤ T`, headers are empty, entity names are suppressed; the version served
+for an observation or page is the one current at `T`, or nothing when it is hidden (N117). *Test seam:* rapid properties mirror the Lean theorems (RRF permutation invariance, packing
 within budget, boost in [0.75, 1.25]); a fake-clock test asserts the 216 ms path and the 106 ms
 reserve; leakage tests assert nothing hidden or future in any arm.
 
@@ -753,28 +903,33 @@ type Writer interface { // stage 2: consolidate_write/v1, one call per touched o
 	Write(ctx context.Context, in WriteInput) (ObservationWrite, *gateway.Usage, error)    // mode update | create | rebuild; only VISIBLE sources are rendered
 }
 type Adjudicator interface { Adjudicate(ctx context.Context, a, b string) (merge bool, u *gateway.Usage, err error) } // dedup_adjudicate/v1: a decision, never text
-type ProposalStore interface {
-	Store(ctx context.Context, tx store.Tx, p Proposal) (stored Proposal, err error) // ON CONFLICT DO NOTHING; the stored list always wins (N43)
-	Load(ctx context.Context, tx store.Tx, key [32]byte) (Proposal, error)
-	Discard(ctx context.Context, tx store.Tx, key [32]byte) error                    // only before any op was applied (RESTRICT FK)
+type ProposalStore interface { // insert-only: nothing is updated or deleted (engram_app holds SELECT, INSERT), N121
+	Store(ctx context.Context, tx store.Tx, p Proposal) (stored Proposal, err error)  // keyed (batch_key, attempt); ON CONFLICT DO NOTHING, the stored list wins (N43); every update and merge op records base_version
+	Load(ctx context.Context, tx store.Tx, key BatchKey, attempt int) (Proposal, error)
+	Retry(ctx context.Context, tx store.Tx, key BatchKey, why RetryWhy) (next int, err error) // a discard or a capacity retry opens attempt+1 (capacity: prompt_variant = 'capacity'); the old list is dead by key
 }
 type Applier interface { Apply(ctx context.Context, tx store.Tx, p Proposal) (Applied, error) }
 ```
 
-`Apply` runs in one fenced derivation transaction (shared derivation lock, N120): `consolidation_applied(op_key)`
-gates each write and commits with the effects (N43); the inputs are re-verified by the visibility predicate in a
-fresh statement (facts are immutable, no row lock); versions carry `root_version`, `observation_inputs`
+`Apply` runs in one fenced derivation transaction and obeys the commit rule of N120 (shared derivation lock;
+`Derived.Observations().Verify` re-verifies every rendered input in a fresh statement against the full marker
+sets and checks `current_version = base_version` and that the base is visible; on any failure it rolls back, the
+**whole** proposal is discarded to the next attempt and the batch re-routed, never "repaired"):
+`consolidation_applied(op_key)` gates each write and commits with the effects (N43); `consolidation_batches.state =
+'applied'` is written with the `done` stamps, and an all-skip batch applies zero ops, stamps and terminates; versions carry `root_version`, `observation_inputs`
 (the facts shown), `observation_version_sources` and a vector; the previous version's write-once
 `superseded_at` is inserted; the working set `observation_sources` is rewritten only here. Nothing
 hides anything: hiding is the read predicate. `effective_at(v) = max(mentioned_at of every fact shown,
 effective_at(v − 1))`. `op_key = sha256(batch_key ‖ op_index)` over the **stored** list. While markers
-are pending only root rebuilds run (degraded mode). *Test seam:* model-based tests from `Consolidation.tla` and
+are pending only root rebuilds run (degraded mode), and they obey the same rule. A rebuild that finds no
+visible source retires the observation without a gateway call (exempt from `quota.Reserve`, N135). *Test seam:* model-based tests from `Consolidation.tla` and
 `Derivation.tla`: at-least-once re-execution yields one effect per `op_key`, and a version written with a
-victim in view is hidden whichever of marker and apply commits first.
+victim in view is hidden whichever of marker and apply commits first; `TestConsolidation_StaleProposalDiscarded`,
+`_AllSkipStamps`, `_CapacityAttempt`.
 
-#### 2.2.15 `internal/reflect` — bounded agent loop (phase 2)
+#### 2.2.15 `internal/reflectagent` — bounded agent loop (phase 2)
 
-Forced searches (observations, then facts), ≤ 10 free iterations, ≤ 100 k context tokens, ≤ 300 s,
+Forced searches (`search_pages` first once pages exist, then observations, then facts; N139), ≤ 10 free iterations, ≤ 100 k context tokens, ≤ 300 s,
 tool deadline 10 s; tools `search_memories`, `search_observations`, `search_pages` (N73), `get_page`,
 `expand_fact`; citations filtered to ids a tool actually returned; optional JSON-schema output;
 at the context cap a map/reduce fallback instead of forcing `done`. Every tool reads through the same
@@ -782,15 +937,15 @@ visibility predicate. *Pattern: Strategy (`Tool`) in a bounded loop; the agent r
 with the caller's scope, no second authz path.*
 
 ```go
-package reflect
+package reflectagent // not "reflect": the old name shadowed the standard library package (N140)
 
 type Tool interface {
 	Name() string
 	Schema() json.RawMessage
-	Call(ctx context.Context, sc authz.RequestScope, args json.RawMessage) (ToolResult, error) // ToolResult.ReturnedIDs feeds the citation verifier
+	Call(ctx context.Context, sc authz.RequestScope, args json.RawMessage) (ToolResult, error) // ToolResult.Returned []id.MemoryRef feeds the citation verifier
 }
 type Agent interface { Run(ctx context.Context, req Request, caps Caps, sink EventSink) (*Result, error) }
-type CitationVerifier interface { Verify(cited []string, returned map[string]struct{}) (kept, dropped []string) }
+type CitationVerifier interface { Verify(cited []id.MemoryRef, returned map[id.MemoryRef]struct{}) (kept, dropped []id.MemoryRef) }
 type SchemaValidator interface { Validate(schema, doc json.RawMessage) error }
 type Registry interface { Register(t Tool); Get(name string) (Tool, bool); Specs() []gateway.ToolSpec }
 ```
@@ -799,7 +954,8 @@ type Registry interface { Register(t Tool); Get(name string) (Tool, bool); Specs
 the call's tags, `disposition`). Each iteration passes `quota.Reserve` (a refusal is
 `RESOURCE_EXHAUSTED`, N130). Rejected: running Reflect as a workflow (interactive, streamed, ≤ 300 s).
 *Test seam:* transcript replay; every emitted citation ∈ the
-union of `ReturnedIDs`; caps with a fake clock.
+union of `Returned`; caps with a fake clock. A transcript (`reflect/{op}.jsonl`) is an optional debugging
+aid that the delete's `DerivedPurge` removes wholesale (N136).
 
 #### 2.2.16 `internal/pages` — mental models / knowledge pages (phase 3)
 
@@ -813,7 +969,7 @@ package pages
 type Reader interface {
 	Get(ctx context.Context, sc authz.RequestScope, p id.PageID, sel VersionSelector) (*Page, string /*markdown*/, error) // PAGE_HIDDEN when hidden
 	List(ctx context.Context, sc authz.RequestScope, q ListQuery) ([]Page, string, error)
-	Search(ctx context.Context, sc authz.RequestScope, q SearchQuery) ([]PageHit, string, error) // BM25 ∪ HNSW over visible page_versions, RRF, no LLM (N73)
+		Search(ctx context.Context, sc authz.RequestScope, q SearchQuery) ([]PageHit, string, error) // BM25 over page_versions.text ∪ HNSW over page_version_vectors, visible versions, RRF, no LLM (N73, N139)
 }
 type Writer interface {
 	Create(ctx context.Context, sc authz.RequestScope, p PageDraft) (*Page, error)
@@ -824,25 +980,30 @@ type Writer interface {
 
 `Page.RefreshPolicy` is the generated `memoryv1.RefreshPolicy`; there is no `on_delete`, `cron` or
 string policy. `Refresh` runs as workflow `ns/{ns}/page/{page_id}`; a refresh whose base version is
-hidden is a root rebuild. *Test seam:* testcontainers; staleness-flag and `PAGE_HIDDEN` tests.
+hidden is a root rebuild, and `CommitPageVersion` obeys the derivation commit rule (N120): it re-verifies every
+rendered input and checks `current_version = base_version` under the shared lock, and a refused commit re-runs
+`page_full/v1` from current evidence (`TestPageRefresh_DeleteMidCall`). Page versions carry `text` (BM25) and a
+`page_version_vectors` row, so pages share the observation visibility and purge path (N139). *Test seam:* testcontainers; staleness-flag and `PAGE_HIDDEN` tests.
 
 #### 2.2.17 `internal/workflows` — Temporal workflows, activities, policies
 
 All workflow definitions and the activity *interfaces* they call; task-queue naming; `ContinueAsNew`
 rules; retry policies; the API's client wrapper. Concrete activities are structs in
 `cmd/engram-worker` that wire service packages into these interfaces. *Pattern: **Pipeline** (the
-workflow body is the ordered list of activity groups) and **Saga** (move, expunge, tenant delete) —
-each activity is idempotent by key and fenced by the epoch, so a restart resumes instead of repeating.*
+workflow body is the ordered list of activity groups) and **Saga** for the move only — it is the one
+workflow with compensations before a point of no return; the expunge and tenant delete are forward-only
+workflows, not sagas). Each activity is idempotent by key and fenced by the epoch, so a restart resumes
+instead of repeating.*
 
 ```go
 package workflows
 
 func TaskQueue(s id.ShardID) string            // "shard-{id}"
-func OpID(ns id.NamespaceID, op id.OperationID) string // "ns/{ns}/op/{op}"
-func ExpungeID(ns id.NamespaceID) string        // "ns/{ns}/expunge"
-func ConsolidateID(ns id.NamespaceID) string    // "ns/{ns}/consolidate"
-func PageRefreshID(ns id.NamespaceID, p id.PageID) string // "ns/{ns}/page/{page}"
-func MoveWorkflowID(ns id.NamespaceID, e id.Epoch) string // "move/{ns}/{epoch}" on shard-{target}
+func OpID(ns id.NamespaceID, op id.OperationID) id.WorkflowID // "ns/{ns}/op/{op}": retain, export, refresh, namespace delete
+func ExpungeID(ns id.NamespaceID) id.WorkflowID        // "ns/{ns}/expunge": the singleton behind DELETE_DOCUMENT (N136)
+func ConsolidateID(ns id.NamespaceID) id.WorkflowID    // "ns/{ns}/consolidate"
+func PageRefreshID(ns id.NamespaceID, p id.PageID) id.WorkflowID // "ns/{ns}/page/{page}"
+func MoveWorkflowID(ns id.NamespaceID, e id.Epoch) id.WorkflowID // "move/{ns}/{epoch}" on shard-{target}
 
 // Workflows (inputs and results are protos in engram.internal.workflow.v1; every input carries schema_version 2).
 func RetainDocument(ctx workflow.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.RetainDocumentResult, error)
@@ -855,7 +1016,7 @@ func Move(ctx workflow.Context, in *workflowv1.MoveInput) (*workflowv1.MoveResul
 // The retain pipeline is three ordered activity groups; the workflow runs Prepare once, ChunkPipeline per chunk
 // (≤ 32 in flight, a workflow-side semaphore), then Finish.
 type Prepare interface {
-	LoadItem(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.LoadItemResult, error)     // APPEND base under the documents row lock (N56); single ver/{sha256} body blob (N104)
+		LoadItem(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.LoadItemResult, error)     // APPEND base under the documents row lock (N56); single owner-keyed ver/{document_id}/v{n} body blob (N104)
 	Chunk(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.ChunkPlan, error)
 	SummarizeDocument(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.SummarizeDocumentResult, error)
 	PlanChunks(ctx context.Context, in *workflowv1.RetainDocumentInput) (*workflowv1.ChunkPlan, error)         // member | live | tombstoned | stale_extraction | absent
@@ -869,21 +1030,33 @@ type ChunkPipeline interface {
 	CommitChunk(ctx context.Context, in *workflowv1.CommitChunkInput) (*workflowv1.CommitChunkResult, error) // inserts only; DocumentBusy retryable; InputBlobMissing re-runs extract+embed ≤ 2× (N100)
 }
 type Finish interface {
-	FinalizeVersion(ctx context.Context, in *workflowv1.FinalizeVersionInput) (*workflowv1.FinalizeVersionResult, error) // inserts tombstones and fact_hidden; superseded_by (N49)
+		FinalizeVersion(ctx context.Context, in *workflowv1.FinalizeVersionInput) (*workflowv1.FinalizeVersionResult, error) // inserts chunk tombstones and fact_hidden(reextract), flags the affected observations stale (evidence rows are kept, derived versions stay visible, N135); superseded_by (N49)
 	ReembedChunk(ctx context.Context, in *workflowv1.ChunkWork) error                                                     // inserts one chunk_vectors row (N60, N111)
 	MarkOperation(ctx context.Context, in *workflowv1.MarkOperationInput) error
 }
 
 // Consolidation steps: RouteBatch, WriteObservation, StoreProposal, ApplyBatch, StampFailed (≤ 5 per interface); the
 // quota gate is a method of quota.Reserver, called inside the LLM activities, not a separate activity (N130).
+// ApplyBatch and CommitPageVersion are the two derivation transactions that obey the commit rule of N120.
 
-type Client interface { // used by engram-api; wraps client.Client
-	StartRetain(ctx context.Context, in *workflowv1.RetainDocumentInput) error        // AlreadyStarted → nil
-	SignalConsolidate(ctx context.Context, t *workflowv1.ConsolidateTrigger) error     // SignalWithStart
-	SignalExpunge(ctx context.Context, in *workflowv1.ExpungeInput) error             // SignalWithStart ns/{ns}/expunge
-	Cancel(ctx context.Context, workflowID string) error
-	WaitResult(ctx context.Context, workflowID string, timeout time.Duration) (done bool, err error) // WaitOperation long-poll (N70)
+// The Temporal client is split by capability (N140), each interface with at most five methods, workflow ids typed.
+type Starter interface { // engram-api (and the delete handlers); AlreadyStarted → nil
+	StartRetain(ctx context.Context, in *workflowv1.RetainDocumentInput) error         // ns/{ns}/op/{op}
+	StartExport(ctx context.Context, in *workflowv1.ExportInput) error                 // ExportSnapshot at ns/{ns}/op/{op}
+	StartRefresh(ctx context.Context, in *workflowv1.RefreshPageInput) error           // PageRefresh (manual refresh creates an operation)
+	StartNamespaceDelete(ctx context.Context, in *workflowv1.ExpungeInput) error       // Expunge{NAMESPACE} at ns/{ns}/op/{op}
+	StartTenantDelete(ctx context.Context, in *workflowv1.TenantDeleteInput) error     // tenant/{tenant}/delete on the cell-wide control queue
 }
+type Signaller interface { // SignalWithStart of the per-namespace singletons
+	SignalConsolidate(ctx context.Context, t *workflowv1.ConsolidateTrigger) error     // ns/{ns}/consolidate
+	SignalExpunge(ctx context.Context, in *workflowv1.ExpungeInput) error              // ns/{ns}/expunge
+	SignalPageRefresh(ctx context.Context, in *workflowv1.RefreshPageInput) error      // ns/{ns}/page/{page}
+}
+type Waiter interface {
+	Cancel(ctx context.Context, wf id.WorkflowID) error                                                // refused for DELETE_* operations before it gets here (N136)
+	WaitResult(ctx context.Context, wf id.WorkflowID, timeout time.Duration) (done bool, err error)    // WaitOperation long-poll (N70)
+}
+// The move is started by move.Orchestrator.Start; RetainBackfill and ReembedNamespace are started by engramctl's own client.
 func DataConverter(keys KeyProvider) converter.DataConverter // AES-256-GCM codec, per-namespace data key wrapped by the shard key (N59, N99)
 type KeyProvider interface {
 	DataKey(ctx context.Context, ns id.NamespaceID, keyID string) ([]byte, error)
@@ -904,7 +1077,7 @@ namespace's payloads are unreadable after `Shred`; a chaos test kills workers mi
 
 #### 2.2.18 `internal/outbox` — transactional outbox, relay, cursors, sinks
 
-*Pattern: **Transactional outbox** — `Writer.Append` is the last statement of every write transaction,
+*Pattern: **Transactional outbox** — `store.OutboxWriter.Append` is the last statement of every write transaction,
 so a consumer sees exactly the committed changes, with no dual write.* One relay per shard, elected
 with `pg_try_advisory_lock` on a dedicated direct connection, reads `outbox` in `seq` order in batches
 of 500, drives named sinks with independent cursors and delivers a strict prefix (no cursor passes an
@@ -913,17 +1086,16 @@ open gap; sound under A-F1, 60 s watchlist).
 ```go
 package outbox
 
-type Writer interface { // inside the same transaction as the state change (D6)
-	Append(ctx context.Context, ev *eventsv1.Event) (seq int64, err error)
-	AppendAll(ctx context.Context, evs []*eventsv1.Event) ([]int64, error) // ONE multi-row INSERT: still the last statement
-}
+// The writer half of the outbox (Append, AppendAll) lives in store as store.OutboxWriter (N140): store does not import
+// outbox, and this package imports store.
+
 type Sink interface {
 	Name() string // "index" | "kafka"
 	Apply(ctx context.Context, events []Event) error // idempotent by (namespace_id, seq)
 	Filter() func(Event) bool
 }
 type Relay struct { /* handle, sinks, cursors, gaps */ }
-func NewRelay(h *router.ShardHandle, sinks []Sink, o RelayOptions) *Relay
+func NewRelay(s store.Store, sinks []Sink, o RelayOptions) *Relay // takes a store.Store and uses s.Direct for the election lock
 func (r *Relay) Run(ctx context.Context) error           // acquires the lock; returns when lost
 func (r *Relay) AddSink(ctx context.Context, s Sink, fromSeq int64) error
 type GapWatch interface { Note(seq int64, seenAt time.Time); Due(now time.Time) []int64; Resolve(seq int64) } // persisted in outbox_cursors.gaps (≤ 1 000)
@@ -935,64 +1107,73 @@ type Group interface { Add(e Event) (complete bool); Ids() [][]byte; Elided() bo
 The relay uses the shard-level `engram_relay` role (RLS bypass for `SELECT` on `outbox` only). Events
 are thin and bounded (≤ 256 ids, ≤ 16 KiB; `DocumentDeleted` has no id list); cursor advances are
 batched to one per second per consumer (N114); the expunge reads the cursors through
-`engram_consumers_passed` before it purges. **Moves are not consumers** (N124). *Test seam:* a model-based test from
+`engram_consumers_passed(event_seq)` before it purges (the tombstone stores the `seq` of its own delete event). **Moves are not consumers** (N124). *Test seam:* a model-based test from
 `Outbox.tla` — random commit orders with holes deliver every seq exactly once or declare it aborted
 after the watch window.
 
 #### 2.2.19 `internal/move` — namespace move saga (D5)
 
 The D5 protocol as Temporal workflow `move/{ns}/{epoch}` on `shard-{target}` (N2): **dirty copy →
-freeze → reconcile by set difference → cutover with a `ready` state** (N124, N125). *Pattern: **Saga**
-with a **state machine** — every step is idempotent, every step before cutover (c) has a compensation,
-and (c) is the point of no return. It is the only code path that holds two shard handles.*
+pre-freeze verification → freeze → reconcile by insertion sequence → cutover with a `ready` state and a
+catalog CAS** (N124, N125, N137). *Pattern: **Saga** with a **state machine** — every step is idempotent,
+every step before the catalog CAS (a″) has a compensation, and (a″) is the point of no return. It is the only
+code path that holds two shard handles.*
 
 ```go
 package move
 
 type Fence struct { Ns id.NamespaceID; Tenant id.TenantID; Source, Target id.ShardID; Epoch id.Epoch /* e; the target holds e+1 */; Move id.MoveID }
 
-// Activities are split by phase so each interface stays small. Every activity first re-checks the fence against
-// the catalog row and both ownership rows and the source session's system_identifier/timeline (MoveFenced).
+// Activities are split by phase so each interface stays small (≤ 5 methods). Every activity first re-checks the fence
+// against the catalog row and both ownership rows and the source session's system_identifier/timeline (MoveFenced).
 type Copier interface {
 	Plan(ctx context.Context, f Fence) (*PlanResult, error)         // plan_target / start_move edges; records system_id, timeline, t_copy; pauses expunge and schedulers
-	BulkCopy(ctx context.Context, f Fence) (*CopyResult, error)     // READ COMMITTED key ranges ≤ 100 k rows; resumable at (table, last_key)
-	Freeze(ctx context.Context, f Fence) error                      // exclusive fence, one 35 s attempt, freeze_move edge; watchdog armed until (c)
-	Reconcile(ctx context.Context, f Fence) (*workflowv1.ReconcileReport, error) // re-copy created_at ≥ t_copy − 10 min; mutable merge-diff; blobs; relay drain; VerifyFK
-	Drain(ctx context.Context, f Fence) (*DrainResult, error)       // in-flight set read from the source operations rows (N97)
+	BulkCopy(ctx context.Context, f Fence) (*CopyResult, error)     // READ COMMITTED key ranges ≤ 100 k rows; resumable at (table, last_key); the three table classes of N137
+	PreVerify(ctx context.Context, f Fence) (*workflowv1.PreVerifyReport, error) // namespace still active: counts, hashes, VerifyFK, blobs below engram_seq_floor(now), catch-up copy by ins_seq (N124)
+}
+type Freezer interface {
+	Freeze(ctx context.Context, f Fence) error                      // exclusive fence, one 35 s attempt, freeze_move edge; watchdog armed until (a″)
+	Reconcile(ctx context.Context, f Fence) (*workflowv1.ReconcileReport, error) // re-copy ins_seq ≥ engram_seq_floor(T_pre); mutable merge-diff; excluded count ≤; blobs; relay drain 120 s; VerifyFK on the range
+	Drain(ctx context.Context, f Fence) (*DrainResult, error)       // in-flight set read from the source operations rows, backfill parents included (N97, C-20)
 }
 type Cutover interface {
 	Begin(ctx context.Context, f Fence) error          // (a) intent only
 	ReadyTarget(ctx context.Context, f Fence) error    // (b′) ready_target
-	Source(ctx context.Context, f Fence) error         // (c) cutover_c: frozen/move → moved_out + target hint — THE point of no return
+	Commit(ctx context.Context, f Fence) error         // (a″) catalog Moves.Commit: CAS cutover → committed — THE point of no return; the mover re-checks its timeline first
+}
+type Handover interface { // only after Commit returned (the mover read `committed`)
+	Source(ctx context.Context, f Fence) error         // (c) cutover_c: frozen/move → moved_out + target hint
 	ActivateTarget(ctx context.Context, f Fence) error // (b″) activate_target, retried indefinitely
 	Catalog(ctx context.Context, f Fence) error        // (d) shard, epoch, state, NOTIFY — retried indefinitely
 }
 type Closer interface {
-	Restart(ctx context.Context, f Fence, d *DrainResult) error // ns/{ns}/op/{op} on shard-{target}, TERMINATE_IF_RUNNING, memo epoch e+1; reconcile loop
-	Cleanup(ctx context.Context, f Fence) error                  // after 24 h: DROP INDEX, engram_cleanup_namespace, old prefix; the moved_out row stays
-	Rollback(ctx context.Context, f Fence, why string) error     // only before (c); see the table
+	Restart(ctx context.Context, f Fence, d *DrainResult) error // ns/{ns}/op/{op} on shard-{target}, TERMINATE_IF_RUNNING, memo epoch e+1; singleton-backed kinds by SignalWithStart; reconcile loop
+	Cleanup(ctx context.Context, f Fence) error                  // after 24 h: DROP INDEX by name, engram_cleanup_namespace, the moved-out ROWS; the source blob prefix only after the 28-day window; the moved_out row stays
+	Rollback(ctx context.Context, f Fence, why string) error     // only before (a″): wins the cutover → rolled_back CAS first; see the table
 }
 type Orchestrator interface { // MoveService
 	Start(ctx context.Context, ns id.NamespaceID, target id.ShardID, o StartOptions) (*Ref, error)
 	Status(ctx context.Context, m id.MoveID) (*Status, error)
-	Abort(ctx context.Context, m id.MoveID) error // rollback before (c), else an error
+	Abort(ctx context.Context, m id.MoveID) error // rollback before (a″), else an error
 }
 ```
 
 | Step | Compensation (what `Rollback` runs when this step has completed) |
 |---|---|
 | `Plan` | `rollback_target` (delete the target rows and ownership row; for a move back onto a `moved_out` shard `return_abort` restores the permanent fence value); `abort_move` on the source |
-| `BulkCopy`, `Reconcile` | the same (copied rows are discarded) |
-| `Freeze` | `thaw_move` first, then the above |
-| `ReadyTarget` (b′) | `unready_target` first, then `thaw_move` and the above |
-| `Source` (c) onward | none: the move completes forward; a reverse move is an ordinary new move |
+| `BulkCopy`, `PreVerify`, `Reconcile` | the same (copied rows and indexes are discarded) |
+| `Freeze` | `thaw_move` first (allowed while the target is unreachable), then the above |
+| `ReadyTarget` (b′), `Begin` (a) | the CAS `cutover → rolled_back`, `unready_target` (at next contact if the target is down), then `thaw_move` and the above |
+| `Commit` (a″) onward | none: the move completes forward (by the mover or by the restore reconcile); a reverse move is an ordinary new move |
 
 `StartOptions` carries `DrainWait` (15 s, max 60 s), `FreezeWatchdog(liveFacts)` (`max(120 s, 60 s + 1 s per
-10 k facts)`, ≤ 15 min), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h and the cutover retry
-(100 ms ×1.5 → 1 s within 60 s; (b″) and (d) unlimited). *Test seam:* a model-based test from `ShardMove.tla`
-with `MemoryCatalog` and two `FakeTx` shards: concurrent retain, consolidate and delete during the copy,
-a row committed between the last range copy and `Freeze`, rollback from every step before (c), a zombie primary
-with a stale timeline; a chaos test kills the worker in every phase and between (c) and (b″).
+10 k facts)`, ≤ 15 min), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h, `SourceBlobGrace` 28 d and the
+cutover retry (100 ms ×1.5 → 1 s within 60 s; (b″) and (d) unlimited). *Test seam:* a model-based test from
+`ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: concurrent retain, consolidate and delete during the
+copy, rows inserted under old ids and mutable rows deleted on the source (`TestMove_ActiveBacklog`), a row committed
+between the last range copy and `Freeze`, rollback from every step before (a″), a restore racing `Commit` for the
+same row, a zombie primary with a stale timeline; a chaos test kills the worker in every phase and between (a″)
+and (b″) (`TestMove_FailoverBetweenCAndD`).
 
 #### 2.2.20 `internal/export` — snapshots for local agentic search (phase 3)
 
@@ -1004,19 +1185,23 @@ chunks, pages, the always-emitted delta with `deleted_ids`) and 1 MiB part strea
 package export
 
 type Builder interface {
-	Begin(ctx context.Context, tx store.Tx, o BuildOptions) (id.SnapshotVersion, error)       // inserts the row as 'building'
-	WriteFiles(ctx context.Context, h *router.ShardHandle, sc id.Scope, v id.SnapshotVersion) (*Manifest, error) // one REPEATABLE READ snapshot, visibility predicate on every row
+	Begin(ctx context.Context, tx store.Tx, o BuildOptions) (id.SnapshotVersion, error)       // inserts the row as 'building' and records the ins_seq watermark
+	WriteFiles(ctx context.Context, h *router.ShardHandle, sc id.Scope, v id.SnapshotVersion) (*Manifest, error) // short READ COMMITTED ranges bounded by the watermark, marker sets read once; NO long snapshot (it would block every index build and pin the vacuum horizon, P-10)
 	Record(ctx context.Context, tx store.Tx, m *Manifest) error                                // refuses to promote an expired row; re-checks tombstones newer than the start
 }
 type Streamer interface {
-	Stream(ctx context.Context, sc authz.RequestScope, v id.SnapshotVersion, part func(ctx context.Context, p Part) error) error // refuses expired versions
+	Stream(ctx context.Context, sc authz.RequestScope, v id.SnapshotVersion, path string, offset int64, part func(ctx context.Context, p Part) error) error // resumable by (path, offset); refuses expired versions; the stored bytes are NOT filtered on read
 	Latest(ctx context.Context, sc authz.RequestScope) (*Manifest, error)
+	Overlay(ctx context.Context, sc authz.RequestScope, page string) (*Overlay, error)       // GetSnapshotManifest's live hidden_overlay: current fact_hidden(invalidate) ids plus the derived_hidden ranges (N126)
 }
 ```
 
 The delete marker transaction expires `building` and `ready` snapshots alike
 (`SnapshotRepo.ExpireContaining`); the delta is a diff of the two snapshots' id indexes, so a delete
-reaches a client even when the base expired.
+reaches a client even when the base expired. `Invalidate` never expires a snapshot: curation reaches synced
+clients through `Streamer.Overlay` now and the next snapshot later. When a delete expired the latest `ready`
+snapshot, the expunge's `Materialize` starts a system `ExportSnapshot` (debounced 10 min per namespace, no
+`memory.write` caller).
 
 #### 2.2.21 `internal/quota` — rates, token metering, admission
 
@@ -1030,17 +1215,14 @@ type Reserver interface {
 	Reserve(ctx context.Context, sc id.Scope, call CallClass, tokens int64) (Reservation, error) // extract | summarize | route | write | refresh | reflect-iteration
 }
 type Meter interface {
-	Record(ctx context.Context, tx store.Tx, op string, u gateway.Usage, day time.Time) error // exactly-once through usage_key (PD-1)
-	Remaining(ctx context.Context, tx store.ReadTx, l Limits, day time.Time) (tokens, facts int64, err error)
-}
-type Deferral interface {
-	Defer(ctx context.Context, tx store.Tx, op id.OperationID, until time.Time, why DeferredInfo) error
-	Resume(ctx context.Context, tx store.Tx, op id.OperationID) error
+	Record(ctx context.Context, tx txn.Tx, op string, u gateway.Usage, day time.Time) error // exactly-once through usage_key (PD-1); takes the leaf txn handle, so quota does not import store (N140)
+	Remaining(ctx context.Context, tx txn.Tx, l Limits, day time.Time) (tokens, facts int64, err error)
 }
 ```
 
-A refused `Reserve` defers a workflow (`DEFERRED`, `resume_at` = the window reset) and returns
-`RESOURCE_EXHAUSTED` to a synchronous Reflect. Tenant limits are per-namespace shares computed by the
+A refused `Reserve` defers a workflow (`DEFERRED`, `resume_at` = the window reset, written through
+`store.OperationRepo.Defer`) and returns `RESOURCE_EXHAUSTED` to a synchronous Reflect. A rebuild that finds no
+visible source retires the observation without a gateway call and is exempt (N135). Tenant limits are per-namespace shares computed by the
 catalog from trailing usage plus a floor, with unused share borrowable at the daily recompute.
 Rejected: a global Redis limiter.
 
@@ -1080,7 +1262,7 @@ and labels are those of the §9.4 table; the ones this section's code emits are
 #### 2.2.24 `internal/ledger` — append-only ingest ledger
 
 `ledger.Writer.Append(ctx, tx, Entry)` and `Reader` (`Get`, `ListByDocument`); there is no update or delete
-method and a trigger rejects both. Inline body ≤ 64 KiB, else the blob key. Ledger rows are deleted only by
+method and a trigger rejects both. Inline body ≤ 64 KiB, else the owner-keyed blob `ledger/{ledger_id}`, which dies with its row. Ledger rows are deleted only by
 an explicit document, namespace or tenant delete under the admin role (the expunge, §5.4.2), never by a
 replace or append retire (N104).
 
@@ -1118,53 +1300,83 @@ implementation, no second annotation layer.* Rejected: grpc-gateway.
 | Command | Does |
 |---|---|
 | `shard provision / migrate / activate / full / drain / readonly / retire` | creates DB, roles (`engram_migrate`, `engram_app`, `engram_relay`, `engram_move`, `engram_admin`), extensions, partitions, RLS; goose rollout with `--canary`; catalog state changes |
-| `index --shard 7 --namespace <ns>` | runs the statements of `engram_hnsw_ddl` chosen by `engram_vector_index_plan` as the owner role (`CREATE INDEX CONCURRENTLY` per partition, `DROP INDEX`, `REINDEX INDEX CONCURRENTLY`); records `vector_indexes` |
+| `index [--shard 7]` | the **index runner** daemon (N138): the one process that holds `engram_migrate`; executes `vector_indexes` requests (`requested → building → ready \| failed`, lease) with the statements of `engram_hnsw_ddl` (`CREATE INDEX CONCURRENTLY` per partition, `DROP INDEX`, rebuild plus `VACUUM (INDEX_CLEANUP ON)` at 1 % of `rows_at_build` or 2 k purged), refusing to start a build while any `backend_xmin` is older than 5 min; `--namespace <ns>` requests one by hand |
 | `move start / status / abort / cleanup` | `MoveService` |
-| `restore --shard 7 --to …` / `restore replay` | pgBackRest restore, open-move reconcile, epoch bump (`catalog epoch + 1`), `frozen/restore`, then replay of the delete intents newer than `restore_point − 10 min` (N122, N123) |
+| `restore --shard 7 --to …` / `restore replay` | pgBackRest restore, open-move reconcile by the catalog CAS (N125), epoch bump (`catalog epoch + 1`, skipping `committed` moves and `deleting` namespaces), `frozen/restore`, then replay of the delete intents newer than `catalog.shards.replay_floor − 10 min` (lowered by this restore, never raised), verbatim and per subject in chain order (N122, N123, N134) |
 | `report --tenant acme --from … --to …` | per-tenant token and cost report from `token_usage` (N62) |
 | `config lint` | checks the `postgres -c` list and role GUCs against the generated table (N131) |
 | `outbox trim / skip`, `catalog flush-cache`, `shard stats`, `backup create`, `entity split` (phase 3) | as named |
 
 #### 2.2.28 `internal/intent` — the delete-intent log (N122)
 
-*Pattern: Append-only log in the blob store — an acknowledged delete exists in two places before the ack.*
+*Pattern: Append-only log in the blob store — an acknowledged delete exists in two places before the ack:
+the committed marker and its intent object.*
 
 ```go
 package intent
 
-type Intent struct { Kind Kind /* document | namespace | tenant | invalidate | restore */; Subject string; Tenant id.TenantID; Namespace id.NamespaceID; Operation id.OperationID; DeletedAt time.Time; RequestHash [32]byte; Epoch id.Epoch }
+type Key string // _control/deletes/{tenant}/{ns}/{deleted_at}-{operation_id}.json
+
+// Intent records the marker's EXACT effect, taken from the store.DeletionRecord that the marker transaction returned.
+type Intent struct {
+	Kind        Kind                 // document | namespace | tenant | invalidate | restore
+	Subject     Subject              // typed: exactly one of Document / Fact is set for the document and fact kinds
+	Tenant      id.TenantID; Namespace id.NamespaceID
+	Operation   id.OperationID
+	Prev        id.OperationID       // the subject's last deletion_log entry read under the document lock: the chain predecessor (zero = first)
+	DeletedAt   time.Time
+	UpToVersion id.DocVersion        // document kind: the tombstone's up_to_version, applied verbatim by the replay
+	MemoryIDs   []id.FactID          // invalidate and restore kinds
+}
+type Subject struct { Document id.DocumentID; Fact id.FactID }
 
 type Log interface {
-	Put(ctx context.Context, in Intent) (key string, err error) // _control/deletes/{tenant}/{ns}/{deleted_at}-{operation_id}.json: shard-independent, strongly consistent
-	List(ctx context.Context, ns id.NamespaceID, since time.Time) ([]Intent, error) // in name order, for the restore replay
+	// Put is put-if-absent under the marker's own name and content (If-None-Match: *). The attempt that committed the marker
+	// calls it after the commit and before the ack; a duplicate attempt that finds the subject already deleted calls it with the
+	// marker it observed, so an ack always implies an intent and a duplicate never writes a second object.
+	Put(ctx context.Context, in Intent) (Key, error)
+	List(ctx context.Context, ns id.NamespaceID, since time.Time) ([]Intent, error) // in name order; replay order is Order, not name order
 	Trim(ctx context.Context, olderThan time.Duration) (int, error)                  // 35 days
 }
+
+// Order returns the replay order: per subject in Prev-chain order (a broken chain starts at its oldest present member),
+// subjects in any order. It reads no clock, so no clock-sync bound is needed (C-16, P-13).
+func Order(in []Intent) []Intent
 ```
 
-`Put` precedes the marker transaction; a replay applies each namespace's intents with `deleted_at ≥
-restore_point − 10 min` in name order through the admin variant of the marker transaction, last state
-per subject wins (`Restore` after `Invalidate` is honoured).
+`Put` follows the marker commit and precedes the ack. Restore and failover replay a namespace's intents with
+`deleted_at ≥ replay_floor − 10 min`, where the floor is `catalog.ReplayFloor` (lowered by every restore, never raised
+while intents are retained), applying each **verbatim** — never recomputing `up_to_version` from restored state —
+through the admin variant of the marker transaction, idempotently through the shard `deletion_log`, and skipping
+namespace and tenant intents whose catalog row is not `deleting` or `deleted`. A tenant delete writes one intent per
+namespace as the workflow fences it, so the per-namespace listing reaches it. *Test seam:* `Durability.tla` model-based
+tests; `TestIntent_AckImpliesIntent`, `TestRestore_ChainOrder`, `TestRestore_FloorInCatalog`.
 
 #### 2.2.29 `internal/expunge` — the asynchronous half of a delete (N119)
 
-*Pattern: **Saga that only goes forward** — Materialize, Purge, Index, Finish are idempotent, resumable
-from `expunge_progress`, throttled (1,000 rows, 50 ms) and paused while a move is open; there is no
-compensation because the marker already made the delete effective.*
+*Pattern: a forward-only **workflow** (not a saga: nothing is compensated) — Materialize, Purge, DerivedPurge,
+Index and Finish are idempotent, resumable from `expunge_progress`, paced by the WAL they write (≤ 25 MB/s,
+measured per batch, not a fixed pause), run at most two per shard and are paused while a move is open; there is
+no compensation because the marker already made the delete effective.*
 
 ```go
 package expunge
 
 type Expunger interface {
-	Materialize(ctx context.Context, in *workflowv1.MaterializeInput) (*workflowv1.MaterializeResult, error) // exclusive derivation lock, one 35 s attempt
-	PurgeBatch(ctx context.Context, in *workflowv1.PurgeBatchInput) (*workflowv1.PurgeBatchResult, error)    // waits for every consumer cursor past the delete's seq
-	PurgeBlobs(ctx context.Context, in *workflowv1.ExpungeInput) (int64, error)
-	ReindexHygiene(ctx context.Context, in *workflowv1.ExpungeInput) (int, error)  // REINDEX INDEX CONCURRENTLY above 5 % dead
-	Finish(ctx context.Context, in *workflowv1.ExpungeInput) error                  // expunge_state 'purged'; tombstone dropped 24 h later
+	Materialize(ctx context.Context, in *workflowv1.MaterializeInput) (*workflowv1.MaterializeResult, error) // exclusive derivation lock, one 35 s attempt; EVERY batch re-reads fact_hidden and the open tombstones under it (N120)
+	PurgeBatch(ctx context.Context, in *workflowv1.PurgeBatchInput) (*workflowv1.PurgeBatchResult, error)    // waits for every consumer cursor past the tombstone's event_seq; targets MARKERS, CHUNK_TOMBSTONES, REEXTRACTED_FACTS, OLD_EMBEDDING_MODEL; never deletes evidence rows (N135)
+	DerivedPurge(ctx context.Context, in *workflowv1.DerivedPurgeInput) (*workflowv1.DerivedPurgeResult, error) // covered observation and page versions → content-free stubs; page markdown and Reflect transcripts deleted (N136)
+	PurgeBlobs(ctx context.Context, in *workflowv1.ExpungeInput) (int64, error)                              // owner-keyed blobs with their rows; caches after xcache_grace
+	Finish(ctx context.Context, in *workflowv1.ExpungeInput) error                                            // expunge_state 'purged'; tombstone dropped 24 h later; the documents row only if no higher tombstone is open and no version row remains (C-12)
+}
+type Hygiene interface {
+	RequestRebuild(ctx context.Context, in *workflowv1.ExpungeInput) (int, error) // marks touched HNSW indexes at 1 % of rows_at_build or 2 k purged as `requested`; the index runner rebuilds (N138)
 }
 ```
 
 SLA: materialize ≤ 15 min, purge ≤ 24 h, index ≤ 48 h. *Test seam:* `Derivation.tla` and `Durability.tla`
-model-based tests; a T3 test that a purge of a 100 k-fact document never exceeds the writer timeout.
+model-based tests; `TestExpunge_Stages` (zero derived rows, vectors, BM25 hits, blobs and transcripts for the
+victim); a T3 test that a purge of a 100 k-fact document never exceeds the writer timeout or the WAL budget.
 
 ### 2.3 Swappable implementations
 

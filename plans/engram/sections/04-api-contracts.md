@@ -40,7 +40,7 @@ call needs a **deadline** (`-max-time`, 4.1.2) and carries the namespace in the 
 |---|---|---|
 | `MemoryService.Retain` | `namespace`, `items[]{content, timestamp}` | Durable acceptance only: one `Operation` per document (`PENDING`). Nothing is visible yet. |
 | `MemoryService.Recall` | `namespace`, `query` | Stream of ranked `result` messages, then one `stats`. Sees everything whose `Operation` is `SUCCEEDED`, never a deleted document. |
-| `DocumentService.DeleteDocument` | `namespace`, `documentId` | The ack **is** the delete: no read path returns anything derived from the document from this response on. The returned `Operation` tracks the physical expunge. |
+| `DocumentService.DeleteDocument` | `namespace`, `documentId` | The ack **is** the delete: the marker is committed and its intent object durable, and no read path returns anything derived from the document from this response on (`DocumentService` itself shows only a content-free tombstone). The returned `Operation` tracks the physical expunge. |
 | `OperationService.WaitOperation` | `namespace`, `operationId` | The operation, `timedOut = true` when it is not terminal yet. After a retain is `SUCCEEDED`, Recall sees its facts unless `result.supersededBy` is set. |
 
 ```bash
@@ -70,8 +70,8 @@ grpcurl -H "authorization: Bearer $JWT" -max-time 3 \
   api.engram.local:8443 memory.v1.MemoryService/Recall
 # -> {"result":{"rank":1,"memory":{"kind":"MEMORY_KIND_FACT","text":"Alice is moving to the search team on April 30th."}}} … {"stats":{…}}
 
-# 4. DeleteDocument: the ack is the delete. Deadline 10 s.
-grpcurl -H "authorization: Bearer $JWT" -max-time 10 \
+# 4. DeleteDocument: the ack is the delete. Deadline 40 s (delete-class cap, 4.1.2).
+grpcurl -H "authorization: Bearer $JWT" -max-time 40 \
   -import-path plans/engram/proto -proto memory/v1/document.proto \
   -d '{"namespace":{"tenantId":"acme","namespaceId":"018f4c9e-7d3a-7c2b-9c1e-3f2a1b4c5d6e"},
        "documentId":"session-2026-09-30"}' \
@@ -81,8 +81,8 @@ grpcurl -H "authorization: Bearer $JWT" -max-time 10 \
 ```
 
 Rules of thumb: pass `meta.requestId` (or `operationId`) on every write you may retry (4.1.3);
-treat `FAILED_PRECONDITION` + `NamespaceFrozen`/`NamespaceNotReady` as "retry after `retry_after`"
-(4.1.6); while a delete is being expunged, Recall keeps working but may be slower for that
+treat `NamespaceFrozen` (`FAILED_PRECONDITION`) and `NamespaceNotReady` (`UNAVAILABLE`) as "retry after
+`retry_after`" (4.1.6), but `PreconditionFailed{NAMESPACE_DELETING}` as final; while a delete is being expunged, Recall keeps working but may be slower for that
 namespace (5.4). Over Connect/JSON the same four calls are plain `curl` POSTs (4.8).
 
 ### 4.1 Conventions
@@ -94,7 +94,7 @@ handler). Envoy in front balances **per request** (HTTP/2 stream), never per con
 
 | Metadata key (gRPC) / header (Connect) | Required | Semantics |
 |---|---|---|
-| `authorization: Bearer <jwt>` | yes | EdDSA/RS256 JWT with claims `tenant_id`, `ns` (list of namespace ids or `["*"]`), `ns_group` (list of tenant-defined namespace groups; a namespace carries one group, so a token for 10 000 per-user namespaces is one claim, not 400 KB of ids — N65, review F-29), `scopes ⊆ {memory.read, memory.write, memory.admin, tenant.admin}` (D13). A namespace is allowed when `"*" ∈ ns`, or its id `∈ ns`, or its group `∈ ns_group`. Verified by the single `authz.Interceptor` (unary + stream). Missing/invalid → `UNAUTHENTICATED`; expired → `UNAUTHENTICATED` with message `token expired`. |
+| `authorization: Bearer <jwt>` | yes | EdDSA/RS256 JWT with claims `tenant_id`, `ns` (list of namespace ids or `["*"]`), `ns_group` (list of tenant-defined namespace groups; a namespace carries one group, so a token for 10 000 per-user namespaces is one claim, not 400 KB of ids — N65, review F-29), `scopes ⊆ {memory.read, memory.write, memory.admin, tenant.admin}` (D13; `tenant.admin` is tenant-bound, and the fleet-wide `engram.operator` scope has its own audience and never appears in a tenant token, 4.1.9). A namespace is allowed when `"*" ∈ ns`, or its id `∈ ns`, or its group `∈ ns_group`. Verified by the single `authz.Interceptor` (unary + stream). Missing/invalid → `UNAUTHENTICATED`; expired → `UNAUTHENTICATED` with message `token expired`. |
 | `grpc-timeout` / `Connect-Timeout-Ms` | yes | The deadline (4.1.2). Absent → `INVALID_ARGUMENT`. |
 | `traceparent`, `tracestate` | no | W3C trace context; propagated into OpenTelemetry spans and into Temporal workflow headers. |
 | `user-agent` | no | Logged; the MCP and Connect adapters append `engram-mcp/<ver>` / `engram-connect/<ver>`. |
@@ -138,6 +138,7 @@ for hours:
 | `Reflect` | 330 s | 5 s | 300 s wall budget (D12) + 30 s for streaming the answer. |
 | `WaitOperation` | 65 s | 1 s | Server wait clamps to `deadline − 500 ms` and 60 s. |
 | `StreamSnapshot` | 600 s | 5 s | Resumable by offset, so long streams are unnecessary. |
+| `DeleteDocument`, `DeleteNamespace`, `DeleteTenant`, `Restore` | 40 s | 1 s | They take an exclusive lock in one 35 s attempt (N82, N120, N139); a cap below the lock timeout would turn a lock wait into `DEADLINE_EXCEEDED` after the intent object was already written. |
 | everything else | 30 s | 100 ms | |
 
 Exceeding the cap is `INVALID_ARGUMENT` (`reason:"DEADLINE_TOO_LONG"`), not a silent clamp:
@@ -167,9 +168,11 @@ is used by the ledger and by Temporal inputs. Rejected alternative: a single key
 are restarted on the target shard with the same id, D5 step 6).
 
 Temporal enforces the second half: workflows start with `WorkflowIdReusePolicy =
-REJECT_DUPLICATE` while running and `ALLOW_DUPLICATE_FAILED_ONLY` afterwards — a failed operation
-may be resubmitted under the same id (the API checks the request hash first), a succeeded one may
-not.
+REJECT_DUPLICATE`, so an operation id is never executed twice. **A `FAILED` operation is final**:
+resubmitting the same `operation_id` returns the `FAILED` row, and a retry uses a **new**
+`operation_id` (the state machine has no `FAILED → PENDING` edge, N35, N139; `OperationError.retryable`
+says whether a retry is expected to help). Rejected: a `RetryOperation` RPC (a second contract and a
+linked-operation model nobody asked for).
 
 **MCP edge rule (A-6, N127).** JSON-RPC ids are per-session counters, so the MCP adapter never
 forwards one as a key: `request_id = sha256(mcp-session-id ‖ jsonrpc-id ‖ tool)`. Two agents (or a
@@ -223,19 +226,22 @@ on the wire they are `google.protobuf.Any` entries with type URL
 (the workspace must build without the BSR, and Engram needs details google.rpc lacks); the two
 standard ones that generic clients act on — `google.rpc.RetryInfo` and `google.rpc.ErrorInfo`
 — are attached from the `errdetails` Go package, which needs no proto import. A response carries
-at most one Engram detail plus, when a retry hint exists, `RetryInfo`.
+at most one Engram detail plus, when a retry hint exists, `RetryInfo`. The table below is
+generated from `internal/errs` (`make gen-docs`): **one gRPC code per detail type** (and per
+`OperationConflict` reason), so the proto comments, the Go mapping and this table cannot disagree
+(N139, A-10).
 
 | Typed detail | gRPC code | Raised when | Client action |
 |---|---|---|---|
 | `ValidationError{violations[]}` | `INVALID_ARGUMENT` | Malformed request: missing/too-long field, bad enum value, inconsistent `TagFilter`, unknown mask path, **missing or over-cap deadline**, bad page token. | Fix the request. Never retry unchanged. |
-| `NotFound{kind, id, namespace}` | `NOT_FOUND` | Unknown memory/document/operation/page/snapshot id; namespace unknown **or belonging to another tenant**; page version absent at `as_of`. | Do not retry; the id is wrong or the resource is gone. |
+| `NotFound{kind, id, namespace, reason}` | `NOT_FOUND` | Unknown memory/document/operation/page/snapshot id; namespace unknown **or belonging to another tenant**; page version absent at `as_of`; `reason = DOCUMENT_DELETED` for `GetDocumentVersion`/`GetDocumentBody` of a version a delete tombstone covers (N136). | Do not retry; the id is wrong or the resource is gone. |
 | `QuotaExceeded{quota, limit, current, retry_after, scope}` (+ `RetryInfo`) | `RESOURCE_EXHAUSTED` | Admission-time rate quotas `recalls_per_min`, `retains_per_min`, `max_request_bytes`, `max_namespaces` (D13), and a synchronous Reflect whose `quota.Reserve` was refused (N130). *Not* raised for workflow gateway calls: those defer the operation (`DEFERRED`) instead. | Sleep `retry_after`, retry identical request. |
 | `WrongShardOrEpoch{namespace_id, expected_epoch, actual_epoch, namespace_state}` | `FAILED_PRECONDITION` | The shard's `namespace_ownership` row disagrees with the resolved (shard, epoch): stale catalog cache, move cut over between resolve and execute, restore bumped the epoch (D2 row 3). The API invalidates its catalog entry, re-resolves and retries the whole call **once** for writes; a call that sees `namespace_state = MOVED_OUT` (the window between cutover sub-steps (c) and (d), §5.5) re-resolves in a **bounded loop of ≤ 5 s**, exactly like `NamespaceFrozen`, because the catalog still names the source until (d) and a single retry would fail identically (N52, N125). It is surfaced only when that also fails and counts against the availability SLI. The routing hint of the permanent `moved_out` row (`target_shard_id`, `next_epoch`, N93) travels as the **internal** `engram.internal.errors.v1.MovedOutHint`, consumed by the router and dropped by the interceptor; no shard id is part of a public message (N128, A-12). | Retry with backoff (a fresh resolve happens server-side). Never persist epochs. |
-| `NamespaceFrozen{namespace_id, retry_after, reason}` (+ `RetryInfo`) | `FAILED_PRECONDITION` | Writes during the freeze window of a move, a restore or a delete (D5), or while an exclusive taker is queued on the namespace fence and the writer's `try`-lock was refused (`reason` unspecified, `retry_after` = 200 ms; the fence never waits, N82; the internal `FenceBusy` detail is mapped to this). Reads continue only for a move freeze; a delete or restore freeze rejects them (N122). The API already retried with backoff for up to 30 s. | Retry after `retry_after`. |
-| `NamespaceNotReady{namespace_id, retry_after}` (+ `RetryInfo`) | `UNAVAILABLE` | The target shard of a move is `ready` but not yet `active` (cutover sub-steps (c) to (b″), well under a second, N125). The API retries inside its bounded loop first. | Retry after `retry_after`. |
+| `NamespaceFrozen{namespace_id, retry_after, reason}` (+ `RetryInfo`) | `FAILED_PRECONDITION` | Writes during the freeze window of a move or a restore (D5), or while an exclusive taker is queued on the namespace fence and the writer's `try`-lock was refused (`reason` unspecified, `retry_after` = 200 ms; the fence never waits, N82; the internal `FenceBusy` detail is mapped to this). Reads continue only for a move freeze; a restore freeze rejects them too (`RESTORING`, N122). A **delete** freeze is not reported here: it is `PreconditionFailed{NAMESPACE_DELETING}` everywhere (N139). The API already retried with backoff for up to 30 s. | Retry after `retry_after`. |
+| `NamespaceNotReady{namespace_id, retry_after}` (+ `RetryInfo`) | `UNAVAILABLE` | The target shard of a move is `ready` but not yet `active` (cutover sub-steps (b′) to (b″), well under a second, N125). The API retries inside its bounded loop first. | Retry after `retry_after`. |
 | `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: namespace cutover in progress, page already refreshing, snapshot already running. | `WaitOperation(existing_operation_id)` then resubmit. |
 | `OperationConflict{reason: IDEMPOTENCY_KEY_REUSED}` | `ALREADY_EXISTS` | `request_id`/`operation_id` reused with a different request hash; namespace/page `name` already taken. | Use a fresh id; the stored one is bound to a different request. |
-| `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation, etag mismatch, `Invalidate` on a non-fact or already-invalidated id, namespace `DELETING`, snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
+| `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation (`OPERATION_TERMINAL`) or on a `DELETE_*` operation (`OPERATION_NOT_CANCELLABLE`, N136), etag mismatch, `Invalidate` on a non-fact id (a second `Invalidate` of the same fact is a **no-op success**, not an error, N139), `Restore` of a fact with no `invalidate` marker (`NOT_INVALIDATED`), namespace `DELETING` (the delete freeze included), tenant `DELETING` (`TENANT_DELETING`), snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
 | — | `UNAUTHENTICATED` | Missing/invalid/expired JWT. | Refresh the token. |
 | — | `PERMISSION_DENIED` | Scope or allowlist (4.1.1). | Obtain a broader token. |
 | — (+ `RetryInfo{2 s}`) | `UNAVAILABLE` | Catalog **miss** while the catalog is down (D4 as amended: cached entries of existing namespaces are served indefinitely, only misses fail), shard `READONLY`/`RETIRED` or marked unavailable by the schema-version guard (N22), pgbouncer pool exhausted. | Retry with jittered backoff; idempotent by construction. |
@@ -270,7 +276,7 @@ it is convenience, not contract (only `value` is guaranteed).
 | `MemoryService.Reflect` | **server-streaming** `ReflectResponse{delta \| tool_call \| tool_result \| citation \| answer \| stats}` | Up to 300 s of wall time with visible progress (tool steps) and token deltas; the client must be able to show something before the end. | Bidirectional (no mid-session client input exists; the loop is bounded and server-driven). Unary (300 s of silence). |
 | `OperationService.WaitOperation` | **unary long-poll** (server wait ≤ min(timeout, deadline − 500 ms, 60 s)) | It is a barrier, not a feed: one round trip, works from curl/Connect/JSON, no long-lived stream to migrate when an API replica restarts, and Envoy balances each poll. **Mechanism (N70, review F-39):** the handler parks on Temporal's workflow-result long-poll (`GetWorkflow(id).Get` with the remaining wait) — one open poll per waiter, capped per API process (`MaxOpenWaits`, default 2 000); above the cap, or when the workflow no longer exists (namespace purge), it falls back to a jittered poll of the `operations` row (1 s ± 250 ms). Neither path needs a per-shard `LISTEN` (impossible through pgbouncer, N15). | `WatchOperation` server stream (nice-to-have for progress bars; deferred until someone needs it — `GetOperation` polling every 2 s is adequate). |
 | `ExportService.StreamSnapshot` | **server-streaming** 1 MiB parts | Files reach gigabytes; gRPC messages should stay ≤ 4 MiB; resumable by `(path, offset)` so a broken stream costs one part. | Unary presigned-URL redirect (leaks blob layout and credentials model to clients; not all deployments have public blob endpoints). |
-| `DocumentService.DeleteDocument`, `NamespaceService.DeleteNamespace` | **unary** → ack + `Operation` | The ack is the soft-delete marker, committed after the intent object (N115, N122); the expunge is async and tracked (N119). | — |
+| `DocumentService.DeleteDocument`, `NamespaceService.DeleteNamespace` | **unary** → ack + `Operation` | The ack is the committed soft-delete marker followed by the durable intent object (N115, N122); the expunge is async and tracked (N119). `DeleteTenant` acks after the catalog `deleting` row and the tenant intent and fences namespaces asynchronously (N122). | — |
 | `PageService.DeletePage` | **unary** (no `Operation`) | Pages are small; the delete is fully synchronous. | — |
 | All `Get*`/`List*`/`BatchGet*` | **unary**, `idempotency_level = NO_SIDE_EFFECTS` | Enables HTTP GET in Connect (4.7). | — |
 
@@ -290,10 +296,11 @@ it is convenience, not contract (only `value` is guaranteed).
 
 | Scope | Methods |
 |---|---|
-| `memory.read` | Recall, Reflect, GetMemory, ListMemories, BatchGetMemories, Get/ListDocuments, GetDocumentVersion, Get/ListNamespaces, GetEffectiveConfig, all OperationService (Get/Wait also while the namespace is `DELETING`, N70), GetSnapshotManifest, ListSnapshots, StreamSnapshot, GetPage, ListPages, SearchPages (N73) |
-| `memory.write` | Retain, Invalidate, Restore, DeleteDocument, CreateSnapshot, Create/Update/Delete/RefreshPage, CancelOperation |
+| `memory.read` | Recall, Reflect, GetMemory, ListMemories, BatchGetMemories, Get/ListDocuments, GetDocumentVersion, GetDocumentBody, ListTags, Get/ListNamespaces, GetEffectiveConfig, all OperationService (Get/Wait also while the namespace is `DELETING`, N70), GetSnapshotManifest, ListSnapshots, StreamSnapshot, GetPage, ListPages, SearchPages (N73) |
+| `memory.write` | Retain, Invalidate, Restore, DeleteDocument, UpdateDocumentTags, CreateSnapshot, Create/Update/Delete/RefreshPage, CancelOperation |
 | `memory.admin` | Create/Update/DeleteNamespace (within the token's tenant) |
-| `tenant.admin` | Everything in `memory.admin.v1`, including `TenantService.GetTenantOperation` (also while the tenant is `DELETING`) |
+| `tenant.admin` | `TenantService` (except `ListTenants`), including `GetTenantOperation` (also while the tenant is `DELETING`). **Tenant-bound:** the interceptor enforces `token.tenant_id == request.tenant_id` on every tenant-level method (D13, N139) |
+| `engram.operator` | `ShardService`, `MoveService`, `ListTenants`. **Fleet-wide**, with its own token audience and the separate Envoy admin route; never present in a tenant token (D13, N139) |
 
 ### 4.2 File inventory
 
@@ -633,9 +640,14 @@ message EntityHint {
 }
 
 // Metadata attached by clients is a free-form JSON object (google.protobuf.Struct).
-// It is stored verbatim (≤ 16 KiB serialised), returned on Memory and
-// Document, indexed for equality filtering on top-level string values only,
-// and never interpreted by the pipeline.
+// It is stored verbatim (≤ 16 KiB serialised) on the document (the metadata of
+// the first item of its current version), returned on Memory and Document,
+// and never interpreted by the pipeline. Filters resolve at DOCUMENT level,
+// exactly like tags (decision N139): the recall layer evaluates them once
+// against `documents.metadata` (GIN `jsonb_path_ops`) into the allowed-document
+// set that every arm receives, so facts, chunks and observations are filtered
+// through their documents. Only equality on top-level string values is
+// supported.
 message MetadataFilter {
   // Top-level key whose value must equal `value` (string comparison).
   string key = 1;
@@ -648,8 +660,9 @@ message MetadataFilter {
 The public typed details of 4.1.6: `ValidationError`, `QuotaExceeded`, `NotFound`,
 `WrongShardOrEpoch` (epochs and state only), `NamespaceFrozen`, `NamespaceNotReady` (the `ready`
 window of a move cutover, N125), `OperationConflict`, `PreconditionFailed`, and the enums they need
-(`ResourceKind`, `NamespaceState`, `QuotaScope`, `FreezeReason` = `MOVE`, `RESTORE`, `DELETE`,
-`OperationConflictReason`). `NamespaceState` is defined here, not in `namespace.proto`, because
+(`ResourceKind`, `NamespaceState`, `QuotaScope`, `FreezeReason` = `MOVE`, `RESTORE` and a deprecated
+`DELETE` that is never emitted because the delete freeze is `PreconditionFailed{NAMESPACE_DELETING}`,
+N139; `OperationConflictReason`). `NotFound` carries an optional `reason` (`DOCUMENT_DELETED`, N136). `NamespaceState` is defined here, not in `namespace.proto`, because
 `WrongShardOrEpoch` needs it and `errors.proto` must not import service files. The write-path and
 routing details (`MovedOutHint`, `FenceBusy`, `DocumentBusy`, `InputBlobMissing`) moved to
 `engram/internal/errors/v1/errors.proto` (N128): a public message can never be removed once
@@ -667,18 +680,28 @@ DEFERRED, SUCCEEDED, FAILED, CANCELLED), `cancel_reason` (CLIENT_REQUEST, DOCUME
 NAMESPACE_DELETING), `progress{units_total, units_done, units_failed, units_skipped, phase}`,
 `error`, `deferred{quota, resume_at, scope}`, `result`, `timestamps`, `finished_at`, `request_id`
 and the `consolidation_lag` hint (D16). N127 closes the review-3 gaps: `result.document_version` is
-**this operation's** version and `result.superseded_by` is set when a newer version finalised
-first, so the read barrier reads "after `SUCCEEDED`, Recall observes every fact of that version
-**unless `superseded_by` is set**"; a retain that races a delete ends `CANCELLED` with
-`CANCEL_REASON_DOCUMENT_DELETED`; `OPERATION_KIND_DELETE_TENANT` (stored in the catalog database,
-read through the tenant-scoped `memory.admin.v1.TenantService.GetTenantOperation`) can be awaited;
-`MOVE_NAMESPACE` left the public enum (number 7 reserved) because a move is the catalog's
-`namespace_moves` row, not an operation. For a delete kind, `SUCCEEDED` means "physically gone"
-(the delete itself was effective at the RPC ack); `progress.phase` walks the expunge phases
-`materialize`, `purge`, `index`, `finish` and `ExpungeSla` states the bounds (15 min, 24 h, 48 h).
-Cancellation is cooperative (next activity boundary); already-committed chunks stay visible.
-`WaitOperation` returns `{operation, timed_out}` so the two return paths are unambiguous.
-Full file under `plans/engram/proto/memory/v1/operation.proto`.
+**this operation's** version and `result.superseded_by` is **the newer version number** (an `int64`
+version, not an operation id; the shard column is a `bigint` version too, N139) set when a newer
+version finalised first, so the read barrier reads "after `SUCCEEDED`, Recall observes every fact of
+that version **unless `superseded_by` is set**"; a retain that races a delete ends `CANCELLED` with
+`CANCEL_REASON_DOCUMENT_DELETED`; `OPERATION_KIND_DELETE_TENANT` (derived from the catalog's tenant
+row, read through the tenant-scoped `memory.admin.v1.TenantService.GetTenantOperation`) can be
+awaited; `MOVE_NAMESPACE` left the public enum (number 7 reserved) because a move is the catalog's
+`namespace_moves` row, not an operation.
+
+**The operation contract per kind (N136).** Retain, export and refresh are backed by their own
+workflow at `ns/{namespace_id}/op/{operation_id}`; `DELETE_DOCUMENT` is the per-namespace expunge
+singleton plus the tombstone's `operation_id`, with progress read from the expunge's bookkeeping;
+`CONSOLIDATE` is the consolidation singleton. Consequently **`DELETE_*` operations are
+non-cancellable** (`CancelOperation` → `PreconditionFailed{OPERATION_NOT_CANCELLABLE}`: the delete is
+already effective and the expunge must finish), `WaitOperation` on them polls the tombstone (or the
+catalog row for a namespace and a tenant), and a move's `Restart` skips singleton-backed kinds. For a
+delete kind, `SUCCEEDED` means "physically gone" (the delete itself was effective at the RPC ack);
+`progress.phase` walks the expunge phases `materialize`, `purge`, `derived`, `index`, `finish` and
+`ExpungeSla` states the bounds (15 min, 24 h, 48 h). A `FAILED` operation is final: a retry uses a
+new `operation_id` (4.1.3). Cancellation of the other kinds is cooperative (next activity boundary);
+already-committed chunks stay visible. `WaitOperation` returns `{operation, timed_out}` so the two
+return paths are unambiguous. Full file under `plans/engram/proto/memory/v1/operation.proto`.
 
 #### `memory/v1/memory.proto` (full text)
 
@@ -695,6 +718,9 @@ Full file under `plans/engram/proto/memory/v1/operation.proto`.
   after the results already sent and no `stats`; results are never re-ordered by a later message.
   Rerank skipped (deadline or `rerank=false`) is signalled by `Scores.stage = FUSED` on every
   result and `RecallStats.rerank_skip_reason`.
+- **`metadata_filters` resolve at document level.** Like `tag_filter`, they are evaluated once
+  against `documents.metadata` (GIN `jsonb_path_ops`) into the allowed-document set that every arm
+  receives (N139); facts, chunks and observations carry no metadata of their own.
 - **`optional bool rerank`** and **`optional bool stream_tokens`** use explicit presence so that
   "not set" can mean "default true" without inverting the flag's name (`disable_rerank`) — the
   proto3 idiom for tri-state booleans.
@@ -719,12 +745,18 @@ Full file under `plans/engram/proto/memory/v1/operation.proto`.
   the embedded header), and `ChunkInfo.header` is returned empty whenever `as_of` is set. Entity
   names, aliases and entity hops are `as_of`-safe too (N118): `EntityRef` carries only `mention`
   under `as_of`.
-- **Deletion and curation are read-time predicates (N115–N117).** `DeleteDocument`, `Invalidate`
-  and `Restore` write one marker row; every read path (Recall arms, GetMemory, ListMemories,
-  Reflect tools, the export) evaluates `visible(f) ≡ document ∉ tombstones ∧ chunk ∉ chunk
-  tombstones ∧ fact ∉ fact_hidden`, and an observation or page version is visible iff no input in
-  its evidence segment is hidden. `Memory.invalidated_at` is the `fact_hidden` marker's time;
-  `ObservationInfo.stale` means "a rebuild is pending", not "hidden".
+- **Deletion and curation are read-time predicates (N115–N117, N135).** `DeleteDocument`,
+  `Invalidate` and `Restore` write one marker row (and then their intent object, N122); every read
+  path (Recall arms, GetMemory, ListMemories, Reflect tools, `DocumentService`) evaluates
+  `visible(f) ≡ document ∉ tombstones ∧ chunk ∉ chunk tombstones ∧ fact has no fact_hidden row`,
+  and an observation or page version is visible iff a version row exists (fail closed) and no
+  input in its evidence segment names a tombstoned document or an **invalidated** fact. Exports
+  follow N126 (expiry on delete, `hidden_overlay` for curation). `fact_hidden` has two causes:
+  `Memory.invalidated_at` reports the `invalidate` marker's time only, and a `reextract` row (a
+  prompt or model bump hid a stale extraction) neither shows there nor hides any derived version.
+  `ObservationInfo.stale` means "a rewrite is pending", not "hidden". A second `Invalidate` of the
+  same fact is a no-op success; `Restore` is exact and takes the exclusive derivation lock, so
+  `Invalidate`/`Restore` and the delete RPCs have a 40 s deadline cap (4.1.2).
 - **Parity rules (N129).** Rank 1 is always emitted whole and its overflow counted in
   `RecallStats.tokens_used` (Hindsight returns the top result whole); the rerank depth 0/50/150 is
   gated by the B.1 ablation `--rerank-top {0,50,150,300}`; `Recall` stays streaming for the
@@ -816,17 +848,26 @@ service MemoryService {
   rpc BatchGetMemories(BatchGetMemoriesRequest) returns (BatchGetMemoriesResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // Invalidate soft-hides one FACT from Recall, Reflect and Export. The
-  // synchronous part is one `fact_hidden` marker row (decisions N115, N116)
-  // after the intent object is durable (N122): no row is updated and nothing
-  // is walked. Every observation or page version whose evidence segment
-  // names the fact is hidden at read time by the same predicate (N117), and
-  // the affected observations are scheduled for a root rebuild. Reversible:
+  // Invalidate soft-hides one FACT from Recall, Reflect and ListMemories
+  // (GetMemory still reads it, with invalidated_at set). The synchronous part is one committed `fact_hidden(invalidate)`
+  // marker row (decisions N115, N116) followed by the intent object (N122,
+  // put after the commit, before the ack): no row is updated and nothing is
+  // walked. Every observation or page version whose evidence segment names
+  // the fact is hidden at read time by the same predicate (N117), and the
+  // affected observations are scheduled for a root rebuild. Exports are not
+  // expired by it; they honour it from the next snapshot and meanwhile
+  // through the manifest's hidden_overlay (decision N126). Reversible:
   // Restore deletes the marker and nothing else encodes the invalidation, so
-  // it is exact. Scope memory.write. Synchronous (milliseconds).
+  // it is exact. Invalidating an already invalidated fact is a no-op success
+  // (decision N139). Scope memory.write. Milliseconds in the common case.
   rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
-  // Restore deletes the `fact_hidden` marker of a fact (decision N115);
-  // visibility flips at commit. Scope memory.write. Synchronous.
+  // Restore deletes the `invalidate` marker of a fact and the derived-hidden
+  // rows that carry its cause (decisions N115, N135); a `reextract` marker is
+  // never touched, so a restore cannot resurrect a stale extraction.
+  // Visibility flips at commit; the intent object follows, as for Invalidate.
+  // Restore takes the exclusive derivation lock and may wait for a running
+  // consolidation or page commit (one attempt of up to 35 s), so its deadline
+  // cap is 40 s (decision N139). Scope memory.write.
   rpc Restore(RestoreRequest) returns (RestoreResponse);
 }
 
@@ -856,8 +897,10 @@ message RetainItem {
   // a retry reproduces it (decision N127); without an operation_id it is a
   // fresh UUIDv7 and the retain is NOT replay-safe.
   string document_id = 4;
-  // Tags applied to every fact and chunk of the item; ≤ 32 tags (decision N32), each
-  // 1-64 bytes, exact-match strings. Filters, never security.
+  // Tags of the item; ≤ 32 tags (decision N32), each 1-64 bytes, exact-match
+  // strings. Tags are item-level and live on the DOCUMENT: the document's tag
+  // set is the union over its items, and every fact and chunk is filtered
+  // through its document (decision N116). Filters, never security.
   repeated string tags = 5;
   // Free-form JSON object stored verbatim (≤ 16 KiB), returned on memories,
   // filterable by top-level string equality.
@@ -1075,21 +1118,26 @@ message ObservationInfo {
   // Ids of the supporting facts (hidden ones are excluded from Recall views
   // but kept in GetMemory with `include_hidden_sources`).
   repeated string source_fact_ids = 2;
-  // Version returned: the latest version that is visible (decision N117) and
-  // has effective_at <= as_of.
+  // Version returned: the version current at as_of (effective_at <= as_of <
+  // superseded_at) or, without as_of, the current version; when that version
+  // is hidden (decision N117) nothing is returned for the observation. A
+  // version with no visible source (proof_count = 0) is not returned.
   int64 version = 3;
   // The as_of visibility key (decision D9): max(mentioned_at) over every
   // fact shown to the consolidation prompt that wrote this version (its
   // inputs, a superset of source_fact_ids), clamped to be >= the effective_at
   // of the observations shown and of the previous version.
   google.protobuf.Timestamp effective_at = 4;
-  // True when evidence changed under this observation since this version was
-  // written and a rebuild has not yet run (a source was retired by a document
-  // replace, hidden by Invalidate or restored). The version is still served.
-  // A version whose evidence segment names a deleted document or a hidden
-  // fact is not served at all: the read-time predicate hides it (decision
-  // N117), permanently for document causes at every as_of, and the latest
-  // unaffected version is returned instead, or none until the rebuild lands.
+  // True when a rewrite is pending for this observation: evidence changed
+  // since this version was written (a document replace or a re-extraction
+  // retired a source, an Invalidate hid one, a Restore brought one back). It
+  // says "a rebuild is pending", never "hidden": a stale version that is
+  // visible is still served (decision N135). A version whose evidence
+  // segment names a deleted document or an invalidated fact is not served at
+  // all, whatever this flag says: the read-time predicate hides it (decision
+  // N117), permanently for document causes at every as_of, and nothing is
+  // returned for the observation at an `as_of` whose current version is
+  // hidden until the rebuild lands.
   bool stale = 5;
   // Verbatim quotes from source facts, aligned with source_fact_ids where
   // available. Evidence is versioned (decision N85): for any returned
@@ -1118,7 +1166,8 @@ message Memory {
   // UUIDv7 (memory_id, observation_id or chunk_id).
   string id = 1;
   MemoryKind kind = 2;
-  // Fact text / observation text / chunk text (≤ 8 KiB for chunks).
+  // Fact text / observation text / chunk text (≤ 16 KiB for chunks, the
+  // stored chunk limit of decision D8).
   string text = 3;
   // Facts only.
   FactType fact_type = 4;
@@ -1151,8 +1200,10 @@ message Memory {
   ObservationInfo observation = 17;
   // Chunks only.
   ChunkInfo chunk = 18;
-  // Set when a `fact_hidden` marker exists for the fact (Invalidate; decision
-  // N115): hidden from Recall/Reflect/Export but readable by GetMemory.
+  // Set when a `fact_hidden` row with cause `invalidate` exists for the fact
+  // (Invalidate; decision N115): hidden from Recall and Reflect but readable
+  // by GetMemory. `reextract` rows (a prompt or model bump hid a stale
+  // extraction) are NOT reported here and cannot be restored (decision N135).
   google.protobuf.Timestamp invalidated_at = 19;
   Timestamps timestamps = 20;
   NamespaceRef namespace = 21;
@@ -1210,8 +1261,9 @@ message ListMemoriesRequest {
   // mentioned_at bounds (inclusive).
   google.protobuf.Timestamp mentioned_after = 8;
   google.protobuf.Timestamp mentioned_before = 9;
-  // Include soft-invalidated facts (fact_hidden markers; default excluded).
-  // Facts of a tombstoned document are never returned.
+  // Include soft-invalidated facts (`fact_hidden(invalidate)` markers;
+  // default excluded). Facts of a tombstoned document, and stale extractions
+  // hidden by `reextract`, are never returned.
   bool include_invalidated = 10;
   // Restrict to items mentioning this entity id.
   string entity_id = 11;
@@ -1253,7 +1305,8 @@ message InvalidateRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   // Must be a MEMORY_KIND_FACT id, else FAILED_PRECONDITION
-  // {MEMORY_NOT_A_FACT}. Already-invalidated facts are a no-op success.
+  // {MEMORY_NOT_A_FACT}. Already-invalidated facts are a no-op success
+  // (decision N139).
   string memory_id = 3;
   // Free-text audit reason, ≤ 1 KiB.
   string reason = 4;
@@ -1420,23 +1473,38 @@ message ReflectStats {
 #### `memory/v1/document.proto`
 
 `DocumentService`: `GetDocument` (with optional version list), `ListDocuments` (tag filter,
-id prefix, `updated_after`, metadata equality), `DeleteDocument`, `GetDocumentVersion`.
-`DeleteDocument` is unary and has two halves (D8, N115, N119). **The synchronous half is an O(1)
-soft-delete marker**: the delete intent object is put to blob storage (N122), then one shard
-transaction flips `documents.state` to `deleting`, inserts one `document_tombstones` row, a
-`deletion_log` row and one outbox event, and the call acks, in milliseconds at any document size.
-From that ack on every read path evaluates the read-time predicate (N116, N117) and returns nothing
-derived from the document, and every export snapshot that contains it (also one still `building`)
-is expired in the same transaction (N126). Nothing is counted, walked or stamped, so
-`DeleteDocumentResponse` carries `deleted_at` and `expunge_sla` instead of the old `facts_retired`,
+id prefix, `updated_after`, metadata equality at document level), `DeleteDocument`,
+`GetDocumentVersion`, and, added by N139, `GetDocumentBody` (a version's reconstructed body in byte
+ranges from its owner-keyed blob), `ListTags` (distinct tags with document counts) and
+`UpdateDocumentTags` (add and remove, set semantics; tags live on the document row only, so tag
+filters see the change at once). `DeleteDocument` is unary and has two halves (D8, N115, N119).
+**The synchronous half is an O(1) soft-delete marker**: one shard transaction, under the exclusive
+document lock, compares `expected_version`, flips `documents.state` to `deleting` **and clears the
+summary, context, metadata and tags in the same row update**, inserts one `document_tombstones`
+row, a `deletion_log` row (with the subject's previous entry as chain predecessor) and one outbox
+event; **after it commits, the delete intent object is put to blob storage** with the marker's
+exact effect (N122), and only then does the call ack, in milliseconds at any document size. A
+duplicate attempt that finds the document already `DELETING` returns the existing operation and
+first makes sure the intent of the marker it found exists, so an ack always implies an intent; a
+crash between the commit and the put leaves a committed but unacknowledged delete that a restore
+may lose and the client's retry re-applies. From the ack on every read path evaluates the
+read-time predicate (N116, N117) and returns nothing derived from the document, and every export
+snapshot that contains it (also one still `building`) is expired in the same transaction (N126).
+**`DocumentService` is one of those read paths (N136):** a `DELETING` document is returned by
+`GetDocument` and `ListDocuments(include_deleting)` as its **tombstone only**, with `document_id`,
+`state`, `deleted_at`, `up_to_version` and `delete_operation_id`; `GetDocumentVersion` and
+`GetDocumentBody` of a covered version answer `NOT_FOUND{DOCUMENT_DELETED}`; a revival writes fresh
+values for the new life. Nothing is counted, walked or stamped, so `DeleteDocumentResponse`
+carries `deleted_at` and `expunge_sla` instead of the old `facts_retired`,
 `observations_marked_stale` and `pages_marked_stale` (fields 2 to 4 reserved). **The asynchronous
 half is the throttled per-namespace `Expunge` workflow** (N119) that the returned `Operation` (kind
-`DELETE_DOCUMENT`) tracks: materialize (≤ 15 min), purge rows and blobs (≤ 24 h), index rebuilt
-(≤ 48 h); Recall SLOs may degrade while a marker is pending. `expected_version` gives
-compare-and-delete. Deleting a document that is already `DELETING` returns the existing operation
-(idempotent), deleting an unknown one is `NOT_FOUND`, and a Retain into a deleted `document_id` is accepted at
-once: it starts at `up_to_version + 1`, so the new content is visible while the deleted versions stay
-hidden and are expunged (N133). Full file under
+`DELETE_DOCUMENT`, not cancellable) tracks: materialize (≤ 15 min), purge rows and blobs (≤ 24 h),
+derived versions reduced to content-free stubs, index rebuilt (≤ 48 h); Recall SLOs may degrade
+while a marker is pending. `expected_version` gives compare-and-delete, compared inside the marker
+transaction. Deleting a document that is already `DELETING` returns the existing operation
+(idempotent), deleting an unknown one is `NOT_FOUND`, and a Retain into a deleted `document_id` is
+accepted at once: it starts at `up_to_version + 1`, so the new content is visible while the
+deleted versions stay hidden and are expunged (N133). Full file under
 `plans/engram/proto/memory/v1/document.proto`.
 
 #### `memory/v1/namespace.proto`
@@ -1446,10 +1514,12 @@ immutable `name`; `models.embed` and the dimension are fixed here, N111), `GetNa
 `stats`), `ListNamespaces` (restricted to the token's allowlist unless `["*"]`), `UpdateNamespace`
 (field mask over `display_name`, `mission`, `reflect_directives`, `disposition`,
 `config_overrides`; etag), **`GetEffectiveConfig`** (resolved and raw config, N129) and
-`DeleteNamespace` → ack + `Operation` (kind `DELETE_NAMESPACE`; typed `confirm_name`). The delete
-writes the intent object (N122), takes `freeze_delete` on the shard and acks: from then on reads
-and writes are rejected; the expunge is `DROP INDEX`, batched `DELETE` and the blob prefix, with no
-graph repair (N112). `Disposition{skepticism, literalism, empathy}` ∈ 1..5, 0 = inherit.
+`DeleteNamespace` → ack + `Operation` (kind `DELETE_NAMESPACE`, not cancellable; typed
+`confirm_name`; a duplicate keeps the client's `operation_id`). The delete takes `freeze_delete` on
+the shard and sets the catalog state `deleting` (the marker), then writes the intent object (N122,
+after the commit) and acks: from then on reads and writes are rejected as
+`PreconditionFailed{NAMESPACE_DELETING}`; the expunge is `DROP INDEX` by deterministic names,
+batched `DELETE` and the blob prefix, with no graph repair (N112). Deadline cap 40 s. `Disposition{skepticism, literalism, empathy}` ∈ 1..5, 0 = inherit.
 `reflect_directives` are typed `Directive{text, priority, active, tags}` (N129); the plain-string
 `directives` (6) is reserved. The `config_overrides` key list in the proto comment is generated
 from the same Go table as the server's allow-list (N66, M0.8 check).
@@ -1465,19 +1535,30 @@ why. Full file under `plans/engram/proto/memory/v1/namespace.proto`.
 #### `memory/v1/export.proto` (phase 3)
 
 `ExportService`: `CreateSnapshot` → `Operation` (kind `CREATE_SNAPSHOT`, one at a time per
-namespace), `GetSnapshotManifest` (`version` 0 = latest), `ListSnapshots`, `StreamSnapshot`
-(server-streaming parts ≤ 1 MiB, resumable by `(path, offset)`, last part carries the file
-SHA-256, every part under the N116 predicate). `BeginSnapshot` inserts the snapshot as `building`;
-`WriteFiles` reads from one `REPEATABLE READ` snapshot; `RecordSnapshot` refuses to promote an
-expired row (N126). Snapshot v*n* always holds a full file set (`facts.jsonl.zst`,
-`observations.jsonl.zst`, optional `chunks.jsonl.zst`, `pages/*.md`, `manifest.json`) and, for
-*n* > 1, **always** `delta-v{n-1}-v{n}.jsonl.zst`, computed by diffing the two snapshots by
-(id, version), with delete records and `deleted_ids` in the manifest even when v*n−1* expired. A
-document delete expires every snapshot that contains the document, `building` and `ready` alike
-(`SnapshotManifest.expired`): `ListSnapshots` still lists it, `StreamSnapshot` refuses it with
-`PreconditionFailed{SNAPSHOT_EXPIRED}`, and `engram-sync` applies the next delta's deletes before
-serving and refuses an expired local copy — an acknowledged delete is never served through an old
-export. Full file under `plans/engram/proto/memory/v1/export.proto`.
+namespace), `GetSnapshotManifest` (`version` 0 = latest, plus the **live `hidden_overlay`**),
+`ListSnapshots`, `StreamSnapshot` (server-streaming parts ≤ 1 MiB, resumable by `(path, offset)`,
+last part carries the file SHA-256). `BeginSnapshot` inserts the snapshot as `building` and records
+an `ins_seq` watermark; `WriteFiles` reads short `READ COMMITTED` ranges bounded by it, with the
+marker sets read once (no long snapshot: a two-hour `REPEATABLE READ` would block every index
+build and pin the vacuum horizon); `RecordSnapshot` refuses to promote an expired row (N126).
+Snapshot v*n* always holds a full file set (`facts.jsonl.zst`, `observations.jsonl.zst`, optional
+`chunks.jsonl.zst`, `pages/*.md`, `manifest.json`) and, for *n* > 1, **always**
+`delta-v{n-1}-v{n}.jsonl.zst`, computed by diffing the two snapshots by (id, version), with delete
+records and `deleted_ids` in the manifest even when v*n−1* expired. **A delete expires; curation
+overlays.** A document delete expires every snapshot that contains the document, `building` and
+`ready` alike (`SnapshotManifest.expired`): `ListSnapshots` still lists it, `StreamSnapshot`
+refuses it with `PreconditionFailed{SNAPSHOT_EXPIRED}`, and `engram-sync` applies the next delta's
+deletes before serving and refuses an expired local copy — an acknowledged delete is never served
+through an old export — while the expunge starts a system-initiated snapshot (debounced 10 min) so
+read-only clients regain a servable copy. `Invalidate` and `Restore` never expire a snapshot: the
+parts are static compressed byte streams and cannot be filtered on read (the earlier sentence
+"every part applies the read-time visibility predicate" is deleted), so snapshots honour curation
+from the next snapshot and `GetSnapshotManifest` carries a live `HiddenOverlay` — the current
+`fact_hidden(invalidate)` ids and the `(kind, id, root_version, from_version)` ranges of
+`derived_hidden`, paged by `overlay_page_token` and computed at read time, never stored in
+`manifest.json` — that `engram-sync` applies before serving. In short: *delete → expiry + delta;
+invalidate/restore → overlay now, snapshot later.* Full file under
+`plans/engram/proto/memory/v1/export.proto`.
 
 #### `memory/v1/page.proto` (phase 3)
 
@@ -1486,8 +1567,9 @@ export. Full file under `plans/engram/proto/memory/v1/export.proto`.
 `ListPages` (`stale_only`), `UpdatePage` (mask; changing `source_query`/`tag_filter` sets
 `stale_write`), `DeletePage` (synchronous), `RefreshPage` → `Operation` (kind `REFRESH_PAGE`;
 `force` = full rewrite), `SearchPages` (unary, page tokens: `query` + `tag_filter` + `as_of` +
-`budget` → ranked `PageHit{rank, page, version, score, snippet}` by BM25 ∪ HNSW over
-`page_versions` fused with RRF, no LLM, N73). **There is exactly one `RefreshPolicy`** (N128):
+`budget` → ranked `PageHit{rank, page, version, score, snippet}` by BM25 over `page_versions.text`
+∪ HNSW over `page_version_vectors` (N111, N112) fused with RRF, no LLM, N73; pages share the
+observation visibility and purge path, N139). **There is exactly one `RefreshPolicy`** (N128):
 `trigger` = `AFTER_CONSOLIDATION` (debounced), `SCHEDULED` (interval, 1 h to 30 d) or `MANUAL`;
 §5.3 and the generated Go `Page` follow it, and there is no `on_delete` knob because the expunge
 always refreshes the pages a delete or invalidation touched. Staleness is two booleans on purpose:
@@ -1499,19 +1581,28 @@ registered and answers `UNIMPLEMENTED`. Full file under `plans/engram/proto/memo
 
 #### `memory/admin/v1/admin.proto`
 
-Scope `tenant.admin`, separate Envoy route. `TenantService` (Create/Get/List/Update/Delete;
-**`GetTenantOperation`**; `Quotas{recalls_per_min, retains_per_min, llm_tokens_per_day, max_facts,
-max_namespaces, max_request_bytes}`, `Isolation{SHARED, DEDICATED}`, config Struct);
-`DeleteTenant` writes the intent object, freezes every namespace (`freeze_delete`), acks, and
-returns one `DELETE_TENANT` operation (in the catalog database) plus one `DELETE_NAMESPACE`
-operation per namespace (N127). `ShardService` (RegisterShard, GetShard, ListShards, DrainShard,
-UpdateShard, **ResolveNamespace** — the ops view of shard/epoch/state that `memory.v1` hides,
-`ReleaseNamespace`; `ShardState` is `PROVISIONING, ACTIVE, FULL, DRAINING, READONLY, RETIRED`).
-`MoveService` (StartMove with optional `pause_before_freeze`/`resume`, GetMove, ListMoves,
-RollbackMove — allowed at every step **before the point of no return** (c), CleanupMove). `Move`
-exposes both epochs, `MoveState` = `PLANNED, COPYING, FROZEN, RECONCILING, CUTOVER, CLEANING, DONE,
-ROLLED_BACK` (`CATCHING_UP` reserved), `cutover_step` (`READY_TARGET`, `MOVED_OUT_SOURCE`,
-`ACTIVE_TARGET`, `CATALOG_FLIP`), `past_point_of_no_return` and `MoveProgress{rows_copied,
+Separate Envoy route. Scopes (D13, N139): `TenantService` needs the tenant-bound `tenant.admin`
+(the interceptor enforces `token.tenant_id == request.tenant_id` on every tenant-level method);
+`ShardService`, `MoveService` and `ListTenants` need the fleet-wide `engram.operator`, which has its
+own audience. `TenantService` (Create/Get/List/Update/Delete; **`GetTenantOperation`**;
+`Quotas{recalls_per_min, retains_per_min, llm_tokens_per_day, max_facts, max_namespaces,
+max_request_bytes}`, `Isolation{SHARED, DEDICATED}`, config Struct); `DeleteTenant` marks the tenant
+`deleting` in the catalog (every request for the tenant then fails
+`PreconditionFailed{TENANT_DELETING}`, the read barrier), writes the tenant-level intent object and
+acks; the `TenantDelete` workflow then fences the namespaces asynchronously, one intent object per
+namespace as it fences each, so the ack has bounded fan-out (N122, A-11). It returns the
+`DELETE_TENANT` operation (derived from the catalog row); `GetTenantOperation` lists the
+per-namespace `DELETE_NAMESPACE` operations as they appear. `ShardService` (RegisterShard,
+GetShard, ListShards, DrainShard, UpdateShard, **ResolveNamespace** — the ops view of
+shard/epoch/state that `memory.v1` hides, `ReleaseNamespace`; `ShardState` is `PROVISIONING, ACTIVE,
+FULL, DRAINING, READONLY, RETIRED`). `MoveService` (StartMove with optional
+`pause_before_freeze`/`resume`, GetMove, ListMoves, RollbackMove — allowed at every step **before
+the point of no return**, the catalog CAS `cutover → committed` (a″), CleanupMove). `Move` exposes
+both epochs, `MoveState` = `PLANNED, COPYING, FROZEN, RECONCILING, CUTOVER, COMMITTED, CLEANING,
+DONE, ROLLED_BACK` (`CATCHING_UP` reserved; the pre-freeze verification runs inside `COPYING`),
+`cutover_step` (`READY_TARGET`, `CATALOG_COMMIT`, `MOVED_OUT_SOURCE`, `ACTIVE_TARGET`,
+`CATALOG_FLIP`), `past_point_of_no_return`, `source_blobs_gc_after` (the source blob prefix is kept
+for the 28-day backup window, N123) and `MoveProgress{rows_copied, rows_catchup_copied,
 rows_recopied, mutable_rows_reconciled, blobs_reconciled, copy_started_at, freeze_watchdog,
 restarted_operation_ids, tables_done}`; `copy_start_seq`, `applied_seq` and the replay lag fields
 are reserved, and `Move.operation_id` is reserved (a move is not an operation, N127). Full file
@@ -1531,22 +1622,28 @@ only as ciphertext, at most 4 KiB per activity result, plus
 `ChunkWork.header`/`context`/`metadata_json`/`entity_hints`; the payload codec uses a per-namespace
 data key wrapped by the shard key, and deleting the wrapped key is the shredding step of a
 namespace or tenant delete. Retain activities are unchanged in shape; what changed is what they
-write: `FinalizeVersion` inserts `chunk_tombstones` and `fact_hidden(reextract)` rows instead of
-updating facts, `CommitChunk` inserts vectors into the side tables keyed by model (N111) and
-re-applies `curation_log` (N115). **Consolidation is two-stage (N121):** `RouteBatchInput/Result`
-(stage 1, `consolidate_route/v1`: `RoutingDecision{ATTACH, CREATE, SKIP, MERGE, DROP_SOURCE}`,
-nothing textual persisted), `WriteObservationInput/Result` (stage 2, `consolidate_write/v1`: one call
-per touched observation, `ObservationWrite` with the shown `input_fact_ids`; modes create, update,
-rebuild), `StoreProposalInput` (write-once, N43) and `ApplyBatchInput/Result`
-(derivation lock, re-verification is the visibility predicate over the batch's fact ids; the
-lineage messages are gone). **Expunge (N119):** `ExpungeInput`, `MaterializeInput/Result`,
-`PurgeBatchInput/Result`, `ExpungeResult`. Also `TenantDeleteInput`, `RetainBackfillInput`,
+write: `FinalizeVersion` inserts `chunk_tombstones` and `fact_hidden(cause = 'reextract')` rows
+instead of updating facts, flags the affected observations `stale_write` and hides no derived
+version (`observations_flagged_stale`, N135), and `CommitChunk` inserts vectors into the side
+tables keyed by model (N111) and re-applies `curation_log` (N115). **Consolidation is two-stage
+(N121):** `RouteBatchInput/Result` (stage 1, `consolidate_route/v1`: `RoutingDecision{ATTACH,
+CREATE, SKIP, MERGE, DROP_SOURCE}`, nothing textual persisted), `WriteObservationInput/Result`
+(stage 2, `consolidate_write/v1`: one call per touched observation, `ObservationWrite` with the
+shown `input_fact_ids` and, for update and merge, the **`base_version`** it was written against;
+modes create, update, rebuild), `StoreProposalInput` (write-once under `(batch_key, attempt)`, N43,
+with `prompt_variant` for the capacity re-run) and `ApplyBatchInput/Result` (the derivation commit
+rule of N120: shared lock, fresh re-verification, `base_version` check, whole-proposal discard to a
+new attempt; the lineage messages are gone). **Expunge (N119, N136):** `ExpungeInput` (WAL budget
+`wal_mb_per_s` instead of a fixed pause; targets `MARKERS`, `NAMESPACE`, `CHUNK_TOMBSTONES`,
+`REEXTRACTED_FACTS`, `OLD_EMBEDDING_MODEL`), `MaterializeInput/Result`, `PurgeBatchInput/Result`,
+`DerivedPurgeInput/Result` (content-free stubs and transcripts), `ExpungeResult`. Also `TenantDeleteInput`, `RetainBackfillInput`,
 `ReembedNamespaceInput`, `SweeperInput` (N128: every workflow, including the schedules, has a
 `schema_version`), `RefreshPageInput`, `ExportInput` (no outbox cut), and the move messages:
 `MoveInput`, `CopyProgress` (resumable key-range heartbeat of the snapshot-less dirty copy),
-`ReconcileReport`, `MoveCheckpoint` (`copy_started_at`, source `system_identifier` and
-`timeline_id`, `CutoverStep`), `MoveResult`. The pre-1.0 breaks of this file are listed in its
-header and in 4.5. Full file under `plans/engram/proto/engram/internal/workflow/v1/workflow.proto`.
+`PreVerifyReport` (the pre-freeze checks against `ins_seq`, N124, N137), `ReconcileReport`,
+`MoveCheckpoint` (`copy_started_at`, source `system_identifier` and `timeline_id`, `CutoverStep`
+including `CATALOG_COMMIT`, the report of each phase), `MoveResult`. The pre-1.0 breaks of this
+file are listed in its header and in 4.5. Full file under `plans/engram/proto/engram/internal/workflow/v1/workflow.proto`.
 
 #### `engram/internal/errors/v1/errors.proto`
 
@@ -1562,15 +1659,16 @@ The outbox/Kafka envelope `Event{seq, namespace_id, tenant_id, epoch, occurred_a
 schema_version (2), event_id, operation_id, shard_id, oneof payload}`. Payloads:
 `DocumentVersionStarted`, `ChunkCommitted`, `ChunksTombstoned`, `DocumentVersionActivated`,
 `DocumentDeleted` (an O(1) marker with `ExpungeState`, emitted at the marker, at materialize and at
-purge), `FactInvalidated`, `FactRestored`, `ObservationUpserted`, `ObservationRetired`,
+purge; the `seq` of the first is the tombstone's `event_seq`, which the purge waits for), `FactInvalidated`, `FactRestored`, `ObservationUpserted`, `ObservationRetired`,
 `ObservationsMarkedStale`, `EntityUpserted`, `EntitiesMerged`, `PageVersionCreated`, `PageDeleted`,
 `PagesMarkedStale`, `SnapshotCreated`, `TokenUsageRecorded`, `NamespaceDeleted`,
 `NamespacePurged`, `RestoreMarker`. The N81 events (oneof 40–47) and `RowsPurged` are removed
 (reserved): a namespace move reconciles by set difference and never reads the outbox, so there is
 no event-to-row replay mapping, no `replay:` annotation and no "covering event" CI rule. Events
-stay **thin and bounded** (N80): ids inside a payload are 16-byte `bytes` on **new field numbers**
-(the old `string` numbers are reserved, so a consumer built before the change ignores them instead
-of decoding a 36-byte UUID string as an id), an event carries at most 256 ids, larger sets are
+stay **thin and bounded** (N80): ids inside a payload are 16-byte `bytes` on **new field numbers
+and new `*_bytes` names** (the old `string` numbers and names are reserved, so a consumer built
+before the change ignores them instead of decoding a 36-byte UUID string as an id, and the protojson
+name is never recycled, N139), an event carries at most 256 ids, larger sets are
 paged with `page`/`page_count`, and above 4,096 ids one event carries `ids_elided = true` and
 counts only; `DocumentDeleted` has no id list at all and consumers delete by the indexed
 `(namespace_id, document_id)` query. Every encoded event is ≤ 16 KiB by construction. Rejected:
@@ -1631,7 +1729,7 @@ may be combined.
 | | `query_timestamp` | `as_of` |
 |---|---|---|
 | Default | server `now()` | unset (no cut-off) |
-| Effect | Resolves relative expressions in the query ("last week", "yesterday") and orders the temporal arm by distance to it; feeds the recency boost. | Filters **every arm** to `mentioned_at ≤ as_of` for facts and chunks, and selects, per observation and per page, the latest version with `effective_at ≤ as_of`. |
+| Effect | Resolves relative expressions in the query ("last week", "yesterday") and orders the temporal arm by distance to it; feeds the recency boost. | Filters **every arm** to `mentioned_at ≤ as_of` for facts and chunks, and selects, per observation and per page, the **version current at `as_of`** (`effective_at ≤ as_of < superseded_at`), or nothing when that version is hidden (N117). |
 | Can it change *which* items are eligible? | No — only ranks/scores. | Yes — it is a visibility boundary. |
 | Applied where | temporal arm, boosts | inside each arm's SQL (`WHERE mentioned_at <= $as_of` on the immutable `facts` row, `WHERE mentioned_at <= $as_of AND embedding_effective_at <= $as_of` on `chunks` (N85); `observation_versions.effective_at <= $as_of` joined to the write-once `observation_version_meta.superseded_at`, the range form of "latest version with `effective_at ≤ T`", N33), and in graph expansion when fetching neighbours, so an invisible fact cannot even be a hop. The visibility predicate of N116 is evaluated in the same statement. |
 | Typical use | "what did I plan for next Tuesday?" asked on 2026-06-01 | leak-free evaluation: answer question *k* of a conversation as if later turns did not exist |
@@ -1694,10 +1792,17 @@ Edge rules:
 - `as_of` is orthogonal to the visibility predicate (N116): tombstoned documents, chunk tombstones
   and `fact_hidden` markers always apply, and `as_of` never resurrects an invalidated fact even if it
   was invalidated after T (curation is not time-travelled; a curator's decision is meant to
-  stick). A `fact_hidden` marker also hides every observation or page version whose **evidence
-  segment** names the fact, superseded ones included (N117), so an old `as_of` cannot serve a
-  version written with the invalidated fact in view; `Restore` deletes the marker and brings
-  exactly those versions back, because nothing else encodes the invalidation.
+  stick). A `fact_hidden(invalidate)` marker also hides every observation or page version whose
+  **evidence segment** names the fact, superseded ones included (N117), so an old `as_of` cannot
+  serve a version written with the invalidated fact in view; `Restore` deletes the marker and
+  brings exactly those versions back, because nothing else encodes the invalidation. A
+  `fact_hidden(reextract)` row (a prompt or model bump hid a stale extraction) hides only that fact
+  from the fact and chunk arms: derived versions that name it stay visible and are rebuilt (N135).
+- **The served version is the one current at `T`.** When it is hidden, nothing is served for that
+  observation or page at `T`, not an older version; retirement is filtered by its own time
+  (`retired_at IS NULL OR retired_at > as_of`); a version with no visible source
+  (`proof_count = 0`) is not served; and a predicate that finds no version row fails closed (N117,
+  N135).
 - `as_of` never resurrects an observation version derived from deleted content: a version whose
   segment (`inputs(O, w)` for `root_version(v) ≤ w ≤ v`) names a tombstoned document stays hidden
   at every T, permanently, through the `derived_hidden` row the expunge materializes (N117, N119),
@@ -1720,24 +1825,28 @@ Edge rules:
 
 ### 4.5 Evolution policy
 
-**Tooling.** `buf breaking --against '.git#tag=proto/v1.0.0,subdir=plans/engram/proto'` runs on
-every pull request with the `FILE` category — the strictest (it is baselined against the latest
-release tag, not `main`, so the gate compares against what clients actually run; N128): besides wire and JSON compatibility it
-forbids moving a definition between files and changing `go_package`, because both break generated
-Go import paths for every consumer. A failure blocks the merge; there is no `--exclude` override
-in CI. Demonstration on a scratch copy (four deliberate edits: `RecallRequest.as_of` changed to
-`string`, `Scores.boost` renumbered/renamed/retyped, `BatchGetMemories` renamed, `WaitOperation`
-made streaming):
+**Tooling.** `buf breaking` runs on every pull request with the `FILE` category — the strictest:
+besides wire and JSON compatibility it forbids moving a definition between files and changing
+`go_package`, because both break generated Go import paths for every consumer. A failure blocks
+the merge; there is no `--exclude` override in CI. **The baseline is stated as what is true
+(N139).** No release tag exists before `v1.0.0`, so until then CI compares against `main@HEAD~1`
+(from the repository root: `buf breaking plans/engram/proto --against
+'.git#branch=main,ref=HEAD~1,subdir=plans/engram/proto'`; in the real repository the module path is
+`proto`), and every intended break needs a `buf-breaking-exception` label on the pull request and
+an entry in the changelog table below. From `v1.0.0` on the baseline is the latest release tag
+(`.git#tag=proto/v1.0.0,…`), so the gate compares against what clients actually run. Demonstration
+on a scratch copy (four deliberate edits: `RecallRequest.as_of` changed to `string`, `Scores.boost`
+renumbered/renamed/retyped, `BatchGetMemories` renamed, `WaitOperation` made streaming):
 
 ```text
 $ buf breaking --against ../proto-baseline
-memory/v1/common.proto:231:3:Field "8" with name "recency_boost" on message "Scores" changed option "json_name" from "boost" to "recencyBoost".
-memory/v1/common.proto:231:3:Field "8" with name "recency_boost" on message "Scores" changed type from "float" to "double".
-memory/v1/common.proto:231:10:Field "8" on message "Scores" changed name from "boost" to "recency_boost".
-memory/v1/memory.proto:37:1:Previously present RPC "BatchGetMemories" on service "MemoryService" was deleted.
-memory/v1/memory.proto:173:3:Field "9" with name "as_of" on message "RecallRequest" changed cardinality from "optional with explicit presence" to "optional with implicit presence".
-memory/v1/memory.proto:173:3:Field "9" with name "as_of" on message "RecallRequest" changed type from "message" to "string".
-memory/v1/operation.proto:45:3:RPC "WaitOperation" on service "OperationService" changed from server unary to server streaming.
+memory/v1/common.proto:253:3:Field "8" with name "recency_boost" on message "Scores" changed option "json_name" from "boost" to "recencyBoost".
+memory/v1/common.proto:253:3:Field "8" with name "recency_boost" on message "Scores" changed type from "float" to "double".
+memory/v1/common.proto:253:10:Field "8" on message "Scores" changed name from "boost" to "recency_boost".
+memory/v1/memory.proto:40:1:Previously present RPC "BatchGetMemories" on service "MemoryService" was deleted.
+memory/v1/memory.proto:230:3:Field "9" with name "as_of" on message "RecallRequest" changed cardinality from "optional with explicit presence" to "optional with implicit presence".
+memory/v1/memory.proto:230:3:Field "9" with name "as_of" on message "RecallRequest" changed type from "message" to "string".
+memory/v1/operation.proto:76:3:RPC "WaitOperation" on service "OperationService" changed from server unary to server streaming.
 $ echo $?
 100
 ```
@@ -1763,29 +1872,39 @@ replacement; (2) keep serving it — identical behaviour — for **at least two 
 (≈ 2 quarters at the planned cadence); (3) removal happens **only in a new major package**
 (`memory.v2`), served side by side with `memory.v1` for at least two minor releases, with the
 `v1` handler delegating to the `v2` implementation. Nothing is ever removed from `memory.v1`
-itself. Pre-1.0 release candidates were the one exception, and the removals made then are the
-`reserved` examples in the files (`RetainRequest.wait_for_visibility = 5`,
-`RecallRequest.min_score = 17`, `TagFilter.include_untagged = 3`, `RetainItem.mentioned_at = 9`).
+itself. Before `v1.0.0` ships a break is still possible, but only through the labelled exception
+procedure above; the `reserved` entries in the files (`RetainRequest.wait_for_visibility = 5`,
+`RecallRequest.min_score = 17`, `TagFilter.include_untagged = 3`, `RetainItem.mentioned_at = 9`)
+are the permanent record of those removals.
 
-**The round-3 exception (v1.0.0-rc6, N128, review A-9/A-11/A-12/A-13).** Nothing has shipped at
-`v1.0.0`, so the D22 redesign changed the contract incompatibly where the old shape encoded
-withdrawn machinery. The breaks are intended, listed here, and every removed number is
-`reserved`:
+**Pre-1.0 exceptions (N128, N139; reviews A-9, A-11, A-12, A-13).** Nothing has shipped at
+`v1.0.0`, so the D22 and D23 redesigns changed the contract incompatibly where the old shape
+encoded withdrawn machinery. The breaks are intended, listed here as the changelog the exception
+procedure requires, and every removed number or name is `reserved`. The gate's baseline moved past
+the round-3 rows when they were committed, so this table, not the tool, is their record:
 
-| Module | Break | Why |
-|---|---|---|
-| `memory.v1` | `DeleteDocumentResponse` fields 2 to 4 (cascade counts) reserved; `deleted_at` and `expunge_sla` added | The delete is an O(1) marker; nothing is counted at delete time (N115). |
-| `memory.v1` | `OperationKind` 7 (`MOVE_NAMESPACE`) reserved; `DELETE_TENANT` (8), `Operation.cancel_reason` (14), `OperationResult.superseded_by` (10) added | A move is not an operation; tenant deletes and superseded retains were inexpressible (N127). |
-| `memory.v1` | `Namespace.directives` (6) reserved, `reflect_directives` (13) added; `GetEffectiveConfig` added | Typed directives (N129). |
-| `memory.v1` | `DocumentBusy`, `InputBlobMissing`, `FREEZE_REASON_FENCE_BUSY` (4) and `WrongShardOrEpoch` fields 5 and 6 left the package | Internal details move to `engram.internal.errors.v1` (N128). |
-| `memory.admin.v1` | `MoveState.CATCHING_UP` (3), `MoveProgress` 4 to 7 and `Move.operation_id` (13) reserved; `RECONCILING`, `CutoverStep`, `GetTenantOperation` added | Replay machinery withdrawn (N124, N127). |
-| `internal.events` | Every `string → bytes` id field moved to a new number (old number reserved); `DocumentDeleted` lost its id lists; `ChunksRetired` and `RowsPurged` and oneof 40 to 47 removed; `schema_version` 2 | N80 retype done safely; N81 events withdrawn (N124). |
-| `internal.workflow` | Lineage consolidation messages replaced by the two-stage shapes; `Purge*` replaced by `Expunge*`; `ExportInput` lost the outbox cut; `MoveCheckpoint`/`MoveResult` lost the replay floor; `item_index` (9) stays reserved; `schema_version` 2 | N121, N119, N126, N124. |
+| Round | Module | Break | Why |
+|---|---|---|---|
+| 3 | `memory.v1` | `DeleteDocumentResponse` fields 2 to 4 (cascade counts) reserved; `deleted_at` and `expunge_sla` added | The delete is an O(1) marker; nothing is counted at delete time (N115). |
+| 3 | `memory.v1` | `OperationKind` 7 (`MOVE_NAMESPACE`) reserved; `DELETE_TENANT` (8), `Operation.cancel_reason` (14), `OperationResult.superseded_by` (10) added | A move is not an operation; tenant deletes and superseded retains were inexpressible (N127). |
+| 3 | `memory.v1` | `Namespace.directives` (6) reserved, `reflect_directives` (13) added; `GetEffectiveConfig` added | Typed directives (N129). |
+| 3 | `memory.v1` | `DocumentBusy`, `InputBlobMissing`, `FREEZE_REASON_FENCE_BUSY` (4) and `WrongShardOrEpoch` fields 5 and 6 left the package | Internal details move to `engram.internal.errors.v1` (N128). |
+| 3 | `memory.v1` | `OperationConflictReason` 2 (`DOCUMENT_PURGING`) reserved | A deleted `document_id` can be retained again at once (N133c). |
+| 3 | `memory.admin.v1` | `MoveState.CATCHING_UP` (3), `MoveProgress` 4 to 7 and `Move.operation_id` (13) reserved; `RECONCILING`, `CutoverStep`, `GetTenantOperation` added | Replay machinery withdrawn (N124, N127). |
+| 3 | `internal.events` | Every `string → bytes` id field moved to a new number (old number reserved); `DocumentDeleted` lost its id lists; `ChunksRetired` and `RowsPurged` and oneof 40 to 47 removed; `schema_version` 2 | N80 retype done safely; N81 events withdrawn (N124). |
+| 3 | `internal.workflow` | Lineage consolidation messages replaced by the two-stage shapes; `Purge*` replaced by `Expunge*`; `ExportInput` lost the outbox cut; `MoveCheckpoint`/`MoveResult` lost the replay floor; `item_index` (9) stays reserved; `schema_version` 2 | N121, N119, N126, N124. |
+| 4 | `internal.events` | The retyped `bytes` fields are renamed `*_bytes` and their old names reserved: `ChunkCommitted` 14 to 16, `FactInvalidated` 4, `FactRestored` 2, `ObservationUpserted` 11 and 12, `ObservationRetired` 4, `ObservationsMarkedStale` 7 and 8, `EntityUpserted` 5, `EntitiesMerged` 7 and 8, `PageVersionCreated` 5, `PageDeleted` 2, `PagesMarkedStale` 8 | The old JSON names stayed in use with a new type, which changes what a protojson consumer decodes (A-9). |
+| 4 | `internal.workflow` | `ExpungeInput.batch_pause` (7) reserved, `wal_mb_per_s` (10) added | The purge is paced by the WAL it writes, not by a fixed pause (N119). |
+
+Round 4 changed `memory.v1` and `memory.admin.v1` only additively (`NotFound.reason`,
+`Document.deleted_at`/`up_to_version`/`delete_operation_id`, `GetDocumentBody`, `ListTags`,
+`UpdateDocumentTags`, `HiddenOverlay`, `MoveState.COMMITTED`, `CutoverStep.CATALOG_COMMIT`,
+`Move.source_blobs_gc_after`, a deprecated `FREEZE_REASON_DELETE` that is no longer emitted), so the
+public gate would have passed without an exception.
 
 The `string → bytes` retype of event ids is the one case where the earlier edit was *silently*
 unsafe (the same number decoded a 36-byte ASCII UUID as a 16-byte id); it is therefore done with
-new numbers, not in place. CI baselines `buf breaking` against the `proto/v1.0.0` tag (N128); the
-table above is the review artefact for the breaks that precede it.
+new numbers and, since round 4, new names, not in place.
 
 **Reserved numbers.** Every top-level request/response and resource message carries
 `reserved 100 to 199;` — upstream never assigns those numbers, so a downstream fork (an enterprise
@@ -1817,7 +1936,8 @@ makes natural).
   adapter) pin a commit in their `buf.lock`. Kafka messages carry header
   `schema=engram.internal.events.v1.Event` and the BSR commit in `schema_commit` (D6).
 - Every top-level workflow input and the event envelope carries `schema_version` (an integer;
-  **2** for everything written by the D22 build, N128). Adding fields never bumps it (histories
+    **2** for everything written by the D22 and D23 builds: nothing has shipped, so there are no
+  running histories whose interpretation round 4 could change, N128, N139). Adding fields never bumps it (histories
   replay with defaults). Workflow inputs that had none (`TenantDeleteInput`, `RetainBackfillInput`,
   `ReembedNamespaceInput`, `SweeperInput`, `ExpungeInput`) carry one from the start. A field whose
   interpretation changes bumps it, and the workflow code branches on `schema_version` for inputs
@@ -1860,7 +1980,7 @@ listed by `tools/list` only when the JWT carries `memory.write` and are enforced
 | `get_memory` | read | `MemoryService.GetMemory` | `memory_id`, optional `fields[]` → `read_mask` | The `Memory` as JSON | 10 s |
 | `get_operation` | read | `OperationService.WaitOperation` (`timeout` ≤ 30 s) | `operation_id`, `wait_seconds` | `{state, progress, error, result}` | 35 s |
 | `list_documents` | read | `DocumentService.ListDocuments` | `tags`/`tag_match`, `prefix`, `updated_after`, `page_token`, `page_size` | `{documents:[…], next_page_token}` | 10 s |
-| `delete_document` | **write** | `DocumentService.DeleteDocument` | `document_id`, optional `expected_version` | `{operation_id, deleted_at, expunge_sla}` and the sentence "deleted: no longer returned by any read; physical purge tracked by operation …" (the ack is the soft-delete marker, N115) | 30 s |
+| `delete_document` | **write** | `DocumentService.DeleteDocument` | `document_id`, optional `expected_version` | `{operation_id, deleted_at, expunge_sla}` and the sentence "deleted: no longer returned by any read; physical purge tracked by operation …" (the ack is the committed soft-delete marker plus its durable intent, N115, N122) | 40 s |
 | `get_page` | read | `PageService.GetPage` (`include_content = true`) | `page_id` or `name`, `as_of`, `version` | Markdown as text `content` plus `{stale_write, stale_delete, version, effective_at}` | 10 s |
 | `list_pages` | read | `PageService.ListPages` | `stale_only`, `prefix`, `page_token` | `{pages:[{page_id, name, current_version, stale_write, stale_delete}], next_page_token}` | 10 s |
 | `search_pages` | read | `PageService.SearchPages` | `query`, `tags`/`tag_match`, `as_of`, `budget`, `page_token` | `{hits:[{rank, page_id, name, version, score, snippet}], next_page_token}` (N73; the same tool the Reflect agent calls) | 10 s |
@@ -1906,7 +2026,7 @@ private, no-store` (N129, A-20); GET exists so that simple read clients need no 
 | `/memory.v1.MemoryService/ListMemories` (+GET) | ListMemories | unary |
 | `/memory.v1.MemoryService/BatchGetMemories` (+GET) | BatchGetMemories | unary |
 | `/memory.v1.MemoryService/Invalidate`, `/Restore` | Invalidate, Restore | unary |
-| `/memory.v1.DocumentService/GetDocument` (+GET), `/ListDocuments` (+GET), `/GetDocumentVersion` (+GET), `/DeleteDocument` | DocumentService | unary |
+| `/memory.v1.DocumentService/GetDocument` (+GET), `/ListDocuments` (+GET), `/GetDocumentVersion` (+GET), `/GetDocumentBody` (+GET), `/ListTags` (+GET), `/UpdateDocumentTags`, `/DeleteDocument` | DocumentService | unary |
 | `/memory.v1.NamespaceService/CreateNamespace`, `/GetNamespace` (+GET), `/ListNamespaces` (+GET), `/GetEffectiveConfig` (+GET), `/UpdateNamespace`, `/DeleteNamespace` | NamespaceService | unary |
 | `/memory.v1.OperationService/GetOperation` (+GET), `/ListOperations` (+GET), `/CancelOperation`, `/WaitOperation` | OperationService | unary (Wait = long-poll) |
 | `/memory.v1.ExportService/CreateSnapshot`, `/GetSnapshotManifest` (+GET), `/ListSnapshots` (+GET) | ExportService | unary |
@@ -2066,10 +2186,10 @@ The output is the same sequence of `{"result":…}` messages and the trailing `{
 gRPC call; an error mid-stream appears as the EndStreamResponse `{"error":{"code":…}}` after the
 results already delivered.
 
-**Delete a document** (the ack is the delete; the operation tracks the expunge):
+**Delete a document** (the ack is the delete; the operation tracks the expunge; delete-class deadline cap 40 s):
 
 ```bash
-grpcurl -H "authorization: Bearer $JWT" -max-time 10 \
+grpcurl -H "authorization: Bearer $JWT" -max-time 40 \
   -import-path plans/engram/proto -proto memory/v1/document.proto \
   -d '{"namespace":{"tenantId":"acme","namespaceId":"018f4c9e-7d3a-7c2b-9c1e-3f2a1b4c5d6e"},
        "meta":{"requestId":"forget-0042"},"documentId":"session-2026-09-30"}' \
@@ -2084,22 +2204,22 @@ grpcurl -H "authorization: Bearer $JWT" -max-time 10 \
 ```
 
 From `deletedAt` on, Recall, Reflect, GetMemory, ListMemories, GetPage, SearchPages and
-StreamSnapshot return nothing derived from the document; `WaitOperation` on the returned id
-completes when the rows and blobs are physically gone (≤ 24 h). A Retain into the same
+StreamSnapshot return nothing derived from the document, and `GetDocument` shows only the
+tombstone (`documentId`, `state: DOCUMENT_STATE_DELETING`, `deletedAt`, `upToVersion`,
+`deleteOperationId`); `WaitOperation` on the returned id completes when the rows, blobs and derived
+text are physically gone (≤ 24 h), and `CancelOperation` on it is refused with
+`OPERATION_NOT_CANCELLABLE`. If the call times out before the ack, retry it: the retry finds the
+marker, makes sure its intent exists and acks. A Retain into the same
 `documentId` is accepted at once and starts a new version above the tombstone (N133).
 
-### Round-3 changes
+### Round-4 changes
 
 | Finding | Register | What changed in §4 and `proto/` |
 |---|---|---|
-| A-5 | N127 | `OperationResult.superseded_by`, `Operation.cancel_reason`, `OPERATION_KIND_DELETE_TENANT`, `TenantService.GetTenantOperation`; `MOVE_NAMESPACE` reserved; barrier sentence restated. |
-| A-6 | N127 | MCP `request_id = sha256(session ‖ jsonrpc id ‖ tool)`; minted document ids `UUIDv5(operation_id, "item/" ‖ index)`; retains without an id are not replay-safe (4.1.3, 4.6). |
-| A-9, A-11, A-12, A-13 | N128 | One `RefreshPolicy`; internal error details moved to `engram.internal.errors.v1`; pre-1.0 exception, `schema_version` 2, new field numbers for `string → bytes`, `proto/v1.0.0` baseline (4.5); proto comments fixed. |
-| A-17, A-18, A-20, A-25, A-26 | N129 | Rerank-depth gate in `RecallRequest.rerank`; streaming rationale restated (4.1.7); rank 1 always whole; MCP OAuth resource server; `GetEffectiveConfig`, typed `Directive`. |
-| H-1, H-2, H-12, A-1 | N115–N117 | `DeleteDocument`, `Invalidate`, `Restore` and `DeleteNamespace` return tombstone/marker acks (`deleted_at`, `expunge_sla`); `PAGE_HIDDEN`; 4.3 and 4.4 rewritten on the read-time predicate and evidence segments. |
-| A-15 | N118 | `EntityRef` carries only `mention` under `as_of` (4.4). |
-| H-4, H-9 | N122 | `remote_apply` and the `UNAVAILABLE`-without-standby path removed; delete freeze rejects reads (`NamespaceFrozen`). |
-| H-5, H-6, H-22 | N125 | `NamespaceNotReady`; `CutoverStep`; `RollbackMove` before (c); `MovedOutHint` internal. |
-| H-7, H-8, H-21 | N124 | `MoveState.RECONCILING`; replay fields and N81 events removed; `ReconcileReport`. |
-| H-10, H-11, A-14 | N126 | `deleted_ids`, always-emitted delta, `building` snapshots expire, no outbox cut. |
-| A-4, A-8 | N130 | `quota.Reserve` in front of every gateway call class (`QuotaExceeded` for synchronous Reflect). |
+| A-3, A-7 | N136 | `Document` tombstone fields and the content-free view of `DELETING` documents; `NotFound.reason = DOCUMENT_DELETED`; per-kind operation-to-workflow contract and non-cancellable `DELETE_*` (`OPERATION_NOT_CANCELLABLE`) (4.2). |
+| A-4, A-21 | N126 | `GetSnapshotManifest` carries a live `HiddenOverlay`; the "every part applies the predicate" sentence is deleted; short `READ COMMITTED` ranges instead of one long snapshot; system snapshots after a delete (4.2). |
+| C-5, C-15, C-17, A-20 | N115, N122, N135 | Delete and curation ack after the committed marker and the durable intent; duplicate attempts re-put a missing intent; `invalidated_at` reports `invalidate` rows only; `expected_version` is compared inside the marker transaction. |
+| A-8, A-10, A-12 | N139 | `superseded_by` is a version number in proto and SQL; one code per detail type; the delete freeze is `NAMESPACE_DELETING`; double `Invalidate` is a no-op success; a retry of a `FAILED` operation uses a new `operation_id`. |
+| A-9 | N139 | Baseline `main@HEAD~1` until `v1.0.0` with a labelled exception per break; `DOCUMENT_PURGING` listed; retyped event fields renamed `*_bytes` with the old names reserved; the demonstration output re-run. |
+| A-11, A-13, A-14, A-22, A-23 | N139 | 40 s cap for delete-class RPCs and `Restore`; `DeleteTenant` acks before fencing; document-level `metadata_filters`; `SearchPages` storage; `GetDocumentBody`, `ListTags`, `UpdateDocumentTags`; tenant-bound `tenant.admin` and fleet-wide `engram.operator`. |
+| C-10, C-20, P-8 | N124, N125, N137 | `MoveState.COMMITTED`, `CutoverStep.CATALOG_COMMIT`, `source_blobs_gc_after`; workflow messages for `PreVerify`, `DerivedPurge`, proposal attempts and `base_version`, WAL pacing. |

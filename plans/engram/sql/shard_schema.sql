@@ -2263,8 +2263,8 @@ $$;
 
 -- 1. Per-namespace partial HNSW. A hash-partitioned table keeps all rows of a namespace in exactly ONE
 -- partition (page_version_vectors is not partitioned and is indexed on the table itself), so a namespace
--- owns one index per (vector table, embedding model): <= 120 namespaces x 4 tables = <= 480 small indexes
--- per shard. Queries that must match the partial-index predicate carry the literal namespace id and model
+-- owns one index per (vector table, embedding model): 120 namespaces per shard (N142) give ~360 expected
+-- small indexes per shard, cap 450, alert at 400. Queries that must match the partial-index predicate carry the literal namespace id and model
 -- (plan_cache_mode = force_custom_plan, so the bound parameters are constants at plan time).
 -- p_action = 'create' | 'drop'. Names are deterministic, so rollback_target and namespace delete drop by
 -- name and orphans cannot hide. 'create' is a plain CREATE INDEX CONCURRENTLY, NEVER IF NOT EXISTS: the

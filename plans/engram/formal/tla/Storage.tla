@@ -44,6 +44,11 @@ CONSTANTS Rows, MaxGen, AllowUpdate, FlipEarly, PurgeUnmarked, AutoRepair, Parti
 VARIABLES content, payload, marked, vec, cur, idx, ingested, snap, pc, repairs, rebuilt
 vars == <<content, payload, marked, vec, cur, idx, ingested, snap, pc, repairs, rebuilt>>
 
+\* Design instance (cfg: NsOf <- NsOfDef, Thr <- ThrDef): rows 1 and 2 in namespace a (threshold 1: due after one purge),
+\* row 3 in namespace b (threshold 2: one purge leaves it touched but not due).
+NsOfDef == <<"a", "a", "b">>
+ThrDef == [n \in {"a", "b"} |-> IF n = "a" THEN 1 ELSE 2]
+
 Gens == 1..MaxGen
 NsOfX(x) == NsOf[x[1]]                      \* namespace of a vector entry <<row, gen>>
 EntriesOf(S, n) == {x \in S : NsOfX(x) = n}

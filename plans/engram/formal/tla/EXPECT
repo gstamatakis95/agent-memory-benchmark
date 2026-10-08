@@ -19,6 +19,7 @@ Storage_AutoRepair.cfg	violates RebuildBeforeRepair
 Storage_PerIndexHygiene.cfg	violates RebuildBeforeRepair
 Derivation.cfg	pass
 Derivation_Page.cfg	pass
+Derivation_Retire.cfg	pass
 Derivation_Live.cfg	pass
 Derivation_NoLock.cfg	violates NoDeletedDerivationServed
 Derivation_CascadeEvidence.cfg	violates NoDeletedDerivationServed
@@ -49,6 +50,7 @@ Durability_NoEpochGuard.cfg	violates IntentOrderLastWins
 Durability_CatalogLossNoBlobFloor.cfg	violates AckedDeleteSurvives
 Durability_ReplayStampsCurrentEpoch.cfg	violates IntentOrderLastWins
 Durability_NoSubjectLock.cfg	violates IntentOrderLastWins
+Durability_NoHelpPrev.cfg	violates IntentOrderLastWins
 ShardMove.cfg	pass
 ShardMove_Live.cfg	pass
 ShardMove_ActiveWriters.cfg	pass

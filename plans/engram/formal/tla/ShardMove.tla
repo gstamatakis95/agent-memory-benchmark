@@ -43,6 +43,16 @@
 (*   CleanupNeedsBackup=FALSE cleanup without a post-activation backup     *)
 (*   AllowAbort              the mover may roll back at any pre-commit step*)
 (*                                                                         *)
+(* D24 knobs (design: SeqAdvance, ShardTruth, TimelineGate TRUE; VerifyFirst*)
+(* FALSE):                                                                 *)
+(*   SeqAdvance=FALSE   Plan and (b') do not raise sq[Tgt] (N147)          *)
+(*   VerifyFirst=TRUE   the check runs before the catch-up (N148)          *)
+(*   ShardTruth=FALSE   the restore reconcile trusts the catalog's cm      *)
+(*   TimelineGate=FALSE cleanup gated on any post-activation backup, no    *)
+(*                      ReconcileIn (the D23 gate, N149)                   *)
+(*   MaxCat, MaxMoves, Lag, SqSkew: catalog restores, moves of the         *)
+(*   namespace, rows a promoted target may lack, initial sq[s1]            *)
+(*                                                                         *)
 (* D24 (N146-N149; round-5 C-3 to C-6).                                    *)
 (*  - Sequences (N147).  ins_seq comes from a PER-SHARD sequence sq[s]      *)
 (*    (the old global clock is gone).  A shard's ring hist[s][t] is its sq  *)
@@ -277,7 +287,7 @@ Freeze ==
 \* watchdog: a selection that reaches back beyond the margin window (the whole namespace, when the source's own
 \* floors are below the moved rows) rolls the move back (FreezeTimeout).
 Work == {r \in store[src] : KeyOf(r) >= Tc}
-Excess == \E r \in Work : dt[r] + Margin < Tct
+Excess == MaxMoves > 1 /\ \E r \in Work : dt[r] + Margin < Tct      \* dt is tracked only when a second move is possible
 Reconcile ==
   /\ mp = "frozen" /\ Fenced /\ (own[src].st = "frozen" \/ ~FencedSteps) /\ ~Excess
   /\ store' = [store EXCEPT ![tgt] = @ \cup Work]

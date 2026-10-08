@@ -127,7 +127,8 @@ ServedFacts(T) == {f \in VisFacts : Mentioned[f] <= T}
 
 -----------------------------------------------------------------------------
 Prop == [n : Nodes, mode : {"root", "update"}, cf : SUBSET Facts, co : SUBSET Pairs, base : 0..3, exp : 0..3]
-\* ck: the commit_key of the attempt that wrote the row (N144): the stored proposal it rendered.
+\* ck: the commit_key of the attempt that wrote the row (N144): the stored proposal it rendered (kept only when the
+\* retry is modelled, to keep the state space of the configurations without it).
 Rec == [root : 1..4, finp : SUBSET Facts, gfinp : SUBSET Facts, oinp : SUBSET Pairs, goinp : SUBSET Pairs,
         eff : 0..MaxT, base : 0..3, st : {"live", "stub", "absent"}, ck : Prop]
 IdleW == [ph |-> "idle", p |-> [n |-> CHOOSE n \in Nodes : TRUE, mode |-> "root", cf |-> {}, co |-> {}, base |-> 0, exp |-> 0]]
@@ -291,7 +292,7 @@ Commit(w) ==
                          finp |-> p.cf, oinp |-> p.co,
                          gfinp |-> p.cf \cup (IF upd THEN vers[n][p.base].gfinp ELSE {}),
                          goinp |-> p.co \cup (IF upd THEN vers[n][p.base].goinp ELSE {}),
-                         eff |-> e, base |-> IF upd THEN p.base ELSE 0, st |-> "live", ck |-> p])]
+                         eff |-> e, base |-> IF upd THEN p.base ELSE 0, st |-> "live", ck |-> IF AllowRetry THEN p ELSE IdleW.p])]
      /\ hw' = [hw EXCEPT ![n] = L + 1]
      /\ cv' = [cv EXCEPT ![n] = cv[n] + 1]                \* the CAS: current_version + 1
      /\ props' = props \ {p}
@@ -332,7 +333,10 @@ RowsNode(n, V, DV) == UNION {{<<n, vers[n][w].root, w, Cause(f, DV)>> : f \in Hi
 \* N145(2): Materialize discovers its work from the markers: a pending tombstone, or an invalidation row whose
 \* materialized_at is unset (hidden \ mat).  MatSignalOnly: the invalidation is found only through the signal
 \* sent after the ack, which can be lost (LoseSignal).
-MatWork == (\E d \in Docs : ms[d] = "pending") \/ (IF MatSignalOnly THEN sig ELSE hidden \ mat # {})
+\* Owed(f): some version that cites f is not yet covered by a derived_hidden row.  An unstamped invalidation with nothing
+\* owed is stamped at once (StampTrivial: the batch finds no rows).
+Owed(f) == \E n \in Nodes : \E w \in 1..Len(vers[n]) : f \in HitF(n, w, {f}) /\ ~RowCovered(n, w)
+MatWork == (\E d \in Docs : ms[d] = "pending") \/ (IF MatSignalOnly THEN sig ELSE \E f \in hidden \ mat : Owed(f))
 
 MatBegin ==
   /\ matPhase = "idle" /\ ~lockX
@@ -367,6 +371,13 @@ MatEnd ==
   /\ mat' = mat \cup matOwe /\ matOwe' = {}                 \* materialized_at stamped for what the run covered
   /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet,
                  cv, ginv, sig>>
+
+StampTrivial(f) ==                  \* an invalidation whose fact no version cites needs no rows: stamped without a run
+  /\ matPhase = "idle" /\ ~lockX /\ f \in hidden \ mat /\ ~Owed(f)
+  /\ (UseLock => \A w \in Writers : wr[w].ph # "verified")        \* like a batch: waits for the shared holders
+  /\ mat' = mat \cup {f}
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur, nRet, cv, ginv, matOwe, sig>>
 
 LoseSignal ==                       \* the SignalWithStart after the ack is lost (API death, a move terminating the singleton)
   /\ MatSignalOnly /\ sig /\ sig' = FALSE
@@ -404,7 +415,7 @@ DerivedPurge(d) ==
 WriterStep == \E w \in Writers : Pick(w) \/ Verify(w) \/ Discard(w) \/ Commit(w) \/ RetryCommit(w) \/ AbortW(w)
 WriterProgress == \E w \in Writers : Verify(w) \/ Discard(w) \/ Commit(w) \/ RetryCommit(w)
 Expunge == MatBegin \/ (\E n \in Nodes : MatScan(n)) \/ MatWrite \/ MatEnd \/ (\E d \in Docs : Purge(d) \/ DerivedPurge(d))
-Next == Propose \/ WriterStep \/ Expunge \/ LoseSignal
+Next == Propose \/ WriterStep \/ Expunge \/ LoseSignal \/ (\E f \in Facts : StampTrivial(f))
         \/ (\E d \in Docs : DeleteDocument(d))
         \/ (\E f \in Facts : Ingest(f) \/ Invalidate(f) \/ Restore(f) \/ Replace(f) \/ Reextract(f)
                              \/ ChunkPurge(f) \/ ReextractPurge(f))
@@ -450,9 +461,9 @@ MaterializeComplete ==
        \A x \in Versions : (GDeriv(x[1], x[2]) \cap Victims(d) # {}) => Perm(x[1], x[2])
   \* N145(2): a stamped invalidation (materialized_at set) is covered by derived_hidden rows (of any cause) on every node ...
   /\ \A f \in mat : \A n \in Nodes : \A w \in 1..Len(vers[n]) : (f \in HitF(n, w, {f})) => RowCovered(n, w)
-  \* ... and an unstamped one is never stranded: while one exists and no run is in progress, Materialize
-  \* is enabled (found from the marker, not from a signal that may be lost).
-  /\ (hidden \ mat # {} /\ matPhase = "idle") => MatWork
+  \* ... and an owed one is never stranded: while an unstamped invalidation with owed rows exists and no run is in
+  \* progress, Materialize is enabled (found from the marker, not from a signal that may be lost).
+  /\ ((\E f \in hidden \ mat : Owed(f)) /\ matPhase = "idle") => MatWork
 
 \* N145: an acknowledged invalidation stays in force until Restore: no served version has an invalidated
 \* fact in its derivation, whatever happened to the fact row (ginv is the ghost of the acknowledged set).

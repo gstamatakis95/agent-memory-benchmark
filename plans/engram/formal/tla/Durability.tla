@@ -68,6 +68,11 @@
 (*   ConcurrentX      TRUE   requests on one fact subject may overlap: the *)
 (*                     marker transaction is TxnBegin (reads the subject's *)
 (*                     previous entry = prev_operation_id) and Commit.     *)
+(*   HelpPrev         TRUE   (design, with ConcurrentX) TxnBegin puts the   *)
+(*                     intent of the subject's latest entry if missing: a  *)
+(*                     marker whose writer crashed before the put would    *)
+(*                     otherwise break the chain and its successors replay *)
+(*                     before older intents.                               *)
 (*   SubjectLock      TRUE   (design) TxnBegin waits while another         *)
 (*                     transaction of the subject is open or has not yet   *)
 (*                     put its intent (advisory lock on the fact, held     *)
@@ -80,7 +85,7 @@ EXTENDS Integers, FiniteSets, Sequences
 CONSTANTS Shape, MaxT, Lat, Skew, Margin, MaxRestores,
           IntentAfterCommit, AckNeedsIntent, AckRecheck, DupReput, ReplayFirst,
           FloorMode, OrderMode, EpochGuard,
-          BlobFloor, MaxCatLoss, ReplayCurrentEpoch, ConcurrentX, SubjectLock
+          BlobFloor, MaxCatLoss, ReplayCurrentEpoch, ConcurrentX, SubjectLock, HelpPrev
 
 ShapeDoc  == <<[s |-> "y", k |-> "del"], [s |-> "y", k |-> "del"], [s |-> "y", k |-> "ret"]>>
 ShapeFact == <<[s |-> "x", k |-> "inv"], [s |-> "x", k |-> "res"], [s |-> "x", k |-> "inv"]>>
@@ -148,7 +153,10 @@ TxnBegin(o) ==
   /\ ConcurrentX /\ S(o) = "x" /\ ops[o].ph = "new" /\ ops[o].rd < 0 /\ sst = "active"
   /\ (SubjectLock => ~LockHeld("x"))
   /\ ops' = [ops EXCEPT ![o].rd = LastOn("x"), ![o].be = ep]
-  /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
+  \* HelpPrev: under the lock the transaction first puts the intent of the subject's latest entry if it is missing
+  \* (a marker whose writer crashed between commit and put); otherwise that entry is a hole in the chain.
+  /\ intents' = IF HelpPrev /\ LastOn("x") # 0 THEN intents \cup {LastOn("x")} ELSE intents
+  /\ UNCHANGED <<t, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
 \* The marker transaction: a local commit, refused by the namespace fence while restoring.
 \* A duplicate (subject already deleting / hidden) writes no marker and observes the existing one.

@@ -319,7 +319,7 @@ orchestrator. Commit after every green step; update PROGRESS.md.
   code in `internal/formal/<spec>/invariants.go` (e.g. `Served` equals the SQL rule of §3.8); the trace converter
   `engramctl formal trace-to-tla` + `TraceNext` modules + `internal/formal/trace.Logger`.
 - READ: PLAN.md §7 (all), §8.4.6, §8.1 tier F; register N46, N96, N141, N156, N178, N188; formal/tla/EXPECT, every
-  `.tla`/`.cfg`, formal/tla/results/README.md.
+  `.tla`/`.cfg`, formal/tla/results/RESULTS.md.
 - TESTS: `make formal-quick` green with every must-fail failing on the invariant its first comment line names; the
   manifest check fails a spec change without its row; the converter replays a TLC trace of each of the six specs.
 - EXIT (§10.2 M0.7 verbatim). No exit item may name code Phase 1 or 2 writes. Discrepancies between EXPECT, §7.6
@@ -446,7 +446,8 @@ LENSES (apply all; report findings under the lens that found them)
    pagination tokens, field masks; MCP tool mapping (§4.6); nothing internal crosses the wire (N128); no proto
    change without the §4.5 procedure.
 4. Guardrails (the orchestrator's GUARDRAILS block): ≤ 5 methods, typed ids, dependency rule, non-goals,
-   metric labels, logging of content, secrets, nomic prefixes.
+   metric labels, logging of content, secrets, nomic prefixes; the 120-column rule (lines ≤ 120, comments
+   filled to the limit, not wrapped at ~80) — a Nit unless the linters were disabled, which is a Major.
 5. Tests: do the named §8 tests exist under those names and assert what §8 says (not a weaker proxy)? Are
    `faultinject` twins really reproducing the must-fail trace with the fix off? Any test that passes against
    `FakeTx` only where §8 says T3? Flaky patterns (sleeps, time.Now in assertions)?

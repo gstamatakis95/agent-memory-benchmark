@@ -125,7 +125,7 @@ Recoverable(s) ==
   IF cleaned THEN {}
   ELSE IF s = tgt /\ mp \in {"backed", "ready", "committed", "cut", "tactive", "done"} /\ frozenSet \subseteq bak[tgt].store
        THEN frozenSet
-  ELSE IF s = src /\ (rep \/ cm = "done" \/ mp \in {"cut", "tactive", "done"}) THEN frozenSet
+  ELSE IF s = src /\ ((cm = "committed" /\ rep) \/ cm = "done" \/ mp \in {"cut", "tactive", "done"}) THEN frozenSet
   ELSE {}
 
 TypeOK ==
@@ -523,13 +523,13 @@ ReconcileDesign(s) ==
        THEN /\ seen
             /\ LET tgtAct == own[tgt].st \in {"active", "ready"} IN
                /\ cat' = IF tgtAct THEN [sh |-> tgt, ep |-> me] ELSE cat
-                  /\ cm' = IF tgtAct THEN "done" ELSE "committed"
-                  /\ mp' = IF tgtAct THEN "done" ELSE "cut"
-                  /\ fin' = [fin EXCEPT ![src] = Row("moved_out", me)]
-                  /\ own' = [own EXCEPT ![src].st = "replaying",
-                                        ![tgt] = IF @.st = "ready" THEN Row("active", me) ELSE @]
-                  /\ actSet' = IF own[tgt].st = "ready" THEN store[tgt] ELSE actSet
-                  /\ actMk' = IF own[tgt].st = "ready" THEN mk[tgt] ELSE actMk
+               /\ cm' = IF tgtAct THEN "done" ELSE "committed"
+               /\ mp' = IF tgtAct THEN "done" ELSE "cut"
+               /\ fin' = [fin EXCEPT ![src] = Row("moved_out", me)]
+               /\ own' = [own EXCEPT ![src].st = "replaying",
+                                     ![tgt] = IF @.st = "ready" THEN Row("active", me) ELSE @]
+               /\ actSet' = IF own[tgt].st = "ready" THEN store[tgt] ELSE actSet
+               /\ actMk' = IF own[tgt].st = "ready" THEN mk[tgt] ELSE actMk
             /\ UNCHANGED <<rep, DatV, idx>>
      ELSE /\ mp' = mp /\ cm' = cm                         \* no open move
           /\ IF cat.sh = s                                 \* owner: new epoch

@@ -48,7 +48,7 @@ others under 7; the reductions are listed in 7.2.6).
 - **A3 (N160(5)), readiness at cutover.** `ShardMove.tla` has one index bit per shard: `BuildIndex` sets it under the
   freeze, `MakeReady` requires it, a ready or active shard must have it (`ServedFromIndex`). The bit stands for "every
   requested partial index is `indisvalid and indisready`" (`engram_move_indexes_valid`); which indexes are requested and
-  the one retry of a failed build are covered by `TestMove_IndexValidAtActivation` and the index runner's tests.
+  the one retry of a failed build are covered by `TestMove_IndexesValidBeforeReady` and the index runner's tests.
 
 ### 7.2 The specifications
 
@@ -344,7 +344,7 @@ relay with a persisted cursor and a gap watchlist declares a missing `seq` abort
 effect and its `op_key` row are one transaction, the worker may crash anywhere; invariants `ExactlyOnceEffect`,
 `ObservationHasSources`, liveness `RoundTerminates`; `_VolatileProposal` and `_NonAtomicKey` violate
 `ExactlyOnceEffect`. The proposal lifecycle of C-11 (`(batch_key, attempt)` keys, no `DELETE`, batch `applied`
-state) is below the model's abstraction and is covered by `TestConsolidation_*` (8.4.6).
+state) is below the model's abstraction and is covered by `TestConsolidation_PersistedProposal` and `TestConsolidation_AtomicKey` (8.4.6).
 
 #### 7.2.6 Boundaries of the results
 
@@ -394,10 +394,10 @@ is absent).
 
 | Spec | Go package and twin tests |
 |---|---|
-| `Derivation` | `internal/recall`, `internal/expunge`, `internal/consolidate`, `internal/pages`: `TestVisibility_AllSurfaces`, `TestVisibility_SegmentHiding`, `TestInvalidate_RestoreExact`, `TestAsOf_*`, `TestExpunge_DerivationLock`, `TestDelete_ReuseDocumentID`, `TestReplace_ThenDelete` (C-1), `TestPage_CommitReverifies` (C-2), `TestApply_BaseVersionCAS` (C-3), `TestReextract_DerivedStaysVisible` (C-6), `TestMaterialize_BatchRereadsFactHidden` (C-7), `TestPageRefresh_CommitRetry` (r5 C-1), `TestInvalidate_SurvivesChunkPurge`, `TestInvalidate_RestoreUndoesTwinSet`, `TestInvalidate_LazyTwinRestored` (N162), `TestExpunge_SweeperFindsUnmaterialized`, `TestExport_OverlayBeforeMaterialize` (r5 C-2) |
-| `ShardMove` | `internal/move`: `TestMove_RollbackEveryStep`, `TestMove_ReadyState`, `TestMove_FrozenWindow`, `TestMove_VerifyCatchesFault`, `TestMove_WindowExceeded`, `TestMove_IndexValidAtActivation` (N160), `TestMove_CatalogCAS`, `TestMove_ZombieFenced`, `TestRestore_OpenMoves`, `TestMove_TwiceAndExport`, `TestMove_CleanupWaitsForPostActivationBackup`, `TestMove_TargetRestoredBeforeActivation`, `TestMove_TargetRestoredAfterActivation`, `TestRestore_SourceCleansMovedOut` (N161), `TestCatalog_PromotionRunsReconcile`, `TestMove_CutWaitsForReplicatedCommit`, `TestCatalog_ReconcileDerivesRouting` (N163); mover killed at every persisted state |
+| `Derivation` | `internal/recall`, `internal/expunge`, `internal/consolidate`, `internal/pages`: `TestVisibility_AllSurfaces`, `TestVisibility_SegmentHiding`, `TestInvalidate_RestoreExact`, `TestAsOf_*`, `TestExpunge_DerivationLock`, `TestDelete_ReuseDocumentID`, `TestVisibility_AllSurfaces` (C-1), `TestDerivation_CommitRule` (C-2), `TestApply_BaseVersionCAS` (C-3), `TestReextract_Rebuilds` (C-6), `TestMaterialize_StampUnderLock` (C-7), `TestPageRefresh_CommitRetry` (r5 C-1), `TestInvalidate_SurvivesChunkPurge`, `TestInvalidate_RestoreUndoesTwinSet`, `TestInvalidate_LazyTwinRestored` (N162), `TestExpunge_SweeperFindsUnmaterialized`, `TestExport_OverlayBeforeMaterialize` (r5 C-2) |
+| `ShardMove` | `internal/move`: `TestMove_RollbackEveryStep`, `TestMove_ReadyState`, `TestMove_FrozenCopy`, `TestMove_VerifyFrozenCatchesFault`, `TestMove_WindowDeadlineRollback`, `TestMove_IndexesValidBeforeReady` (N160), `TestMove_CatalogCAS`, `TestMove_ZombieFenced`, `TestRestore_OpenMoves`, `TestMove_TwiceAndExport`, `TestMove_CleanupGateAtEntry`, `TestMove_TargetRestoredAfterMoveBackup`, `TestMove_TargetRestoredAfterActivation`, `TestRestore_SourceCleansMovedOut` (N161), `TestCatalog_PromotionRunsReconcile`, `TestMove_CutWaitsForReplicatedCommit`, `TestCatalog_ReconcileDerivesRouting` (N163); mover killed at every persisted state |
 | `Durability` | `internal/intent`, `cmd/engramctl restore replay`: `TestIntent_AckImpliesIntent`, `TestIntent_DuplicateAttempt` (re-put of the committed marker's intent), `TestIntent_AckRereadsMarker`, `TestIntent_EpochGuard`, `TestRestore_ReplaysIntents`, `TestFailover_ReplaysIntents`, a double-restore case, `TestReplay_FloorFromBlob` (r5 C-3), `TestIntent_ReplayTwoOfSameSubject`, `TestIntent_ConcurrentCurationOneChain` (r5 C-7, C-8) |
-| `Storage` | `internal/store`, `internal/index`: `TestContent_InsertOnly`, `TestVectors_ModelGeneration`, `TestHNSW_PerNamespace`, `TestHNSW_RebuildOnly`, `TestIndex_Hygiene` (N152: a partition with three namespaces purged at 0.2 %, 1 % and 0 %; N166(6): a neighbour touched once is not rebuilt and a purge during the rebuild set is skipped) |
+| `Storage` | `internal/store`, `internal/index`: `TestContent_InsertOnly`, `TestVectors_ModelGeneration`, `TestHNSW_PerNamespace`, `TestIndex_Hygiene`, `TestIndex_Hygiene` (N152: a partition with three namespaces purged at 0.2 %, 1 % and 0 %; N166(6): a neighbour touched once is not rebuilt and a purge during the rebuild set is skipped) |
 | `Outbox` | `internal/outbox`: relay with writers delayed by `pg_sleep`, `TestOutbox_Watch1x` |
 | `Consolidation` | `internal/consolidate`: `TestConsolidation_PersistedProposal`, `_AtomicKey`, `_TwoStage` |
 | Lean modules | `internal/recall` table and `rapid` tests (tags, fusion, packing, temporal window) |
@@ -445,7 +445,7 @@ behaviour is a behaviour of the spec and that every invariant held along it. M0.
   tested (`TestIso_Move_Epoch`, misroute suites), not modelled.
 - **Which indexes a move requests and when a build counts as failed (N160(5))**, **the attempt-unique markdown blob key
   (N144)**, **the export overlay (N145)**: below the abstraction of the specs (the first is one bit);
-  `TestMove_IndexValidAtActivation`, `TestPageRefresh_CommitRetry` and `TestExport_OverlayBeforeMaterialize` carry them.
+  `TestMove_IndexesValidBeforeReady`, `TestPageRefresh_CommitRetry` and `TestExport_OverlayBeforeMaterialize` carry them.
 - **Export snapshot expiry (N126), page refresh policy, Reflect, quotas, config inheritance, JWT/authz, Kafka
   beyond per-partition order**: no interleaving worth a model.
 

@@ -36,7 +36,8 @@
 (* Catalog (N163, N171, N172): CatalogLoss is a promotion of the standby   *)
 (* (loses an arbiter outcome that is not replicated yet and sets cdirty);  *)
 (* CatalogRestore is a restore from backup (RPO 60 s, T7-3: rep is reset); *)
-(* the reconcile re-derives cat/cm from the ownership rows: ReadShard(s)   *)
+(* the reconcile (no catalog access by anyone else while cdirty)          *)
+(* re-derives cat/cm from the ownership rows: ReadShard(s)                 *)
 (* snapshots one row, ApplyReconcile derives from the snapshots, so mover  *)
 (* steps interleave with the reads.                                        *)
 (*                                                                         *)
@@ -83,7 +84,7 @@ Final == {"none", "rolled_back", "done"}
 VARIABLES cat, cm, mp, own, fin, store, mk, ex, bak, used, sqt, committed, lost, gone,
           wr, cc, now, mtl, tl, nRestore, nBak,
           frozenSet, frozenMk, frozenEx, actSet, actMk, zcut, cleaned,
-          src, tgt, nMoves, me, sq, tlc, nCat, idx, rep, cdirty, rview,
+          src, tgt, nMoves, me, sq, tlc, nCat, idx, rep, cdirty, rview, abt, abp,
           cdn, cex, rc, nFault, fzt
 CatV  == <<cat, cm>>
 MovV  == <<mp, mtl>>
@@ -96,7 +97,7 @@ FzV   == <<frozenSet, frozenMk, frozenEx, actSet, actMk, zcut, cleaned>>
 RolV  == <<src, tgt, nMoves, me>>             \* roles of the current move (a second move swaps them); me = target epoch
 SqV   == <<sq>>
 IdxV  == <<idx>>
-FlagV == <<rep, cdirty, rview>>
+FlagV == <<rep, cdirty, rview, abt, abp>>
 CpV   == <<cdn, cex, rc, nFault, fzt>>
 TlV   == <<tlc, nCat>>
 vars == <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV>>
@@ -152,7 +153,7 @@ Init ==
   /\ frozenSet = {} /\ frozenMk = {} /\ frozenEx = 0 /\ actSet = {} /\ actMk = {} /\ zcut = FALSE /\ cleaned = FALSE
   /\ src = "s1" /\ tgt = "s2" /\ nMoves = 0 /\ me = 1
   /\ tlc = [s \in Shards |-> 0] /\ nCat = 0
-  /\ rep = FALSE /\ cdirty = FALSE /\ rview = [s \in Shards |-> NoRow]
+  /\ rep = FALSE /\ cdirty = FALSE /\ rview = [s \in Shards |-> NoRow] /\ abt = FALSE /\ abp = "none"
   /\ cdn = {} /\ cex = FALSE /\ rc = 0 /\ nFault = 0 /\ fzt = 0
 
 -----------------------------------------------------------------------------
@@ -233,7 +234,7 @@ Plan ==
   /\ frozenSet' = {} /\ frozenMk' = {} /\ frozenEx' = 0 /\ actSet' = {} /\ actMk' = {} /\ cleaned' = FALSE
   /\ rep' = FALSE
   /\ cdn' = {} /\ cex' = FALSE /\ rc' = 0 /\ fzt' = 0
-  /\ UNCHANGED <<cat, fin, DatV, HistV, CliV, EnvV, zcut, SqV, cdirty, rview, nFault, TlV>>
+  /\ UNCHANGED <<cat, fin, DatV, HistV, CliV, EnvV, zcut, SqV, cdirty, rview, abt, abp, nFault, TlV>>
 
 \* Freeze (exclusive fence, one attempt, no holder).  The source is static from here.  The one engram_seq_advance
 \* call of the move follows directly (no source write exists in between, N147).
@@ -309,22 +310,22 @@ MakeReady ==                                                 \* (b')
 
 \* (a''): the catalog CAS, the point of no return.  Retried when a catalog loss reverted it.
 CommitCAS ==
-  /\ mp \in {"ready", "committed"} /\ ~StampAfterCut /\ cm = "open" /\ SessionOk
+  /\ mp \in {"ready", "committed"} /\ ~StampAfterCut /\ cm = "open" /\ SessionOk /\ ~cdirty
   /\ (~FencedSteps \/ (own[src].st = "frozen" /\ own[tgt].st = "ready"))   \* the rows the mover verified
   /\ cm' = "committed" /\ mp' = "committed" /\ rep' = FALSE
   /\ zcut' = (zcut \/ mtl # tl)
-  /\ UNCHANGED <<cat, mtl, OwnV, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, actSet, actMk, cleaned, RolV, SqV, IdxV, cdirty, rview, CpV, TlV>>
+  /\ UNCHANGED <<cat, mtl, OwnV, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, actSet, actMk, cleaned, RolV, SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV>>
 
 \* The asynchronous standby has replayed the commit (N163(3)).
 Replicated ==
   /\ cm = "committed" /\ ~rep
   /\ rep' = TRUE
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, CpV, TlV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV>>
 
 \* (c) (N169(4), N171): Src frozen -> moved_out, fenced on the source row and the replicated `committed` only; the
 \* target row is not a conjunct (after the commit point it is the restore path's business).
 Cut ==
-  /\ own[src].st = "frozen" /\ SessionOk
+  /\ own[src].st = "frozen" /\ SessionOk /\ ~cdirty
   /\ \/ mp = "committed" /\ cm = "committed" /\ (rep \/ ~CutNeedsReplicated)
      \/ mp \in {"early", "early_flipped"}
      \/ StampAfterCut /\ mp = "ready"
@@ -349,6 +350,7 @@ Activate ==                                                  \* (b'')
 \* (d): catalog flip WHERE epoch = e AND state = frozen; early order flips before (c).  After a catalog
 \* reconcile the flip has already been derived from the shards.
 CatFlip ==
+  /\ ~cdirty
   /\ \/ mp = "tactive" /\ cat = [sh |-> src, ep |-> me - 1]
      \/ mp = "tactive" /\ cat = [sh |-> tgt, ep |-> own[tgt].ep]
      \/ mp = "early"
@@ -377,26 +379,28 @@ Cleanup ==
 \* Abort before the point of no return (N171(2)): the abort CAS open -> rolled_back; the shard actions follow only
 \* once it is replicated.  A catalog loss may revert it, then the mover (or a restore reconcile) takes it again.
 AbortCAS ==
-  /\ mp \in PreC /\ cm = "open" /\ Holders(tgt) = {}
-  /\ cm' = "rolled_back" /\ mp' = "aborting" /\ rep' = FALSE
+  /\ mp \in PreC /\ cm = "open" /\ Holders(tgt) = {} /\ ~cdirty
+  /\ cm' = "rolled_back" /\ mp' = "aborting" /\ rep' = FALSE /\ abt' = TRUE /\ abp' = mp
   /\ UNCHANGED <<cat, mtl, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, CpV, TlV>>
 
 AbortReplicated ==
   /\ cm = "rolled_back" /\ ~rep
   /\ rep' = TRUE
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, CpV, TlV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV>>
 
 \* Thaw the source, drop the target rows and indexes, undo a premature flip.  It re-reads `rolled_back` and (design)
 \* waits for its replication.
 Thaw ==
-  /\ mp = "aborting" /\ cm = "rolled_back" /\ (rep \/ ~ThawNeedsReplicated) /\ Settled
-  /\ mp' = "rolled_back"
+  /\ abt /\ Settled /\ ~cdirty
+  /\ IF ThawNeedsReplicated THEN cm = "rolled_back" /\ rep ELSE TRUE   \* without it the actor acts on the outcome it read
+  /\ mp' = IF mp = "aborting" THEN "rolled_back" ELSE mp
+  /\ abt' = FALSE
   /\ own' = [own EXCEPT ![src] = IF @.st = "frozen" THEN Row("active", @.ep) ELSE @,
                         ![tgt] = Row("none", 0)]
   /\ store' = [store EXCEPT ![tgt] = {}] /\ mk' = [mk EXCEPT ![tgt] = {}] /\ ex' = [ex EXCEPT ![tgt] = 0]
   /\ idx' = [idx EXCEPT ![tgt] = FALSE]
   /\ cat' = IF cat.sh = tgt THEN [sh |-> src, ep |-> own[src].ep] ELSE cat
-  /\ UNCHANGED <<cm, mtl, fin, HistV, CliV, EnvV, FzV, RolV, SqV, FlagV, CpV, TlV>>
+  /\ UNCHANGED <<cm, mtl, fin, HistV, CliV, EnvV, FzV, RolV, SqV, rep, cdirty, rview, abp, CpV, TlV>>
 AbortAny == AllowAbort /\ AbortCAS
 AbortRetry == mp = "aborting" /\ AbortCAS
 VerifyAbort == VerifyFails /\ rc = 1 /\ AbortCAS                         \* the second mismatch: MoveVerifyFailed
@@ -451,7 +455,11 @@ CatalogLoss ==
   /\ nCat < MaxCat /\ cm \in {"committed", "rolled_back"} /\ ~rep
   /\ cm' = "open" /\ nCat' = nCat + 1
   /\ cdirty' = ShardTruth /\ rview' = [s \in Shards |-> NoRow]
-  /\ UNCHANGED <<cat, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, CpV, tlc>>
+  \* a lost abort: the mover never learned of it and resumes from its pre-abort step; the aborting actor's thaw is
+  \* pending only if it does not wait (ThawNeedsReplicated = FALSE)
+  /\ mp' = (IF mp = "aborting" THEN abp ELSE mp)
+  /\ abt' = (abt /\ ~ThawNeedsReplicated) /\ abp' = abp
+  /\ UNCHANGED <<cat, mtl, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, CpV, tlc>>
 
 \* N146, N163(5), T7-3: a catalog restore from backup (RPO 60 s) reverts the move row and the routing row.
 CatalogRestore ==
@@ -460,15 +468,15 @@ CatalogRestore ==
   /\ cat' = IF cat.sh = tgt THEN [sh |-> src, ep |-> me - 1] ELSE cat
   /\ cdirty' = ShardTruth /\ rep' = FALSE /\ rview' = [s \in Shards |-> NoRow]   \* the commit is gone from the catalog, so it is no promise any more
   /\ nCat' = nCat + 1
-  /\ UNCHANGED <<MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, CpV, tlc>>
+  /\ UNCHANGED <<MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, abt, abp, CpV, tlc>>
 
 \* engramctl catalog reconcile --from-shards (N163(2), N172, C7-5): ReadShard snapshots one ownership row, ApplyReconcile
 \* derives the routing row from the unique owner (its epoch from owner rows only; EpochFromAnyRow counts every row) and the
 \* move row from the source's moved_out or the target's active row.
 ReadShard(s) ==
-  /\ ShardTruth /\ cdirty /\ own[s].st \notin {"restoring", "replaying"} /\ rview[s] = NoRow
+  /\ ShardTruth /\ cdirty /\ rview[s] = NoRow            \* a restoring shard reads as no owner
   /\ rview' = [rview EXCEPT ![s] = own[s]]
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, cdirty, CpV, TlV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, cdirty, abt, abp, CpV, TlV>>
 
 ApplyReconcile ==
   /\ ShardTruth /\ cdirty /\ \A s \in Shards : rview[s] # NoRow
@@ -479,7 +487,7 @@ ApplyReconcile ==
   /\ cm' = IF cm = "open" /\ (rview[src].st = "moved_out" \/ rview[tgt].st = "active")
              THEN (IF mp = "done" THEN "done" ELSE "committed") ELSE cm
   /\ cdirty' = FALSE /\ rview' = [s \in Shards |-> NoRow]
-  /\ UNCHANGED <<MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, CpV, TlV>>
+  /\ UNCHANGED <<MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, abt, abp, CpV, TlV>>
 
 \* What the ownership rows say about the catalog's move (N146): the source row moved_out, or the target row active at
 \* the move's epoch or later, can only exist after the CAS committed.
@@ -491,11 +499,11 @@ DerivedCommitted(s) ==
 \* from the ownership rows.  Every act on an arbiter outcome waits for its replication (N171(2)): the abort CAS
 \* of the reconcile is its own step, the thaw follows once `rolled_back` is replicated.
 ReconcileDesign(s) ==
-  /\ own[s].st = "restoring"
+  /\ own[s].st = "restoring" /\ ~cdirty
   /\ LET cmE == IF ShardTruth /\ cm = "open" /\ DerivedCommitted(s) THEN "committed" ELSE cm IN
      LET seen == cm # "committed" \/ rep \/ ~CutNeedsReplicated IN            \* a read `committed` is acted on once replicated
      IF cmE = "open"                                       \* the rows show no commit (N161(4)): abort CAS
-       THEN /\ cm' = "rolled_back" /\ mp' = "aborting" /\ rep' = FALSE
+       THEN /\ cm' = "rolled_back" /\ mp' = "aborting" /\ rep' = FALSE /\ abp' = mp /\ abt' = FALSE
             /\ UNCHANGED <<own, cat, fin, DatV, idx, actSet, actMk>>
      ELSE IF cm = "rolled_back" /\ mp = "aborting"         \* the thaw, once `rolled_back` is replicated
        THEN /\ rep \/ ~ThawNeedsReplicated
@@ -510,7 +518,7 @@ ReconcileDesign(s) ==
                       /\ fin' = [fin EXCEPT ![tgt] = Row("none", 0)]
                       /\ own' = [own EXCEPT ![tgt].st = "replaying",
                                             ![src] = IF @.st = "frozen" THEN Row("active", @.ep) ELSE @]
-            /\ UNCHANGED <<actSet, actMk>>
+            /\ UNCHANGED <<actSet, actMk, abt, abp>>
      ELSE IF s = tgt /\ cmE \in {"committed", "done"}      \* N169: an ordinary restore after (c)/(d), at a new epoch
        THEN /\ seen
             /\ LET ne == IF cat.sh = tgt THEN cat.ep + 1 ELSE me + 1 IN
@@ -518,7 +526,7 @@ ReconcileDesign(s) ==
                /\ fin' = [fin EXCEPT ![tgt] = Row("active", ne)]
             /\ own' = [own EXCEPT ![tgt].st = "replaying", ![src] = Row("moved_out", me)]
             /\ actSet' = store[tgt] \cap frozenSet /\ actMk' = mk[tgt] \cap frozenMk   \* the moved rows it holds (post-activation writes are not moved rows)
-            /\ UNCHANGED <<rep, DatV, idx>>
+            /\ UNCHANGED <<rep, DatV, idx, abt, abp>>
      ELSE IF cmE = "committed"                             \* the source: complete (c) here; no epoch bump
        THEN /\ seen
             /\ LET tgtAct == own[tgt].st \in {"active", "ready"} IN
@@ -530,7 +538,7 @@ ReconcileDesign(s) ==
                                      ![tgt] = IF @.st = "ready" THEN Row("active", me) ELSE @]
                /\ actSet' = IF own[tgt].st = "ready" THEN store[tgt] ELSE actSet
                /\ actMk' = IF own[tgt].st = "ready" THEN mk[tgt] ELSE actMk
-            /\ UNCHANGED <<rep, DatV, idx>>
+            /\ UNCHANGED <<rep, DatV, idx, abt, abp>>
      ELSE /\ mp' = mp /\ cm' = cm                         \* no open move
           /\ IF cat.sh = s                                 \* owner: new epoch
                THEN /\ cat' = [sh |-> s, ep |-> cat.ep + 1]
@@ -542,7 +550,7 @@ ReconcileDesign(s) ==
           /\ IF s = src /\ cleaned /\ cat.sh = tgt
                THEN store' = [store EXCEPT ![src] = {}] /\ mk' = [mk EXCEPT ![src] = {}] /\ ex' = [ex EXCEPT ![src] = 0]
                ELSE UNCHANGED DatV
-          /\ UNCHANGED <<rep, idx, actSet, actMk>>
+          /\ UNCHANGED <<rep, idx, actSet, actMk, abt, abp>>
   /\ UNCHANGED <<mtl, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, cdirty, rview, CpV, TlV>>
 
 \* Bug variant: trust the backup row, bump the epoch if it says active, ignore the open move.
@@ -598,6 +606,9 @@ ActiveStores == UNION {store[s] : s \in {s2 \in Shards : own[s2].st = "active"}}
 NoLossNoDup ==
   /\ mp \in {"tactive", "done", "early", "early_flipped"} =>
        ((frozenSet \ gone) \subseteq actSet /\ actSet \subseteq frozenSet /\ (frozenMk \ gone) \subseteq actMk /\ actMk \subseteq frozenMk)
+  \* a committed move whose source no longer holds the namespace frozen has a ready or active target with the rows
+  /\ (Settled /\ ~cleaned /\ cm \in {"committed", "done"} /\ own[src].st \in {"active", "moved_out"}) =>
+       (own[tgt].st \in {"ready", "active"} /\ ((frozenSet \ gone) \ lost) \subseteq store[tgt])
   /\ (cleaned /\ own[tgt].st = "active") => (frozenSet \ gone) \subseteq store[tgt]
   /\ (Settled /\ mp \in Final) => ((committed \ lost) \ gone) \subseteq ActiveStores
 

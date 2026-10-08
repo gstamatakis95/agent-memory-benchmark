@@ -87,7 +87,7 @@ MoveService, ShardService), `catalog_stats_reader` (`NOLOGIN`, member of `pg_rea
 
 **Catalog operations are derived, never stored (N127, N133d).** There is no catalog `operations` table: `DELETE_NAMESPACE` is
 answered from `namespaces.state` (`deleting` → `RUNNING`, `deleted` → `SUCCEEDED`) and `DELETE_TENANT` from the `tenants` row
-(`delete_operation_id`, `delete_requested_at`, `deleted_at`) through the view `tenant_delete_operations`.
+(`delete_operation_id`, `delete_requested_at`, `delete_acknowledged_at` (N182: set once every namespace is `frozen/delete`), `deleted_at`) through the view `tenant_delete_operations`.
 
 ```sql
 CREATE TABLE shards (

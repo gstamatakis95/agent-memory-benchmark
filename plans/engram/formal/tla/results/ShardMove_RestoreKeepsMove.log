@@ -1,6 +1,6 @@
 Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=46745 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 72 and seed 411442809906959884 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 23253] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 105 and seed -2314372335872710889 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 24785] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -13,12 +13,12 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module ShardMove
-Starting... (2026-10-08 17:27:19)
+Starting... (2026-10-08 17:28:19)
 Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
 (Use the -nowarning option to disable this warning.)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 17:27:19.
-Progress(12) at 2026-10-08 17:27:22: 394,187 states generated (394,187 s/min), 98,113 distinct states found (98,113 ds/min), 48,868 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 17:28:19.
+Progress(11) at 2026-10-08 17:28:22: 170,244 states generated (170,244 s/min), 43,605 distinct states found (43,605 ds/min), 23,182 states left on queue.
 Error: Invariant MoveClosedWhenFinal is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -714,9 +714,9 @@ State 9: <CommitCAS line 336, col 3 to line 340, col 171 of module ShardMove>
 /\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 
-State 10: <Replicated line 344, col 3 to line 346, col 123 of module ShardMove>
-/\ own = [s2 |-> [st |-> "ready", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
-/\ rep = TRUE
+State 10: <Failover line 492, col 3 to line 494, col 32 of module ShardMove>
+/\ own = [s2 |-> [st |-> "restoring", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
+/\ rep = FALSE
 /\ nMoves = 1
 /\ frozenSet = {}
 /\ actSet = {}
@@ -751,7 +751,7 @@ State 10: <Replicated line 344, col 3 to line 346, col 123 of module ShardMove>
 /\ frozenMk = {}
 /\ committed = {}
 /\ rc = 0
-/\ idx = [s2 |-> TRUE, s1 |-> TRUE]
+/\ idx = [s2 |-> FALSE, s1 |-> TRUE]
 /\ sb = [ s2 |->
       [ own |-> [st |-> "none", ep |-> 0],
         store |-> {},
@@ -766,12 +766,12 @@ State 10: <Replicated line 344, col 3 to line 346, col 123 of module ShardMove>
         ex |-> 0,
         sq |-> 2,
         idx |-> TRUE ] ]
-/\ sq = [s2 |-> 2, s1 |-> 2]
+/\ sq = [s2 |-> 0, s1 |-> 2]
 /\ sqt = <<0>>
-/\ nRestore = 0
+/\ nRestore = 1
 /\ src = "s1"
 /\ tl = 0
-/\ tlc = [s2 |-> 0, s1 |-> 0]
+/\ tlc = [s2 |-> 1, s1 |-> 0]
 /\ nFault = 0
 /\ bak = [ s2 |->
       [ own |-> [st |-> "none", ep |-> 0],
@@ -791,7 +791,7 @@ State 10: <Replicated line 344, col 3 to line 346, col 123 of module ShardMove>
 /\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 
-State 11: <Failover line 492, col 3 to line 494, col 32 of module ShardMove>
+State 11: <Replicated line 344, col 3 to line 346, col 123 of module ShardMove>
 /\ own = [s2 |-> [st |-> "restoring", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
 /\ rep = TRUE
 /\ nMoves = 1
@@ -1022,7 +1022,7 @@ State 13: <RestoreDone line 641, col 3 to line 647, col 104 of module ShardMove>
 /\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 
-530123 states generated, 129757 distinct states found, 62874 states left on queue.
+352002 states generated, 89387 distinct states found, 45062 states left on queue.
 The depth of the complete state graph search is 13.
 The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 11 and the 95th percentile is 6).
-Finished in 04s at (2026-10-08 17:27:22)
+Finished in 05s at (2026-10-08 17:28:24)

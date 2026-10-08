@@ -1,6 +1,6 @@
 Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=46745 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 115 and seed 8413690063698824953 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 23371] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 85 and seed 2983040727574672498 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 25340] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -13,12 +13,12 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module ShardMove
-Starting... (2026-10-08 17:27:27)
+Starting... (2026-10-08 17:28:29)
 Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
 (Use the -nowarning option to disable this warning.)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 17:27:27.
-Progress(15) at 2026-10-08 17:27:30: 328,009 states generated (328,009 s/min), 80,268 distinct states found (80,268 ds/min), 24,688 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 17:28:29.
+Progress(12) at 2026-10-08 17:28:32: 301,443 states generated (301,443 s/min), 76,246 distinct states found (76,246 ds/min), 37,795 states left on queue.
 Error: Invariant NoLossNoDup is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -714,7 +714,7 @@ State 9: <BuildIndex line 311, col 3 to line 313, col 98 of module ShardMove>
 /\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 
-State 10: <StandbyReplay line 499, col 3 to line 504, col 108 of module ShardMove>
+State 10: <StandbyReplay line 499, col 3 to line 504, col 126 of module ShardMove>
 /\ own = [s2 |-> [st |-> "incoming", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
 /\ rep = FALSE
 /\ nMoves = 1
@@ -1022,7 +1022,7 @@ State 13: <CommitCAS line 336, col 3 to line 340, col 171 of module ShardMove>
 /\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 
-State 14: <StandbyReplay line 499, col 3 to line 504, col 108 of module ShardMove>
+State 14: <StandbyReplay line 499, col 3 to line 504, col 126 of module ShardMove>
 /\ own = [s2 |-> [st |-> "ready", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
 /\ rep = FALSE
 /\ nMoves = 1
@@ -1034,7 +1034,7 @@ State 14: <StandbyReplay line 499, col 3 to line 504, col 108 of module ShardMov
 /\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
 /\ cdn = {1}
 /\ ex = [s2 |-> 1, s1 |-> 1]
-/\ nBak = 0
+/\ nBak = 1
 /\ gone = {}
 /\ cex = TRUE
 /\ store = [s2 |-> {1}, s1 |-> {1}]
@@ -1111,7 +1111,7 @@ State 15: <Replicated line 344, col 3 to line 346, col 123 of module ShardMove>
 /\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
 /\ cdn = {1}
 /\ ex = [s2 |-> 1, s1 |-> 1]
-/\ nBak = 0
+/\ nBak = 1
 /\ gone = {}
 /\ cex = TRUE
 /\ store = [s2 |-> {1}, s1 |-> {1}]
@@ -1188,7 +1188,7 @@ State 16: <Failover line 492, col 3 to line 494, col 32 of module ShardMove>
 /\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
 /\ cdn = {1}
 /\ ex = [s2 |-> 0, s1 |-> 1]
-/\ nBak = 0
+/\ nBak = 1
 /\ gone = {}
 /\ cex = TRUE
 /\ store = [s2 |-> {}, s1 |-> {1}]
@@ -1265,7 +1265,7 @@ State 17: <Reconcile_ line 636, col 18 to line 636, col 85 of module ShardMove>
 /\ fin = [s2 |-> [st |-> "active", ep |-> 3], s1 |-> [st |-> "active", ep |-> 1]]
 /\ cdn = {1}
 /\ ex = [s2 |-> 0, s1 |-> 1]
-/\ nBak = 0
+/\ nBak = 1
 /\ gone = {}
 /\ cex = TRUE
 /\ store = [s2 |-> {}, s1 |-> {1}]
@@ -1342,7 +1342,7 @@ State 18: <RestoreDone line 641, col 3 to line 647, col 104 of module ShardMove>
 /\ fin = [s2 |-> [st |-> "active", ep |-> 3], s1 |-> [st |-> "active", ep |-> 1]]
 /\ cdn = {1}
 /\ ex = [s2 |-> 0, s1 |-> 1]
-/\ nBak = 0
+/\ nBak = 1
 /\ gone = {}
 /\ cex = TRUE
 /\ store = [s2 |-> {}, s1 |-> {1}]
@@ -1407,7 +1407,7 @@ State 18: <RestoreDone line 641, col 3 to line 647, col 104 of module ShardMove>
 /\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 
-667592 states generated, 163633 distinct states found, 29873 states left on queue.
-The depth of the complete state graph search is 18.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 10 and the 95th percentile is 3).
-Finished in 05s at (2026-10-08 17:27:32)
+5744783 states generated, 1441370 distinct states found, 334180 states left on queue.
+The depth of the complete state graph search is 19.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 12 and the 95th percentile is 3).
+Finished in 29s at (2026-10-08 17:28:58)

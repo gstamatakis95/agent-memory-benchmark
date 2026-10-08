@@ -90,10 +90,12 @@ CREATE TABLE tenants (
   updated_at    timestamptz NOT NULL DEFAULT now(),
   delete_operation_id  uuid,                        -- the DELETE_TENANT operation id (UUIDv7 minted by engram-api at the ack)
   delete_requested_at  timestamptz,                 -- the ack time = the operation's create_time
+  delete_acknowledged_at timestamptz,               -- N182: stamped by TenantDelete once every namespace is frozen/delete
   deleted_at    timestamptz,                        -- the operation's finish_time
   CHECK ((state = 'deleted') = (deleted_at IS NOT NULL)),
   CHECK ((state IN ('deleting', 'deleted')) = (delete_operation_id IS NOT NULL)),
-  CHECK ((state IN ('deleting', 'deleted')) = (delete_requested_at IS NOT NULL))
+  CHECK ((state IN ('deleting', 'deleted')) = (delete_requested_at IS NOT NULL)),
+  CHECK (delete_acknowledged_at IS NULL OR state IN ('deleting', 'deleted'))
 );
 
 -- DELETE_TENANT operations, derived (N133d): 'deleting' -> RUNNING, 'deleted' -> SUCCEEDED. No other
@@ -104,6 +106,7 @@ SELECT t.tenant_id,
        t.delete_operation_id AS operation_id,
        CASE t.state WHEN 'deleting' THEN 'RUNNING' ELSE 'SUCCEEDED' END AS state,
        t.delete_requested_at AS create_time,
+       t.delete_acknowledged_at AS acknowledged_at,
        t.deleted_at AS finish_time
   FROM tenants t
  WHERE t.state IN ('deleting', 'deleted');

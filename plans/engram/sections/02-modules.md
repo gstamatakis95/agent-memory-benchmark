@@ -357,8 +357,7 @@ Owns the `engram_catalog` tables (D4) and the in-process `Resolver` (LRU 100 k, 
 unreachable, only misses fail `UNAVAILABLE` — F-21). The catalog database has **one asynchronous hot
 standby** (N163): everything it arbitrates is also derivable from the shards' ownership rows, so **every promotion and
 every restore runs `engramctl catalog reconcile --from-shards` before the catalog serves writes**, and the one step that
-acts irreversibly on a catalog outcome (the move's (c), thaw, rollback) first waits for the standby to replay it and re-reads the row (N171): routing, moves and shard-side deletes are re-derived from the shards, every other acknowledged catalog write waits for replay (`catalog.AckAfterReplay`). *Pattern: Repository for the control plane,
-split by capability so no interface passes five methods; the Resolver is a read-through cache.*
+acts irreversibly on a catalog outcome (the move's (c), thaw, rollback) first waits for the standby to replay it and re-reads the row (N171): routing, moves and shard-side deletes are re-derived from the shards, every other acknowledged catalog write waits for replay (`catalog.AckAfterReplay`). *Pattern: Repository for the control plane, split by capability (≤ 5 methods); the Resolver is a read-through cache.*
 
 ```go
 package catalog
@@ -388,7 +387,7 @@ type Moves interface { // the move ledger: every transition is a CAS on the curr
 type MoveStamps interface { // every non-derived `namespace_moves` column has exactly one writer (N184)
 	Stamp(ctx context.Context, m id.MoveID, k StampKind, at time.Time) error // k ∈ {ready, moved_out, activated, finished}: a same-state update (`activated` is the 24 h gate's input, N170, N180)
 	RecordFloor(ctx context.Context, m id.MoveID, lsn pg.LSN, timeline int32, sealedAt time.Time) error // copy_end_lsn, copy_end_timeline, copy_sealed_at: what the `cutover → …` CHECK reads (N179)
-	RecordReplicated(ctx context.Context, m id.MoveID, o Outcome, at time.Time) error // o ∈ {committed, rolled_back}: committed_replicated_at / rolled_back_replicated_at (N171)
+	RecordReplicated(ctx context.Context, m id.MoveID, o Outcome, at time.Time) error // committed_replicated_at / rolled_back_replicated_at (N171)
 }
 type Replication interface { // catalog_replicated(lsn) and the commit LSN (N171(1))
 	Replicated(ctx context.Context, lsn LSN) (bool, error) // a streaming standby has replay_lsn ≥ lsn
@@ -1701,5 +1700,5 @@ type).
 | Register | What changed in this section |
 |---|---|
 | N179, N180 | `Readier.SealCopy`; (b″) unconditional; the end test reads the target row; `W_est` ≈ 27 min per 1 M |
-| N182, N184, N185 | `TenantDelete` stamps `acknowledged_at`; `catalog.MoveStamps`; `CleanupMove` one transition; one writer per column; unreadable shards skipped |
+| N182, N184, N185 | `acknowledged_at`; `catalog.MoveStamps`; one-transition `CleanupMove`; unreadable shards skipped |
 | N186 | connections 55 + 2P = 63 at P = 4 |

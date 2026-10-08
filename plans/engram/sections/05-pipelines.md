@@ -98,7 +98,7 @@ in one *derivation transaction*:
    observation-version inputs, including the base text a delta was rendered from, with
    `engram_obs_version_hidden` against **all open tombstones** (`engram_doc_tomb(ns, false)`), not
    only pending ones;
-3. **decide idempotency first** (N144): `SELECT version FROM page_versions WHERE namespace_id AND
+3. **decide idempotency first** (N144, `engram_derivation_commit_seen`): `SELECT version FROM page_versions WHERE namespace_id AND
    page_id AND commit_key = $k` (`observation_versions` likewise), with `commit_key =
    sha256(root_id ‖ base_version ‖ evidence_hash ‖ prompt_version ‖ attempt_nonce)`, where
    `attempt_nonce` is minted **once per Temporal activity execution id** (`ActivityInfo.ActivityID ‖
@@ -114,7 +114,7 @@ in one *derivation transaction*:
    the same base; the row lock of the `UPDATE` does (`BaseCurrentAtCommit`, `Derivation.tla`). The
    compare-and-set is **the same for every writer, root rebuilds included**: `$expected` is the
    `current_version` the writer read when it loaded the root (`LoadPage`, the batch's candidate
-   read), and `engram_derivation_base_cas(p_base IS NULL)` has no "advance whatever it holds"
+   read), and `engram_derivation_base_cas($expected, check_visible)` has no "advance whatever it holds"
    branch, so a rebuild never overwrites a version that landed meanwhile and `current_version`
    never names a row that does not exist (`NoPhantomVersion`). The same transaction clears the
    stale flags only with `WHERE stale_seq = $captured` (N37), never unconditionally;
@@ -125,7 +125,7 @@ in one *derivation transaction*:
 in the same transaction, only after `NOT EXISTS (SELECT 1 FROM page_versions WHERE
 markdown_blob_key = $key)`: the blob of a committed row is never a deletion candidate.
 
-The SQL helpers are `engram_facts_all_visible` (step 2, fact inputs), `engram_obs_version_hidden` / `engram_page_version_hidden` (one `p_doc_tomb` jsonb of all open tombstones; invalidation is an anti-join on `fact_hidden` with `cause = 'invalidate'`) and `engram_derivation_base_cas` (step 4, the compare-and-set with a required `p_base`, returns the new version number or NULL). The lock is never held across an LLM call (a refresh would block `Materialize` for a minute): the
+The SQL helpers are `engram_facts_all_visible` (step 2, fact inputs), `engram_obs_version_hidden` / `engram_page_version_hidden` (one `p_doc_tomb` jsonb of all open tombstones; invalidation is an anti-join on `fact_hidden` with `cause = 'invalidate'`) `engram_derivation_commit_seen` (step 3, the `commit_key` lookup, returns the committed version or NULL) and `engram_derivation_base_cas($expected, check_visible)` (step 4, the compare-and-set; `$expected` is required, returns the new version number or NULL). The lock is never held across an LLM call (a refresh would block `Materialize` for a minute): the
 re-verification, not the lock, covers the call's duration. `Materialize` and `Restore` take the
 lock exclusively, and `Materialize` re-reads `fact_hidden` and the open tombstones in every batch
 (§5.4.2); markers take no lock. A configuration without the lock, without the page re-verify,
@@ -1310,7 +1310,7 @@ role. **A run is per tombstone `(document_id, up_to_version)`:** every predicate
    for the indexes it touched (the expunge's own bookkeeping, one writer); a touched HNSW is **due**
    at `purged_since_build ≥ max(1 % × rows_at_build, 2,000)` (the 2 k floor binds only below
    200 k rows). **The partition is the hygiene unit:** when any index on a vector partition is due,
-   the index runner rebuilds **every** HNSW on that partition with `purged_since_build > 0`
+   the index runner (`engram_index_partition_hygiene`) rebuilds **every** HNSW on that partition with `purged_since_build > 0`
    (`engram_hnsw_ddl(…, 'rebuild')` = `REINDEX INDEX CONCURRENTLY`, after dropping any
    `<name>_ccnew*` leftover; a crash mid-rebuild is repaired the same way) and only then runs one
    `VACUUM (INDEX_CLEANUP ON)` of the partition, never earlier while an un-rebuilt touched graph sits
@@ -1423,8 +1423,7 @@ work inside the deadline).
 lock): fence prelude; the **per-fact lock** `pg_advisory_xact_lock(engram_doc_lock_keys(ns,
 memory_id))` (two-argument form, N150), taken before the chain predecessor is read, so concurrent
 `Invalidate` and `Restore` calls on one fact form one chain; **resolve the subject** (N145): the
-fact `f` and, if the same document holds a visible fact `f'` with the same `content_hash` (the
-re-extraction twin, found through `curation_log` and `facts`), `f'` too; `INSERT fact_hidden(memory_id,
+fact `f` and, if the same document holds a visible fact `f'` with the same `content_hash` (the re-extraction twin, found by `engram_invalidation_twins` over `curation_log` and `facts`), `f'` too; `INSERT fact_hidden(memory_id,
 cause = 'invalidate', reason)` for each — a conflict leaves visibility unchanged and succeeds (a
 double `Invalidate` hides nothing new), but it is **not silent** (N143): it still inserts its own
 `deletion_log` row (new `operation_id`, `prev_operation_id` = the subject's last entry of either
@@ -1760,9 +1759,9 @@ every shard's credentials).
      point of no return.
    - (b′) `ReadyTarget`: target `incoming → ready` (edge `ready_target`, `engram_move`), with two
      preconditions re-checked on the rows: **`engram_seq_advance(W_final)`** has run on the target,
-     `W_final` being the source's final `nextval` under the freeze (recorded on `namespace_moves`),
+     `W_final` being the source's final `nextval` under the freeze (recorded as `namespace_moves.w_final`; `w_plan` at `Plan`),
      so copied rows sort below every row the target inserts after cutover (`CopiedBelowTargetSeq`);
-     and **every partial index of the namespace is `ready`** (step 2c). **Nothing routes to
+     and **every partial index of the namespace is `ready`** (step 2c; the target's ownership trigger refuses `ready` without `engram_move_indexes_ready`). **Nothing routes to
      `ready`**: writers and readers get the retryable `NamespaceNotReady`.
    - (a″) `CommitMove` (catalog): `UPDATE namespace_moves SET state = 'committed' WHERE move_id =
      $1 AND state = 'cutover' AND …` where `…` repeats the verified source and target shards, the
@@ -1813,10 +1812,9 @@ every shard's credentials).
    (`MoveBackups.RecordTargetBackup`); the workflow polls it (a forced full backup is requested if none
    starts within 24 h); the early signal shortens only the grace, and `CleanupMove` refuses to run
    before `target_backup_at` is set. **The gate is content-recoverable (N149):** besides the grace
-   and `target_backup_at`, `catalog.shards(target).timeline_id` must equal the timeline recorded on
-   `namespace_moves.activated_timeline` (`MoveBackups.RecordTimeline`), **or** the target was repaired
-   by `ReconcileIn` (§5.5.5), `reconciled_in_at` later than the last timeline change; in either case
-   the full target backup must have *started* after `max(activated_at, reconciled_in_at)`. The only
+   and `target_backup_at`, the target's timeline must equal `namespace_moves.activated_timeline` (`target_timeline_changed_at` unset; `MoveBackups.RecordTimeline`), **or** the target was repaired
+   by `ReconcileIn` (§5.5.5), `reconciled_in_at` later than `target_timeline_changed_at`; in either case
+   the full target backup must have *started* (`target_backup_started_at`) after `max(activated_at, reconciled_in_at)`. The only
    copy of a row is therefore never deleted while the target may lack rows the source still holds. When both are done the last activity calls the `MoveService.CleanupMove` admin RPC, which has the index runner drop
    the namespace's partial indexes on the source by their deterministic names, runs
    `engram_cleanup_namespace` in batches (its outer `DELETE` carries `namespace_id`, N131) and
@@ -1996,7 +1994,7 @@ failover may compute "catalog epoch + 1". Then:
    blob storage, then lists each hosted namespace's intent objects (`_control/deletes/{tenant}/{ns}/`,
    written per namespace for a tenant delete too) with `deleted_at ≥ replay_floor − 10 min`, where
    **`replay_floor = min(catalog.shards.replay_floor, the restore markers in
-   _control/restores/{shard}/)`** (N146): the catalog value lives outside the restorable shard
+   _control/restores/{shard}/)`** (catalog columns `replay_floor_mirror` and `replay_floor_effective`) (N146): the catalog value lives outside the restorable shard
    state, so neither a PITR nor a stale promotion can lose it, and the blob markers make it
    derivable, so a catalog that lost the lowered value cannot raise it
    (`TestReplay_FloorFromBlob`). Every restore and failover lowers it with `min()` of its

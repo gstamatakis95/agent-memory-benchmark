@@ -54,12 +54,31 @@
 (*   OrderMode         "chain" prev_operation_id; "clock" (deleted_at,id); *)
 (*                     "any"                                               *)
 (* A Margin below Lat + Skew loses commits outside the replay window.      *)
+(*                                                                         *)
+(* D24 additions (N146, N150):                                             *)
+(*   BlobFloor        FALSE  replay reads the catalog floor only; TRUE     *)
+(*                     (design) it reads min(fl, blobFloor): a record in   *)
+(*                     the blob store, written before each replay and      *)
+(*                     lowered only (N146).  CatalogRestore (up to         *)
+(*                     MaxCatLoss times) reverts the catalog's fl to an    *)
+(*                     earlier, higher value.                              *)
+(*   ReplayCurrentEpoch TRUE  a replayed entry is stamped with the bumped  *)
+(*                     epoch instead of the intent's recorded one (the     *)
+(*                     guard then skips the second intent of a subject)    *)
+(*   ConcurrentX      TRUE   requests on one fact subject may overlap: the *)
+(*                     marker transaction is TxnBegin (reads the subject's *)
+(*                     previous entry = prev_operation_id) and Commit.     *)
+(*   SubjectLock      TRUE   (design) TxnBegin waits while another         *)
+(*                     transaction of the subject is open (advisory lock   *)
+(*                     on the fact); FALSE: both read the same prev, the   *)
+(*                     chain forks and replay order is unspecified.        *)
 (***************************************************************************)
-EXTENDS Naturals, FiniteSets, Sequences
+EXTENDS Integers, FiniteSets, Sequences
 
 CONSTANTS Shape, MaxT, Lat, Skew, Margin, MaxRestores,
           IntentAfterCommit, AckNeedsIntent, AckRecheck, DupReput, ReplayFirst,
-          FloorMode, OrderMode, EpochGuard
+          FloorMode, OrderMode, EpochGuard,
+          BlobFloor, MaxCatLoss, ReplayCurrentEpoch, ConcurrentX, SubjectLock
 
 ShapeDoc  == <<[s |-> "y", k |-> "del"], [s |-> "y", k |-> "del"], [s |-> "y", k |-> "ret"]>>
 ShapeFact == <<[s |-> "x", k |-> "inv"], [s |-> "x", k |-> "res"], [s |-> "x", k |-> "inv"]>>
@@ -69,25 +88,25 @@ OpIds == 1..N
 S(i) == Shape[i].s
 K(i) == Shape[i].k
 
-VARIABLES t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep
-vars == <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep>>
+VARIABLES t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat
+vars == <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
-\* dbq: the marker rows the shard has applied, in application order: [op, eff].
+\* dbq: the marker rows the shard has applied, in application order: [op, eff, ep] (ep: the epoch the row records).
 \* eff: for a document delete, the versions it covers (the tombstone's up_to_version).
 db == {dbq[i].op : i \in DOMAIN dbq}
 Entries == {dbq[i] : i \in DOMAIN dbq}
 
-NoOp == [ph |-> "none", ep |-> 0, it |-> 0, at |-> 0, ct |-> 0, cn0 |-> 0, eff |-> {}, prev |-> 0, obs |-> 0]
+NoOp == [ph |-> "none", ep |-> 0, it |-> 0, at |-> 0, ct |-> 0, cn0 |-> 0, eff |-> {}, prev |-> 0, obs |-> 0, rd |-> -1, be |-> 0]
 Phases == {"none", "new", "committed", "acked", "failed"}
 
 TypeOK ==
   /\ t \in 0..MaxT /\ intents \subseteq OpIds /\ db \subseteq OpIds /\ Len(dbq) <= 2 * N
-  /\ sst \in {"active", "restoring"} /\ fl \in 0..(MaxT + 1)
+  /\ sst \in {"active", "restoring"} /\ fl \in 0..(MaxT + 1) /\ bf \in 0..(MaxT + 1)
   /\ \A i \in OpIds : ops[i].ph \in Phases
 
 Init ==
   /\ t = 0 /\ ops = [i \in OpIds |-> NoOp] /\ intents = {} /\ dbq = << >>
-  /\ sst = "active" /\ fl = MaxT + 1 /\ nIssued = 0 /\ nRestore = 0 /\ cn = 0 /\ ep = 1
+  /\ sst = "active" /\ fl = MaxT + 1 /\ nIssued = 0 /\ nRestore = 0 /\ cn = 0 /\ ep = 1 /\ bf = MaxT + 1 /\ nCat = 0
 
 -----------------------------------------------------------------------------
 (* What the marker tables show *)
@@ -105,33 +124,45 @@ Issued == {i \in OpIds : ops[i].ph # "none"}
 Live(i) == ops[i].ph \in {"new", "committed"}
 
 -----------------------------------------------------------------------------
+LockHeld(s) == \E j \in OpIds : S(j) = s /\ ops[j].ph = "new" /\ ops[j].rd >= 0
+
 Issue ==
   /\ nIssued < N /\ sst = "active"
   /\ LET i == nIssued + 1 IN
-     /\ (S(i) = "x" => \A j \in Issued : ~Live(j))          \* x: one request at a time
+     /\ (S(i) = "x" /\ ~ConcurrentX => \A j \in Issued : ~Live(j))   \* x: one request at a time unless ConcurrentX
      /\ \E sk \in 0..Skew :
           /\ sk <= t
           /\ ops' = [ops EXCEPT ![i] = [NoOp EXCEPT !.ph = "new", !.it = t, !.at = t - sk]]
   /\ nIssued' = nIssued + 1
-  /\ UNCHANGED <<t, intents, dbq, sst, fl, nRestore, cn, ep>>
+  /\ UNCHANGED <<t, intents, dbq, sst, fl, nRestore, cn, ep, bf, nCat>>
+
+\* ConcurrentX: the marker transaction of a fact subject begins by reading the subject's previous entry
+\* (prev_operation_id).  With the subject lock (N150) it waits while another transaction of the subject is open.
+TxnBegin(o) ==
+  /\ ConcurrentX /\ S(o) = "x" /\ ops[o].ph = "new" /\ ops[o].rd < 0 /\ sst = "active"
+  /\ (SubjectLock => ~LockHeld("x"))
+  /\ ops' = [ops EXCEPT ![o].rd = LastOn("x"), ![o].be = ep]
+  /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
 \* The marker transaction: a local commit, refused by the namespace fence while restoring.
 \* A duplicate (subject already deleting / hidden) writes no marker and observes the existing one.
 Commit(o) ==
   /\ ops[o].ph = "new" /\ sst = "active" /\ t - ops[o].it <= Lat
   /\ (IntentAfterCommit \/ o \in intents)                  \* old order: intent first
+  /\ (ConcurrentX /\ S(o) = "x" => ops[o].rd >= 0 /\ ops[o].be = ep)   \* the transaction began in this epoch
   /\ LET k == K(o) IN LET s == S(o) IN
      LET isDup == k = "del" /\ Vis = {} IN
      /\ (k = "res" => HiddenX)
      /\ IF isDup
           THEN /\ ops' = [ops EXCEPT ![o] = [@ EXCEPT !.ph = "committed", !.ct = t, !.obs = LastOn(s)]]
-               /\ UNCHANGED <<dbq, cn>>
+               /\ UNCHANGED <<dbq, cn, bf, nCat>>
           ELSE LET eff == IF k = "del" THEN AllRet ELSE {} IN
-               /\ dbq' = Append(dbq, [op |-> o, eff |-> eff])
+               /\ dbq' = Append(dbq, [op |-> o, eff |-> eff, ep |-> ep])
                /\ cn' = cn + 1
                /\ ops' = [ops EXCEPT ![o] = [@ EXCEPT !.ph = "committed", !.ct = t, !.cn0 = cn + 1, !.ep = ep,
-                            !.eff = eff, !.obs = o, !.prev = IF k = "ret" THEN 0 ELSE LastOn(s)]]
-  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, ep>>
+                            !.eff = eff, !.obs = o,
+                            !.prev = IF k = "ret" THEN 0 ELSE IF ConcurrentX /\ s = "x" THEN ops[o].rd ELSE LastOn(s)]]
+  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, ep, bf, nCat>>
 
 \* Design: after the commit, put the intent of the marker this attempt relies on (its own, or the
 \* one a duplicate observed).  Old order: before the commit, its own.
@@ -143,7 +174,7 @@ PutIntent(o) ==
             /\ intents' = intents \cup {ops[o].obs}
        ELSE /\ ops[o].ph = "new" /\ o \notin intents
             /\ intents' = intents \cup {o}
-  /\ UNCHANGED <<t, ops, dbq, sst, fl, nIssued, nRestore, cn, ep>>
+  /\ UNCHANGED <<t, ops, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
 IntentOK(o) == ops[o].obs \in intents \/ ~AckNeedsIntent \/ (ops[o].obs # o /\ ~DupReput)
 
@@ -151,23 +182,23 @@ Ack(o) ==
   /\ ops[o].ph = "committed"
   /\ K(o) = "ret" \/ (IntentOK(o) /\ (AckRecheck => ops[o].obs \in db))
   /\ ops' = [ops EXCEPT ![o].ph = "acked"]
-  /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep>>
+  /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
 \* The client sees an error: before the commit (Abort), or after it with the intent not yet put
 \* (CrashBeforePut), or with the intent put (LostAck).
 Abort(o) == /\ ops[o].ph = "new" /\ K(o) # "ret"
             /\ ops' = [ops EXCEPT ![o].ph = "failed"]
-            /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep>>
+            /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 CrashBeforePut(o) == /\ ops[o].ph = "committed" /\ K(o) # "ret" /\ ops[o].obs \notin intents
                      /\ ops' = [ops EXCEPT ![o].ph = "failed"]
-                     /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep>>
+                     /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 LostAck(o) == /\ ops[o].ph = "committed" /\ K(o) # "ret" /\ ops[o].obs \in intents
               /\ ops' = [ops EXCEPT ![o].ph = "failed"]
-              /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep>>
+              /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
 Tick ==
   /\ t < MaxT /\ t' = t + 1
-  /\ UNCHANGED <<ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep>>
+  /\ UNCHANGED <<ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
 \* Restore or failover to point p: commits after p are lost; the floor (catalog) is not.
 RestoreTo(p) ==
@@ -175,10 +206,20 @@ RestoreTo(p) ==
   /\ dbq' = SelectSeq(dbq, LAMBDA e : ops[e.op].ct <= p)
   /\ sst' = "restoring" /\ nRestore' = nRestore + 1
   /\ fl' = IF FloorMode = "target" THEN p ELSE IF fl < p THEN fl ELSE p
+  /\ bf' = IF bf < p THEN bf ELSE p                      \* the blob-store floor record, written before the replay (N146)
   /\ ep' = ep + 1
-  /\ UNCHANGED <<t, ops, intents, nIssued, cn>>
+  /\ UNCHANGED <<t, ops, intents, nIssued, cn, bf, nCat>>
 
-InWindow(o) == o \in intents /\ ops[o].at + Margin >= fl
+\* CatalogRestore: the catalog is restored from a backup (or fails over asynchronously) and its floor goes back to
+\* an earlier, higher value; the blob-store record is not affected.
+CatalogRestore ==
+  /\ nCat < MaxCatLoss /\ fl < MaxT + 1
+  /\ \E v \in (fl + 1)..(MaxT + 1) : fl' = v
+  /\ nCat' = nCat + 1
+  /\ UNCHANGED <<t, ops, intents, dbq, sst, nIssued, nRestore, cn, ep, bf>>
+
+RFloor == IF BlobFloor THEN (IF fl < bf THEN fl ELSE bf) ELSE fl
+InWindow(o) == o \in intents /\ ops[o].at + Margin >= RFloor
 Pending == {o \in intents : InWindow(o) /\ o \notin db}
 
 Before(o, o2) == ops[o].at < ops[o2].at \/ (ops[o].at = ops[o2].at /\ o <= o2)
@@ -186,29 +227,32 @@ Before(o, o2) == ops[o].at < ops[o2].at \/ (ops[o].at = ops[o2].at /\ o <= o2)
 \* Admin variant of the marker transaction: same effect, fence bypassed.
 Replay(o) ==
   /\ sst = "restoring" /\ o \in Pending
-  /\ (EpochGuard => \A e \in Entries : (S(e.op) = S(o) /\ K(e.op) # "ret") => ops[e.op].ep <= ops[o].ep)
+  \* the guard compares RECORDED epochs: the entry's own (e.ep) against the intent's (N150)
+  /\ (EpochGuard => \A e \in Entries : (S(e.op) = S(o) /\ K(e.op) # "ret") => e.ep <= ops[o].ep)
   /\ CASE OrderMode = "chain" -> ops[o].prev = 0 \/ ops[o].prev \notin Pending
        [] OrderMode = "clock" -> \A o2 \in Pending : S(o2) = S(o) => Before(o, o2)
        [] OTHER -> TRUE
   /\ LET eff == IF K(o) = "del" /\ ~IntentAfterCommit THEN AllRet ELSE ops[o].eff IN
-     dbq' = Append(dbq, [op |-> o, eff |-> eff])
+     dbq' = Append(dbq, [op |-> o, eff |-> eff, ep |-> IF ReplayCurrentEpoch THEN ep ELSE ops[o].ep])
   /\ ops' = [ops EXCEPT ![o].ct = t]
-  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, cn, ep>>
+  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
 Reopen ==
   /\ sst = "restoring" /\ (ReplayFirst => Pending = {})
   /\ sst' = "active"
   /\ fl' = IF FloorMode = "raise" THEN MaxT + 1 ELSE fl
-  /\ UNCHANGED <<t, ops, intents, dbq, nIssued, nRestore, cn, ep>>
+  /\ UNCHANGED <<t, ops, intents, dbq, nIssued, nRestore, cn, ep, bf, nCat>>
 
-Next == Tick \/ Reopen \/ Issue \/ (\E p \in 0..MaxT : RestoreTo(p))
-        \/ (\E o \in OpIds : PutIntent(o) \/ Commit(o) \/ Ack(o) \/ Abort(o) \/ CrashBeforePut(o)
+Next == Tick \/ Reopen \/ Issue \/ (\E p \in 0..MaxT : RestoreTo(p)) \/ CatalogRestore
+        \/ (\E o \in OpIds : TxnBegin(o) \/ PutIntent(o) \/ Commit(o) \/ Ack(o) \/ Abort(o) \/ CrashBeforePut(o)
                              \/ LostAck(o) \/ Replay(o))
 
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
-LastIssued(s) == LET L == {i \in Issued : S(i) = s} IN IF L = {} THEN 0 ELSE CHOOSE m \in L : \A j \in L : j <= m
+\* The operation of subject s that committed last (by commit order, whatever the issue order of overlapping requests).
+LastCommitted(s) ==
+  LET L == {i \in OpIds : S(i) = s /\ ops[i].cn0 > 0} IN IF L = {} THEN 0 ELSE CHOOSE m \in L : \A j \in L : ops[j].cn0 <= ops[m].cn0
 
 \* Every acknowledged delete or invalidation has a durable intent.
 AckImpliesIntent == \A o \in OpIds : (ops[o].ph = "acked" /\ K(o) # "ret") => ops[o].obs \in intents
@@ -219,7 +263,7 @@ AckedDeleteSurvives == sst = "active" => \A o \in OpIds : (ops[o].ph = "acked" /
 \* Invalidate/Restore: per-subject chain order makes the last state win, whatever the clocks say.
 IntentOrderLastWins ==
   sst = "active" =>
-    LET l == LastIssued("x") IN
+    LET l == LastCommitted("x") IN
     (l # 0 /\ ops[l].ph = "acked") => (HiddenX <=> K(l) = "inv")
 
 \* An effect that reaches a later acknowledged write is not allowed: every applied marker was

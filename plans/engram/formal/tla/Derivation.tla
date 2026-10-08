@@ -57,7 +57,8 @@ CONSTANTS Docs, Facts, DocOf, FVer, Mentioned, Twin,
           Obs, Pages, MaxVerO, MaxVerP, Writers, Budget, MaxF,
           MaxT, MaxDeletes, MaxCuration, MaxRetire,
           UseLock, RestoreLock, TombByVersion, EffAllShown, CascadeEvidence, ReextractHides,
-          PageVerify, BaseCheck, MatOnce, DropStub, AllowAbortW
+          PageVerify, BaseCheck, MatOnce, DropStub, AllowAbortW,
+          CascadeHidden, MatSignalOnly, CasFirst, RootExpected, AllowRetry
 
 \* Design instance (cfg: DocOf <- DocOfDef, FVer <- FVerDef, Mentioned <- MentionedDef, Twin <- TwinDef).
 DocOfDef == <<"d1", "d1", "d2", "d1">>
@@ -72,9 +73,11 @@ Pairs == {<<o, v>> : o \in Obs, v \in 1..MaxVerO}
 Twins == {f \in Facts : \E g \in Facts : Twin[g] = f}
 
 VARIABLES tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX,
-          matPhase, matDocs, matV0, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet
+          matPhase, matDocs, matV0, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet,
+          cv, ginv, mat, matOwe, sig
+NewV == <<cv, ginv, mat, matOwe, sig>>
 vars == <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX,
-          matPhase, matDocs, matV0, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet>>
+          matPhase, matDocs, matV0, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet, NewV>>
 
 Max2(a, b) == IF a >= b THEN a ELSE b
 MaxSet(S) == IF S = {} THEN 0 ELSE CHOOSE m \in S : \A x \in S : x <= m
@@ -123,10 +126,11 @@ Served(T) == {x \in Versions :
 ServedFacts(T) == {f \in VisFacts : Mentioned[f] <= T}
 
 -----------------------------------------------------------------------------
+Prop == [n : Nodes, mode : {"root", "update"}, cf : SUBSET Facts, co : SUBSET Pairs, base : 0..3, exp : 0..3]
+\* ck: the commit_key of the attempt that wrote the row (N144): the stored proposal it rendered.
 Rec == [root : 1..4, finp : SUBSET Facts, gfinp : SUBSET Facts, oinp : SUBSET Pairs, goinp : SUBSET Pairs,
-        eff : 0..MaxT, base : 0..3, st : {"live", "stub", "absent"}]
-Prop == [n : Nodes, mode : {"root", "update"}, cf : SUBSET Facts, co : SUBSET Pairs, base : 0..3]
-IdleW == [ph |-> "idle", p |-> [n |-> CHOOSE n \in Nodes : TRUE, mode |-> "root", cf |-> {}, co |-> {}, base |-> 0]]
+        eff : 0..MaxT, base : 0..3, st : {"live", "stub", "absent"}, ck : Prop]
+IdleW == [ph |-> "idle", p |-> [n |-> CHOOSE n \in Nodes : TRUE, mode |-> "root", cf |-> {}, co |-> {}, base |-> 0, exp |-> 0]]
 
 TypeOK ==
   /\ tomb \in [Docs -> 0..2] /\ hidden \subseteq Facts /\ hidRe \subseteq Facts /\ ctomb \subseteq Facts
@@ -134,6 +138,7 @@ TypeOK ==
   /\ ms \in [Docs -> {"none", "pending", "materialized", "purged", "done"}]
   /\ \A n \in Nodes : \A i \in 1..Len(vers[n]) : vers[n][i] \in Rec
   /\ \A n \in Nodes : Len(vers[n]) <= MaxVer(n)
+  /\ cv \in [Nodes -> 0..(MaxVerP + 2)] /\ ginv \subseteq Facts /\ mat \subseteq Facts /\ matOwe \subseteq Facts /\ sig \in BOOLEAN
   /\ lockX \in BOOLEAN /\ matPhase \in {"idle", "running", "scanned"}
   /\ props \subseteq Prop
   /\ budget \in 0..Budget /\ nDel \in 0..MaxDeletes /\ nCur \in 0..MaxCuration /\ nRet \in 0..MaxRetire
@@ -144,6 +149,7 @@ Init ==
   /\ lockX = FALSE /\ matPhase = "idle" /\ matDocs = {} /\ matV0 = {} /\ matTodo = {} /\ matSnap = {}
   /\ wr = [w \in Writers |-> IdleW] /\ props = {}
   /\ budget = Budget /\ nDel = 0 /\ nCur = 0 /\ nRet = 0
+  /\ cv = [n \in Nodes |-> 0] /\ ginv = {} /\ mat = {} /\ matOwe = {} /\ sig = FALSE
 
 -----------------------------------------------------------------------------
 (* Ingest, and the markers: the only synchronous writes of a delete, an    *)
@@ -153,19 +159,20 @@ Ingest(f) ==
   /\ f \notin born /\ f \notin Twins /\ FVer[f] = tomb[DocOf[f]] + 1
   /\ born' = born \cup {f}
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur, nRet>>
+                 wr, props, budget, nDel, nCur, nRet, NewV>>
 
 DeleteDocument(d) ==
   /\ nDel < MaxDeletes /\ CurVer(d) > tomb[d] /\ ms[d] \in {"none", "done"}
   /\ tomb' = [tomb EXCEPT ![d] = CurVer(d)] /\ ms' = [ms EXCEPT ![d] = "pending"] /\ nDel' = nDel + 1
   /\ UNCHANGED <<hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nCur, nRet>>
+                 wr, props, budget, nCur, nRet, NewV>>
 
 Invalidate(f) ==
   /\ f \in born \ gone /\ f \notin hidden /\ nCur < MaxCuration
   /\ hidden' = hidden \cup {f} /\ nCur' = nCur + 1
+  /\ ginv' = ginv \cup {f} /\ sig' = MatSignalOnly            \* the lossy signal after the ack (MatSignalOnly only)
   /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nRet>>
+                 wr, props, budget, nDel, nRet, cv, mat, matOwe>>
 
 \* N133: Restore takes the derivation lock exclusively (waits for shared holders, excludes a Materialize
 \* batch) and deletes the cause-tagged derived_hidden rows.
@@ -173,38 +180,43 @@ Restore(f) ==
   /\ f \in hidden /\ nCur < MaxCuration
   /\ (RestoreLock => ~lockX /\ \A w \in Writers : wr[w].ph # "verified")
   /\ hidden' = hidden \ {f} /\ dh' = {r \in dh : r[4] # <<"inv", f>>} /\ nCur' = nCur + 1
+  /\ ginv' = ginv \ {f} /\ mat' = mat \ {f} /\ matOwe' = matOwe \ {f}      \* the stamp dies with the marker row
   /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, gone, vers, hw, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nRet>>
+                 wr, props, budget, nDel, nRet, cv, sig>>
 
 \* REPLACE retires a fact's chunk (chunk_tombstones); observations and pages stay visible.
 Replace(f) ==
   /\ f \in born \ gone /\ f \notin ctomb /\ ~TombTrue(f) /\ nRet < MaxRetire
   /\ ctomb' = ctomb \cup {f} /\ nRet' = nRet + 1
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur>>
+                 wr, props, budget, nDel, nCur, NewV>>
 
 \* Re-extraction is a write: the new-key twin is ingested, the old-key fact gets fact_hidden(reextract).
 Reextract(f) ==
   /\ f \in born \ gone /\ f \notin hidRe /\ Twin[f] # 0 /\ Twin[f] \notin born /\ ~TombTrue(f) /\ nRet < MaxRetire
   /\ hidRe' = hidRe \cup {f} /\ born' = born \cup {Twin[f]} /\ nRet' = nRet + 1
   /\ UNCHANGED <<tomb, ms, hidden, ctomb, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur>>
+                 wr, props, budget, nDel, nCur, NewV>>
 
 \* The FK of the old schema: evidence rows of observation versions die with their fact.
+\* N145: the invalidate row is independent of the fact row; CascadeHidden models the old foreign key (purges drop it).
+DropH(S) == IF CascadeHidden THEN S ELSE {}
 Strip(S) == [n \in Nodes |-> [i \in 1..Len(vers[n]) |->
                IF CascadeEvidence /\ n \in Obs THEN [vers[n][i] EXCEPT !.finp = @ \ S] ELSE vers[n][i]]]
 
 ChunkPurge(f) ==                    \* grace elapsed: the retired chunk's fact is deleted
   /\ f \in ctomb /\ f \notin gone
   /\ gone' = gone \cup {f} /\ vers' = Strip({f})
-  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur, nRet>>
+  /\ hidden' = hidden \ DropH({f}) /\ mat' = mat \ DropH({f}) /\ matOwe' = matOwe \ DropH({f})
+  /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur, nRet, cv, ginv, sig>>
 
 ReextractPurge(f) ==                \* REEXTRACTED_FACTS: the old-key fact is deleted after 1 h
   /\ f \in hidRe /\ f \notin gone
   /\ gone' = gone \cup {f} /\ vers' = Strip({f})
-  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 wr, props, budget, nDel, nCur, nRet>>
+  /\ hidden' = hidden \ DropH({f}) /\ mat' = mat \ DropH({f}) /\ matOwe' = matOwe \ DropH({f})
+  /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur, nRet, cv, ginv, sig>>
 
 -----------------------------------------------------------------------------
 (* Writers of derived versions (N120, N121): Propose = stage 2 stored      *)
@@ -217,25 +229,30 @@ Propose ==
   /\ \E n \in Nodes : \E mode \in {"root", "update"} : \E cf \in SmallSubsets(VisFacts, MaxF) :
      \E co \in SmallSubsets(IF IsPage(n) THEN VisPairs ELSE {}, 1) :
        /\ (cf # {} \/ co # {})
-       /\ (mode = "update" => Len(vers[n]) > 0 /\ VisN(n, Len(vers[n])))
+       /\ (mode = "update" => cv[n] > 0 /\ cv[n] <= Len(vers[n]) /\ VisN(n, cv[n]))
+       \* base: the version an update was rendered from; exp: current_version read at LoadPage by a root rebuild (N144)
        /\ props' = props \cup {[n |-> n, mode |-> mode, cf |-> cf, co |-> co,
-                                base |-> IF mode = "update" THEN Len(vers[n]) ELSE 0]}
+                                base |-> IF mode = "update" THEN cv[n] ELSE 0,
+                                exp |-> IF mode = "root" /\ RootExpected THEN cv[n] ELSE 0]}
   /\ budget' = budget - 1
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
-                 matSnap, wr, nDel, nCur, nRet>>
+                 matSnap, wr, nDel, nCur, nRet, NewV>>
 
 Pick(w) ==
   /\ wr[w].ph = "idle" /\ props # {}
   /\ \E p \in props : wr' = [wr EXCEPT ![w] = [ph |-> "picked", p |-> p]]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
-                 matSnap, props, budget, nDel, nCur, nRet>>
+                 matSnap, props, budget, nDel, nCur, nRet, NewV>>
 
 \* Everything the rendered result depends on is still fine: inputs visible, base current and visible.
 InputsOK(p) == (IsPage(p.n) /\ ~PageVerify) \/ (p.cf \subseteq VisFacts /\ p.co \subseteq VisPairs)
+\* The base compare-and-set (UPDATE ... SET current_version = v+1 WHERE current_version = base): an update compares
+\* its base, and since N144 a root rebuild compares the version it read at LoadPage (RootExpected).
 BaseOK(p) ==
-  p.mode = "update" =>
-    IF BaseCheck THEN Len(vers[p.n]) = p.base /\ VisN(p.n, p.base)
-                 ELSE Len(vers[p.n]) > 0 /\ VisN(p.n, Len(vers[p.n]))
+  /\ p.mode = "update" =>
+       IF BaseCheck THEN cv[p.n] = p.base /\ p.base <= Len(vers[p.n]) /\ VisN(p.n, p.base)
+                    ELSE Len(vers[p.n]) > 0 /\ VisN(p.n, Len(vers[p.n]))
+  /\ (p.mode = "root" /\ RootExpected) => cv[p.n] = p.exp
 CheckOK(p) == InputsOK(p) /\ BaseOK(p)
 
 Verify(w) ==
@@ -244,7 +261,7 @@ Verify(w) ==
   /\ CheckOK(wr[w].p)
   /\ wr' = [wr EXCEPT ![w].ph = "verified"]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
-                 matSnap, props, budget, nDel, nCur, nRet>>
+                 matSnap, props, budget, nDel, nCur, nRet, NewV>>
 
 \* Verification failed: ROLLBACK and discard the stored proposal (never repair it).
 Discard(w) ==
@@ -255,7 +272,7 @@ Discard(w) ==
      \/ wr[w].p \in props /\ wr[w].ph = "verified" /\ Len(vers[wr[w].p.n]) >= MaxVer(wr[w].p.n)   \* bound of the model
   /\ props' = props \ {wr[w].p} /\ wr' = [wr EXCEPT ![w] = IdleW]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
-                 matSnap, budget, nDel, nCur, nRet>>
+                 matSnap, budget, nDel, nCur, nRet, NewV>>
 
 \* The insert is a compare-and-set on the base (UPDATE observations SET current_version = v+1 WHERE
 \* current_version = base): shared-lock holders do not exclude each other, so the base is re-evaluated here.
@@ -274,18 +291,35 @@ Commit(w) ==
                          finp |-> p.cf, oinp |-> p.co,
                          gfinp |-> p.cf \cup (IF upd THEN vers[n][p.base].gfinp ELSE {}),
                          goinp |-> p.co \cup (IF upd THEN vers[n][p.base].goinp ELSE {}),
-                         eff |-> e, base |-> IF upd THEN p.base ELSE 0, st |-> "live"])]
+                         eff |-> e, base |-> IF upd THEN p.base ELSE 0, st |-> "live", ck |-> p])]
      /\ hw' = [hw EXCEPT ![n] = L + 1]
+     /\ cv' = [cv EXCEPT ![n] = cv[n] + 1]                \* the CAS: current_version + 1
      /\ props' = props \ {p}
-  /\ wr' = [wr EXCEPT ![w] = IdleW]
+  \* The transaction committed; the worker may crash before the result is recorded (Temporal retries the activity).
+  /\ \E lost \in (IF AllowRetry THEN BOOLEAN ELSE {FALSE}) :
+       wr' = [wr EXCEPT ![w] = IF lost THEN [ph |-> "lost", p |-> wr[w].p] ELSE IdleW]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
-                 budget, nDel, nCur, nRet>>
+                 budget, nDel, nCur, nRet, ginv, mat, matOwe, sig>>
+
+\* N144: the re-execution of a committed Commit with the same rendered result (same commit_key).  Design: the
+\* commit transaction first looks for a row with its commit_key; a hit returns that version and touches nothing.
+\* CasFirst (the D23 order): the compare-and-set runs first; a root rebuild that was blind (not RootExpected)
+\* advances current_version, and the insert then conflicts on commit_key, so the pointer names no row.
+RetryCommit(w) ==
+  /\ AllowRetry /\ wr[w].ph = "lost"
+  /\ LET p == wr[w].p IN LET n == p.n IN
+     LET hit == \E i \in 1..Len(vers[n]) : vers[n][i].ck = p IN
+     LET casOk == IF p.mode = "update" THEN cv[n] = p.base ELSE (RootExpected => cv[n] = p.exp) IN
+     cv' = IF CasFirst /\ casOk /\ hit THEN [cv EXCEPT ![n] = cv[n] + 1] ELSE cv
+  /\ wr' = [wr EXCEPT ![w] = IdleW]
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
+                 matSnap, props, budget, nDel, nCur, nRet, ginv, mat, matOwe, sig>>
 
 AbortW(w) ==
   /\ AllowAbortW /\ wr[w].ph # "idle"
   /\ wr' = [wr EXCEPT ![w] = IdleW]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
-                 matSnap, props, budget, nDel, nCur, nRet>>
+                 matSnap, props, budget, nDel, nCur, nRet, NewV>>
 
 -----------------------------------------------------------------------------
 (* Expunge (N119, N136): Materialize in batches, Purge, DerivedPurge       *)
@@ -295,15 +329,20 @@ Cause(f, DV) == IF f \in DV THEN <<"doc", 0>> ELSE <<"inv", f>>
 HitF(n, w, V) == V \cap (vers[n][w].finp \cup
                          UNION {DerivF(x[1], x[2]) : x \in {y \in vers[n][w].oinp : Exists(y)}})
 RowsNode(n, V, DV) == UNION {{<<n, vers[n][w].root, w, Cause(f, DV)>> : f \in HitF(n, w, V)} : w \in 1..Len(vers[n])}
-NeedInv == \E n \in Nodes : RowsNode(n, hidden, {}) \ dh # {}
+\* N145(2): Materialize discovers its work from the markers: a pending tombstone, or an invalidation row whose
+\* materialized_at is unset (hidden \ mat).  MatSignalOnly: the invalidation is found only through the signal
+\* sent after the ack, which can be lost (LoseSignal).
+MatWork == (\E d \in Docs : ms[d] = "pending") \/ (IF MatSignalOnly THEN sig ELSE hidden \ mat # {})
 
 MatBegin ==
   /\ matPhase = "idle" /\ ~lockX
-  /\ (\E d \in Docs : ms[d] = "pending") \/ NeedInv
+  /\ MatWork
   /\ LET D == {d \in Docs : ms[d] = "pending"} IN
      /\ matDocs' = D /\ matV0' = UNION {Victims(d) : d \in D} \cup hidden
   /\ matTodo' = Nodes /\ matPhase' = "running"
-  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matSnap, wr, props, budget, nDel, nCur, nRet>>
+  /\ matOwe' = hidden \ mat /\ sig' = FALSE                \* the run owes the unstamped invalidations it read
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matSnap, wr, props, budget, nDel, nCur, nRet,
+                 cv, ginv, mat>>
 
 \* One batch (one node): the scan under the exclusive lock re-reads the open tombstones and fact_hidden.
 MatScan(n) ==
@@ -313,26 +352,34 @@ MatScan(n) ==
      LET V == IF MatOnce THEN matV0 ELSE DV \cup hidden IN
      matSnap' = RowsNode(n, V, DV)
   /\ matTodo' = matTodo \ {n} /\ matPhase' = "scanned" /\ lockX' = TRUE
-  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, matDocs, matV0, wr, props, budget, nDel, nCur, nRet>>
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, matDocs, matV0, wr, props, budget, nDel, nCur, nRet, NewV>>
 
 MatWrite ==
   /\ matPhase = "scanned"
   /\ dh' = dh \cup matSnap
   /\ matPhase' = "running" /\ lockX' = FALSE /\ matSnap' = {}
-  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, matDocs, matV0, matTodo, wr, props, budget, nDel, nCur, nRet>>
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, matDocs, matV0, matTodo, wr, props, budget, nDel, nCur, nRet, NewV>>
 
 MatEnd ==
   /\ matPhase = "running" /\ matTodo = {}
   /\ ms' = [d \in Docs |-> IF d \in matDocs THEN "materialized" ELSE ms[d]]
   /\ matPhase' = "idle" /\ matDocs' = {} /\ matV0' = {}
-  /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet>>
+  /\ mat' = mat \cup matOwe /\ matOwe' = {}                 \* materialized_at stamped for what the run covered
+  /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matTodo, matSnap, wr, props, budget, nDel, nCur, nRet,
+                 cv, ginv, sig>>
+
+LoseSignal ==                       \* the SignalWithStart after the ack is lost (API death, a move terminating the singleton)
+  /\ MatSignalOnly /\ sig /\ sig' = FALSE
+  /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
+                 wr, props, budget, nDel, nCur, nRet, cv, ginv, mat, matOwe>>
 
 Purge(d) ==                         \* the victims' facts; evidence rows stay (no FK)
   /\ ms[d] = "materialized"
   /\ ms' = [ms EXCEPT ![d] = "purged"]
   /\ gone' = gone \cup (Victims(d) \cap born) /\ vers' = Strip(Victims(d))
-  /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap, wr, props,
-                 budget, nDel, nCur, nRet>>
+  /\ hidden' = hidden \ DropH(Victims(d)) /\ mat' = mat \ DropH(Victims(d)) /\ matOwe' = matOwe \ DropH(Victims(d))
+  /\ UNCHANGED <<tomb, hidRe, ctomb, born, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap, wr, props,
+                 budget, nDel, nCur, nRet, cv, ginv, sig>>
 
 RECURSIVE Trim(_)
 Trim(s) == IF s # << >> /\ s[Len(s)].st = "absent" THEN Trim(SubSeq(s, 1, Len(s) - 1)) ELSE s
@@ -351,13 +398,13 @@ DerivedPurge(d) ==
                              ELSE vers[n][i]]
                IN IF DropStub THEN Trim(s) ELSE s]
   /\ UNCHANGED <<tomb, hidden, hidRe, ctomb, born, gone, hw, dh, lockX, matPhase, matDocs, matV0, matTodo, matSnap, wr,
-                 props, budget, nDel, nCur, nRet>>
+                 props, budget, nDel, nCur, nRet, NewV>>
 
 -----------------------------------------------------------------------------
-WriterStep == \E w \in Writers : Pick(w) \/ Verify(w) \/ Discard(w) \/ Commit(w) \/ AbortW(w)
-WriterProgress == \E w \in Writers : Verify(w) \/ Discard(w) \/ Commit(w)
+WriterStep == \E w \in Writers : Pick(w) \/ Verify(w) \/ Discard(w) \/ Commit(w) \/ RetryCommit(w) \/ AbortW(w)
+WriterProgress == \E w \in Writers : Verify(w) \/ Discard(w) \/ Commit(w) \/ RetryCommit(w)
 Expunge == MatBegin \/ (\E n \in Nodes : MatScan(n)) \/ MatWrite \/ MatEnd \/ (\E d \in Docs : Purge(d) \/ DerivedPurge(d))
-Next == Propose \/ WriterStep \/ Expunge
+Next == Propose \/ WriterStep \/ Expunge \/ LoseSignal
         \/ (\E d \in Docs : DeleteDocument(d))
         \/ (\E f \in Facts : Ingest(f) \/ Invalidate(f) \/ Restore(f) \/ Replace(f) \/ Reextract(f)
                              \/ ChunkPurge(f) \/ ReextractPurge(f))
@@ -399,8 +446,22 @@ AsOfNoLeak ==
 \* Once a document is materialized, derived_hidden covers every committed version
 \* with a victim of its tombstone in the derivation.
 MaterializeComplete ==
-  \A d \in Docs : ms[d] \in {"materialized", "purged", "done"} =>
-    \A x \in Versions : (GDeriv(x[1], x[2]) \cap Victims(d) # {}) => Perm(x[1], x[2])
+  /\ \A d \in Docs : ms[d] \in {"materialized", "purged", "done"} =>
+       \A x \in Versions : (GDeriv(x[1], x[2]) \cap Victims(d) # {}) => Perm(x[1], x[2])
+  \* N145(2): a stamped invalidation (materialized_at set) has its derived_hidden rows on every node ...
+  /\ \A f \in mat : \A n \in Nodes : RowsNode(n, {f}, {}) \subseteq dh
+  \* ... and an unstamped one is never stranded: while one exists and no run is in progress, Materialize
+  \* is enabled (found from the marker, not from a signal that may be lost).
+  /\ (hidden \ mat # {} /\ matPhase = "idle") => MatWork
+
+\* N145: an acknowledged invalidation stays in force until Restore: no served version has an invalidated
+\* fact in its derivation, whatever happened to the fact row (ginv is the ghost of the acknowledged set).
+NoGhostInvalidatedServed ==
+  \A T \in 1..MaxT : \A x \in Served(T) : GDeriv(x[1], x[2]) \cap ginv = {}
+
+\* N144: current_version always names an existing row of the node (it is never ahead of the rows).
+NoPhantomVersion ==
+  \A n \in Nodes : cv[n] = 0 \/ (cv[n] <= Len(vers[n]) /\ vers[n][cv[n]].st # "absent" /\ vers[n][cv[n]].root <= cv[n])
 
 \* N135(1): evidence outlives the facts it names -- a live version's evidence is everything its text
 \* was derived from.

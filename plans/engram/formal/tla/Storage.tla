@@ -115,9 +115,9 @@ Rebuild(n) ==
 
 \* Vacuum of the partition (heap and indexes): it reads every HNSW on the partition, and a graph that still holds
 \* dead entries is repaired in place.  Design: runs only when every touched graph has been rebuilt
-\* (dead[i] = 0 \/ rebuilt[i]); per-index hygiene: when no graph is due any more.
+\* (dead[i] = 0 \/ rebuilt[i]); per-index hygiene: after the due graph was rebuilt, when no graph is due.
 VacuumReady == IF PartitionUnit THEN \A n \in Ns : EntriesOf(idx, n) \ vec = {} \/ n \in rebuilt
-                                 ELSE \A n \in Ns : ~Due(n)
+                                 ELSE rebuilt # {} /\ \A n \in Ns : ~Due(n)
 Vacuum ==
   /\ (idx \ vec) # {} \/ \E n \in Ns : n \in rebuilt
   /\ VacuumReady

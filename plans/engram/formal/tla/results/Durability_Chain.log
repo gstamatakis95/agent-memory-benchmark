@@ -1,25 +1,40 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=45529 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 16 and seed 5543327611104721719 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 18283] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 16 and seed 8824448425285841505 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 25395] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Durability.tla
-Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
 Parsing file /tmp/Sequences.tla
+Parsing file /tmp/Naturals.tla
 Semantic processing of module Naturals
+Semantic processing of module Integers
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module Durability
-Starting... (2026-10-08 02:00:24)
+Starting... (2026-10-08 08:25:10)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 02:00:24.
-Progress(15) at 2026-10-08 02:00:27: 876,095 states generated (876,095 s/min), 354,491 distinct states found (354,491 ds/min), 193,581 states left on queue.
-Progress(22) at 2026-10-08 02:01:27: 23,327,932 states generated (22,451,837 s/min), 8,506,330 distinct states found (8,151,839 ds/min), 1,578,663 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 08:25:10.
+Progress(12) at 2026-10-08 08:25:13: 633,107 states generated (633,107 s/min), 219,652 distinct states found (219,652 ds/min), 129,709 states left on queue.
+Progress(17) at 2026-10-08 08:26:13: 24,215,340 states generated (23,582,233 s/min), 7,219,256 distinct states found (6,999,604 ds/min), 3,081,097 states left on queue.
+Progress(18) at 2026-10-08 08:27:13: 44,990,441 states generated (20,775,101 s/min), 13,195,170 distinct states found (5,975,914 ds/min), 5,014,115 states left on queue.
+Progress(19) at 2026-10-08 08:28:13: 64,703,273 states generated (19,712,832 s/min), 18,765,759 distinct states found (5,570,589 ds/min), 6,509,861 states left on queue.
+Progress(20) at 2026-10-08 08:29:13: 83,683,173 states generated (18,979,900 s/min), 24,022,904 distinct states found (5,257,145 ds/min), 7,655,430 states left on queue.
+Progress(20) at 2026-10-08 08:30:13: 101,429,176 states generated (17,746,003 s/min), 28,849,004 distinct states found (4,826,100 ds/min), 8,284,618 states left on queue.
+Progress(21) at 2026-10-08 08:31:13: 119,277,980 states generated (17,848,804 s/min), 33,647,506 distinct states found (4,798,502 ds/min), 8,893,620 states left on queue.
+Progress(21) at 2026-10-08 08:32:13: 135,961,762 states generated (16,683,782 s/min), 38,017,753 distinct states found (4,370,247 ds/min), 8,803,693 states left on queue.
+Progress(22) at 2026-10-08 08:33:13: 153,178,347 states generated (17,216,585 s/min), 42,507,426 distinct states found (4,489,673 ds/min), 8,931,127 states left on queue.
+Progress(22) at 2026-10-08 08:34:13: 168,914,694 states generated (15,736,347 s/min), 46,509,830 distinct states found (4,002,404 ds/min), 8,192,951 states left on queue.
+Progress(23) at 2026-10-08 08:35:13: 184,893,154 states generated (15,978,460 s/min), 50,529,733 distinct states found (4,019,903 ds/min), 7,709,122 states left on queue.
+Progress(24) at 2026-10-08 08:36:13: 199,209,293 states generated (14,316,139 s/min), 54,059,546 distinct states found (3,529,813 ds/min), 6,485,131 states left on queue.
+Progress(24) at 2026-10-08 08:37:13: 213,715,816 states generated (14,506,523 s/min), 57,500,850 distinct states found (3,441,304 ds/min), 4,928,544 states left on queue.
+Progress(25) at 2026-10-08 08:38:13: 227,237,822 states generated (13,522,006 s/min), 60,677,618 distinct states found (3,176,768 ds/min), 2,852,372 states left on queue.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
-  calculated (optimistic):  val = 1.0E-5
-  based on the actual fingerprints:  val = 1.1E-5
-28312605 states generated, 10352781 distinct states found, 0 states left on queue.
-The depth of the complete state graph search is 25.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 7 and the 95th percentile is 3).
-Finished in 01min 24s at (2026-10-08 02:01:48)
-elapsed 85s rc=0
+  calculated (optimistic):  val = 6.0E-4
+  based on the actual fingerprints:  val = 1.4E-4
+237637520 states generated, 63006042 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 28.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 11 and the 95th percentile is 3).
+Finished in 13min 57s at (2026-10-08 08:39:07)
+elapsed 839s

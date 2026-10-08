@@ -1,6 +1,6 @@
 Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=45529 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 102 and seed -1628758101645337415 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 27782] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 8 and seed 285591526963771952 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 28181] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Durability.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -11,23 +11,24 @@ Semantic processing of module Integers
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module Durability
-Starting... (2026-10-08 09:14:46)
+Starting... (2026-10-08 09:15:39)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 09:14:46.
-Error: Invariant AckedDeleteSurvives is violated.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 09:15:39.
+Progress(12) at 2026-10-08 09:15:42: 778,922 states generated (778,922 s/min), 265,621 distinct states found (265,621 ds/min), 155,391 states left on queue.
+Error: Invariant IntentOrderLastWins is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ nRestore = 0
 /\ dbq = <<>>
 /\ sst = "active"
 /\ nIssued = 0
-/\ bf = 8
+/\ bf = 5
 /\ cn = 0
 /\ t = 0
 /\ nCat = 0
 /\ ep = 1
 /\ intents = {}
-/\ fl = 8
+/\ fl = 5
 /\ ops = << [ ep |-> 0,
      ph |-> "none",
      it |-> 0,
@@ -67,13 +68,13 @@ State 2: <Tick line 214, col 3 to line 215, col 82 of module Durability>
 /\ dbq = <<>>
 /\ sst = "active"
 /\ nIssued = 0
-/\ bf = 8
+/\ bf = 5
 /\ cn = 0
 /\ t = 1
 /\ nCat = 0
 /\ ep = 1
 /\ intents = {}
-/\ fl = 8
+/\ fl = 5
 /\ ops = << [ ep |-> 0,
      ph |-> "none",
      it |-> 0,
@@ -108,114 +109,22 @@ State 2: <Tick line 214, col 3 to line 215, col 82 of module Durability>
      rd |-> -1,
      be |-> 0 ] >>
 
-State 3: <Tick line 214, col 3 to line 215, col 82 of module Durability>
-/\ nRestore = 0
-/\ dbq = <<>>
-/\ sst = "active"
-/\ nIssued = 0
-/\ bf = 8
-/\ cn = 0
-/\ t = 2
-/\ nCat = 0
-/\ ep = 1
-/\ intents = {}
-/\ fl = 8
-/\ ops = << [ ep |-> 0,
-     ph |-> "none",
-     it |-> 0,
-     at |-> 0,
-     ct |-> 0,
-     cn0 |-> 0,
-     eff |-> {},
-     prev |-> 0,
-     obs |-> 0,
-     rd |-> -1,
-     be |-> 0 ],
-   [ ep |-> 0,
-     ph |-> "none",
-     it |-> 0,
-     at |-> 0,
-     ct |-> 0,
-     cn0 |-> 0,
-     eff |-> {},
-     prev |-> 0,
-     obs |-> 0,
-     rd |-> -1,
-     be |-> 0 ],
-   [ ep |-> 0,
-     ph |-> "none",
-     it |-> 0,
-     at |-> 0,
-     ct |-> 0,
-     cn0 |-> 0,
-     eff |-> {},
-     prev |-> 0,
-     obs |-> 0,
-     rd |-> -1,
-     be |-> 0 ] >>
-
-State 4: <Tick line 214, col 3 to line 215, col 82 of module Durability>
-/\ nRestore = 0
-/\ dbq = <<>>
-/\ sst = "active"
-/\ nIssued = 0
-/\ bf = 8
-/\ cn = 0
-/\ t = 3
-/\ nCat = 0
-/\ ep = 1
-/\ intents = {}
-/\ fl = 8
-/\ ops = << [ ep |-> 0,
-     ph |-> "none",
-     it |-> 0,
-     at |-> 0,
-     ct |-> 0,
-     cn0 |-> 0,
-     eff |-> {},
-     prev |-> 0,
-     obs |-> 0,
-     rd |-> -1,
-     be |-> 0 ],
-   [ ep |-> 0,
-     ph |-> "none",
-     it |-> 0,
-     at |-> 0,
-     ct |-> 0,
-     cn0 |-> 0,
-     eff |-> {},
-     prev |-> 0,
-     obs |-> 0,
-     rd |-> -1,
-     be |-> 0 ],
-   [ ep |-> 0,
-     ph |-> "none",
-     it |-> 0,
-     at |-> 0,
-     ct |-> 0,
-     cn0 |-> 0,
-     eff |-> {},
-     prev |-> 0,
-     obs |-> 0,
-     rd |-> -1,
-     be |-> 0 ] >>
-
-State 5: <Issue line 141, col 3 to line 148, col 71 of module Durability>
+State 3: <Issue line 141, col 3 to line 148, col 71 of module Durability>
 /\ nRestore = 0
 /\ dbq = <<>>
 /\ sst = "active"
 /\ nIssued = 1
-/\ bf = 8
+/\ bf = 5
 /\ cn = 0
-/\ t = 3
+/\ t = 1
 /\ nCat = 0
 /\ ep = 1
 /\ intents = {}
-/\ fl = 8
+/\ fl = 5
 /\ ops = << [ ep |-> 0,
      ph |-> "new",
-     it |-> 3,
-     at |-> 3,
+     it |-> 1,
+     at |-> 1,
      ct |-> 0,
      cn0 |-> 0,
      eff |-> {},
@@ -246,22 +155,22 @@ State 5: <Issue line 141, col 3 to line 148, col 71 of module Durability>
      rd |-> -1,
      be |-> 0 ] >>
 
-State 6: <Issue line 141, col 3 to line 148, col 71 of module Durability>
+State 4: <Issue line 141, col 3 to line 148, col 71 of module Durability>
 /\ nRestore = 0
 /\ dbq = <<>>
 /\ sst = "active"
 /\ nIssued = 2
-/\ bf = 8
+/\ bf = 5
 /\ cn = 0
-/\ t = 3
+/\ t = 1
 /\ nCat = 0
 /\ ep = 1
 /\ intents = {}
-/\ fl = 8
+/\ fl = 5
 /\ ops = << [ ep |-> 0,
      ph |-> "new",
-     it |-> 3,
-     at |-> 3,
+     it |-> 1,
+     at |-> 1,
      ct |-> 0,
      cn0 |-> 0,
      eff |-> {},
@@ -271,8 +180,8 @@ State 6: <Issue line 141, col 3 to line 148, col 71 of module Durability>
      be |-> 0 ],
    [ ep |-> 0,
      ph |-> "new",
-     it |-> 3,
-     at |-> 3,
+     it |-> 1,
+     at |-> 0,
      ct |-> 0,
      cn0 |-> 0,
      eff |-> {},
@@ -292,33 +201,33 @@ State 6: <Issue line 141, col 3 to line 148, col 71 of module Durability>
      rd |-> -1,
      be |-> 0 ] >>
 
-State 7: <Commit line 164, col 3 to line 179, col 71 of module Durability>
+State 5: <TxnBegin line 153, col 3 to line 159, col 71 of module Durability>
 /\ nRestore = 0
-/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {0}]>>
+/\ dbq = <<>>
 /\ sst = "active"
 /\ nIssued = 2
-/\ bf = 8
-/\ cn = 1
-/\ t = 3
+/\ bf = 5
+/\ cn = 0
+/\ t = 1
 /\ nCat = 0
 /\ ep = 1
 /\ intents = {}
-/\ fl = 8
-/\ ops = << [ ep |-> 1,
-     ph |-> "committed",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
-     cn0 |-> 1,
-     eff |-> {0},
+/\ fl = 5
+/\ ops = << [ ep |-> 0,
+     ph |-> "new",
+     it |-> 1,
+     at |-> 1,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
      prev |-> 0,
-     obs |-> 1,
-     rd |-> -1,
-     be |-> 0 ],
+     obs |-> 0,
+     rd |-> 0,
+     be |-> 1 ],
    [ ep |-> 0,
      ph |-> "new",
-     it |-> 3,
-     at |-> 3,
+     it |-> 1,
+     at |-> 0,
      ct |-> 0,
      cn0 |-> 0,
      eff |-> {},
@@ -338,38 +247,38 @@ State 7: <Commit line 164, col 3 to line 179, col 71 of module Durability>
      rd |-> -1,
      be |-> 0 ] >>
 
-State 8: <Commit line 164, col 3 to line 179, col 71 of module Durability>
+State 6: <Commit line 164, col 3 to line 179, col 71 of module Durability>
 /\ nRestore = 0
-/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {0}]>>
+/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {}]>>
 /\ sst = "active"
 /\ nIssued = 2
-/\ bf = 8
+/\ bf = 5
 /\ cn = 1
-/\ t = 3
+/\ t = 1
 /\ nCat = 0
 /\ ep = 1
 /\ intents = {}
-/\ fl = 8
+/\ fl = 5
 /\ ops = << [ ep |-> 1,
      ph |-> "committed",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
      cn0 |-> 1,
-     eff |-> {0},
-     prev |-> 0,
-     obs |-> 1,
-     rd |-> -1,
-     be |-> 0 ],
-   [ ep |-> 0,
-     ph |-> "committed",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
-     cn0 |-> 0,
      eff |-> {},
      prev |-> 0,
      obs |-> 1,
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "new",
+     it |-> 1,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
      rd |-> -1,
      be |-> 0 ],
    [ ep |-> 0,
@@ -384,40 +293,224 @@ State 8: <Commit line 164, col 3 to line 179, col 71 of module Durability>
      rd |-> -1,
      be |-> 0 ] >>
 
-State 9: <Ack line 196, col 3 to line 199, col 80 of module Durability>
+State 7: <PutIntent line 184, col 3 to line 191, col 76 of module Durability>
 /\ nRestore = 0
-/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {0}]>>
+/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {}]>>
 /\ sst = "active"
 /\ nIssued = 2
-/\ bf = 8
+/\ bf = 5
 /\ cn = 1
-/\ t = 3
+/\ t = 1
 /\ nCat = 0
 /\ ep = 1
-/\ intents = {}
-/\ fl = 8
+/\ intents = {1}
+/\ fl = 5
 /\ ops = << [ ep |-> 1,
      ph |-> "committed",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
      cn0 |-> 1,
-     eff |-> {0},
+     eff |-> {},
      prev |-> 0,
      obs |-> 1,
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "new",
+     it |-> 1,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
      rd |-> -1,
      be |-> 0 ],
    [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+State 8: <TxnBegin line 153, col 3 to line 159, col 71 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {}]>>
+/\ sst = "active"
+/\ nIssued = 2
+/\ bf = 5
+/\ cn = 1
+/\ t = 1
+/\ nCat = 0
+/\ ep = 1
+/\ intents = {1}
+/\ fl = 5
+/\ ops = << [ ep |-> 1,
+     ph |-> "committed",
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
+     cn0 |-> 1,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 1,
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "new",
+     it |-> 1,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> 1,
+     be |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+State 9: <Commit line 164, col 3 to line 179, col 71 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {}], [ep |-> 1, op |-> 2, eff |-> {}]>>
+/\ sst = "active"
+/\ nIssued = 2
+/\ bf = 5
+/\ cn = 2
+/\ t = 1
+/\ nCat = 0
+/\ ep = 1
+/\ intents = {1}
+/\ fl = 5
+/\ ops = << [ ep |-> 1,
+     ph |-> "committed",
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
+     cn0 |-> 1,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 1,
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 1,
+     ph |-> "committed",
+     it |-> 1,
+     at |-> 0,
+     ct |-> 1,
+     cn0 |-> 2,
+     eff |-> {},
+     prev |-> 1,
+     obs |-> 2,
+     rd |-> 1,
+     be |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+State 10: <PutIntent line 184, col 3 to line 191, col 76 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {}], [ep |-> 1, op |-> 2, eff |-> {}]>>
+/\ sst = "active"
+/\ nIssued = 2
+/\ bf = 5
+/\ cn = 2
+/\ t = 1
+/\ nCat = 0
+/\ ep = 1
+/\ intents = {1, 2}
+/\ fl = 5
+/\ ops = << [ ep |-> 1,
+     ph |-> "committed",
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
+     cn0 |-> 1,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 1,
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 1,
+     ph |-> "committed",
+     it |-> 1,
+     at |-> 0,
+     ct |-> 1,
+     cn0 |-> 2,
+     eff |-> {},
+     prev |-> 1,
+     obs |-> 2,
+     rd |-> 1,
+     be |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+State 11: <Ack line 196, col 3 to line 199, col 80 of module Durability>
+/\ nRestore = 0
+/\ dbq = <<[ep |-> 1, op |-> 1, eff |-> {}], [ep |-> 1, op |-> 2, eff |-> {}]>>
+/\ sst = "active"
+/\ nIssued = 2
+/\ bf = 5
+/\ cn = 2
+/\ t = 1
+/\ nCat = 0
+/\ ep = 1
+/\ intents = {1, 2}
+/\ fl = 5
+/\ ops = << [ ep |-> 1,
+     ph |-> "committed",
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
+     cn0 |-> 1,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 1,
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 1,
      ph |-> "acked",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
-     cn0 |-> 0,
+     it |-> 1,
+     at |-> 0,
+     ct |-> 1,
+     cn0 |-> 2,
      eff |-> {},
-     prev |-> 0,
-     obs |-> 1,
-     rd |-> -1,
-     be |-> 0 ],
+     prev |-> 1,
+     obs |-> 2,
+     rd |-> 1,
+     be |-> 1 ],
    [ ep |-> 0,
      ph |-> "none",
      it |-> 0,
@@ -430,40 +523,40 @@ State 9: <Ack line 196, col 3 to line 199, col 80 of module Durability>
      rd |-> -1,
      be |-> 0 ] >>
 
-State 10: <RestoreTo line 219, col 3 to line 225, col 53 of module Durability>
+State 12: <RestoreTo line 219, col 3 to line 225, col 53 of module Durability>
 /\ nRestore = 1
 /\ dbq = <<>>
 /\ sst = "restoring"
 /\ nIssued = 2
 /\ bf = 0
-/\ cn = 1
-/\ t = 3
+/\ cn = 2
+/\ t = 1
 /\ nCat = 0
 /\ ep = 2
-/\ intents = {}
+/\ intents = {1, 2}
 /\ fl = 0
 /\ ops = << [ ep |-> 1,
      ph |-> "committed",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
      cn0 |-> 1,
-     eff |-> {0},
-     prev |-> 0,
-     obs |-> 1,
-     rd |-> -1,
-     be |-> 0 ],
-   [ ep |-> 0,
-     ph |-> "acked",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
-     cn0 |-> 0,
      eff |-> {},
      prev |-> 0,
      obs |-> 1,
-     rd |-> -1,
-     be |-> 0 ],
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 1,
+     ph |-> "acked",
+     it |-> 1,
+     at |-> 0,
+     ct |-> 1,
+     cn0 |-> 2,
+     eff |-> {},
+     prev |-> 1,
+     obs |-> 2,
+     rd |-> 1,
+     be |-> 1 ],
    [ ep |-> 0,
      ph |-> "none",
      it |-> 0,
@@ -476,40 +569,86 @@ State 10: <RestoreTo line 219, col 3 to line 225, col 53 of module Durability>
      rd |-> -1,
      be |-> 0 ] >>
 
-State 11: <Reopen line 256, col 3 to line 259, col 76 of module Durability>
+State 13: <Replay line 246, col 3 to line 253, col 75 of module Durability>
 /\ nRestore = 1
-/\ dbq = <<>>
+/\ dbq = <<[ep |-> 2, op |-> 1, eff |-> {}]>>
+/\ sst = "restoring"
+/\ nIssued = 2
+/\ bf = 0
+/\ cn = 2
+/\ t = 1
+/\ nCat = 0
+/\ ep = 2
+/\ intents = {1, 2}
+/\ fl = 0
+/\ ops = << [ ep |-> 1,
+     ph |-> "committed",
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
+     cn0 |-> 1,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 1,
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 1,
+     ph |-> "acked",
+     it |-> 1,
+     at |-> 0,
+     ct |-> 1,
+     cn0 |-> 2,
+     eff |-> {},
+     prev |-> 1,
+     obs |-> 2,
+     rd |-> 1,
+     be |-> 1 ],
+   [ ep |-> 0,
+     ph |-> "none",
+     it |-> 0,
+     at |-> 0,
+     ct |-> 0,
+     cn0 |-> 0,
+     eff |-> {},
+     prev |-> 0,
+     obs |-> 0,
+     rd |-> -1,
+     be |-> 0 ] >>
+
+State 14: <Reopen line 256, col 3 to line 259, col 76 of module Durability>
+/\ nRestore = 1
+/\ dbq = <<[ep |-> 2, op |-> 1, eff |-> {}]>>
 /\ sst = "active"
 /\ nIssued = 2
 /\ bf = 0
-/\ cn = 1
-/\ t = 3
+/\ cn = 2
+/\ t = 1
 /\ nCat = 0
 /\ ep = 2
-/\ intents = {}
+/\ intents = {1, 2}
 /\ fl = 0
 /\ ops = << [ ep |-> 1,
      ph |-> "committed",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
+     it |-> 1,
+     at |-> 1,
+     ct |-> 1,
      cn0 |-> 1,
-     eff |-> {0},
-     prev |-> 0,
-     obs |-> 1,
-     rd |-> -1,
-     be |-> 0 ],
-   [ ep |-> 0,
-     ph |-> "acked",
-     it |-> 3,
-     at |-> 3,
-     ct |-> 3,
-     cn0 |-> 0,
      eff |-> {},
      prev |-> 0,
      obs |-> 1,
-     rd |-> -1,
-     be |-> 0 ],
+     rd |-> 0,
+     be |-> 1 ],
+   [ ep |-> 1,
+     ph |-> "acked",
+     it |-> 1,
+     at |-> 0,
+     ct |-> 1,
+     cn0 |-> 2,
+     eff |-> {},
+     prev |-> 1,
+     obs |-> 2,
+     rd |-> 1,
+     be |-> 1 ],
    [ ep |-> 0,
      ph |-> "none",
      it |-> 0,
@@ -522,8 +661,8 @@ State 11: <Reopen line 256, col 3 to line 259, col 76 of module Durability>
      rd |-> -1,
      be |-> 0 ] >>
 
-41626 states generated, 17788 distinct states found, 12377 states left on queue.
-The depth of the complete state graph search is 11.
-The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 13 and the 95th percentile is 10).
-Finished in 01s at (2026-10-08 09:14:47)
-elapsed 2s
+6120798 states generated, 1911045 distinct states found, 958843 states left on queue.
+The depth of the complete state graph search is 15.
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 11 and the 95th percentile is 5).
+Finished in 14s at (2026-10-08 09:15:54)
+elapsed 15s

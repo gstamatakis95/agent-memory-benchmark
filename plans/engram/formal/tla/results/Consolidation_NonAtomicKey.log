@@ -1,5 +1,6 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=45529 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 72 and seed 3074405108908134133 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26387] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 85 and seed -1567937720940358550 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26861] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Consolidation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,9 +11,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Consolidation
-Starting... (2026-10-08 03:38:20)
+Starting... (2026-10-08 09:13:58)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 03:38:20.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 09:13:59.
 Error: Invariant ExactlyOnceEffect is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -155,7 +156,7 @@ State 2: <ProposeOk line 117, col 3 to line 120, col 118 of module Consolidation
   <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
 /\ applied = {}
 /\ pending = {}
-/\ stored = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o2]>>)
+/\ stored = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o1]>>)
 /\ queue = {1..4}
 /\ crashes = 0
 /\ failed = {}
@@ -225,16 +226,16 @@ State 3: <ApplyEffectOnly line 164, col 3 to line 171, col 95 of module Consolid
   <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
   <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
   <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
-  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o2] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o1] @@
   <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
 /\ applied = {}
 /\ pending = {<<{1, 2, 3, 4}, 1>>}
-/\ stored = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o2]>>)
+/\ stored = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o1]>>)
 /\ queue = {1..4}
 /\ crashes = 0
 /\ failed = {}
-/\ obs = ( o1 :> [st |-> "absent", src |-> {}] @@
-  o2 :> [st |-> "live", src |-> {1, 2, 3, 4}] )
+/\ obs = ( o1 :> [st |-> "live", src |-> {1, 2, 3, 4}] @@
+  o2 :> [st |-> "absent", src |-> {}] )
 /\ live = 1..4
 /\ mem = <<>>
 
@@ -300,16 +301,16 @@ State 4: <Crash line 195, col 3 to line 199, col 108 of module Consolidation>
   <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
   <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
   <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
-  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o2] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o1] @@
   <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
 /\ applied = {}
 /\ pending = {}
-/\ stored = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o2]>>)
+/\ stored = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o1]>>)
 /\ queue = {1..4}
 /\ crashes = 1
 /\ failed = {}
-/\ obs = ( o1 :> [st |-> "absent", src |-> {}] @@
-  o2 :> [st |-> "live", src |-> {1, 2, 3, 4}] )
+/\ obs = ( o1 :> [st |-> "live", src |-> {1, 2, 3, 4}] @@
+  o2 :> [st |-> "absent", src |-> {}] )
 /\ live = 1..4
 /\ mem = <<>>
 
@@ -375,21 +376,21 @@ State 5: <ApplyEffectOnly line 164, col 3 to line 171, col 95 of module Consolid
   <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
   <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
   <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
-  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o2] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o1] @@
   <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
 /\ applied = {}
 /\ pending = {<<{1, 2, 3, 4}, 1>>}
-/\ stored = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o2]>>)
+/\ stored = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o1]>>)
 /\ queue = {1..4}
 /\ crashes = 1
 /\ failed = {}
-/\ obs = ( o1 :> [st |-> "absent", src |-> {}] @@
-  o2 :> [st |-> "live", src |-> {1, 2, 3, 4}] )
+/\ obs = ( o1 :> [st |-> "live", src |-> {1, 2, 3, 4}] @@
+  o2 :> [st |-> "absent", src |-> {}] )
 /\ live = 1..4
 /\ mem = <<>>
 
-1136 states generated, 719 distinct states found, 536 states left on queue.
+415 states generated, 344 distinct states found, 263 states left on queue.
 The depth of the complete state graph search is 5.
 The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 31 and the 95th percentile is 6).
-Finished in 00s at (2026-10-08 03:38:20)
-elapsed 1s rc=0
+Finished in 00s at (2026-10-08 09:13:59)
+elapsed 1s

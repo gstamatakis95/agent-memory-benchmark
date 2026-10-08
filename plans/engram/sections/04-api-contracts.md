@@ -241,7 +241,7 @@ generated from `internal/errs` (`make gen-docs`): **one gRPC code per detail typ
 | `NamespaceNotReady{namespace_id, retry_after}` (+ `RetryInfo`) | `UNAVAILABLE` | The target shard of a move is `ready` but not yet `active` (cutover sub-steps (b′) to (b″), well under a second, N125). The API retries inside its bounded loop first. | Retry after `retry_after`. |
 | `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: namespace cutover in progress, page already refreshing, snapshot already running. | `WaitOperation(existing_operation_id)` then resubmit. |
 | `OperationConflict{reason: IDEMPOTENCY_KEY_REUSED}` | `ALREADY_EXISTS` | `request_id`/`operation_id` reused with a different request hash; namespace/page `name` already taken. | Use a fresh id; the stored one is bound to a different request. |
-| `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation (`OPERATION_TERMINAL`) or on a `DELETE_*` operation (`OPERATION_NOT_CANCELLABLE`, N136), etag mismatch, `Invalidate` on a non-fact id (a second `Invalidate` of the same fact is a **no-op success**, not an error, N139), `Restore` of a fact with no `invalidate` marker (`NOT_INVALIDATED`), namespace `DELETING` (the delete freeze included), tenant `DELETING` (`TENANT_DELETING`), snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
+| `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation (`OPERATION_TERMINAL`) or on a `DELETE_*` operation (`OPERATION_NOT_CANCELLABLE`, N136), etag mismatch, `Invalidate` on a non-fact id (a second `Invalidate` of the same fact succeeds, not an error, and changes no visibility, but still writes its own `deletion_log` row and intent, N139, N143), `Restore` of a fact with no `invalidate` marker (`NOT_INVALIDATED`), namespace `DELETING` (the delete freeze included), tenant `DELETING` (`TENANT_DELETING`), snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
 | — | `UNAUTHENTICATED` | Missing/invalid/expired JWT. | Refresh the token. |
 | — | `PERMISSION_DENIED` | Scope or allowlist (4.1.1). | Obtain a broader token. |
 | — (+ `RetryInfo{2 s}`) | `UNAVAILABLE` | Catalog **miss** while the catalog is down (D4 as amended: cached entries of existing namespaces are served indefinitely, only misses fail), shard `READONLY`/`RETIRED` or marked unavailable by the schema-version guard (N22), pgbouncer pool exhausted. | Retry with jittered backoff; idempotent by construction. |
@@ -755,7 +755,7 @@ return paths are unambiguous. Full file under `plans/engram/proto/memory/v1/oper
   `Memory.invalidated_at` reports the `invalidate` marker's time only, and a `reextract` row (a
   prompt or model bump hid a stale extraction) neither shows there nor hides any derived version.
   `ObservationInfo.stale` means "a rewrite is pending", not "hidden". A second `Invalidate` of the
-  same fact is a no-op success; `Restore` is exact and takes the exclusive derivation lock, so
+  same fact succeeds without changing visibility and still writes its own deletion record and intent (N143); `Restore` is exact and takes the exclusive derivation lock, so
   `Invalidate`/`Restore` and the delete RPCs have a 40 s deadline cap (4.1.2).
 - **Parity rules (N129).** Rank 1 is always emitted whole and its overflow counted in
   `RecallStats.tokens_used` (Hindsight returns the top result whole); the rerank depth 0/50/150 is
@@ -858,8 +858,12 @@ service MemoryService {
   // expired by it; they honour it from the next snapshot and meanwhile
   // through the manifest's hidden_overlay (decision N126). Reversible:
   // Restore deletes the marker and nothing else encodes the invalidation, so
-  // it is exact. Invalidating an already invalidated fact is a no-op success
-  // (decision N139). Scope memory.write. Milliseconds in the common case.
+  // it is exact. Invalidating an already invalidated fact succeeds and changes
+  // no visibility, but it still writes its own deletion-log row and intent
+  // (decisions N139, N143). The ack follows a re-read of the marker after the
+  // intent put; if a restore removed it, the call returns UNAVAILABLE and the
+  // client retries (decision N143). Scope memory.write. Milliseconds in the
+  // common case.
   rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
   // Restore deletes the `invalidate` marker of a fact and the derived-hidden
   // rows that carry its cause (decisions N115, N135); a `reextract` marker is
@@ -1305,8 +1309,9 @@ message InvalidateRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   // Must be a MEMORY_KIND_FACT id, else FAILED_PRECONDITION
-  // {MEMORY_NOT_A_FACT}. Already-invalidated facts are a no-op success
-  // (decision N139).
+  // {MEMORY_NOT_A_FACT}. Already-invalidated facts succeed without changing
+  // visibility and still write their own deletion-log row and intent
+  // (decisions N139, N143).
   string memory_id = 3;
   // Free-text audit reason, ≤ 1 KiB.
   string reason = 4;
@@ -1485,8 +1490,9 @@ row, a `deletion_log` row (with the subject's previous entry as chain predecesso
 event; **after it commits, the delete intent object is put to blob storage** with the marker's
 exact effect (N122), and only then does the call ack, in milliseconds at any document size. A
 duplicate attempt that finds the document already `DELETING` returns the existing operation and
-first makes sure the intent of the marker it found exists, so an ack always implies an intent; a
-crash between the commit and the put leaves a committed but unacknowledged delete that a restore
+first makes sure the intent of the marker it found exists, so an ack always implies an intent; after the put
+the handler re-reads the marker and acks only if it is still present, else the call returns `UNAVAILABLE` and the
+client retries (N143); a crash between the commit and the put leaves a committed but unacknowledged delete that a restore
 may lose and the client's retry re-applies. From the ack on every read path evaluates the
 read-time predicate (N116, N117) and returns nothing derived from the document, and every export
 snapshot that contains it (also one still `building`) is expired in the same transaction (N126).
@@ -1602,7 +1608,7 @@ both epochs, `MoveState` = `PLANNED, COPYING, FROZEN, RECONCILING, CUTOVER, COMM
 DONE, ROLLED_BACK` (`CATCHING_UP` reserved; the pre-freeze verification runs inside `COPYING`),
 `cutover_step` (`READY_TARGET`, `CATALOG_COMMIT`, `MOVED_OUT_SOURCE`, `ACTIVE_TARGET`,
 `CATALOG_FLIP`), `past_point_of_no_return`, `source_blobs_gc_after` (the source blob prefix is kept
-for the 28-day backup window, N123) and `MoveProgress{rows_copied, rows_catchup_copied,
+for the 28-day backup window, N123; the source rows are deleted only after the 24 h grace and a full target backup taken after activation, N143) and `MoveProgress{rows_copied, rows_catchup_copied,
 rows_recopied, mutable_rows_reconciled, blobs_reconciled, copy_started_at, freeze_watchdog,
 restarted_operation_ids, tables_done}`; `copy_start_seq`, `applied_seq` and the replay lag fields
 are reserved, and `Move.operation_id` is reserved (a move is not an operation, N127). Full file

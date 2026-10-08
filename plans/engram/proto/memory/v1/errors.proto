@@ -280,8 +280,8 @@ message Precondition {
   // "PAGE_NO_VERSION", "PAGE_HIDDEN" (the requested page version is hidden by
   // a delete or invalidation until the refresh lands, decision N117),
   // "MEMORY_NOT_A_FACT", "NOT_INVALIDATED" (Restore of a fact with no
-  // `invalidate` marker; a second Invalidate is a no-op success, decision
-  // N139),
+  // `invalidate` marker; a second Invalidate succeeds without changing visibility and still
+  // writes its own deletion-log row and intent, decisions N139 and N143),
   // "TENANT_DELETING", "SCHEMA_VERSION_MISMATCH" (a move or migration refused
   // because source and target shards run different schema versions).
   string type = 1;

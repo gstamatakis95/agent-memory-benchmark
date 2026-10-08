@@ -744,6 +744,11 @@ CREATE TABLE outbox_skipped (
 -- previous entry read under the document lock: replay applies a subject's intents in chain order, never
 -- by clock. effect is the marker's exact effect, so a duplicate attempt that finds the subject already
 -- deleted re-puts the committed marker's own intent (put-if-absent). Insert-only.
+-- epoch (N143): the namespace epoch the marker committed under, copied into the intent object. Replay applies a
+-- subject's intents in chain order and SKIPS an intent whose epoch is older than that of an entry of the same
+-- subject already applied (here or by an earlier replay step), so a stale intent can never override a later one.
+-- A second Invalidate or Restore of the same fact is NOT a silent no-op: it writes its own row (fresh operation_id,
+-- prev_operation_id = the subject's last entry) and its own intent, although visibility does not change.
 CREATE TABLE deletion_log (
   namespace_id  uuid NOT NULL,
   tenant_id     text NOT NULL,
@@ -2029,23 +2034,38 @@ LANGUAGE sql STABLE AS $$
         OR EXISTS (SELECT 1 FROM fact_hidden h WHERE h.namespace_id = p_ns AND h.memory_id = f.memory_id));
 $$;
 
---   (3) the base: the version the writer rendered from is still CURRENT and VISIBLE. A root rebuild has no base
---       (p_base IS NULL) and skips the check. Inheriting root(base) and requiring only a visible base is rejected:
---       a visible but superseded base still lets stale text overwrite a rebuild.
-CREATE FUNCTION engram_derivation_base_ok(p_ns uuid, p_kind text, p_id uuid, p_base integer) RETURNS boolean
-LANGUAGE sql STABLE AS $$
-  SELECT CASE
-           WHEN p_base IS NULL THEN true
-           WHEN p_kind = 'observation' THEN
-             coalesce((SELECT o.current_version = p_base
-                              AND NOT engram_obs_version_hidden(p_ns, p_id, p_base, engram_doc_tomb(p_ns, false))
-                         FROM observations o WHERE o.namespace_id = p_ns AND o.observation_id = p_id), false)
-           WHEN p_kind = 'page' THEN
-             coalesce((SELECT g.current_version = p_base
-                              AND NOT engram_page_version_hidden(p_ns, p_id, p_base, engram_doc_tomb(p_ns, false))
-                         FROM pages g WHERE g.namespace_id = p_ns AND g.page_id = p_id), false)
-           ELSE false END;
-$$;
+--   (3) the base, as a COMPARE-AND-SET at commit (N143, BaseCurrentAtCommit): the version the writer rendered from
+--       is still CURRENT and VISIBLE, and the same statement advances current_version, so two writers that rendered
+--       from the same base cannot both commit (the SHARED derivation lock does not serialise them; the row lock of
+--       this UPDATE does). It is the last check before the version rows are inserted, in the commit transaction:
+--         UPDATE observations SET current_version = v + 1 WHERE ... AND current_version = base_version
+--       Zero rows (NULL result) means the writer lost: ROLLBACK and discard the rendered result. Returns the new
+--       version number the caller inserts into observation_versions / page_versions. A root rebuild has no base
+--       (p_base IS NULL): it advances the row it holds and skips the equality and visibility checks. Inheriting
+--       root(base) and requiring only a visible base is rejected: a visible but superseded base still lets stale
+--       text overwrite a rebuild. VOLATILE: this is a write, never a read-only probe.
+CREATE FUNCTION engram_derivation_base_cas(p_ns uuid, p_kind text, p_id uuid, p_base integer) RETURNS integer
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE
+  v integer;
+BEGIN
+  IF p_kind = 'observation' THEN
+    UPDATE observations o SET current_version = o.current_version + 1
+     WHERE o.namespace_id = p_ns AND o.observation_id = p_id
+       AND (p_base IS NULL
+            OR (o.current_version = p_base
+                AND NOT engram_obs_version_hidden(p_ns, p_id, p_base, engram_doc_tomb(p_ns, false))))
+    RETURNING o.current_version INTO v;
+  ELSIF p_kind = 'page' THEN
+    UPDATE pages g SET current_version = g.current_version + 1
+     WHERE g.namespace_id = p_ns AND g.page_id = p_id
+       AND (p_base IS NULL
+            OR (g.current_version = p_base
+                AND NOT engram_page_version_hidden(p_ns, p_id, p_base, engram_doc_tomb(p_ns, false))))
+    RETURNING g.current_version INTO v;
+  END IF;
+  RETURN v;   -- NULL: zero rows updated (lost the compare-and-set, or an unknown kind/id) -> discard
+END $$;
 
 -- The tombstone view of a DELETING document (N115, N136): the only thing GetDocument and
 -- ListDocuments(include_deleting) return from the ack on. security_invoker: the caller's RLS applies.

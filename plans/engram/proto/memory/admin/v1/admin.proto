@@ -121,7 +121,9 @@ service MoveService {
   // fence value is restored. After (a″) a rollback is a new move back
   // (FAILED_PRECONDITION).
   rpc RollbackMove(RollbackMoveRequest) returns (RollbackMoveResponse);
-  // CleanupMove runs decision D5 step 7 after the 24 h grace: drops the
+  // CleanupMove runs decision D5 step 7 after the 24 h grace AND a full backup
+  // of the target shard that started after activation (decision N143; before
+  // both it is refused with FAILED_PRECONDITION): drops the
   // namespace's partial indexes on the source shard by their deterministic
   // names, deletes its rows (`engram_cleanup_namespace`, batched) and sets the
   // move DONE. The source blob prefix is kept until the 28-day backup window

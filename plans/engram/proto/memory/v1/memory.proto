@@ -85,8 +85,12 @@ service MemoryService {
   // expired by it; they honour it from the next snapshot and meanwhile
   // through the manifest's hidden_overlay (decision N126). Reversible:
   // Restore deletes the marker and nothing else encodes the invalidation, so
-  // it is exact. Invalidating an already invalidated fact is a no-op success
-  // (decision N139). Scope memory.write. Milliseconds in the common case.
+  // it is exact. Invalidating an already invalidated fact succeeds and changes
+  // no visibility, but it still writes its own deletion-log row and intent
+  // (decisions N139, N143). The ack follows a re-read of the marker after the
+  // intent put; if a restore removed it, the call returns UNAVAILABLE and the
+  // client retries (decision N143). Scope memory.write. Milliseconds in the
+  // common case.
   rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
   // Restore deletes the `invalidate` marker of a fact and the derived-hidden
   // rows that carry its cause (decisions N115, N135); a `reextract` marker is
@@ -532,8 +536,9 @@ message InvalidateRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   // Must be a MEMORY_KIND_FACT id, else FAILED_PRECONDITION
-  // {MEMORY_NOT_A_FACT}. Already-invalidated facts are a no-op success
-  // (decision N139).
+  // {MEMORY_NOT_A_FACT}. Already-invalidated facts succeed without changing
+  // visibility and still write their own deletion-log row and intent
+  // (decisions N139, N143).
   string memory_id = 3;
   // Free-text audit reason, ≤ 1 KiB.
   string reason = 4;

@@ -147,6 +147,7 @@ CREATE TABLE namespace_moves (
   committed_at timestamptz,    -- (a'') the catalog CAS cutover -> committed: the point of no return
   moved_out_at timestamptz,    -- (c) on the source; informational
   activated_at timestamptz,    -- (b'') target ready -> active
+  target_backup_at timestamptz, -- completion of a FULL target backup that STARTED after activated_at (N143); source cleanup waits for it and for the 24 h grace
   finished_at timestamptz
 );
 CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)
@@ -157,7 +158,11 @@ CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)
 It is the arbiter of the move, of restore and of failover, through one catalog CAS (N123, N125):
 `UPDATE namespace_moves SET state = 'committed' WHERE move_id = $1 AND state = 'cutover'` is the point
 of no return; restore and failover CAS `cutover → rolled_back` instead, or, reading `committed`,
-complete (c), (b″) and (d) themselves. Exactly one CAS wins and the loser stops. The trigger
+complete (c), (b″) and (d) themselves. Exactly one CAS wins and the loser stops. The CAS is on the **exact rows the mover
+verified** (N143): its `WHERE` also carries the source and target shards, `from_epoch`, the recorded `source_system_id` and
+`source_timeline_id`, and requires the catalog `namespaces` row to still name `(source, e, frozen)`; every shard-side step is
+likewise an `UPDATE namespace_ownership … WHERE` on the verified `(state, freeze_reason, epoch, move_id)` of the source or
+target row, and zero rows stops the step with `MoveFenced`. The trigger
 `catalog_check_move_transition` encodes the edges, so nothing leaves `committed` backwards.
 
 **Config inheritance.** `tenants.config` and `namespaces.config` are `jsonb` objects holding the keys of D12; the database
@@ -184,7 +189,8 @@ quota_key, used)` is the cross-shard rollup for tenant-level daily quotas, fed b
 after the mover re-checks its timeline; (c) the source row goes `frozen/move → moved_out` with
 `target_shard_id` and `target_epoch`, executed only after the mover *read* `committed`; (b″) the target
 row goes `ready → active`; (d) the catalog `namespaces` flip `WHERE epoch = e AND state = 'frozen'`,
-retried indefinitely, with "already `(target, e + 1)`" as its only idempotent success. The API routes a
+retried indefinitely, with "already `(target, e + 1)`" as its only idempotent success; each of these steps is a compare-and-set
+on the ownership rows it verified (N143). The API routes a
 request that hits the `moved_out` row to the target using only the `WrongShardOrEpoch{MOVED_OUT}` detail
 and verifies at the target's fence, so (d) is on no read path. Between (c) and (b″) there is no owner at
 all, the simplest way to make "at most one writable owner" true. A failure before (a″) rolls back (3.3.1)
@@ -613,8 +619,9 @@ root rebuilds and merges, `CommitPageVersion` for `page/v1` and `page_full/v1`) 
 transaction that (1) try-locks the derivation lock shared, (2) re-verifies every rendered input in a
 fresh statement (`engram_facts_all_visible` for fact inputs against all open tombstones, `chunk_tomb`
 and `fact_hidden` of both causes; `engram_obs_version_hidden(…, engram_doc_tomb(ns, false))` for
-observation-version inputs), (3) checks its base (`engram_derivation_base_ok`: `current_version =
-base_version` and visible; a root rebuild has none), (4) on any failure rolls back and re-derives from
+observation-version inputs), (3) checks its base (a **compare-and-set at commit**, N143: `engram_derivation_base_cas` runs `UPDATE … SET
+current_version = v + 1 WHERE … AND current_version = base_version` for a visible base and returns the new number, zero rows rolls
+back and discards; a root rebuild has no base), (4) on any failure rolls back and re-derives from
 current evidence. The lock is never held across an LLM call.
 
 **Two-stage consolidation (N121).** Stage 1 (routing, one call per batch of 8 facts) persists
@@ -1153,9 +1160,9 @@ VALUES ($1, $t, $ik, 'document', $2, $e, $op, $prev, '{"up_to_version": …}'); 
 -- in-flight retain operations of the document are cancelled with cancel_reason 'document_deleted'; the delete operation row is kind 'delete_document' (N136)
 INSERT INTO outbox (seq, event_type, payload) VALUES ($seq, 'DocumentDeleted', $proto);              -- last statement; one row, O(1)
 COMMIT;                                                                                               -- then: put the intent object, then ack
--- Invalidate(f):  INSERT fact_hidden (cause 'invalidate') + curation_log ('invalidate') + deletion_log + outbox FactInvalidated      (a double Invalidate is a no-op success)
+-- Invalidate(f):  INSERT fact_hidden (cause 'invalidate') + curation_log ('invalidate') + deletion_log + outbox FactInvalidated      (a double Invalidate changes no visibility but still inserts its own deletion_log row and intent, N143)
 -- Restore(f):     exclusive derivation lock; DELETE FROM fact_hidden WHERE memory_id = $f AND cause = 'invalidate';
---                 DELETE FROM derived_hidden WHERE cause_kind = 'invalidation' AND cause_id = $f::text;  + curation_log ('restore') + deletion_log + outbox FactRestored
+--                 DELETE FROM derived_hidden WHERE cause_kind = 'invalidation' AND cause_id = $f::text;  + curation_log ('restore') + deletion_log (a repeated Restore also writes its own row, N143) + outbox FactRestored
 ```
 
 Nothing else is touched, so the commit takes milliseconds at any size and the SLO is the marker transaction (plus the 10 to 50 ms
@@ -1222,7 +1229,7 @@ UPDATE observations SET stale_write = true, stale_since = coalesce(stale_since, 
 
 **Consolidation apply order** (stage 2, N120/N121). One transaction: `engram_try_derivation_lock` (refused → retry); re-verify every
 rendered input in a fresh statement (`engram_facts_all_visible($input_fact_ids)`; no `FOR SHARE`, facts are immutable); for an `update`
-or `merge` op check the base (`engram_derivation_base_ok(ns, 'observation', $o, $base_version)`), and on **any** failure roll back,
+or `merge` op the base check is the **compare-and-set** `SELECT engram_derivation_base_cas(ns, 'observation', $o, $base_version)` (i.e. `UPDATE observations SET current_version = v + 1 WHERE … AND current_version = base_version`; it returns the new version number and its row lock serialises writers that the shared derivation lock does not), and on **any** failure, zero rows included, roll back,
 `UPDATE consolidation_batches SET state = 'discarded'`, and re-route under a new attempt (no `DELETE`, no stored text is trusted past its
 base). Otherwise the `update` op inserts the new `observation_versions` row (with `root_version` inherited from the base), the
 `observation_version_vectors` row, `observation_version_meta` for the previous version, the `observation_inputs` rows (the facts shown),
@@ -1291,7 +1298,9 @@ Freeze work = rows inserted since `T_pre − 10 min` + the mutable rows (M1.5 me
 `TestMove_ActiveBacklog`). The expunge is paused from Plan to done. After the catalog CAS and cutover, cleanup on the source runs the
 `drop` statements of `engram_hnsw_ddl` (by their deterministic names; rollback does the same on the target), then `SELECT
 engram_cleanup_namespace($1, 10000)` in a loop until it returns 0 (the outer `DELETE` carries `namespace_id`, P-19), as `engram_move`,
-once the row is `moved_out`. `CleanupMove` deletes the moved-out rows at 24 h and the source blob prefix only after the 28-day backup window.
+once the row is `moved_out`. `CleanupMove` deletes the moved-out rows only after the 24 h grace **and** a full backup of the target taken after activation
+(`namespace_moves.target_backup_at IS NOT NULL`, N143: until then the target's only restorable copy of the moved rows would be
+the source's), and the source blob prefix only after the 28-day backup window.
 
 **Outbox relay** (`engram_relay`, direct connection): `SELECT … FROM outbox WHERE seq > $hwm ORDER BY seq LIMIT 500`; gap probe `WHERE seq = ANY ($gaps)`;
 `UPDATE outbox_cursors SET last_seq = $n, gaps = $j WHERE consumer = $c` (batched to 1/s). Retention (admin): `DELETE FROM outbox` in 10,000-row `seq`
@@ -1365,10 +1374,11 @@ admin RPC, D4). The **stats sweeper** refreshes `namespace_stats` (visible-fact 
 | Finding | Register | Change in §3 and the SQL |
 |---|---|---|
 | C-1, C-6, C-14, C-15, C-18, P-2, A-19, A-20 | N135, N42, N58 | evidence tables without FK to `facts`; `fact_hidden` keyed `(memory_id, cause)`; derived predicates read `invalidate` only and fail closed; `stale_write` on re-extraction; `REEXTRACTED_FACTS` purge |
-| C-2, C-3, C-7, C-11 | N120, N121, N43 | `engram_facts_all_visible`, `engram_derivation_base_ok`; proposals keyed `(batch_key, attempt)` with `base_version`; `consolidation_batches.state`/`attempt`; no `DELETE` by `engram_app` |
+| C-2, C-3, C-7, C-11 | N120, N121, N43 | `engram_facts_all_visible`, `engram_derivation_base_cas` (N143); proposals keyed `(batch_key, attempt)` with `base_version`; `consolidation_batches.state`/`attempt`; no `DELETE` by `engram_app` |
 | A-2, A-3, A-7, C-12 | N136, N115, N119 | `stub` on versions, deferred meta FK, `DerivedPurge`; content columns cleared by the marker, `document_tombstone_view`; operation kinds from the proto enums |
 | C-4, C-5, C-13, C-16, P-13 | N122, N134, N101 | intent after commit; `deletion_log.prev_operation_id`, `effect`; replay floor in `catalog.shards`; `restore_delete` edge |
 | C-8, C-23, P-1, C-20 | N137, N124 | class tags, `ins_seq` + `engram_seq_log`/`engram_seq_floor`; `namespace_moves.t_pre`, `w_pre` |
+| model checking round 4 | N143 | `engram_derivation_base_cas` (compare-and-set at commit); `deletion_log.epoch` carried into the intent and the replay guard; `namespace_moves.target_backup_at`; CAS on the verified ownership rows |
 | C-10, C-22 | N125, N123 | `move_state` `committed`, `committed_at`, transition trigger (catalog CAS) |
 | C-9, A-1, P-3, P-4, P-7, P-8, P-9, P-10 | N104, N138 | owner-keyed `ledger/{ledger_id}`, `ver/{document_id}/v{n}` with `CHECK`s; `fact_type` on `fact_vectors`, `fact_count`, `mentioned_histogram`; `vector_indexes` machine, runner views, `engram_hnsw_ddl` `index_state`; `vacuum_index_cleanup = off` |
 | P-5, P-6, P-11, A-16 | N114, D3, N142 | 8 M / 12 M / 600 GB, 120 namespaces, 181 GB per 10 M, IOPS table, WAL pacing |

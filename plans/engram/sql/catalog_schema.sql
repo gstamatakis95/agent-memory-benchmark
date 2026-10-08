@@ -203,6 +203,9 @@ CREATE TRIGGER namespaces_touch BEFORE UPDATE ON namespaces
 -- (target, e + 1)" as the only idempotent success. The API routes from the moved_out row's
 -- WrongShardOrEpoch detail, so (d) is on no read path.
 -- There is no outbox position here: the move never reads or replays the outbox (N124).
+-- Every step, the CAS above included, is a compare-and-set on the exact ownership rows the mover verified (N143): the
+-- CAS adds the verified shards, from_epoch, source_system_id / source_timeline_id and requires the namespaces row to
+-- still be (source, from_epoch, 'frozen'). Cleanup of the source needs 'done', which needs target_backup_at (N143).
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespace_moves (
   move_id                uuid PRIMARY KEY,
@@ -228,13 +231,15 @@ CREATE TABLE namespace_moves (
   committed_at           timestamptz,               -- (a'') the catalog CAS cutover -> committed: the point of no return
   moved_out_at           timestamptz,               -- (c) on the source; informational (the arbiter is committed_at)
   activated_at           timestamptz,               -- (b'') target ready -> active
+  target_backup_at       timestamptz,               -- N143: completion of a FULL target backup that STARTED after activated_at; source cleanup waits for it and for the 24 h grace
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
   CHECK (to_epoch = from_epoch + 1),
   CHECK ((source_system_id IS NULL) = (source_timeline_id IS NULL)),
   CHECK (state NOT IN ('reconciling', 'cutover', 'committed', 'cleaning', 'done') OR frozen_at IS NOT NULL),
   CHECK (state NOT IN ('committed', 'cleaning', 'done') OR committed_at IS NOT NULL),
-  CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL)
+  CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL),
+  CHECK (state <> 'done' OR (activated_at IS NOT NULL AND target_backup_at IS NOT NULL AND target_backup_at >= activated_at))
 );
 
 CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)

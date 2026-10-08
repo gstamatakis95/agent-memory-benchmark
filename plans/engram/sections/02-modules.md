@@ -258,13 +258,16 @@ type Submitter interface { Submit(ctx context.Context, sc authz.RequestScope, re
 
 // Deleter is the synchronous half of every delete: ONE marker transaction, then the intent object (put after the
 // commit, before the ack), then the ack (N115, N122). A duplicate attempt that finds the subject already deleted
-// returns the existing operation and first ensures the intent of the marker it found (put-if-absent).
+// returns the existing operation and first ensures the intent of the marker it found (put-if-absent). The ack is
+// conditional (N143): after the intent put the handler RE-READS the marker (a plain read of the tombstone or
+// fact_hidden row and its deletion_log row) and acks only if it is still present; if a restore or failover removed
+// it in between, the request returns UNAVAILABLE and the client retries (TestIntent_AckRereadsMarker).
 type Deleter interface {
 	DeleteDocument(ctx context.Context, sc authz.RequestScope, doc id.DocumentID, o DeleteOptions) (*memoryv1.DeleteDocumentResponse, error) // DeleteOptions{OperationID, ExpectedVersion id.DocVersion (compared inside the marker tx)}
 	DeleteNamespace(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirmName string) (*memoryv1.DeleteNamespaceResponse, error) // keeps the client's operation_id
 	DeleteTenant(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirm id.TenantID) (*adminv1.DeleteTenantResponse, error)       // acks after the catalog row and the tenant intent; fences asynchronously
-	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // a second Invalidate is a no-op success
-	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // exclusive derivation lock: 40 s deadline cap
+	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // a second Invalidate changes no visibility but still writes its own deletion_log row and intent (N143)
+	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // exclusive derivation lock: 40 s deadline cap; a repeated Restore also writes its own row and intent (N143)
 }
 
 // OperationWaiter implements WaitOperation: park on Temporal's workflow-result long-poll (≤ MaxOpenWaits per
@@ -345,7 +348,8 @@ type Namespaces interface { // the directory
 type Moves interface { // the move ledger: every transition is a CAS on the current state
 	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID) (*MoveRow, error)   // source_system_id, source_timeline_id, t_copy recorded
 	Advance(ctx context.Context, m id.MoveID, from, to fsm.MoveState) error
-	Commit(ctx context.Context, m id.MoveID) error                                      // (a″) CAS cutover → committed: THE point of no return; ErrLost if a rollback or restore won the row (N125)
+	Commit(ctx context.Context, p CommitParams) error                                   // (a″) CAS cutover → committed WHERE move_id, state = 'cutover' AND the verified source/target shards, epochs, timeline AND the catalog namespace row (source, e, frozen) (N143): THE point of no return; ErrLost if a rollback or restore won the row (N125) or any verified value changed
+	RecordTargetBackup(ctx context.Context, m id.MoveID, completedAt time.Time) error  // sets target_backup_at, only for a full backup that STARTED after activated_at (N143)
 	Cutover(ctx context.Context, p CutoverParams) error                                 // step (d) only: shard, epoch, state, NOTIFY; success also when already (target, e + 1)
 	Rollback(ctx context.Context, m id.MoveID, reason string) error                     // CAS cutover → rolled_back (or any earlier state); ErrCommitted if (a″) won
 }
@@ -610,7 +614,7 @@ type GraphReader interface {
 type Markers interface {
 	TombstoneDocument(ctx context.Context, t DocumentTombstone) (DeletionRecord, error)                       // document_tombstones 'pending' covering (document, t.UpToVersion = highest version assigned, N133c); event_seq set from the outbox seq in the same statement as the append (P-15)
 	TombstoneChunks(ctx context.Context, reason ChunkReason, cs []id.ChunkID) error                            // 'replace' | 'reextract'
-	Hide(ctx context.Context, f id.FactID, cause HideCause, reason string) (rec DeletionRecord, changed bool, err error) // fact_hidden keyed (memory_id, cause): 'invalidate' | 'reextract'; a second invalidate is changed = false, a no-op success (N139)
+	Hide(ctx context.Context, f id.FactID, cause HideCause, reason string) (rec DeletionRecord, changed bool, err error) // fact_hidden keyed (memory_id, cause): 'invalidate' | 'reextract'; a second invalidate is changed = false and a success (N139), but it still inserts its own deletion_log row (N143)
 	Unhide(ctx context.Context, f id.FactID) (rec DeletionRecord, changed bool, err error)                    // deletes the 'invalidate' row only; a 'reextract' row is never touched (N135)
 	Expunge() ExpungeRepo                                                                                      // expunge_progress, derived_hidden, consumer-cursor check
 }
@@ -626,10 +630,10 @@ type Derived interface {
 	TryDerivationLock(ctx context.Context) error       // shared; ErrRefused → retry (N120)
 	DerivationLockExclusive(ctx context.Context) error // Materialize and Restore: one 35 s attempt
 }
-// The derivation commit rule (N120) is two repository calls under the shared lock, in this order: Verify (a fresh statement), then InsertVersion.
+// The derivation commit rule (N120, N143) is two repository calls under the shared lock, in this order: Verify (a fresh statement), then InsertVersion, whose FIRST statement is the base compare-and-set.
 type ObservationRepo interface {
-	Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) // every rendered fact input against the FULL marker sets (all open tombstones, chunk_tomb, fact_hidden of both causes), observation-version inputs with engram_obs_version_hidden against ALL open tombstones, and the base: current_version = base_version and visible (a root rebuild has no base)
-	InsertVersion(ctx context.Context, v ObservationVersion, inputs []id.FactID, sources []Source) error // root_version, observation_inputs, observation_version_sources, vector, meta.superseded_at; no FK to facts (N135)
+	Verify(ctx context.Context, in VerifyInput) (VerifyResult, error) // every rendered fact input against the FULL marker sets (all open tombstones, chunk_tomb, fact_hidden of both causes), observation-version inputs with engram_obs_version_hidden against ALL open tombstones; an early, advisory base read only (the base check that counts is the CAS in InsertVersion)
+	InsertVersion(ctx context.Context, v ObservationVersion, inputs []id.FactID, sources []Source) error // FIRST the base CAS `UPDATE observations SET current_version = v + 1 WHERE … AND current_version = base_version` (engram_derivation_base_cas; a root rebuild has no base), zero rows = ErrBaseLost, the caller rolls back and discards (N143, BaseCurrentAtCommit, TestApply_BaseVersionCAS); then root_version, observation_inputs, observation_version_sources, vector, meta.superseded_at; no FK to facts (N135)
 	ReplaceSources(ctx context.Context, o id.ObservationID, add, drop []id.FactID) error   // the working set; only under the derivation lock; add before drop (N57)
 	Served(ctx context.Context, os []id.ObservationID, asOf time.Time) ([]ObservationVersion, error) // the version CURRENT at asOf if visible, nothing if hidden; zero visible sources are not served; fail closed (N117, N135)
 	MarkStale(ctx context.Context, os []id.ObservationID, k StaleKind) error                // narrow mutable row; hides nothing
@@ -913,7 +917,9 @@ type Applier interface { Apply(ctx context.Context, tx store.Tx, p Proposal) (Ap
 
 `Apply` runs in one fenced derivation transaction and obeys the commit rule of N120 (shared derivation lock;
 `Derived.Observations().Verify` re-verifies every rendered input in a fresh statement against the full marker
-sets and checks `current_version = base_version` and that the base is visible; on any failure it rolls back, the
+sets, and the base is checked as a **compare-and-set at commit** (`UPDATE … SET current_version = v + 1 WHERE …
+AND current_version = base_version`, base visible; zero rows means the writer lost; the shared lock does not serialise
+two writers, the row lock of the CAS does, N143); on any failure it rolls back, the
 **whole** proposal is discarded to the next attempt and the batch re-routed, never "repaired"):
 `consolidation_applied(op_key)` gates each write and commits with the effects (N43); `consolidation_batches.state =
 'applied'` is written with the `done` stamps, and an all-skip batch applies zero ops, stamps and terminates; versions carry `root_version`, `observation_inputs`
@@ -981,7 +987,7 @@ type Writer interface {
 `Page.RefreshPolicy` is the generated `memoryv1.RefreshPolicy`; there is no `on_delete`, `cron` or
 string policy. `Refresh` runs as workflow `ns/{ns}/page/{page_id}`; a refresh whose base version is
 hidden is a root rebuild, and `CommitPageVersion` obeys the derivation commit rule (N120): it re-verifies every
-rendered input and checks `current_version = base_version` under the shared lock, and a refused commit re-runs
+rendered input under the shared lock and commits with the same compare-and-set on `current_version = base_version` (N143), and a refused commit re-runs
 `page_full/v1` from current evidence (`TestPageRefresh_DeleteMidCall`). Page versions carry `text` (BM25) and a
 `page_version_vectors` row, so pages share the observation visibility and purge path (N139). *Test seam:* testcontainers; staleness-flag and `PAGE_HIDDEN` tests.
 
@@ -1122,10 +1128,14 @@ code path that holds two shard handles.*
 ```go
 package move
 
-type Fence struct { Ns id.NamespaceID; Tenant id.TenantID; Source, Target id.ShardID; Epoch id.Epoch /* e; the target holds e+1 */; Move id.MoveID }
+type Fence struct { Ns id.NamespaceID; Tenant id.TenantID; Source, Target id.ShardID; Epoch id.Epoch /* e; the target holds e+1 */; Move id.MoveID
+	SrcRow, DstRow OwnershipRow /* the exact source and target namespace_ownership rows the activity VERIFIED (state, freeze_reason, epoch, move_id, target hint) */ }
 
 // Activities are split by phase so each interface stays small (≤ 5 methods). Every activity first re-checks the fence
 // against the catalog row and both ownership rows and the source session's system_identifier/timeline (MoveFenced).
+// Every STEP, including the catalog CAS, is then a compare-and-set on the exact rows it verified (N143, ShardMove_UnfencedSteps):
+// each ownership edge is `UPDATE namespace_ownership … WHERE namespace_id AND state, freeze_reason, epoch, move_id = <the verified values>`,
+// and Moves.Commit adds the verified source/target shards, epochs and timeline to its WHERE; zero rows = MoveFenced, the step stops (TestMove_CatalogCAS).
 type Copier interface {
 	Plan(ctx context.Context, f Fence) (*PlanResult, error)         // plan_target / start_move edges; records system_id, timeline, t_copy; pauses expunge and schedulers
 	BulkCopy(ctx context.Context, f Fence) (*CopyResult, error)     // READ COMMITTED key ranges ≤ 100 k rows; resumable at (table, last_key); the three table classes of N137
@@ -1139,7 +1149,7 @@ type Freezer interface {
 type Cutover interface {
 	Begin(ctx context.Context, f Fence) error          // (a) intent only
 	ReadyTarget(ctx context.Context, f Fence) error    // (b′) ready_target
-	Commit(ctx context.Context, f Fence) error         // (a″) catalog Moves.Commit: CAS cutover → committed — THE point of no return; the mover re-checks its timeline first
+	Commit(ctx context.Context, f Fence) error         // (a″) catalog Moves.Commit: CAS cutover → committed on the VERIFIED source/target rows (f.SrcRow, f.DstRow, timeline) — THE point of no return; the mover re-checks its timeline first
 }
 type Handover interface { // only after Commit returned (the mover read `committed`)
 	Source(ctx context.Context, f Fence) error         // (c) cutover_c: frozen/move → moved_out + target hint
@@ -1148,7 +1158,7 @@ type Handover interface { // only after Commit returned (the mover read `committ
 }
 type Closer interface {
 	Restart(ctx context.Context, f Fence, d *DrainResult) error // ns/{ns}/op/{op} on shard-{target}, TERMINATE_IF_RUNNING, memo epoch e+1; singleton-backed kinds by SignalWithStart; reconcile loop
-	Cleanup(ctx context.Context, f Fence) error                  // after 24 h: DROP INDEX by name, engram_cleanup_namespace, the moved-out ROWS; the source blob prefix only after the 28-day window; the moved_out row stays
+	Cleanup(ctx context.Context, f Fence) error                  // after 24 h AND a full target backup taken after activation (N143, namespace_moves.target_backup_at; else ErrBackupPending, retried): DROP INDEX by name, engram_cleanup_namespace, the moved-out ROWS; the source blob prefix only after the 28-day window; the moved_out row stays
 	Rollback(ctx context.Context, f Fence, why string) error     // only before (a″): wins the cutover → rolled_back CAS first; see the table
 }
 type Orchestrator interface { // MoveService
@@ -1167,7 +1177,7 @@ type Orchestrator interface { // MoveService
 | `Commit` (a″) onward | none: the move completes forward (by the mover or by the restore reconcile); a reverse move is an ordinary new move |
 
 `StartOptions` carries `DrainWait` (15 s, max 60 s), `FreezeWatchdog(liveFacts)` (`max(120 s, 60 s + 1 s per
-10 k facts)`, ≤ 15 min), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h, `SourceBlobGrace` 28 d and the
+10 k facts)`, ≤ 15 min), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h (source cleanup also waits for a full target backup started after activation, N143), `SourceBlobGrace` 28 d and the
 cutover retry (100 ms ×1.5 → 1 s within 60 s; (b″) and (d) unlimited). *Test seam:* a model-based test from
 `ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: concurrent retain, consolidate and delete during the
 copy, rows inserted under old ids and mutable rows deleted on the source (`TestMove_ActiveBacklog`), a row committed
@@ -1325,6 +1335,7 @@ type Intent struct {
 	Operation   id.OperationID
 	Prev        id.OperationID       // the subject's last deletion_log entry read under the document lock: the chain predecessor (zero = first)
 	DeletedAt   time.Time
+	Epoch       id.Epoch             // the namespace epoch the marker committed under (N143): replay skips an intent older than an applied entry of its subject
 	UpToVersion id.DocVersion        // document kind: the tombstone's up_to_version, applied verbatim by the replay
 	MemoryIDs   []id.FactID          // invalidate and restore kinds
 }
@@ -1333,7 +1344,8 @@ type Subject struct { Document id.DocumentID; Fact id.FactID }
 type Log interface {
 	// Put is put-if-absent under the marker's own name and content (If-None-Match: *). The attempt that committed the marker
 	// calls it after the commit and before the ack; a duplicate attempt that finds the subject already deleted calls it with the
-	// marker it observed, so an ack always implies an intent and a duplicate never writes a second object.
+	// marker it observed, so an ack always implies an intent and a duplicate never writes a second object. After Put the
+	// handler re-reads the marker and acks only if it is still present, else UNAVAILABLE (N143, TestIntent_AckRereadsMarker).
 	Put(ctx context.Context, in Intent) (Key, error)
 	List(ctx context.Context, ns id.NamespaceID, since time.Time) ([]Intent, error) // in name order; replay order is Order, not name order
 	Trim(ctx context.Context, olderThan time.Duration) (int, error)                  // 35 days
@@ -1344,13 +1356,17 @@ type Log interface {
 func Order(in []Intent) []Intent
 ```
 
-`Put` follows the marker commit and precedes the ack. Restore and failover replay a namespace's intents with
+`Put` follows the marker commit and precedes the ack, and the ack is conditional: **after the put the handler re-reads the
+marker and acks only if it is still present**, otherwise it returns `UNAVAILABLE` and the client retries (a restore or
+failover between the put and the ack removed the marker; N143, `Durability_AckNoRecheck`). Intents carry the namespace
+epoch; **replay skips an intent older than an already-applied entry of the same subject** (`Durability_NoEpochGuard`), and a
+repeated `Invalidate` or `Restore` of the same fact writes its own `deletion_log` row and intent. Restore and failover replay a namespace's intents with
 `deleted_at ≥ replay_floor − 10 min`, where the floor is `catalog.ReplayFloor` (lowered by every restore, never raised
 while intents are retained), applying each **verbatim** — never recomputing `up_to_version` from restored state —
 through the admin variant of the marker transaction, idempotently through the shard `deletion_log`, and skipping
 namespace and tenant intents whose catalog row is not `deleting` or `deleted`. A tenant delete writes one intent per
 namespace as the workflow fences it, so the per-namespace listing reaches it. *Test seam:* `Durability.tla` model-based
-tests; `TestIntent_AckImpliesIntent`, `TestRestore_ChainOrder`, `TestRestore_FloorInCatalog`.
+tests; `TestIntent_AckImpliesIntent`, `TestIntent_DuplicateAttempt`, `TestIntent_AckRereadsMarker`, `TestIntent_EpochGuard`, `TestRestore_ChainOrder`, `TestRestore_FloorInCatalog`.
 
 #### 2.2.29 `internal/expunge` — the asynchronous half of a delete (N119)
 
@@ -1548,4 +1564,5 @@ type).
 | N120, N121, N135 | `Derived.*.Verify` and the commit rule; proposals keyed by attempt with `base_version`; `Served` is the version current at `T`; evidence has no FK to facts |
 | N122, N134 | `Deleter` commits then puts the intent, duplicates re-put; `intent.Log` with `Prev` chain and `Order`; `catalog.ReplayFloor` has no raise method |
 | N124, N125, N137 | `move` gains `PreVerify`, `Commit` (catalog CAS) and splits into `Copier`, `Freezer`, `Cutover`, `Handover`, `Closer`; `catalog.Moves.Commit` |
+| N143 | `InsertVersion` opens with the base compare-and-set (`engram_derivation_base_cas`); the delete ack re-reads the marker after the intent put; `Intent.Epoch` and the replay epoch guard; every mover step and `Moves.Commit` are CASes on the verified ownership rows; `Cleanup` waits for `target_backup_at` |
 | N136, N138 | `Purger`/`DerivedPurge`, WAL-paced expunge; selectivity-aware `Plan`; the index runner is the one DDL owner |

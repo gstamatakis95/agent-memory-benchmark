@@ -1,6 +1,5 @@
-Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=45529 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 67 and seed 7094808397790407494 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 27566] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 120 and seed -6319248962221789007 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30878] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -11,9 +10,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 09:14:23)
+Starting... (2026-10-08 12:54:33)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 09:14:23.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 12:54:34.
 Error: Invariant NoGhostInvalidatedServed is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -32,6 +31,7 @@ State 1: <Initial predicate>
 /\ vers = (o1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
+/\ itag = <<0, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
@@ -62,7 +62,7 @@ State 1: <Initial predicate>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 2: <Ingest line 160, col 3 to line 163, col 60 of module Derivation>
+State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
 /\ nCur = 0
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
@@ -78,6 +78,7 @@ State 2: <Ingest line 160, col 3 to line 163, col 60 of module Derivation>
 /\ vers = (o1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
+/\ itag = <<0, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
@@ -108,7 +109,7 @@ State 2: <Ingest line 160, col 3 to line 163, col 60 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 3: <Propose line 229, col 3 to line 240, col 54 of module Derivation>
+State 3: <Propose line 266, col 3 to line 277, col 54 of module Derivation>
 /\ nCur = 0
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
@@ -124,6 +125,7 @@ State 3: <Propose line 229, col 3 to line 240, col 54 of module Derivation>
 /\ vers = (o1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
+/\ itag = <<0, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
@@ -154,7 +156,7 @@ State 3: <Propose line 229, col 3 to line 240, col 54 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 4: <Pick line 243, col 3 to line 246, col 65 of module Derivation>
+State 4: <Pick line 280, col 3 to line 283, col 65 of module Derivation>
 /\ nCur = 0
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
@@ -170,6 +172,7 @@ State 4: <Pick line 243, col 3 to line 246, col 65 of module Derivation>
 /\ vers = (o1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
+/\ itag = <<0, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
@@ -200,7 +203,7 @@ State 4: <Pick line 243, col 3 to line 246, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 5: <Verify line 260, col 3 to line 265, col 65 of module Derivation>
+State 5: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
 /\ nCur = 0
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
@@ -216,6 +219,7 @@ State 5: <Verify line 260, col 3 to line 265, col 65 of module Derivation>
 /\ vers = (o1 :> <<>>)
 /\ hidRe = {}
 /\ nRet = 0
+/\ itag = <<0, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
@@ -246,38 +250,54 @@ State 5: <Verify line 260, col 3 to line 265, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 6: <Invalidate line 172, col 3 to line 176, col 65 of module Derivation>
-/\ nCur = 1
+State 6: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
+/\ nCur = 0
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
 /\ matDocs = {}
 /\ sig = FALSE
-/\ cv = (o1 :> 0)
+/\ cv = (o1 :> 1)
 /\ matSnap = {}
-/\ ginv = {1}
+/\ ginv = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
-/\ vers = (o1 :> <<>>)
+/\ vers = ( o1 :>
+      << [ root |-> 1,
+           finp |-> {1},
+           oinp |-> {},
+           gfinp |-> {1},
+           goinp |-> {},
+           st |-> "live",
+           eff |-> 1,
+           base |-> 0,
+           ck |->
+               [ n |-> o1,
+                 mode |-> "root",
+                 cf |-> {},
+                 co |-> {},
+                 base |-> 0,
+                 exp |-> 0 ] ] >> )
 /\ hidRe = {}
 /\ nRet = 0
+/\ itag = <<0, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
-/\ hidden = {1}
+/\ hidden = {}
 /\ matPhase = "idle"
 /\ mat = {}
 /\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ hw = (o1 :> 1)
+/\ props = {}
 /\ born = {1}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
-      [ ph |-> "verified",
+      [ ph |-> "idle",
         p |->
             [ n |-> o1,
               mode |-> "root",
-              cf |-> {1},
+              cf |-> {},
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] @@
@@ -292,7 +312,7 @@ State 6: <Invalidate line 172, col 3 to line 176, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 7: <Commit line 281, col 3 to line 303, col 67 of module Derivation>
+State 7: <Invalidate line 188, col 3 to line 195, col 65 of module Derivation>
 /\ nCur = 1
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
@@ -323,6 +343,7 @@ State 7: <Commit line 281, col 3 to line 303, col 67 of module Derivation>
                  exp |-> 0 ] ] >> )
 /\ hidRe = {}
 /\ nRet = 0
+/\ itag = <<1, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {1}
 /\ matPhase = "idle"
@@ -353,7 +374,7 @@ State 7: <Commit line 281, col 3 to line 303, col 67 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 8: <Replace line 190, col 3 to line 193, col 54 of module Derivation>
+State 8: <Replace line 217, col 3 to line 220, col 54 of module Derivation>
 /\ nCur = 1
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
@@ -384,6 +405,7 @@ State 8: <Replace line 190, col 3 to line 193, col 54 of module Derivation>
                  exp |-> 0 ] ] >> )
 /\ hidRe = {}
 /\ nRet = 1
+/\ itag = <<1, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {1}
 /\ matPhase = "idle"
@@ -414,7 +436,7 @@ State 8: <Replace line 190, col 3 to line 193, col 54 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 9: <ChunkPurge line 209, col 3 to line 213, col 69 of module Derivation>
+State 9: <ChunkPurge line 246, col 3 to line 250, col 75 of module Derivation>
 /\ nCur = 1
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
@@ -445,6 +467,7 @@ State 9: <ChunkPurge line 209, col 3 to line 213, col 69 of module Derivation>
                  exp |-> 0 ] ] >> )
 /\ hidRe = {}
 /\ nRet = 1
+/\ itag = <<1, 0, 0, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
 /\ hidden = {}
 /\ matPhase = "idle"
@@ -475,8 +498,8 @@ State 9: <ChunkPurge line 209, col 3 to line 213, col 69 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-1700 states generated, 604 distinct states found, 231 states left on queue.
-The depth of the complete state graph search is 9.
-The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 6 and the 95th percentile is 4).
-Finished in 00s at (2026-10-08 09:14:23)
-elapsed 2s
+2610 states generated, 823 distinct states found, 254 states left on queue.
+The depth of the complete state graph search is 10.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 7 and the 95th percentile is 4).
+Finished in 01s at (2026-10-08 12:54:34)
+elapsed 20s

@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 102 and seed -2359169846057372873 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30580] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 122 and seed -7582434163055284697 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30344] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -12,13 +12,15 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module ShardMove
-Starting... (2026-10-08 12:52:53)
+Starting... (2026-10-08 12:51:33)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 12:52:54.
-Error: Invariant SourceStaticUnderFreeze is violated.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 12:51:33.
+Error: Invariant ServedFromIndex is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
-/\ sqt = <<0, 0>>
+/\ sqt = <<0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
       [ own |-> [st |-> "none", ep |-> 0],
@@ -41,7 +43,7 @@ State 1: <Initial predicate>
 /\ fzt = 0
 /\ mp = "none"
 /\ mtl = 0
-/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"] @@ c2 :> [ep |-> 1, sh |-> "s1"])
+/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"])
 /\ store = [s2 |-> {}, s1 |-> {}]
 /\ cm = "none"
 /\ now = 0
@@ -72,13 +74,12 @@ State 1: <Initial predicate>
 /\ idx = [s2 |-> FALSE, s1 |-> TRUE]
 /\ cex = FALSE
 /\ nBak = 0
-/\ wr = ( c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] @@
-  c2 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] )
+/\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 /\ frozenSet = {}
 /\ nFault = 0
 
 State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
-/\ sqt = <<0, 0>>
+/\ sqt = <<0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
       [ own |-> [st |-> "none", ep |-> 0],
@@ -101,7 +102,7 @@ State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
 /\ fzt = 0
 /\ mp = "planned"
 /\ mtl = 0
-/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"] @@ c2 :> [ep |-> 1, sh |-> "s1"])
+/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"])
 /\ store = [s2 |-> {}, s1 |-> {}]
 /\ cm = "open"
 /\ now = 0
@@ -132,13 +133,12 @@ State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
 /\ idx = [s2 |-> FALSE, s1 |-> TRUE]
 /\ cex = FALSE
 /\ nBak = 0
-/\ wr = ( c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] @@
-  c2 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] )
+/\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 3: <Begin line 168, col 3 to line 174, col 108 of module ShardMove>
-/\ sqt = <<0, 2>>
+State 3: <Freeze line 241, col 3 to line 247, col 134 of module ShardMove>
+/\ sqt = <<0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
       [ own |-> [st |-> "none", ep |-> 0],
@@ -159,9 +159,9 @@ State 3: <Begin line 168, col 3 to line 174, col 108 of module ShardMove>
 /\ me = 2
 /\ mk = [s2 |-> {}, s1 |-> {}]
 /\ fzt = 0
-/\ mp = "planned"
+/\ mp = "frozen"
 /\ mtl = 0
-/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"] @@ c2 :> [ep |-> 1, sh |-> "s1"])
+/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"])
 /\ store = [s2 |-> {}, s1 |-> {}]
 /\ cm = "open"
 /\ now = 0
@@ -169,7 +169,7 @@ State 3: <Begin line 168, col 3 to line 174, col 108 of module ShardMove>
 /\ frozenMk = {}
 /\ gone = {}
 /\ nCat = 0
-/\ own = [s2 |-> [st |-> "incoming", ep |-> 2], s1 |-> [st |-> "active", ep |-> 1]]
+/\ own = [s2 |-> [st |-> "incoming", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
 /\ actMk = {}
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
@@ -177,8 +177,8 @@ State 3: <Begin line 168, col 3 to line 174, col 108 of module ShardMove>
 /\ rr = FALSE
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
-/\ sq = [s2 |-> 0, s1 |-> 3]
-/\ used = {2}
+/\ sq = [s2 |-> 2, s1 |-> 2]
+/\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
 /\ tgt = "s2"
@@ -192,13 +192,12 @@ State 3: <Begin line 168, col 3 to line 174, col 108 of module ShardMove>
 /\ idx = [s2 |-> FALSE, s1 |-> TRUE]
 /\ cex = FALSE
 /\ nBak = 0
-/\ wr = ( c1 :> [ph |-> "hold", r |-> 2, sh |-> "s1", age |-> 0] @@
-  c2 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] )
+/\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 4: <Commit line 177, col 3 to line 185, col 107 of module ShardMove>
-/\ sqt = <<0, 2>>
+State 4: <CopyEx line 260, col 3 to line 263, col 121 of module ShardMove>
+/\ sqt = <<0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
       [ own |-> [st |-> "none", ep |-> 0],
@@ -217,136 +216,16 @@ State 4: <Commit line 177, col 3 to line 185, col 107 of module ShardMove>
 /\ src = "s1"
 /\ tlc = [s2 |-> 0, s1 |-> 0]
 /\ me = 2
-/\ mk = [s2 |-> {}, s1 |-> {2}]
+/\ mk = [s2 |-> {}, s1 |-> {}]
 /\ fzt = 0
-/\ mp = "planned"
+/\ mp = "frozen"
 /\ mtl = 0
-/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"] @@ c2 :> [ep |-> 1, sh |-> "s1"])
-/\ store = [s2 |-> {}, s1 |-> {2}]
+/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"])
+/\ store = [s2 |-> {}, s1 |-> {}]
 /\ cm = "open"
 /\ now = 0
 /\ cleaned = FALSE
 /\ frozenMk = {}
-/\ gone = {}
-/\ nCat = 0
-/\ own = [s2 |-> [st |-> "incoming", ep |-> 2], s1 |-> [st |-> "active", ep |-> 1]]
-/\ actMk = {}
-/\ rc = 0
-/\ ex = [s2 |-> 0, s1 |-> 1]
-/\ rep = FALSE
-/\ rr = FALSE
-/\ actSet = {}
-/\ cat = [ep |-> 1, sh |-> "s1"]
-/\ sq = [s2 |-> 0, s1 |-> 3]
-/\ used = {2}
-/\ tl = 0
-/\ cdirty = FALSE
-/\ tgt = "s2"
-/\ committed = {2}
-/\ frozenEx = 0
-/\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
-/\ lost = {}
-/\ zcut = FALSE
-/\ cdn = {}
-/\ nMoves = 1
-/\ idx = [s2 |-> FALSE, s1 |-> TRUE]
-/\ cex = FALSE
-/\ nBak = 0
-/\ wr = ( c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] @@
-  c2 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] )
-/\ frozenSet = {}
-/\ nFault = 0
-
-State 5: <Freeze line 241, col 3 to line 247, col 134 of module ShardMove>
-/\ sqt = <<0, 2>>
-/\ nRestore = 0
-/\ bak = [ s2 |->
-      [ own |-> [st |-> "none", ep |-> 0],
-        store |-> {},
-        mk |-> {},
-        ex |-> 0,
-        sq |-> 0,
-        idx |-> FALSE ],
-  s1 |->
-      [ own |-> [st |-> "active", ep |-> 1],
-        store |-> {},
-        mk |-> {},
-        ex |-> 0,
-        sq |-> 2,
-        idx |-> TRUE ] ]
-/\ src = "s1"
-/\ tlc = [s2 |-> 0, s1 |-> 0]
-/\ me = 2
-/\ mk = [s2 |-> {}, s1 |-> {2}]
-/\ fzt = 0
-/\ mp = "frozen"
-/\ mtl = 0
-/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"] @@ c2 :> [ep |-> 1, sh |-> "s1"])
-/\ store = [s2 |-> {}, s1 |-> {2}]
-/\ cm = "open"
-/\ now = 0
-/\ cleaned = FALSE
-/\ frozenMk = {2}
-/\ gone = {}
-/\ nCat = 0
-/\ own = [s2 |-> [st |-> "incoming", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
-/\ actMk = {}
-/\ rc = 0
-/\ ex = [s2 |-> 0, s1 |-> 1]
-/\ rep = FALSE
-/\ rr = FALSE
-/\ actSet = {}
-/\ cat = [ep |-> 1, sh |-> "s1"]
-/\ sq = [s2 |-> 3, s1 |-> 3]
-/\ used = {2}
-/\ tl = 0
-/\ cdirty = FALSE
-/\ tgt = "s2"
-/\ committed = {2}
-/\ frozenEx = 1
-/\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
-/\ lost = {}
-/\ zcut = FALSE
-/\ cdn = {}
-/\ nMoves = 1
-/\ idx = [s2 |-> FALSE, s1 |-> TRUE]
-/\ cex = FALSE
-/\ nBak = 0
-/\ wr = ( c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] @@
-  c2 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] )
-/\ frozenSet = {2}
-/\ nFault = 0
-
-State 6: <SweepEx line 206, col 3 to line 210, col 104 of module ShardMove>
-/\ sqt = <<0, 2>>
-/\ nRestore = 0
-/\ bak = [ s2 |->
-      [ own |-> [st |-> "none", ep |-> 0],
-        store |-> {},
-        mk |-> {},
-        ex |-> 0,
-        sq |-> 0,
-        idx |-> FALSE ],
-  s1 |->
-      [ own |-> [st |-> "active", ep |-> 1],
-        store |-> {},
-        mk |-> {},
-        ex |-> 0,
-        sq |-> 2,
-        idx |-> TRUE ] ]
-/\ src = "s1"
-/\ tlc = [s2 |-> 0, s1 |-> 0]
-/\ me = 2
-/\ mk = [s2 |-> {}, s1 |-> {2}]
-/\ fzt = 0
-/\ mp = "frozen"
-/\ mtl = 0
-/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"] @@ c2 :> [ep |-> 1, sh |-> "s1"])
-/\ store = [s2 |-> {}, s1 |-> {2}]
-/\ cm = "open"
-/\ now = 0
-/\ cleaned = FALSE
-/\ frozenMk = {2}
 /\ gone = {}
 /\ nCat = 0
 /\ own = [s2 |-> [st |-> "incoming", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
@@ -357,28 +236,145 @@ State 6: <SweepEx line 206, col 3 to line 210, col 104 of module ShardMove>
 /\ rr = FALSE
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
-/\ sq = [s2 |-> 3, s1 |-> 3]
-/\ used = {2}
+/\ sq = [s2 |-> 2, s1 |-> 2]
+/\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
 /\ tgt = "s2"
-/\ committed = {2}
-/\ frozenEx = 1
+/\ committed = {}
+/\ frozenEx = 0
 /\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
 /\ lost = {}
 /\ zcut = FALSE
 /\ cdn = {}
 /\ nMoves = 1
 /\ idx = [s2 |-> FALSE, s1 |-> TRUE]
-/\ cex = FALSE
+/\ cex = TRUE
 /\ nBak = 0
-/\ wr = ( c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] @@
-  c2 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] )
-/\ frozenSet = {2}
+/\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
+/\ frozenSet = {}
 /\ nFault = 0
 
-1360 states generated, 391 distinct states found, 211 states left on queue.
+State 5: <VerifyFrozen line 277, col 3 to line 279, col 98 of module ShardMove>
+/\ sqt = <<0>>
+/\ nRestore = 0
+/\ bak = [ s2 |->
+      [ own |-> [st |-> "none", ep |-> 0],
+        store |-> {},
+        mk |-> {},
+        ex |-> 0,
+        sq |-> 0,
+        idx |-> FALSE ],
+  s1 |->
+      [ own |-> [st |-> "active", ep |-> 1],
+        store |-> {},
+        mk |-> {},
+        ex |-> 0,
+        sq |-> 2,
+        idx |-> TRUE ] ]
+/\ src = "s1"
+/\ tlc = [s2 |-> 0, s1 |-> 0]
+/\ me = 2
+/\ mk = [s2 |-> {}, s1 |-> {}]
+/\ fzt = 0
+/\ mp = "copied"
+/\ mtl = 0
+/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"])
+/\ store = [s2 |-> {}, s1 |-> {}]
+/\ cm = "open"
+/\ now = 0
+/\ cleaned = FALSE
+/\ frozenMk = {}
+/\ gone = {}
+/\ nCat = 0
+/\ own = [s2 |-> [st |-> "incoming", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
+/\ actMk = {}
+/\ rc = 0
+/\ ex = [s2 |-> 0, s1 |-> 0]
+/\ rep = FALSE
+/\ rr = FALSE
+/\ actSet = {}
+/\ cat = [ep |-> 1, sh |-> "s1"]
+/\ sq = [s2 |-> 2, s1 |-> 2]
+/\ used = {}
+/\ tl = 0
+/\ cdirty = FALSE
+/\ tgt = "s2"
+/\ committed = {}
+/\ frozenEx = 0
+/\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
+/\ lost = {}
+/\ zcut = FALSE
+/\ cdn = {}
+/\ nMoves = 1
+/\ idx = [s2 |-> FALSE, s1 |-> TRUE]
+/\ cex = TRUE
+/\ nBak = 0
+/\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
+/\ frozenSet = {}
+/\ nFault = 0
+
+State 6: <MakeReady line 294, col 3 to line 300, col 138 of module ShardMove>
+/\ sqt = <<0>>
+/\ nRestore = 0
+/\ bak = [ s2 |->
+      [ own |-> [st |-> "none", ep |-> 0],
+        store |-> {},
+        mk |-> {},
+        ex |-> 0,
+        sq |-> 0,
+        idx |-> FALSE ],
+  s1 |->
+      [ own |-> [st |-> "active", ep |-> 1],
+        store |-> {},
+        mk |-> {},
+        ex |-> 0,
+        sq |-> 2,
+        idx |-> TRUE ] ]
+/\ src = "s1"
+/\ tlc = [s2 |-> 0, s1 |-> 0]
+/\ me = 2
+/\ mk = [s2 |-> {}, s1 |-> {}]
+/\ fzt = 0
+/\ mp = "ready"
+/\ mtl = 0
+/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"])
+/\ store = [s2 |-> {}, s1 |-> {}]
+/\ cm = "open"
+/\ now = 0
+/\ cleaned = FALSE
+/\ frozenMk = {}
+/\ gone = {}
+/\ nCat = 0
+/\ own = [s2 |-> [st |-> "ready", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
+/\ actMk = {}
+/\ rc = 0
+/\ ex = [s2 |-> 0, s1 |-> 0]
+/\ rep = FALSE
+/\ rr = FALSE
+/\ actSet = {}
+/\ cat = [ep |-> 1, sh |-> "s1"]
+/\ sq = [s2 |-> 2, s1 |-> 2]
+/\ used = {}
+/\ tl = 0
+/\ cdirty = FALSE
+/\ tgt = "s2"
+/\ committed = {}
+/\ frozenEx = 0
+/\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
+/\ lost = {}
+/\ zcut = FALSE
+/\ cdn = {}
+/\ nMoves = 1
+/\ idx = [s2 |-> FALSE, s1 |-> TRUE]
+/\ cex = TRUE
+/\ nBak = 0
+/\ wr = (c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0])
+/\ frozenSet = {}
+/\ nFault = 0
+
+232 states generated, 97 distinct states found, 35 states left on queue.
 The depth of the complete state graph search is 7.
-The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 5 and the 95th percentile is 4).
-Finished in 01s at (2026-10-08 12:52:54)
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 3 and the 95th percentile is 3).
+Finished in 00s at (2026-10-08 12:51:34)
 elapsed 20s

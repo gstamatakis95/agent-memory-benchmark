@@ -1,6 +1,5 @@
-Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=45529 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 54 and seed 8289609918239872348 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 25163] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 93 and seed -966973491067654730 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 28870] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -13,28 +12,26 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module ShardMove
-Starting... (2026-10-08 08:15:26)
+Starting... (2026-10-08 12:35:33)
 Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
 (Use the -nowarning option to disable this warning.)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 08:15:26.
-Progress(11) at 2026-10-08 08:15:29: 399,510 states generated (399,510 s/min), 131,627 distinct states found (131,627 ds/min), 83,586 states left on queue.
-Progress(15) at 2026-10-08 08:16:29: 17,017,431 states generated (16,617,921 s/min), 4,299,415 distinct states found (4,167,788 ds/min), 1,870,208 states left on queue.
-Progress(17) at 2026-10-08 08:17:29: 33,496,787 states generated (16,479,356 s/min), 8,236,915 distinct states found (3,937,500 ds/min), 2,807,758 states left on queue.
-Progress(18) at 2026-10-08 08:18:29: 50,059,292 states generated (16,562,505 s/min), 12,149,853 distinct states found (3,912,938 ds/min), 3,435,004 states left on queue.
-Progress(19) at 2026-10-08 08:19:29: 65,819,229 states generated (15,759,937 s/min), 15,964,690 distinct states found (3,814,837 ds/min), 3,804,804 states left on queue.
-Progress(20) at 2026-10-08 08:20:29: 81,179,501 states generated (15,360,272 s/min), 19,784,814 distinct states found (3,820,124 ds/min), 3,957,164 states left on queue.
-Progress(21) at 2026-10-08 08:21:29: 96,173,389 states generated (14,993,888 s/min), 23,639,355 distinct states found (3,854,541 ds/min), 3,894,456 states left on queue.
-Progress(22) at 2026-10-08 08:22:29: 111,158,323 states generated (14,984,934 s/min), 27,632,612 distinct states found (3,993,257 ds/min), 3,580,890 states left on queue.
-Progress(23) at 2026-10-08 08:23:29: 125,205,210 states generated (14,046,887 s/min), 31,399,972 distinct states found (3,767,360 ds/min), 2,855,427 states left on queue.
-Progress(25) at 2026-10-08 08:24:29: 138,197,457 states generated (12,992,247 s/min), 34,920,154 distinct states found (3,520,182 ds/min), 1,517,160 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 12:35:33.
+Progress(13) at 2026-10-08 12:35:36: 454,353 states generated (454,353 s/min), 149,642 distinct states found (149,642 ds/min), 82,570 states left on queue.
+Progress(20) at 2026-10-08 12:36:36: 16,671,942 states generated (16,217,589 s/min), 4,785,222 distinct states found (4,635,580 ds/min), 1,493,700 states left on queue.
+Progress(22) at 2026-10-08 12:37:36: 32,669,559 states generated (15,997,617 s/min), 8,857,952 distinct states found (4,072,730 ds/min), 1,577,808 states left on queue.
+Progress(25) at 2026-10-08 12:38:36: 48,266,881 states generated (15,597,322 s/min), 12,820,025 distinct states found (3,962,073 ds/min), 1,423,491 states left on queue.
+Progress(28) at 2026-10-08 12:39:36: 63,791,526 states generated (15,524,645 s/min), 16,796,826 distinct states found (3,976,801 ds/min), 1,305,698 states left on queue.
+Progress(30) at 2026-10-08 12:40:36: 79,054,994 states generated (15,263,468 s/min), 20,660,320 distinct states found (3,863,494 ds/min), 1,403,084 states left on queue.
+Progress(32) at 2026-10-08 12:41:36: 93,863,911 states generated (14,808,917 s/min), 24,190,995 distinct states found (3,530,675 ds/min), 1,229,304 states left on queue.
+Progress(35) at 2026-10-08 12:42:36: 109,176,916 states generated (15,313,005 s/min), 27,589,281 distinct states found (3,398,286 ds/min), 557,065 states left on queue.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
-  calculated (optimistic):  val = 2.2E-4
-  based on the actual fingerprints:  val = 1.1E-4
-145121412 states generated, 36807699 distinct states found, 0 states left on queue.
-The depth of the complete state graph search is 30.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 14 and the 95th percentile is 3).
-Finished in 09min 42s at (2026-10-08 08:25:08)
-elapsed 584s
+  calculated (optimistic):  val = 1.3E-4
+  based on the actual fingerprints:  val = 2.2E-5
+112413371 states generated, 28152715 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 39.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 13 and the 95th percentile is 3).
+Finished in 07min 18s at (2026-10-08 12:42:51)
+elapsed 440s

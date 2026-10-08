@@ -1,6 +1,5 @@
-Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=45529 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 112 and seed -5095527732405595093 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 26903] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 106 and seed 8057014259000253388 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 28811] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Storage.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
@@ -9,52 +8,67 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module Storage
-Starting... (2026-10-08 09:13:59)
+Starting... (2026-10-08 12:35:12)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 09:14:00.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 12:35:13.
 Error: Invariant ContentImmutable is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
-/\ idx = {}
-/\ ingested = {}
-/\ rebuilt = {}
+/\ lk = FALSE
 /\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {}
-/\ vec = {}
+/\ rbusy = {}
 /\ content = {}
 /\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
 /\ snap = {}
-
-State 2: <Insert line 68, col 3 to line 70, col 77 of module Storage>
-/\ idx = {}
-/\ ingested = {1}
+/\ pc = [a |-> 0, b |-> 0]
 /\ rebuilt = {}
-/\ repairs = 0
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {}
+/\ marked = {}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
 /\ payload = <<0, 0, 0>>
-/\ marked = {}
-/\ vec = {}
-/\ content = {1}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
-/\ snap = {}
-
-State 3: <Update line 78, col 3 to line 80, col 87 of module Storage>
 /\ idx = {}
-/\ ingested = {1}
-/\ rebuilt = {}
+
+State 2: <Insert line 85, col 3 to line 87, col 83 of module Storage>
+/\ lk = FALSE
 /\ repairs = 0
-/\ payload = <<1, 0, 0>>
-/\ marked = {}
-/\ vec = {}
-/\ content = {1}
+/\ rbusy = {}
+/\ content = {2}
 /\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
 /\ snap = {}
+/\ pc = [a |-> 0, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {2}
+/\ marked = {}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {}
+
+State 3: <Update line 95, col 3 to line 97, col 93 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {2}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {2}
+/\ marked = {}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 1, 0>>
+/\ idx = {}
 
 12 states generated, 12 distinct states found, 3 states left on queue.
 The depth of the complete state graph search is 4.
 The average outdegree of the complete state graph is 4 (minimum is 4, the maximum 4 and the 95th percentile is 4).
-Finished in 00s at (2026-10-08 09:14:00)
-elapsed 1s
+Finished in 00s at (2026-10-08 12:35:13)
+elapsed 20s

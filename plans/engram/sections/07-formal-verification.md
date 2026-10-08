@@ -30,27 +30,25 @@ configuration finished in under 30 minutes (the longest, `Durability.cfg` (about
 
 **Assumptions of the D25 models** (what the specs take as given; each is a sentence a reader can falsify):
 
-- **A1 (N146, N163), the catalog.** A catalog commit that has been replayed to the one asynchronous standby
-  (`rep` in `ShardMove.tla`) survives a *promotion*; one that has not is lost by it (`CatalogLoss`), which is why (c)
-  is the only step that waits for the flag. A catalog **restore from backup** keeps nothing: `Durability.tla` and
-  `ShardMove.tla` revert the floor and `cm`/`cat` (`CatalogRestore`), and the design recovers from state outside the
-  catalog: the replay reads `min(fl, blobFloor)` where the blob-store record is written before each replay and only
-  lowered, and `engramctl catalog reconcile --from-shards` re-derives routing and the move row from the ownership
-  rows before any shard fault (the model does not interleave a shard restore with a dirty catalog). The blob store's
-  strong consistency (7.5) is what makes the floor record lossless.
-- **A2 (N161), the target after the CAS.** A pre-activation target (restored to `none`, `incoming` or `ready`) is
-  re-copied from the static source (wipe, copy, verify, index, then the intent replay of the acknowledged deletes); a
-  post-activation target is never repaired from it, and nothing is merged. The source rows are intact until the
-  cleanup, which needs a full target backup that started after activation. The acknowledged deletes of the target
-  (`gone`) are durable (intents) and re-applied by every restore and by the re-run; deletes without an intent
-  (sweeps, purges) are re-derived by their schedulers and are not modelled. Repeated faults hit one shard; a fault of
-  **both** copies of a row before it is re-replicated is an RPO loss outside the model.
-- **A3 (N160(5)), readiness at cutover.** `ShardMove.tla` has one index bit per shard: `BuildIndex` sets it under
-  the freeze, `MakeReady` requires it and a ready or active shard must have it (`ServedFromIndex`). The bit stands
-  for "every requested partial index is `indisvalid and indisready`" (`engram_move_indexes_valid`); which indexes are
-  requested, the 2,000-vector threshold and the one retry of a failed build are covered by
-  `TestMove_IndexValidAtActivation` and the index runner's tests; a failed build rolls the move back, which the
-  model already allows.
+- **A1 (N146, N163), the catalog.** A catalog commit that the one asynchronous standby has replayed (`rep` in
+  `ShardMove.tla`) survives a *promotion*; one that has not is lost by it (`CatalogLoss`), which is why (c) is the only
+  step that waits for the flag. A catalog **restore from backup** keeps nothing: `Durability.tla` and `ShardMove.tla`
+  revert the floor and `cm`/`cat` (`CatalogRestore`), and the design recovers from state outside the catalog: the
+  replay reads `min(fl, blobFloor)` (the blob-store record is written before each replay and only lowered) and
+  `engramctl catalog reconcile --from-shards` re-derives routing and the move row from the ownership rows before any
+  shard fault (the model never interleaves a shard restore with a dirty catalog). The blob store's strong consistency
+  (7.5) is what makes the floor record lossless.
+- **A2 (N161), the target after the CAS.** A pre-activation target is re-copied from the static source (wipe, copy,
+  verify, index, then the intent replay of the acknowledged deletes); a post-activation target is never repaired from
+  it, and nothing is merged. The source rows are intact until the cleanup, which needs a full target backup that
+  started after activation. The target's acknowledged deletes (`gone`) are durable (intents) and re-applied by every
+  restore and by the re-run; deletes without an intent (sweeps, purges) are re-derived by their schedulers and are not
+  modelled. Repeated faults hit one shard; a fault of **both** copies of a row before it is re-replicated is an RPO
+  loss outside the model.
+- **A3 (N160(5)), readiness at cutover.** `ShardMove.tla` has one index bit per shard: `BuildIndex` sets it under the
+  freeze, `MakeReady` requires it, a ready or active shard must have it (`ServedFromIndex`). The bit stands for "every
+  requested partial index is `indisvalid and indisready`" (`engram_move_indexes_valid`); which indexes are requested and
+  the one retry of a failed build are covered by `TestMove_IndexValidAtActivation` and the index runner's tests.
 
 ### 7.2 The specifications
 
@@ -74,11 +72,10 @@ with rows owed (the markers; an unstamped one with nothing owed is stamped at on
 `StampTrivial`), the run stamps what it read at its start, `Restore` deletes the stamp with the row. `ginv` is the ghost set
 of acknowledged invalidations; `CascadeHidden` restores the old foreign key (purges drop `fact_hidden`). `Served(T)` is the SQL rule of N117: the version current at `T`, served
 only if visible. A ghost copy of each version's real derivation (its inputs plus its base's) states the truth the
-invariants are checked against. D25 (N162): `f1` and its re-extraction twin `f4` are one subject (same document, same
-content hash); `itag[f]` is `fact_hidden.invalidation_op`; `Invalidate(f)` hides the fact and every live twin in one
-step under one id, `LazyTwin(f)` is a re-extraction of an invalidated fact (the twin is born hidden and carries the
-id), and `Restore(g)` removes every row that carries the id of `g` (and the cause-tagged `derived_hidden` rows of
-those facts) and nothing else.
+invariants are checked against. D25 (N162): `f1` and its re-extraction twin `f4` are one subject; `itag[f]` is
+`fact_hidden.invalidation_op`; `Invalidate(f)` hides the fact and its live twins in one step under one id, `LazyTwin(f)`
+is a re-extraction of an invalidated fact (the twin is born hidden, with the id), and `Restore(g)` removes every row
+that carries the id of `g` (and those facts' `derived_hidden` rows) and nothing else.
 
 *Invariants.* `NoDeletedDerivationServed`, `NoInvalidatedDerivationServed`, `RestoreExact`, `NoOverHiding`,
 `AsOfNoLeak`, `MaterializeComplete`, and the round-4 additions `EvidenceOutlivesFacts`, `BaseCurrentAtCommit`,
@@ -107,8 +104,8 @@ REPLACE and re-extraction are left to the first), `Derivation_Live.cfg`. Must-fa
 | `_CasBeforeIdem` | the base compare-and-set runs before the `commit_key` check, and a root rebuild is blind (`RootExpected = FALSE`) | `NoPhantomVersion` | r5 C-1 (N144): a retried `page_full/v1` commit advances `current_version` past the last row |
 | `_CascadeHidden` | purges also drop `fact_hidden(invalidate)` (the old foreign key) | `NoGhostInvalidatedServed` | r5 C-2 (N145): invalidate, REPLACE, chunk purge before Materialize: the hidden text is served again |
 | `_MatSignalOnly` | Materialize is enabled only by the post-ack signal, which is lost | `MaterializeComplete` | r5 C-2: an unstamped invalidation is never found |
-| `_RestoreOnlySelf` | `Restore(g)` un-hides only `g` | `RestoreExact` | r6 C-4 (N162): the twin hidden with it stays hidden (found in four steps: ingest, invalidate, lazy twin, restore) |
-| `_RestoreByVisibleTwin` | `Restore` resolves the twins by current state (twins not hidden for another cause) | `RestoreExact` | r6 C-4: a twin that is also hidden by re-extraction keeps its invalidate row; resolving by the id removes it |
+| `_RestoreOnlySelf` | `Restore(g)` un-hides only `g` | `RestoreExact` | r6 C-4 (N162): the twin hidden with it stays hidden |
+| `_RestoreByVisibleTwin` | `Restore` resolves the twins by current state | `RestoreExact` | r6 C-4: a twin also hidden by re-extraction keeps its invalidate row |
 
 *What the model changed or showed.*
 
@@ -144,113 +141,91 @@ REPLACE and re-extraction are left to the first), `Derivation_Live.cfg`. Must-fa
    "a stamp implies coverage" (the first draft of the stamp, written without the derivation lock for invalidations
    that nothing cites, was refuted by the model: a writer that had verified before the `Invalidate` committed a version
    citing the fact after the stamp, so the stamp waits for the shared holders like any batch); `_MatSignalOnly` fails the first half in eight steps (a committed version, Invalidate, LoseSignal).
-8. **The curation subject is the pair, and `Restore` must be exact by tag** (r6 C-4, N162). With the invalidation id on
-   every row it wrote, the lazily added twin included, `Restore` is exact by construction and the model needs no
-   look-up by current hidden state; both variants that resolve the twin set at `Restore` time (`_RestoreOnlySelf`,
-   `_RestoreByVisibleTwin`) fail on the first twin that is hidden for a second reason.
+8. **`Restore` must be exact by tag** (r6 C-4, N162). With the invalidation id on every row it wrote, the lazy twin
+   included, `Restore` needs no look-up by current hidden state; both variants that resolve the twin set at `Restore`
+   time (`_RestoreOnlySelf`, `_RestoreByVisibleTwin`) fail on the first twin.
 9. **`NoPhantomVersion` says "an existing row", not "a non-stub row".** `DerivedPurge` legitimately turns the current
    version into a stub (the document it was derived from was deleted); N144's wording "existing, non-stub row of the
    same root" cannot hold for that state and should read "existing row" (the stub is hidden by `FailClosed`).
 
-#### 7.2.2 `ShardMove.tla`: dirty copy, freeze, reconcile, cutover, restore
+#### 7.2.2 `ShardMove.tla`: freeze, copy, verify, index, cut over, restore
 
-*Model.* Source `s1` and target `s2` (a second move swaps the roles); per shard a set of insert-only rows (each carries
-an `ins_seq` drawn at `Begin` from the shard's own sequence `sq[s]` and, for `old` rows in the D23 key variant, a
-created-at/entity key from before the copy), a set of mutable keys (idempotency keys, swept by the source at any
-time) and a counter for the expiring class (its sweep pauses while a move is open). `hist[s][t]` is the shard's
-sequence at the start of tick `t` (the ring), and every floor is a number computed on the source from it. The catalog
-carries the move row `cm` (`open`, `committed`, `rolled_back`, `done`) and the namespace `(shard, epoch)`. Mover:
-`Plan` (raises `sq[Tgt]` to `sq[Src]`, takes the bulk floor `Fb`), `CopyRange`/`CopyMk`/`CopyEx` (any part, any
-order; the bulk copy guarantees only the rows below `Fb`), `CatchUp` (copies the rows with key `>= Fb`, takes the
-floor `Tc` of its own start), `Verify` (check-then-abort over keys below `Tc`; `VerifyAbort` rolls the move back when
-it fails), `Freeze`, `Reconcile` (re-copy insert-only rows with key `>= Tc`, bounded by a watchdog
-(`FreezeTimeout`: a selection that reaches back beyond the margin window rolls the move back); merge-diff the
-mutable class including deletes, `count <=` for the expiring class, then the count/hash `Verified`), `MakeReady` (b';
-raises `sq[Tgt]` again), `CommitCAS` (the catalog CAS, a''), `Cut` (c, only after `committed`), `Activate` (b''),
-`CatFlip` (d, `WHERE epoch = e`), `ReconcileIn` (the cleanup workflow's re-copy from the intact source after a
-timeline change of the target), `Cleanup` (needs a backup of the target that contains the moved rows and was taken
-after its last timeline change), `Rollback` (abort CAS `open -> rolled_back`), `SrcDelete` and `SweepEx`, writers
-with a bounded lifetime. Recovery: `Restore` (to the last backup, or lossless failover; reverts the shard's sequence
-with the rows), `TgtRestore` (a lagging standby of the target is promoted after the CAS and lacks up to `Lag` rows),
-`CatalogRestore` (`cm` goes from `committed` back to `open`), `Reconcile_` (first re-derives `cm` from the ownership
-rows; `open`: abort CAS and roll back; `committed`: complete (c), (b''), (d) with `ReconcileIn` and the sequence
-advance, no epoch bump; no move: owner bump, and the sequence advance again if the move is `done` and not yet
-cleaned), `RestoreDone`.
+*Model.* Source `s1` and target `s2` (a second move swaps the roles). Per shard: insert-only rows (each with an
+`ins_seq` from the shard's sequence `sq[s]`), mutable keys (swept by an active source), a counter for the expiring class
+and **one index bit** `idx[s]` (A3). The catalog carries the move row `cm`, the namespace `(shard, epoch)` and the flag
+`rep` (the standby has replayed the commit). Mover: `Plan`; `Freeze` (the source is static from here; also the one
+`engram_seq_advance`); `CopyStep(r)`, `CopyEx` (only in `frozen`: a set difference, no floor, catch-up or merge);
+`CopyFault(r)` (a dropped row or a stale key); `VerifyFrozen` (equal row and key sets, `ex[Tgt] <= ex[Src]`; a mismatch
+re-copies once, a second one rolls back); `BuildIndex`; `MakeReady` (b', needs the index); `CommitCAS` (a'', retried when
+the commit is lost); `Replicated`; `Cut` (c, needs `committed` and `rep`); `Activate` (b''); `CatFlip` (d); `Cleanup`
+(needs a full target backup that started after activation); `Rollback`, `WindowTimeout` (rollback from `frozen`,
+`copied` or `built`); `Rerun`. Environment: writers before the freeze and after activation (never under it),
+`SrcDelete`, `SweepEx`, `TgtDelete(r)` (a legitimate delete on the active target; the row joins `gone`), `Backup`,
+`Restore` and `TgtRestore` (to the last backup, which may predate activation, or lossless failover; the acknowledged
+deletes in `gone` are re-applied, as the intent replay does), `CatalogLoss` (the standby is promoted and lacks an
+unreplicated commit), `CatalogRestore` (reverts `cm` and `cat`; `CatalogReconcile` re-derives them from the ownership
+rows before the next shard fault), `Reconcile_` (first re-derives `cm` from the ownership rows; `open`: abort CAS and roll
+back; `committed`: complete (c), (b''), (d), or mark a re-run when the target's restored row is not `active` at the move's
+epoch; no move: owner bump), `RestoreDone`.
 
-*Invariants.* `SingleWriter`, `NoLossNoDup`, `RollbackPossibleBeforeC`, `NoWriteToTargetBeforeC`,
-`NoRouteToTargetBeforeC`, `ZombieCannotCutOver`, `RestoreReconciles`, `OneOwner`, `CatalogNamesOwnerAfterDone`,
-`CleanupSafe`, and the round-5 `CopiedBelowTargetSeq` (every row a ready or active shard holds has a key below that
-shard's sequence). `NoLossNoDup` now also says that once the source is cleaned an active target holds every frozen
-row, and that, once the namespace is settled, every acknowledged row that was not an accepted RPO loss is on an
-active owner (a row that a repairable `done` move still has on its intact source is not yet counted). Liveness
-`MoveTerminates` (done or rolled back) and `MoveTerminatesActive` (done, with writers, sweeps and old-id inserts but no
-restore and no voluntary abort).
+*Invariants.* `SingleWriter`, `NoLossNoDup` (the target is activated with exactly the rows frozen at the source; after the
+cleanup an active target holds every frozen row it did not delete; once settled every acknowledged row that is not an
+accepted RPO loss and not deleted on the target is on an active owner), `RollbackPossibleBeforeC`,
+`NoWriteToTargetBeforeC`, `NoRouteToTargetBeforeC`, `ZombieCannotCutOver`, `RestoreReconciles`, `OneOwner`,
+`CatalogNamesOwnerAfterDone`, `CleanupSafe`, `CopiedBelowTargetSeq`, and new: `NoResurrect` (a row deleted on an active
+target is never again in an active store), `ServedFromIndex` (`ready` or `active` implies the index bit),
+`SourceStaticUnderFreeze`. Liveness: `MoveTerminates` and `FrozenBounded` (a `frozen` move reaches the commit point or
+rolls back); `MoveTerminatesActive` is gone: writers cannot run under the freeze and the only deterministic rollbacks left
+are the window deadline and a second `VerifyFrozen` mismatch.
 
-*Configurations.* Design: `ShardMove.cfg` (2 rows, 1 client, writer lifetime 1, margin 1, 2 ticks, 1 restore or
-failover, 1 extra backup), `_Live` (2 clients), **`_ActiveWriters`** (2 clients; every started move completes), **`_Twice`** (one row, two
-moves of the namespace, the second from the first target after its cleanup, 4 ticks: `CopiedBelowTargetSeq` and
-`MoveTerminatesActive`) and **`_TgtRestore`** (one row, one promotion of the target that loses a row, one catalog
-restore, 2 backups). Experiments that must pass: `_ZeroMargin` (margin 0 with the verify can only cost a rollback)
-and `_NoTimelineCheck`. Must-fail: `_NoReady`, `_RestoreNoReconcile`, `_NoVerify` (kept), `_UnfencedSteps` (fails since D23, item 4), and
+*Configurations.* Design: `ShardMove.cfg` (2 rows, 1 client, writer lifetime 1, 2 ticks, freeze window 1 tick, 1 restore or
+failover of either shard, 1 extra backup, 1 copy fault, 1 catalog loss or restore; 28.2 M distinct states, 7 min 18 s),
+`_Live` (2 clients, both liveness properties; 2.3 M, 4 min 35 s), `_ActiveWriters` (2 clients, writers before and after, no
+fault; 23 k), `_Twice` (one row, two moves, the second from the first target after its cleanup; 28 k) and `_TgtRestore`
+(one row, one restore or promotion of the target after the commit point, one catalog restore, 2 backups; 1.6 M, 28 s).
+Must-fail, kept: `_UnfencedSteps`, `_NoReady`, `_RestoreNoReconcile`, `_NoVerify` (a copy fault nothing detects),
+`_StampAfterCut`, `_SweepNotPaused` (now `SourceStaticUnderFreeze`), `_CleanupNoBackup`, `_NoSeqAdvance`,
+`_CatalogLossNoShardTruth`; new:
 
 | Config | Knob | Violates | Finding |
 |---|---|---|---|
-| `_IdKeyedRecopy` | re-copy by created_at / entity id | `MoveTerminatesActive` | C-8, P-1: rows inserted under old ids are missed, the verify rolls the move back every time |
-| `_MergeNoDeletes` | mutable class merged by upserts | `MoveTerminatesActive` | C-8a: a swept key stays on the target |
-| `_SweepNotPaused` | expiring-class sweep runs during a move | `MoveTerminatesActive` | C-8a |
-| `_StampAfterCut` | (c) first, the catalog stamped afterwards, and no re-derivation of `cm` (`ShardTruth = FALSE`) | `OneOwner` | C-10: a failover between them rolls back a target whose source is already `moved_out`: no owner |
-| `_CleanupNoBackup` | cleanup without a post-activation backup of the target | `CleanupSafe` | C-21: after a restore of the target to an older backup the moved rows exist only on the source; cleanup then deletes the last copy |
-| `_NoSeqAdvance` | `sq[Tgt]` is not raised at Plan and (b') | `CopiedBelowTargetSeq` | r5 C-4 (N147): the moved rows are above the young target's sequence |
-| `_NoSeqAdvanceTwice` | same, only the second move is checked | `MoveTerminatesActive` | r5 C-4: the second move's floors lie below every moved row, the freeze re-copies the whole namespace and the watchdog rolls it back |
-| `_VerifyBeforeCatchUp` | the check runs before the catch-up copy | `MoveTerminatesActive` | r5 C-5 (N148): a row inserted under an old id into a copied range fails the check on every move of an active namespace |
-| `_CatalogLossNoShardTruth` | the restore reconcile trusts the catalog instead of re-deriving `cm` from the ownership rows | `NoLossNoDup` | r5 C-3 (N146): the catalog loses `committed`; the reconcile rolls the move back and the target's acknowledged writes are gone |
-| `_CleanupTimeGate` | cleanup gated on any backup taken after activation, no `ReconcileIn` | `NoLossNoDup` | r5 C-6 (N149): the target is promoted behind after (d), the next backup comes from it, and the cleanup deletes the only copy of the rows it lacks |
+| `_UnionRepair` | a restored, serving target is repaired as `store[Tgt] u store[Src]` (the D24 `ReconcileIn`) | `NoResurrect` | N161: the target's own deletes look like missing rows; a deleted row comes back (17 states) |
+| `_RerunMerges` | a target restored to before activation is repaired by a union, not wipe-and-copy | `NoResurrect` | N161(2): the same after a restore to the pre-activation backup (19 states) |
+| `_CleanupBackupBeforeActivate` | the cleanup gate accepts a backup that started before activation | `NoLossNoDup` | N161(1): a backup taken during the copy is not a copy; a restore to it after the cleanup leaves a partial target |
+| `_CopyBeforeFreeze` | the copy runs from the unfrozen source, with no catch-up | `NoLossNoDup` | N160: rows committed after the copy are missing at cutover |
+| `_ReadyBeforeIndex` | `MakeReady` does not wait for the index | `ServedFromIndex` | N160(5): the first recall after activation would not use the HNSW |
+| `_CutOnUnreplicatedCommit` | (c) runs before the standby has the commit | `NoLossNoDup` | N163(3): the promotion loses the commit, the source is restored, the reconcile rolls back after the cut and wipes the target's copy |
 
 *What the model showed.*
 
-1. **Safety does not depend on the re-copy key; completion does.** `_IdKeyedRecopy`, `_MergeNoDeletes` and
-   `_SweepNotPaused` never lose a row (the count/hash verify blocks (b')); they roll back deterministically, which
-   `MoveTerminates` hides and `MoveTerminatesActive` exposes. The ins_seq key with a margin of at least the writer
-   lifetime is what makes the active-writer move complete (`_ActiveWriters`).
-2. **The catalog CAS before (c) is what makes a restore during cutover decidable.** With the stamp after (c)
-   (`_StampAfterCut`) the restore reads `open` for a source that is already `moved_out` and has no legal edge back.
-   With the CAS the reconcile either aborts (`open -> rolled_back`) or completes the move itself (`committed`),
-   without the epoch bump that would leave the catalog naming the source. D24 finding: with the re-derivation of `cm`
-   from the ownership rows (N146) the stamp-after-(c) order is repaired too, so `_StampAfterCut` now fails only with
-   `ShardTruth = FALSE`; the CAS stays the design because it makes the mover's own view decidable without a restore.
-3. **Cleanup is only safe after a backup that contains the moved rows** (`_CleanupNoBackup`; N125 and §5.5.1 say
-   "24 h after done"; they must also say "and after a differential backup of the target taken after activation").
-4. **The row-state guard on every mover step became load-bearing** (a change from D22, where `_UnfencedSteps`
-   passed). With the catalog CAS completing a `committed` move on restore, a mover that ignores the ownership rows it
-   acts on can finish its copy from a source that was restored after Freeze and lost a row; recovery then completes
-   the move with that smaller set (`NoLossNoDup`). Every step, the CAS included, must be a compare-and-set on the
-   source and target rows it verified (`WHERE state = expected`). The count/hash verify stays load-bearing
-   (`_NoVerify` loses a row; `_ZeroMargin` only rolls back); `_NoTimelineCheck` still changes no result, so the
-   timeline comparison stays as the register decided and the case it covers is outside the model.
-5. **Per-shard sequences make a second move and an export visible** (r5 C-4, `_NoSeqAdvance`, `_NoSeqAdvanceTwice`). The
-   old global clock hid the bug. With the advance at Plan and (b') the second move's floors are above every moved row,
-   the freeze re-copies only the margin window, and `_Twice` completes. The model needs the move to wait a margin
-   after the previous activation (`now > ta + Margin`) because the ring has no sample before the advance; the prose
-   says the same as "exports and the watermark are deferred 10 min after a move-in" and the next move must be too.
-6. **The advance must be re-run when the target is restored.** `_TgtRestore` found a hole in N147 as written: a
-   backup of the target taken during the copy phase holds rows above its (then lower) sequence; a restore to it after
-   activation brings back the low sequence with the rows, and when the move is already `done` the reconcile ran
-   neither `ReconcileIn` nor the advance (all rows were present), leaving an active target below its rows. The restore
-   reconcile of the target runs `engram_seq_advance` whenever the move is `committed` or `done` and not yet cleaned.
-7. **The check after the catch-up cannot fail; the check before it always can** (r5 C-5). `_VerifyBeforeCatchUp` rolls
-   back in a handful of steps on any active namespace; in the design `Verify` never aborts, which is why one retry
-   round is enough in the prose. The bulk copy guarantees only the rows below the floor taken at `Plan`
-   (`BulkDone`); everything else is the catch-up's job.
-8. **The catalog is repairable from the shards, and that subsumes the stamp order** (r5 C-3, `_CatalogLossNoShardTruth`).
-   After `CatalogRestore` the mover is blocked (it waits for `committed`) until a reconcile runs; the re-derivation
-   (source `moved_out`, or target `active` at the move's epoch, means the CAS had committed) completes it. The design
-   needs the repair to run on **every** catalog restore or promotion, not only when a shard restores, or a move
-   stays blocked until the next shard fault (a liveness gap that the safety configurations do not see).
-9. **The cleanup gate is content plus timeline, and the cleanup workflow repairs first** (r5 C-6). The D23 gate
-   (any backup taken after activation) lets a promoted target that lacks moved rows produce the backup that satisfies
-   it; `_CleanupTimeGate` loses the rows eight steps after the CAS. The design gate needs the backup to contain
-   the moved rows and to postdate the last timeline change, and the workflow runs `ReconcileIn` from the intact source
-   before that backup. A fault of both copies of a row is outside the model (A2).
+1. **Freeze-then-copy removes the dirty-copy failures, not the restore ones.** The seven D24 configurations that showed a
+   re-copy key, a merge, a verify order, a margin, a timeline gate or the sequence ring failing are gone with their
+   machinery; the move completes (`MoveTerminates`, `FrozenBounded`). What remains is what a restored shard does to a
+   committed move.
+2. **The catalog CAS before (c) and the row-state guard on every mover step stay load-bearing** (`_StampAfterCut`,
+   `_UnfencedSteps`, `_RestoreNoReconcile`). `_StampAfterCut` fails only with `ShardTruth = FALSE`; with the re-derivation
+   of `cm` from the shards the stamp order is repaired too.
+3. **(c) is the one step that needs the commit to have survived** (`_CutOnUnreplicatedCommit`). After (c) the only
+   evidence of the move may be the source's `moved_out` row; a source restored to before (c) with a catalog that lost the
+   commit rolls back and wipes the target's complete copy. With the gate a lost commit is one no shard has acted on. The
+   accounting is explicit: rows lost by a source restore are an RPO loss unless the commit was replicated or (c) has
+   run, and a catalog *restore* withdraws that promise (`rep := FALSE`): it restores from backup, not from the standby.
+4. **A catalog restore must be repaired from the shards before any shard fault** (`_CatalogLossNoShardTruth`): after (c)
+   the reconcile finds `committed` in the source's `moved_out` or the target's `active` row; without it the shard
+   reconcile trusts `open` and rolls back a cut move.
+5. **N161(2) is short by two cases.** A target whose restored row is not `active` at the move's epoch needs the re-run:
+   `incoming`, `ready`, and also `none`, a restore point that predates `Plan` (a small namespace moves within the 60 s
+   archive window); without that case the reconcile activates an empty target (`ServedFromIndex`, and the rows are
+   gone). The re-run may also find the source still `frozen` (the target was restored between (a'') and (c)): the
+   mover's (c) needs a `ready` target and would wait forever (`MoveTerminates` fails if `Rerun` demands a `moved_out`
+   source), so `Rerun` takes (c) itself.
+6. **Nothing is merged** (`_UnionRepair`, `_RerunMerges`): a target that has served writes has legitimately deleted
+   rows. Wipe, copy and replay of the acknowledged deletes is exact.
+7. **The cleanup gate is "a full backup that started after activation", nothing more** (`_CleanupNoBackup`,
+   `_CleanupBackupBeforeActivate`); the time, content and timeline conditions of D24 are gone and the property holds,
+   because such a backup contains the complete copy. One advance under the freeze is enough (`_NoSeqAdvance`, `_Twice`).
+8. **A source that sweeps under the freeze is not static** (`_SweepNotPaused`), a copy from an unfrozen source without a
+   catch-up loses rows (`_CopyBeforeFreeze`), and `VerifyFrozen` is load-bearing against a copy fault (`_NoVerify`).
 
 #### 7.2.3 `Durability.tla`: acknowledged deletes survive restore and failover
 
@@ -359,9 +334,8 @@ between is a dead entry of the published graph that nothing counts; `VacuumStart
 moment and `VacuumCollect` removes exactly those (a repair, if there were any). The design takes the partition key
 `lk` from the selection of the rebuild set until `VacuumStart`, and purge batches (`Purge`, `ExpungeOld`) skip the
 partition while it is held. `Storage_PurgeDuringRebuildSet` (purges ignore the key) fails `RebuildBeforeRepair` in
-eleven steps: `RebuildStart`, `Purge`, `RebuildPublish`, `VacuumStart`, `VacuumCollect`. The vacuum cannot repair
-anything in the design because the key makes the dead set empty at `VacuumStart`; a purge after it is counted by
-`pc` and waits for the next round.
+thirteen states (`RebuildStart`, `Purge`, `RebuildPublish`, `VacuumStart`, `VacuumCollect`): in the design the key makes
+the dead set empty at `VacuumStart`, and a purge after it is counted by `pc` and waits for the next round.
 
 #### 7.2.5 `Outbox.tla` and `Consolidation.tla`
 
@@ -378,29 +352,26 @@ state) is below the model's abstraction and is covered by `TestConsolidation_*` 
 #### 7.2.6 Boundaries of the results
 
 1. **Abstractions that matter.** One namespace, one fact per chunk, two to three writers, version caps of one to
-   three; restores are "revert to the last backup" or lossless failover, not PITR; the mutable and expiring
-   classes are sets and a counter. A bound bump is a spec change reviewed as such.
-   D24 additions: the models of the promotion (`TgtRestore`) and of the catalog restore (`CatalogRestore`) are one
-   event each, not a sequence of replica states; a restored shard's sequence reverts with its rows; repeated restores
-   hit one shard (a fault of both copies of a row is outside the model, assumption A2); the freeze watchdog is a ghost
-   comparison (`dt[r] + Margin < Tct`: the selection reaches back beyond the margin window), not a clock.
-2. **Experiments that pass by design** (`_ZeroMargin`, `_NoTimelineCheck`) are not gates for the property they name:
-   they document that the verify, not a larger margin or the timeline check, carries the move's safety in this
-   abstraction.
-3. **`Derivation_Page.cfg` leaves REPLACE and re-extraction out** (the product with a page ran past 30 minutes);
+   three; restores are "revert to the last backup" or lossless failover, not PITR; the mutable and expiring classes are
+   sets and a counter; the promotion and the catalog restore are one event each, not a sequence of replica states;
+   repeated restores hit one shard (assumption A2); the freeze window is a tick count, not a clock. A bound bump is a
+   spec change reviewed as such.
+2. **`Derivation_Page.cfg` leaves REPLACE and re-extraction out** (the product with a page ran past 30 minutes);
    `Derivation.cfg` covers both on observations only, and the page path is the same `Commit`. The retry of N144 is
    in the design configurations that have no REPLACE (`Derivation.cfg`, `_Retire`, `_Page`, `_Live`); the must-fail
-   `_CasBeforeIdem` uses one observation and one proposal.
-4. **Liveness runs forbid writer crashes** (`AllowAbortW = FALSE`): with crashes a writer can starve Materialize
+   `_CasBeforeIdem` uses one observation and one proposal. The twin rule of N162 is exercised where a re-extraction is
+   possible (`_Retire` and the two `Restore` must-fail configurations).
+3. **Liveness runs forbid writer crashes** (`AllowAbortW = FALSE`): with crashes a writer can starve Materialize
    by re-taking the shared lock forever, which the 35 s single attempt and the retry make a latency issue, not a
    safety one.
-5. **Bounds reduced in D24 to keep every design configuration under 30 minutes** (the figures are in
-   `results/RESULTS.md`): REPLACE, re-extraction and the two purges moved out of `Derivation.cfg` into
-   `Derivation_Retire.cfg` (2 versions, 2 proposals); `ShardMove.cfg` and `_NoTimelineCheck` have one client (`_Live` and
-   `_ActiveWriters` keep two), the catalog restore and the promotion of the target are in `_TgtRestore` (one row), and
-   the second-move configurations use one row (with two rows the product passed a million states at depth 14 within a
-   minute and the second move lies about forty steps deep); `Durability_Chain.cfg` has no catalog restore. `Storage.cfg`
-   and `Durability.cfg` keep their D23 bounds and now take 22 and 26 minutes, the two closest to the cap.
+4. **Bounds reduced to keep every design configuration under 30 minutes** (the figures are in `results/RESULTS.md`).
+   D24: REPLACE, re-extraction and the two purges moved out of `Derivation.cfg` into `Derivation_Retire.cfg`;
+   `Durability_Chain.cfg` has no catalog restore. **D25: `Storage.cfg` has two embedding generations** (the three
+   generation product with snapshot-then-publish and start-then-collect ran 30 minutes to 2.8 M distinct states at
+   depth 22 with the queue still growing and was stopped), and the third generation is covered by `Storage_Gens.cfg`
+   with one row in each namespace. `ShardMove.cfg` needed no reduction (7 min 18 s: with a static source a move has
+   far fewer interleavings than the D24 dirty copy), `_Twice` keeps one row, and `Durability.cfg` keeps its D23
+   bounds (about 26 minutes, the closest to the cap).
 
 ### 7.3 Lean 4 theorems
 

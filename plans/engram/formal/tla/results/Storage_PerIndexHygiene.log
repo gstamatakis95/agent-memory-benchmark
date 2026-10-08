@@ -1,6 +1,5 @@
-Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=45529 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 123 and seed -6586725642600404078 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 27075] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 111 and seed 7625934142369947199 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 28635] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Storage.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
@@ -9,182 +8,283 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module Storage
-Starting... (2026-10-08 09:14:04)
+Starting... (2026-10-08 12:34:12)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 09:14:04.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 12:34:13.
 Error: Invariant RebuildBeforeRepair is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
-/\ idx = {}
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
 /\ ingested = {}
-/\ rebuilt = {}
-/\ repairs = 0
-/\ payload = <<0, 0, 0>>
 /\ marked = {}
+/\ dsn = {}
 /\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {}
+
+State 2: <Insert line 85, col 3 to line 87, col 83 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {1}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1}
+/\ marked = {}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {}
+
+State 3: <Mark line 100, col 3 to line 102, col 94 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {1}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1}
+/\ marked = {1}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {}
+
+State 4: <EmbedRow line 90, col 3 to line 92, col 97 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {1}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1}
+/\ marked = {1}
+/\ dsn = {}
+/\ vec = {<<1, 1>>}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {}
+
+State 5: <IndexAdd line 117, col 16 to line 118, col 110 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {1}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1}
+/\ marked = {1}
+/\ dsn = {}
+/\ vec = {<<1, 1>>}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {<<1, 1>>}
+
+State 6: <Purge line 105, col 3 to line 112, col 75 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
 /\ content = {}
 /\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
 /\ snap = {}
-
-State 2: <Insert line 68, col 3 to line 70, col 77 of module Storage>
-/\ idx = {}
-/\ ingested = {2}
+/\ pc = [a |-> 1, b |-> 0]
 /\ rebuilt = {}
-/\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1}
+/\ marked = {1}
+/\ dsn = {}
 /\ vec = {}
-/\ content = {2}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
-/\ snap = {}
-
-State 3: <Mark line 83, col 3 to line 85, col 88 of module Storage>
-/\ idx = {}
-/\ ingested = {2}
-/\ rebuilt = {}
-/\ repairs = 0
+/\ vst = FALSE
 /\ payload = <<0, 0, 0>>
-/\ marked = {2}
-/\ vec = {}
-/\ content = {2}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
-/\ snap = {}
+/\ idx = {<<1, 1>>}
 
-State 4: <EmbedRow line 73, col 3 to line 75, col 91 of module Storage>
-/\ idx = {}
-/\ ingested = {2}
-/\ rebuilt = {}
+State 7: <Insert line 85, col 3 to line 87, col 83 of module Storage>
+/\ lk = FALSE
 /\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {2}
-/\ vec = {<<2, 1>>}
-/\ content = {2}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
-/\ snap = {}
-
-State 5: <Insert line 68, col 3 to line 70, col 77 of module Storage>
-/\ idx = {}
-/\ ingested = {2, 3}
-/\ rebuilt = {}
-/\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {2}
-/\ vec = {<<2, 1>>}
-/\ content = {2, 3}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
-/\ snap = {}
-
-State 6: <EmbedRow line 73, col 3 to line 75, col 91 of module Storage>
-/\ idx = {}
-/\ ingested = {2, 3}
-/\ rebuilt = {}
-/\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {2}
-/\ vec = {<<2, 1>>, <<3, 1>>}
-/\ content = {2, 3}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
-/\ snap = {}
-
-State 7: <Mark line 83, col 3 to line 85, col 88 of module Storage>
-/\ idx = {}
-/\ ingested = {2, 3}
-/\ rebuilt = {}
-/\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {2, 3}
-/\ vec = {<<2, 1>>, <<3, 1>>}
-/\ content = {2, 3}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
-/\ snap = {}
-
-State 8: <IndexAdd line 99, col 16 to line 100, col 104 of module Storage>
-/\ idx = {<<2, 1>>}
-/\ ingested = {2, 3}
-/\ rebuilt = {}
-/\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {2, 3}
-/\ vec = {<<2, 1>>, <<3, 1>>}
-/\ content = {2, 3}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 0]
-/\ snap = {}
-
-State 9: <Purge line 88, col 3 to line 94, col 69 of module Storage>
-/\ idx = {<<2, 1>>}
-/\ ingested = {2, 3}
-/\ rebuilt = {}
-/\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {2, 3}
-/\ vec = {<<3, 1>>}
+/\ rbusy = {}
 /\ content = {3}
 /\ cur = 1
-/\ pc = [a |-> 1, b |-> 0]
 /\ snap = {}
-
-State 10: <IndexAdd line 99, col 16 to line 100, col 104 of module Storage>
-/\ idx = {<<2, 1>>, <<3, 1>>}
-/\ ingested = {2, 3}
+/\ pc = [a |-> 1, b |-> 0]
 /\ rebuilt = {}
-/\ repairs = 0
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
 /\ payload = <<0, 0, 0>>
-/\ marked = {2, 3}
-/\ vec = {<<3, 1>>}
+/\ idx = {<<1, 1>>}
+
+State 8: <EmbedRow line 90, col 3 to line 92, col 97 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
 /\ content = {3}
 /\ cur = 1
-/\ pc = [a |-> 1, b |-> 0]
 /\ snap = {}
-
-State 11: <Purge line 88, col 3 to line 94, col 69 of module Storage>
-/\ idx = {<<2, 1>>, <<3, 1>>}
-/\ ingested = {2, 3}
+/\ pc = [a |-> 1, b |-> 0]
 /\ rebuilt = {}
-/\ repairs = 0
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1}
+/\ dsn = {}
+/\ vec = {<<3, 1>>}
+/\ vst = FALSE
 /\ payload = <<0, 0, 0>>
-/\ marked = {2, 3}
-/\ vec = {}
+/\ idx = {<<1, 1>>}
+
+State 9: <Mark line 100, col 3 to line 102, col 94 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {3}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 1, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1, 3}
+/\ dsn = {}
+/\ vec = {<<3, 1>>}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {<<1, 1>>}
+
+State 10: <IndexAdd line 117, col 16 to line 118, col 110 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {3}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 1, b |-> 0]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1, 3}
+/\ dsn = {}
+/\ vec = {<<3, 1>>}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {<<1, 1>>, <<3, 1>>}
+
+State 11: <Purge line 105, col 3 to line 112, col 75 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
 /\ content = {}
 /\ cur = 1
+/\ snap = {}
 /\ pc = [a |-> 1, b |-> 1]
-/\ snap = {}
-
-State 12: <Rebuild line 111, col 3 to line 114, col 78 of module Storage>
-/\ idx = {<<3, 1>>}
-/\ ingested = {2, 3}
-/\ rebuilt = {"a"}
-/\ repairs = 0
-/\ payload = <<0, 0, 0>>
-/\ marked = {2, 3}
-/\ vec = {}
-/\ content = {}
-/\ cur = 1
-/\ pc = [a |-> 0, b |-> 1]
-/\ snap = {}
-
-State 13: <Vacuum line 122, col 3 to line 125, col 73 of module Storage>
-/\ idx = {}
-/\ ingested = {2, 3}
 /\ rebuilt = {}
-/\ repairs = 1
-/\ payload = <<0, 0, 0>>
-/\ marked = {2, 3}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1, 3}
+/\ dsn = {}
 /\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {<<1, 1>>, <<3, 1>>}
+
+State 12: <RebuildStart line 130, col 3 to line 133, col 106 of module Storage>
+/\ lk = TRUE
+/\ repairs = 0
+/\ rbusy = {"a"}
 /\ content = {}
 /\ cur = 1
-/\ pc = [a |-> 0, b |-> 1]
 /\ snap = {}
+/\ pc = [a |-> 1, b |-> 1]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1, 3}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {<<1, 1>>, <<3, 1>>}
 
-76288 states generated, 17097 distinct states found, 4797 states left on queue.
-The depth of the complete state graph search is 13.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 8 and the 95th percentile is 4).
-Finished in 01s at (2026-10-08 09:14:05)
-elapsed 2s
+State 13: <RebuildPublish line 136, col 3 to line 140, col 92 of module Storage>
+/\ lk = TRUE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 1]
+/\ rebuilt = {"a"}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1, 3}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {<<3, 1>>}
+
+State 14: <VacuumStart line 149, col 3 to line 153, col 110 of module Storage>
+/\ lk = FALSE
+/\ repairs = 0
+/\ rbusy = {}
+/\ content = {}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 1]
+/\ rebuilt = {"a"}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1, 3}
+/\ dsn = {<<3, 1>>}
+/\ vec = {}
+/\ vst = TRUE
+/\ payload = <<0, 0, 0>>
+/\ idx = {<<3, 1>>}
+
+State 15: <VacuumCollect line 155, col 3 to line 158, col 91 of module Storage>
+/\ lk = FALSE
+/\ repairs = 1
+/\ rbusy = {}
+/\ content = {}
+/\ cur = 1
+/\ snap = {}
+/\ pc = [a |-> 0, b |-> 1]
+/\ rebuilt = {}
+/\ rsnap = [a |-> {}, b |-> {}]
+/\ ingested = {1, 3}
+/\ marked = {1, 3}
+/\ dsn = {}
+/\ vec = {}
+/\ vst = FALSE
+/\ payload = <<0, 0, 0>>
+/\ idx = {}
+
+136244 states generated, 32732 distinct states found, 9152 states left on queue.
+The depth of the complete state graph search is 15.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 8 and the 95th percentile is 3).
+Finished in 01s at (2026-10-08 12:34:14)
+elapsed 20s

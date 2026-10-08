@@ -1,5 +1,6 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=46745 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 101 and seed -6369216460553172493 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 5949] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 15 and seed -8954071984222453414 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 4102] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,9 +11,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 16:33:59)
+Starting... (2026-10-08 19:04:14)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 16:33:59.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 19:04:15.
 Error: Invariant MaterializeComplete is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -25,7 +26,6 @@ State 1: <Initial predicate>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -41,6 +41,10 @@ State 1: <Initial predicate>
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
 /\ props = {}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
 /\ born = {}
 /\ matV0 = {}
 /\ matTodo = {}
@@ -64,7 +68,7 @@ State 1: <Initial predicate>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
+State 2: <Ingest line 186, col 3 to line 189, col 60 of module Derivation>
 /\ nCur = 0
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -74,7 +78,6 @@ State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -90,7 +93,11 @@ State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
 /\ props = {}
-/\ born = {1}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -113,7 +120,7 @@ State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 3: <Propose line 286, col 3 to line 297, col 54 of module Derivation>
+State 3: <Propose line 291, col 3 to line 302, col 54 of module Derivation>
 /\ nCur = 0
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -123,7 +130,6 @@ State 3: <Propose line 286, col 3 to line 297, col 54 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -138,8 +144,12 @@ State 3: <Propose line 286, col 3 to line 297, col 54 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
-/\ born = {1}
+/\ props = {[n |-> o1, mode |-> "root", cf |-> {3}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -162,7 +172,7 @@ State 3: <Propose line 286, col 3 to line 297, col 54 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 4: <Pick line 300, col 3 to line 303, col 65 of module Derivation>
+State 4: <Pick line 305, col 3 to line 308, col 65 of module Derivation>
 /\ nCur = 0
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -172,7 +182,6 @@ State 4: <Pick line 300, col 3 to line 303, col 65 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -187,8 +196,12 @@ State 4: <Pick line 300, col 3 to line 303, col 65 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
-/\ born = {1}
+/\ props = {[n |-> o1, mode |-> "root", cf |-> {3}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -196,7 +209,7 @@ State 4: <Pick line 300, col 3 to line 303, col 65 of module Derivation>
         p |->
             [ n |-> o1,
               mode |-> "root",
-              cf |-> {1},
+              cf |-> {3},
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] @@
@@ -211,7 +224,7 @@ State 4: <Pick line 300, col 3 to line 303, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 5: <Verify line 317, col 3 to line 322, col 65 of module Derivation>
+State 5: <Verify line 322, col 3 to line 327, col 65 of module Derivation>
 /\ nCur = 0
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -221,7 +234,6 @@ State 5: <Verify line 317, col 3 to line 322, col 65 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -236,8 +248,12 @@ State 5: <Verify line 317, col 3 to line 322, col 65 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
-/\ born = {1}
+/\ props = {[n |-> o1, mode |-> "root", cf |-> {3}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -245,7 +261,7 @@ State 5: <Verify line 317, col 3 to line 322, col 65 of module Derivation>
         p |->
             [ n |-> o1,
               mode |-> "root",
-              cf |-> {1},
+              cf |-> {3},
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] @@
@@ -260,7 +276,7 @@ State 5: <Verify line 317, col 3 to line 322, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 6: <Commit line 338, col 3 to line 360, col 85 of module Derivation>
+State 6: <Commit line 343, col 3 to line 365, col 83 of module Derivation>
 /\ nCur = 0
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -270,19 +286,18 @@ State 6: <Commit line 338, col 3 to line 360, col 85 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
 /\ vers = ( o1 :>
       << [ root |-> 1,
-           finp |-> {1},
+           finp |-> {3},
            oinp |-> {},
-           gfinp |-> {1},
+           gfinp |-> {3},
            goinp |-> {},
            st |-> "live",
-           eff |-> 1,
+           eff |-> 2,
            base |-> 0,
            ck |->
                [ n |-> o1,
@@ -301,7 +316,11 @@ State 6: <Commit line 338, col 3 to line 360, col 85 of module Derivation>
 /\ lockX = FALSE
 /\ hw = (o1 :> 1)
 /\ props = {}
-/\ born = {1}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -324,7 +343,7 @@ State 6: <Commit line 338, col 3 to line 360, col 85 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 7: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
+State 7: <Invalidate line 201, col 3 to line 211, col 69 of module Derivation>
 /\ nCur = 1
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -334,19 +353,18 @@ State 7: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
 /\ sig = TRUE
 /\ cv = (o1 :> 1)
 /\ matSnap = {}
-/\ lastOp = 1
-/\ ginv = {1}
+/\ ginv = {3}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
 /\ vers = ( o1 :>
       << [ root |-> 1,
-           finp |-> {1},
+           finp |-> {3},
            oinp |-> {},
-           gfinp |-> {1},
+           gfinp |-> {3},
            goinp |-> {},
            st |-> "live",
-           eff |-> 1,
+           eff |-> 2,
            base |-> 0,
            ck |->
                [ n |-> o1,
@@ -357,15 +375,19 @@ State 7: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
                  exp |-> 0 ] ] >> )
 /\ hidRe = {}
 /\ nRet = 0
-/\ itag = <<1, 0, 0, 0>>
+/\ itag = <<0, 0, 1, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
-/\ hidden = {1}
+/\ hidden = {3}
 /\ matPhase = "idle"
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 1)
 /\ props = {}
-/\ born = {1}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 1, act |-> "inv"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -388,7 +410,7 @@ State 7: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 8: <LoseSignal line 440, col 3 to line 442, col 95 of module Derivation>
+State 8: <LoseSignal line 445, col 3 to line 447, col 93 of module Derivation>
 /\ nCur = 1
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -398,19 +420,18 @@ State 8: <LoseSignal line 440, col 3 to line 442, col 95 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {}
-/\ lastOp = 1
-/\ ginv = {1}
+/\ ginv = {3}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
 /\ vers = ( o1 :>
       << [ root |-> 1,
-           finp |-> {1},
+           finp |-> {3},
            oinp |-> {},
-           gfinp |-> {1},
+           gfinp |-> {3},
            goinp |-> {},
            st |-> "live",
-           eff |-> 1,
+           eff |-> 2,
            base |-> 0,
            ck |->
                [ n |-> o1,
@@ -421,15 +442,19 @@ State 8: <LoseSignal line 440, col 3 to line 442, col 95 of module Derivation>
                  exp |-> 0 ] ] >> )
 /\ hidRe = {}
 /\ nRet = 0
-/\ itag = <<1, 0, 0, 0>>
+/\ itag = <<0, 0, 1, 0>>
 /\ tomb = [d1 |-> 0, d2 |-> 0]
-/\ hidden = {1}
+/\ hidden = {3}
 /\ matPhase = "idle"
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 1)
 /\ props = {}
-/\ born = {1}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 1, act |-> "inv"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -452,8 +477,7 @@ State 8: <LoseSignal line 440, col 3 to line 442, col 95 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-747 states generated, 299 distinct states found, 109 states left on queue.
+757 states generated, 300 distinct states found, 111 states left on queue.
 The depth of the complete state graph search is 9.
 The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 5 and the 95th percentile is 4).
-Finished in 00s at (2026-10-08 16:33:59)
-elapsed 20s
+Finished in 00s at (2026-10-08 19:04:15)

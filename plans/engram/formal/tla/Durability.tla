@@ -222,19 +222,15 @@ LostAck(o) == /\ ops[o].ph = "committed" /\ K(o) # "ret" /\ ops[o].obs \in inten
               /\ ops' = [ops EXCEPT ![o].ph = "failed"]
               /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
-\* DeleteTenant: the catalog `deleting` row, then the tenant intent (the RPC waits for the row's replication).
-TenantRow == /\ tdp = 0 /\ tdp' = 1
-             /\ UNCHANGED <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, ta>>
-\* TenantDelete: freeze_delete on one more namespace of the tenant.
-TenantFence == /\ tdp \in 1..2 /\ tdp' = tdp + 1
-               /\ UNCHANGED <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, ta>>
-\* The operation's acknowledged_at: after the last fence (design) or after the intent (TenantAckBeforeFence).
-TenantAck == /\ ~ta /\ (IF TenantAckBeforeFence THEN tdp \in 1..3 ELSE tdp = 3) /\ ta' = TRUE
-             /\ UNCHANGED <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp>>
-
+\* One tick advances the tenant delete by one step (the model fixes the pace so that the tenant machine does not multiply the
+\* state space): tdp 0 -> 1 the catalog `deleting` row and the tenant intent, 1 -> 2 -> 3 `freeze_delete` on each of the two
+\* namespaces.  The operation is acknowledged (ta) after the last fence, or, under TenantAckBeforeFence, after the intent.
+TenantStep == IF tdp \in 0..2 THEN tdp + 1 ELSE tdp
 Tick ==
   /\ t < MaxT /\ t' = t + 1
-  /\ UNCHANGED <<ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
+  /\ tdp' = TenantStep
+  /\ ta' = (ta \/ (IF TenantAckBeforeFence THEN TenantStep = 1 ELSE TenantStep = 3))
+  /\ UNCHANGED <<ops, intents, dbq, sst, fl, nIssued, nRestore, cn, ep, bf, nCat>>
 
 \* Restore or failover to point p: commits after p are lost; the floor (catalog) is not.
 RestoreTo(p) ==
@@ -281,7 +277,7 @@ Reopen ==
   /\ fl' = IF FloorMode = "raise" THEN MaxT + 1 ELSE fl
   /\ UNCHANGED <<t, ops, intents, dbq, nIssued, nRestore, cn, ep, bf, nCat, tdp, ta>>
 
-Next == Tick \/ TenantRow \/ TenantFence \/ TenantAck \/ Reopen \/ Issue \/ (\E p \in 0..MaxT : RestoreTo(p)) \/ CatalogRestore
+Next == Tick \/ Reopen \/ Issue \/ (\E p \in 0..MaxT : RestoreTo(p)) \/ CatalogRestore
         \/ (\E o \in OpIds : TxnBegin(o) \/ PutIntent(o) \/ Commit(o) \/ Ack(o) \/ Abort(o) \/ CrashBeforePut(o)
                              \/ LostAck(o) \/ Replay(o))
 

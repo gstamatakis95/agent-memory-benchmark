@@ -1,5 +1,6 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=46745 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 80 and seed 5389294015360247091 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 5007] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 66 and seed 5370860966647846711 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 6123] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,20 +11,19 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 16:26:38)
+Starting... (2026-10-08 19:14:30)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 16:26:39.
-Progress(12) at 2026-10-08 16:26:42: 211,974 states generated (211,974 s/min), 66,009 distinct states found (66,009 ds/min), 37,475 states left on queue.
-Progress(18) at 2026-10-08 16:27:42: 8,166,099 states generated (7,954,125 s/min), 1,739,765 distinct states found (1,673,756 ds/min), 512,790 states left on queue.
-Progress(20) at 2026-10-08 16:28:42: 16,371,339 states generated (8,205,240 s/min), 3,102,356 distinct states found (1,362,591 ds/min), 519,321 states left on queue.
-Progress(23) at 2026-10-08 16:29:42: 24,400,169 states generated (8,028,830 s/min), 4,244,048 distinct states found (1,141,692 ds/min), 299,265 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 19:14:31.
+Progress(13) at 2026-10-08 19:14:34: 200,856 states generated (200,856 s/min), 62,778 distinct states found (62,778 ds/min), 35,180 states left on queue.
+Progress(18) at 2026-10-08 19:15:34: 7,132,369 states generated (6,931,513 s/min), 1,545,524 distinct states found (1,482,746 ds/min), 478,232 states left on queue.
+Progress(21) at 2026-10-08 19:16:34: 14,502,865 states generated (7,370,496 s/min), 2,819,461 distinct states found (1,273,937 ds/min), 552,473 states left on queue.
+Progress(23) at 2026-10-08 19:17:34: 22,120,267 states generated (7,617,402 s/min), 3,951,614 distinct states found (1,132,153 ds/min), 398,081 states left on queue.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
-  calculated (optimistic):  val = 6.1E-6
-  based on the actual fingerprints:  val = 2.0E-6
-28632580 states generated, 4718290 distinct states found, 0 states left on queue.
+  calculated (optimistic):  val = 6.4E-6
+  based on the actual fingerprints:  val = 4.3E-7
+29274470 states generated, 4837592 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 31.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 11 and the 95th percentile is 3).
-Finished in 03min 31s at (2026-10-08 16:30:09)
-elapsed 220s
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 10 and the 95th percentile is 3).
+Finished in 03min 55s at (2026-10-08 19:18:26)

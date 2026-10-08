@@ -1,6 +1,6 @@
 Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=46745 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 127 and seed -3954682224798572136 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 29261] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 22 and seed 6787885453034797016 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 3657] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -11,9 +11,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 18:19:43)
+Starting... (2026-10-08 19:04:04)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 18:19:44.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 19:04:04.
 Error: Invariant RestoreExact is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -328,7 +328,7 @@ State 6: <LazyTwinCommit line 257, col 3 to line 262, col 82 of module Derivatio
               exp |-> 0 ] ] )
 /\ budget = 1
 
-595 states generated, 308 distinct states found, 201 states left on queue.
-The depth of the complete state graph search is 7.
-The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 8 and the 95th percentile is 6).
-Finished in 00s at (2026-10-08 18:19:44)
+1328 states generated, 586 distinct states found, 359 states left on queue.
+The depth of the complete state graph search is 8.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 7 and the 95th percentile is 6).
+Finished in 00s at (2026-10-08 19:04:04)

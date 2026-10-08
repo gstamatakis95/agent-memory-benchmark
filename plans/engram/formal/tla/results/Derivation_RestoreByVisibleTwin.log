@@ -1,5 +1,6 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=46745 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 24 and seed 7109396199530506244 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 4479] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 104 and seed 2870744261864459609 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 4369] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,9 +11,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 16:19:38)
+Starting... (2026-10-08 19:04:20)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 16:19:38.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 19:04:20.
 Error: Invariant RestoreExact is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -25,7 +26,6 @@ State 1: <Initial predicate>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -41,6 +41,10 @@ State 1: <Initial predicate>
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
 /\ props = {}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
 /\ born = {}
 /\ matV0 = {}
 /\ matTodo = {}
@@ -64,7 +68,7 @@ State 1: <Initial predicate>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
+State 2: <Ingest line 186, col 3 to line 189, col 60 of module Derivation>
 /\ nCur = 0
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -74,7 +78,6 @@ State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -90,6 +93,10 @@ State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
 /\ props = {}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
 /\ born = {1}
 /\ matV0 = {}
 /\ matTodo = {}
@@ -113,7 +120,7 @@ State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 3: <Propose line 286, col 3 to line 297, col 54 of module Derivation>
+State 3: <Reextract line 241, col 3 to line 244, col 54 of module Derivation>
 /\ nCur = 0
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -123,56 +130,6 @@ State 3: <Propose line 286, col 3 to line 297, col 54 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 0
-/\ ginv = {}
-/\ gone = {}
-/\ dh = {}
-/\ ctomb = {}
-/\ vers = (o1 :> <<>>)
-/\ hidRe = {}
-/\ nRet = 0
-/\ itag = <<0, 0, 0, 0>>
-/\ tomb = [d1 |-> 0, d2 |-> 0]
-/\ hidden = {}
-/\ matPhase = "idle"
-/\ mat = {}
-/\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
-/\ born = {1}
-/\ matV0 = {}
-/\ matTodo = {}
-/\ wr = ( w1 :>
-      [ ph |-> "idle",
-        p |->
-            [ n |-> o1,
-              mode |-> "root",
-              cf |-> {},
-              co |-> {},
-              base |-> 0,
-              exp |-> 0 ] ] @@
-  w2 :>
-      [ ph |-> "idle",
-        p |->
-            [ n |-> o1,
-              mode |-> "root",
-              cf |-> {},
-              co |-> {},
-              base |-> 0,
-              exp |-> 0 ] ] )
-/\ budget = 0
-
-State 4: <Reextract line 236, col 3 to line 239, col 54 of module Derivation>
-/\ nCur = 0
-/\ lz = [f |-> 0, tag |-> 0]
-/\ ms = [d1 |-> "none", d2 |-> "none"]
-/\ nDel = 0
-/\ matOwe = {}
-/\ matDocs = {}
-/\ sig = FALSE
-/\ cv = (o1 :> 0)
-/\ matSnap = {}
-/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -187,7 +144,11 @@ State 4: <Reextract line 236, col 3 to line 239, col 54 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ props = {}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
 /\ born = {1, 4}
 /\ matV0 = {}
 /\ matTodo = {}
@@ -209,9 +170,9 @@ State 4: <Reextract line 236, col 3 to line 239, col 54 of module Derivation>
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] )
-/\ budget = 0
+/\ budget = 1
 
-State 5: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
+State 4: <Invalidate line 201, col 3 to line 211, col 69 of module Derivation>
 /\ nCur = 1
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -221,7 +182,6 @@ State 5: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 1
 /\ ginv = {1, 4}
 /\ gone = {}
 /\ dh = {}
@@ -236,7 +196,11 @@ State 5: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ props = {}
+/\ clog = << [tag |-> 1, act |-> "inv"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
 /\ born = {1, 4}
 /\ matV0 = {}
 /\ matTodo = {}
@@ -258,9 +222,9 @@ State 5: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] )
-/\ budget = 0
+/\ budget = 1
 
-State 6: <Restore line 214, col 3 to line 225, col 69 of module Derivation>
+State 5: <Restore line 218, col 3 to line 230, col 61 of module Derivation>
 /\ nCur = 2
 /\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
@@ -270,7 +234,6 @@ State 6: <Restore line 214, col 3 to line 225, col 69 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
-/\ lastOp = 1
 /\ ginv = {1}
 /\ gone = {}
 /\ dh = {}
@@ -285,7 +248,11 @@ State 6: <Restore line 214, col 3 to line 225, col 69 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ props = {}
+/\ clog = << [tag |-> 0, act |-> "res"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
 /\ born = {1, 4}
 /\ matV0 = {}
 /\ matTodo = {}
@@ -307,10 +274,9 @@ State 6: <Restore line 214, col 3 to line 225, col 69 of module Derivation>
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] )
-/\ budget = 0
+/\ budget = 1
 
-653 states generated, 331 distinct states found, 223 states left on queue.
+258 states generated, 156 distinct states found, 110 states left on queue.
 The depth of the complete state graph search is 7.
-The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 7 and the 95th percentile is 6).
-Finished in 00s at (2026-10-08 16:19:38)
-elapsed 20s
+The average outdegree of the complete state graph is 3 (minimum is 1, the maximum 7 and the 95th percentile is 6).
+Finished in 00s at (2026-10-08 19:04:21)

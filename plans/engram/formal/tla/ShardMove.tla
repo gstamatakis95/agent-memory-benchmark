@@ -317,11 +317,11 @@ BuildIndex ==
   /\ UNCHANGED <<CatV, mtl, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, FlagV, CpV, TlV, FlrV>>
 
 \* SealCopy (N179(1)): after the last index build, the target's WAL is archived through copy_end_lsn and its standby has
-\* replayed it (sb covers the copy); the floor flr is then recorded.  A restore or failover of the target lands at or past it.
+\* replayed it (sb equals the target's image); the floor flr then covers what the target holds.  A restore or failover of the target lands at or past it.
 SealCopy ==
   /\ mp = "built" /\ Fenced /\ SrcFrozen
-  /\ FloorBeforeCut => CoversRows(frozenSet, frozenMk, sb[tgt])
-  /\ flr' = [flr EXCEPT ![tgt] = [on |-> TRUE, rows |-> frozenSet, keys |-> frozenMk]]
+  /\ FloorBeforeCut => sb[tgt] = SbOf(tgt)                  \* the standby has replayed the target through copy_end_lsn
+  /\ flr' = [flr EXCEPT ![tgt] = [on |-> TRUE, rows |-> store[tgt], keys |-> mk[tgt]]]
   /\ mp' = "sealed"
   /\ UNCHANGED <<CatV, mtl, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, sb, mv>>
 

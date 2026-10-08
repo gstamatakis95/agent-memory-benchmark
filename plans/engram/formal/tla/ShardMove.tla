@@ -206,6 +206,7 @@ MakeReady ==                                                 \* (b')
 \* (a''): the catalog CAS, the point of no return; it also compares the session's timeline.
 CommitCAS ==
   /\ mp = "ready" /\ ~StampAfterCut /\ cm = "open" /\ SessionOk
+  /\ (~FencedSteps \/ (own[Src].st = "frozen" /\ own[Tgt].st = "ready"))   \* the rows the mover verified
   /\ cm' = "committed" /\ mp' = "committed"
   /\ zcut' = (zcut \/ mtl # tl)
   /\ UNCHANGED <<cat, Tc, mtl, OwnV, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, actSet, actMk, cleaned>>

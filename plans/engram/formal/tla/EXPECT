@@ -15,25 +15,44 @@ Storage.cfg	pass
 Storage_Update.cfg	violates ContentImmutable
 Storage_FlipEarly.cfg	violates VectorGenerationConsistent
 Storage_PurgeUnmarked.cfg	violates PurgeNeedsMarker
+Storage_AutoRepair.cfg	violates RebuildBeforeRepair
 Derivation.cfg	pass
 Derivation_Page.cfg	pass
 Derivation_Live.cfg	pass
-Derivation_RestoreNoLock.cfg	pass
 Derivation_NoLock.cfg	violates NoDeletedDerivationServed
-Derivation_MatInvalid.cfg	violates RestoreExact
+Derivation_CascadeEvidence.cfg	violates NoDeletedDerivationServed
+Derivation_PageNoVerify.cfg	violates NoDeletedDerivationServed
+Derivation_StaleProposal.cfg	violates NoDeletedDerivationServed
+Derivation_ReextractHides.cfg	violates ReextractKeepsDerivedVisible
+Derivation_RestoreNoLock.cfg	violates RestoreExact
+Derivation_MatOnce.cfg	violates RestoreExact
+Derivation_PurgeDropsStub.cfg	violates FailClosed
 Derivation_EffCited.cfg	violates AsOfNoLeak
 Derivation_TombByDocId.cfg	violates NoOverHiding
 Durability.cfg	pass
-Durability_AckBeforeIntent.cfg	violates AckImpliesIntent
-Durability_ReopenEarly.cfg	violates AckedDeleteSurvives
-Durability_UnorderedReplay.cfg	violates IntentOrderLastWins
-Durability_NarrowWindow.cfg	violates AckedDeleteSurvives
+Durability_Chain.cfg	pass
+Durability_IntentBeforeCommit.cfg	violates NoUnackedEffectOnLaterAck
+Durability_RaiseOnReopen.cfg	violates AckedDeleteSurvives
 Durability_RetargetRestore.cfg	violates AckedDeleteSurvives
+Durability_DupNoReput.cfg	violates AckedDeleteSurvives
+Durability_AckNoRecheck.cfg	violates AckedDeleteSurvives
+Durability_ReopenEarly.cfg	violates AckedDeleteSurvives
+Durability_NarrowWindow.cfg	violates AckedDeleteSurvives
+Durability_AckBeforeIntent.cfg	violates AckImpliesIntent
+Durability_ClockOrder.cfg	violates IntentOrderLastWins
+Durability_UnorderedReplay.cfg	violates IntentOrderLastWins
+Durability_NoEpochGuard.cfg	violates IntentOrderLastWins
 ShardMove.cfg	pass
 ShardMove_Live.cfg	pass
+ShardMove_ActiveWriters.cfg	pass
 ShardMove_ZeroMargin.cfg	pass
 ShardMove_UnfencedSteps.cfg	pass
 ShardMove_NoTimelineCheck.cfg	pass
 ShardMove_NoReady.cfg	violates RollbackPossibleBeforeC
 ShardMove_RestoreNoReconcile.cfg	violates RestoreReconciles
 ShardMove_NoVerify.cfg	violates NoLossNoDup
+ShardMove_StampAfterCut.cfg	violates OneOwner
+ShardMove_IdKeyedRecopy.cfg	violates MoveTerminatesActive
+ShardMove_MergeNoDeletes.cfg	violates MoveTerminatesActive
+ShardMove_SweepNotPaused.cfg	violates MoveTerminatesActive
+ShardMove_CleanupNoBackup.cfg	violates CleanupSafe

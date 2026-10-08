@@ -90,7 +90,7 @@ Flip ==
   /\ cur < MaxGen
   /\ FlipEarly \/ \A r \in Live : <<r, cur + 1>> \in vec /\ <<r, cur + 1>> \in idx
   /\ cur' = cur + 1 /\ snap' = Live
-  /\ UNCHANGED <<content, payload, marked, vec, idx, ingested>>
+  /\ UNCHANGED <<content, payload, marked, vec, idx, ingested, pc, repairs>>
 
 ExpungeOld(x) ==
   /\ x \in vec /\ x[2] < cur

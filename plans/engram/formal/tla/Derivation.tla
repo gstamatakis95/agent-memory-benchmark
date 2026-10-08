@@ -13,7 +13,7 @@
 (*             evidence rows (fact ids; observation versions for pages;    *)
 (*             no foreign key to facts, N135), st live | stub | absent     *)
 (*   dh        derived_hidden rows <<node, root_version, from_version,     *)
-(*             cause>>, cause "doc" or the invalidated fact id             *)
+(*             cause>>, cause <<"doc", 0>> or <<"inv", fact id>>             *)
 (*   props     persisted stage-2 proposals (write-once) with base_version  *)
 (*   lockX     the derivation lock, exclusive: Materialize batch, Restore  *)
 (*             (writers hold it shared from Verify to Commit, N120)        *)
@@ -49,6 +49,7 @@
 (*   BaseCheck=FALSE      an update is applied without checking its base    *)
 (*   MatOnce              Materialize reads fact_hidden once, not per batch *)
 (*   DropStub             DerivedPurge deletes the version row              *)
+(*   AllowAbortW=FALSE    writers never crash (liveness runs)               *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -56,7 +57,7 @@ CONSTANTS Docs, Facts, DocOf, FVer, Mentioned, Twin,
           Obs, Pages, MaxVerO, MaxVerP, Writers, Budget, MaxF,
           MaxT, MaxDeletes, MaxCuration, MaxRetire,
           UseLock, RestoreLock, TombByVersion, EffAllShown, CascadeEvidence, ReextractHides,
-          PageVerify, BaseCheck, MatOnce, DropStub
+          PageVerify, BaseCheck, MatOnce, DropStub, AllowAbortW
 
 \* Design instance (cfg: DocOf <- DocOfDef, FVer <- FVerDef, Mentioned <- MentionedDef, Twin <- TwinDef).
 DocOfDef == <<"d1", "d1", "d2", "d1">>
@@ -97,7 +98,7 @@ GDeriv(n, v)  == GDerivF(n, v) \cup UNION {GDerivF(x[1], x[2]) : x \in {y \in GD
 TombTrue(f) == FVer[f] <= tomb[DocOf[f]]                           \* the truth: deleted
 TombImpl(f) == IF TombByVersion THEN TombTrue(f) ELSE tomb[DocOf[f]] > 0   \* what the predicate checks
 Victim(f)  == TombTrue(f) \/ f \in hidden                          \* ghost: deleted or invalidated
-VictimD(f) == TombImpl(f) \/ f \in hidden \/ (ReextractHides /\ f \in hidRe)   \* derived-version predicate
+VictimD(f) == (TombImpl(f) /\ ms[DocOf[f]] = "pending") \/ f \in hidden \/ (ReextractHides /\ f \in hidRe)   \* derived-version predicate: pending tombstones only (N117)
 VictimF(f) == TombImpl(f) \/ f \in hidden \/ f \in hidRe \/ f \in ctomb        \* fact and chunk arms
 
 RowCovered(n, v) == \E r \in dh : r[1] = n /\ r[2] = vers[n][v].root /\ r[3] <= v
@@ -171,7 +172,7 @@ Invalidate(f) ==
 Restore(f) ==
   /\ f \in hidden /\ nCur < MaxCuration
   /\ (RestoreLock => ~lockX /\ \A w \in Writers : wr[w].ph # "verified")
-  /\ hidden' = hidden \ {f} /\ dh' = {r \in dh : r[4] # f} /\ nCur' = nCur + 1
+  /\ hidden' = hidden \ {f} /\ dh' = {r \in dh : r[4] # <<"inv", f>>} /\ nCur' = nCur + 1
   /\ UNCHANGED <<tomb, ms, hidRe, ctomb, born, gone, vers, hw, lockX, matPhase, matDocs, matV0, matTodo, matSnap,
                  wr, props, budget, nDel, nRet>>
 
@@ -230,7 +231,7 @@ Pick(w) ==
                  matSnap, props, budget, nDel, nCur, nRet>>
 
 \* Everything the rendered result depends on is still fine: inputs visible, base current and visible.
-InputsOK(p) == IsPage(p.n) /\ ~PageVerify \/ (p.cf \subseteq VisFacts /\ p.co \subseteq VisPairs)
+InputsOK(p) == (IsPage(p.n) /\ ~PageVerify) \/ (p.cf \subseteq VisFacts /\ p.co \subseteq VisPairs)
 BaseOK(p) ==
   p.mode = "update" =>
     IF BaseCheck THEN Len(vers[p.n]) = p.base /\ VisN(p.n, p.base)
@@ -247,14 +248,19 @@ Verify(w) ==
 
 \* Verification failed: ROLLBACK and discard the stored proposal (never repair it).
 Discard(w) ==
-  /\ wr[w].ph = "picked" /\ wr[w].p \in props
-  /\ ~(UseLock /\ lockX) /\ ~CheckOK(wr[w].p)
+  /\ wr[w].ph # "idle"
+  /\ \/ wr[w].p \notin props                              \* another writer applied it: the unique key refuses
+     \/ wr[w].p \in props /\ wr[w].ph = "picked" /\ ~(UseLock /\ lockX) /\ ~CheckOK(wr[w].p)
+     \/ wr[w].p \in props /\ wr[w].ph = "verified" /\ ~BaseOK(wr[w].p)   \* the base compare-and-set failed
+     \/ wr[w].p \in props /\ wr[w].ph = "verified" /\ Len(vers[wr[w].p.n]) >= MaxVer(wr[w].p.n)   \* bound of the model
   /\ props' = props \ {wr[w].p} /\ wr' = [wr EXCEPT ![w] = IdleW]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
                  matSnap, budget, nDel, nCur, nRet>>
 
+\* The insert is a compare-and-set on the base (UPDATE observations SET current_version = v+1 WHERE
+\* current_version = base): shared-lock holders do not exclude each other, so the base is re-evaluated here.
 Commit(w) ==
-  /\ wr[w].ph = "verified" /\ wr[w].p \in props
+  /\ wr[w].ph = "verified" /\ wr[w].p \in props /\ BaseOK(wr[w].p)
   /\ LET p == wr[w].p IN LET n == p.n IN LET L == Len(vers[n]) IN
      /\ L < MaxVer(n)
      /\ \E cit \in SUBSET p.cf :
@@ -276,7 +282,7 @@ Commit(w) ==
                  budget, nDel, nCur, nRet>>
 
 AbortW(w) ==
-  /\ wr[w].ph # "idle"
+  /\ AllowAbortW /\ wr[w].ph # "idle"
   /\ wr' = [wr EXCEPT ![w] = IdleW]
   /\ UNCHANGED <<tomb, ms, hidden, hidRe, ctomb, born, gone, vers, hw, dh, lockX, matPhase, matDocs, matV0, matTodo,
                  matSnap, props, budget, nDel, nCur, nRet>>
@@ -285,10 +291,10 @@ AbortW(w) ==
 (* Expunge (N119, N136): Materialize in batches, Purge, DerivedPurge       *)
 
 \* The derived_hidden rows of one node for victim set V (DV: the tombstoned part of V, cause "doc").
-Cause(f, DV) == IF f \in DV THEN "doc" ELSE f
+Cause(f, DV) == IF f \in DV THEN <<"doc", 0>> ELSE <<"inv", f>>
 HitF(n, w, V) == V \cap (vers[n][w].finp \cup
                          UNION {DerivF(x[1], x[2]) : x \in {y \in vers[n][w].oinp : Exists(y)}})
-RowsNode(n, V, DV) == {<<n, vers[n][w].root, w, Cause(f, DV)>> : w \in 1..Len(vers[n]), f \in HitF(n, w, V)}
+RowsNode(n, V, DV) == UNION {{<<n, vers[n][w].root, w, Cause(f, DV)>> : f \in HitF(n, w, V)} : w \in 1..Len(vers[n])}
 NeedInv == \E n \in Nodes : RowsNode(n, hidden, {}) \ dh # {}
 
 MatBegin ==
@@ -331,7 +337,7 @@ Purge(d) ==                         \* the victims' facts; evidence rows stay (n
 RECURSIVE Trim(_)
 Trim(s) == IF s # << >> /\ s[Len(s)].st = "absent" THEN Trim(SubSeq(s, 1, Len(s) - 1)) ELSE s
 
-DocCovered(n, i) == \E r \in dh : r[4] = "doc" /\ r[1] = n /\ r[2] = vers[n][i].root /\ r[3] <= i
+DocCovered(n, i) == \E r \in dh : r[4] = <<"doc", 0>> /\ r[1] = n /\ r[2] = vers[n][i].root /\ r[3] <= i
 
 \* Versions covered by a document-cause row become content-free stubs (evidence and text gone, the row stays);
 \* DropStub deletes the row instead, and the next version number is reused.

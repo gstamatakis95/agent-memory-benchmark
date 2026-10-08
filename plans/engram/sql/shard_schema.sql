@@ -3280,6 +3280,12 @@ BEGIN
   IF EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = 'fact_hidden'::regclass AND k.contype = 'f') THEN
     RAISE EXCEPTION 'fact_hidden must not reference facts (N145)';
   END IF;
+  -- 16c. an invalidation is tagged (N162): invalidate rows carry invalidation_op; the chain subject is class-encoded
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = 'fact_hidden'::regclass AND k.contype = 'c'
+                  AND pg_get_constraintdef(k.oid) LIKE '%invalidation_op%')
+     OR NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = 'deletion_log'::regclass AND a.attname = 'subject_class' AND NOT a.attisdropped) THEN
+    RAISE EXCEPTION 'fact_hidden.invalidation_op CHECK or deletion_log.subject_class is missing (N162)';
+  END IF;
   IF has_table_privilege('engram_app', 'consolidation_proposals', 'DELETE')
      OR has_table_privilege('engram_app', 'consolidation_proposals', 'UPDATE')
      OR has_table_privilege('engram_app', 'consolidation_applied', 'DELETE') THEN

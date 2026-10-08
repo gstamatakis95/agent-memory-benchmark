@@ -1,16 +1,14 @@
 ## 3. Data model
 
-This section fixes the physical schema of the two kinds of database Engram runs, what lives in
+This section fixes the physical schema of the two databases Engram runs, what lives in
 blob storage, and the queries the schema is shaped for. The complete, runnable DDL is in
 `plans/engram/sql/catalog_schema.sql` (control plane) and `plans/engram/sql/shard_schema.sql`
 (one copy per shard). Both files parse under the PostgreSQL 16 grammar and apply cleanly to a
 PostgreSQL 16.15 instance with pgvector 0.8.6, pg_trgm, btree_gin and btree_gist; the `USING
 bm25` statements were parser-checked and written against the pg_search 0.25 syntax (the
 `paradedb/paradedb:latest-pg16` image). The marker, visibility, ownership, index-procedure and
-immutability behaviour described below was executed as `engram_app`, `engram_move` and
-`engram_admin` against the applied shard schema (the BM25 arm with a `tsvector` stand-in). Excerpts
-below are abbreviated; the SQL files are the source of truth and the section 9 migration
-`0001_init.sql` is generated from them.
+immutability behaviour below was executed as `engram_app`, `engram_move` and `engram_admin` against the applied shard schema (BM25 with a `tsvector` stand-in). Excerpts
+below are abbreviated; the SQL files are the source of truth (section 9's `0001_init.sql` is generated from them).
 
 Conventions used throughout: ids are `uuid` holding UUIDv7 (D1); every timestamp is
 `timestamptz`; epochs and outbox sequence numbers are `bigint`; hashes are `bytea` of exactly 32
@@ -31,19 +29,17 @@ sets that grow (operation kinds, event names, reasons) are `text` with a `CHECK`
    carries one class tag (`COMMENT ON TABLE`; N137, 3.3.1). Everything that changes
    sits in a narrow table that stays HOT (`fillfactor` 50 to 70): `documents`, `observations`,
    `pages`, the markers, `namespace_stats`. A delete or an invalidation therefore writes one
-   small marker row and rewrites nothing that an HNSW or BM25 index points at. Rejected: flags
-   on the vectored row with a partial `WHERE live` HNSW (a retire still rewrites a 2.4 KB tuple
-   and re-indexes it, and every later visibility change lands on the same row again).
+   small marker row and rewrites nothing that an HNSW or BM25 index points at.
 2. **Keys lead with `namespace_id`.** Every primary key and every B-tree, GIN and GiST index of a namespace-scoped table starts with `namespace_id` (D2), so a query touches one key range and prunes to one of
-   the 16 hash partitions; the only shard-wide indexes are the outbox PK and the scheduler partial indexes. Rejected: `tenant_id` as the leading column.
+   the 16 hash partitions; the only shard-wide indexes are the outbox PK and the scheduler partial indexes.
 3. **Row-Level Security on every namespace-scoped table**, policy `ns_isolation` (`namespace_id = current_setting('engram.namespace_id')::uuid`, `USING` and `WITH CHECK`), enabled *and forced*, on the
    partitions as well as the parents; `engram_app` is `NOBYPASSRLS`. An unset scope is `42704`, an expired one `22P02`: it errors, never leaks. No tag predicate and no non-leakproof operator runs under RLS: tags
-   resolve once per recall against `documents.tags` into an allowed-document set, and the trigram lookup is a `SECURITY DEFINER` function that re-checks the namespace (N116, N131, P-5). Rejected: application predicates only; per-namespace tables.
+   resolve once per recall against `documents.tags` into an allowed-document set, and the trigram lookup is a `SECURITY DEFINER` function that re-checks the namespace (N116, N131, P-5).
 4. **Sixteen hash partitions by `namespace_id`** for the eight large tables (`facts`, `chunks`, `fact_links`, `entity_mentions`, `observation_versions`, three vector tables): a namespace lives in one partition
-   of each, so **vector indexes are per namespace** and per-partition `VACUUM` stays short. Rejected: one partition per namespace; no partitioning.
+   of each, so **vector indexes are per namespace** and per-partition `VACUUM` stays short.
 5. **Vectors are insert-only side tables with one partial HNSW per namespace (N111, N112)**, keyed by content id and embedding model; the arms read the current model. Below 2,000 vectors an arm scans exactly (≤ 2,000 rows),
-   at 2,000 the stats sweeper requests the namespace's partial index through `engram_hnsw_ddl` (3.3.4), below 1,000 it drops it. A query visits only its own graph, a namespace delete or move cleanup is `DROP INDEX` plus batched
-   `DELETE` with no graph repair, and a purge dirties one small index. Index DDL has one owner, the index runner (N138).
+   at 2,000 the stats sweeper requests the namespace's partial index through `engram_hnsw_ddl` (3.3.4), below 1,000 it drops it. A query visits only its own graph; a namespace delete or move cleanup is `DROP INDEX` plus batched
+   `DELETE`, and a purge dirties one small index. Index DDL has one owner, the index runner (N138).
 6. **Deletion is a marker; physical work is the expunge (N115, N119).** `DeleteDocument` is one
    `document_tombstones` row, `documents.state = 'deleting'`, one `deletion_log` row and one
    outbox event, committed in milliseconds at any size after the intent object is durable
@@ -148,14 +144,8 @@ CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)
 
 `namespace_moves` has no outbox position: a move never reads or replays the outbox (N124). **Freeze, then copy (N160):** the namespace is read-only from `frozen_at` to cutover; `W_est` (≈ 25 min per 1 M facts) must fit the operator `window` (default maximum 4 h) and the rebalancer starts only a move with `W_est ≤ 10 min`.
 It is the arbiter of the move, of restore and of failover, through one catalog CAS (N123, N125):
-`UPDATE namespace_moves SET state = 'committed' WHERE move_id = $1 AND state = 'cutover'` is the point
-of no return; restore and failover CAS `cutover → rolled_back` instead, or, reading `committed`,
-complete (c), (b″) and (d) themselves. Exactly one CAS wins and the loser stops. The CAS is on the **exact rows the mover
-verified** (N143): its `WHERE` also carries the source and target shards, `from_epoch`, the recorded `source_system_id` and
-`source_timeline_id`, and requires the catalog `namespaces` row to still name `(source, e, frozen)`; every shard-side step is
-likewise an `UPDATE namespace_ownership … WHERE` on the verified `(state, freeze_reason, epoch, move_id)` of the source or
-target row, and zero rows stops the step with `MoveFenced`. The trigger
-`catalog_check_move_transition` encodes the edges, so nothing leaves `committed` backwards.
+`UPDATE namespace_moves SET state = 'committed' WHERE move_id = $1 AND state = 'cutover'` is the point of no return, on the **exact rows the mover verified** (N143: the shards, `from_epoch`, `source_system_id`/`source_timeline_id`, and a catalog `namespaces` row still `(source, e, frozen)`); every shard-side step is likewise an
+`UPDATE namespace_ownership … WHERE` on the verified row, and zero rows stops it with `MoveFenced`. `catalog_check_move_transition` encodes the edges, so nothing leaves `committed` backwards.
 
 **Config inheritance.** `tenants.config` and `namespaces.config` are `jsonb` objects holding the keys of D12; the database
 checks only that each is an object, key validation is the Go config schema's job, and the resolver caches the deep-merged
@@ -176,12 +166,10 @@ Triggers on `namespaces`, `tenants` and `namespace_moves` insert an event for ev
 updates; retention is 30 days, so the table doubles as the audit log of every move and epoch bump. `tenant_usage_daily(tenant_id, day,
 quota_key, used)` is the cross-shard rollup for tenant-level daily quotas, fed by per-minute deltas through the API (D4).
 
-**Cutover and the catalog (N125, N160, N161, N163).** (b′) the target row goes `incoming → ready` (nothing routes to it; the trigger requires every requested index `indisvalid ∧ indisready` and the target's sequence past `w_final`); **(a″) the catalog CAS
-`cutover → committed`, the point of no return**, then the wait for the standby's `replay_lsn` to pass the CAS commit LSN (10 s per attempt, retried; standby down: the move stalls `committed` and stays rollback-able by the arbiter rule below); (c) the source goes `frozen/move → moved_out`
-with `target_shard_id`/`target_epoch`, only after the mover *read* `committed` and the standby has it; (b″) the target goes `ready → active`; (d) the catalog `namespaces` flip `WHERE epoch = e AND state = 'frozen'`, retried indefinitely, "already `(target, e + 1)`" its only idempotent success. Every step is a compare-and-set on the rows it verified (N143).
+**Cutover and the catalog (N125, N160, N161, N163).** (b′) `incoming → ready` on the target (nothing routes to it; the trigger requires every requested index `indisvalid ∧ indisready` and the target's sequence past `w_final`); **(a″) the CAS `cutover → committed`**, then the wait for the standby's `replay_lsn` to pass its commit LSN (10 s per attempt, retried; standby down: the move stalls `committed`
+and stays rollback-able by the rule below); (c) the source goes `frozen/move → moved_out` with `target_shard_id`/`target_epoch`, only after the mover *read* `committed` and the standby has it; (b″) `ready → active`; (d) the `namespaces` flip `WHERE epoch = e AND state = 'frozen'`, retried indefinitely, "already `(target, e + 1)`" its only idempotent success.
 **Restore and failover (N161):** a reconcile takes `cutover → rolled_back` only after reading both ownership rows and finding neither `moved_out` on the source nor `active` at the move's epoch on the target; otherwise it completes (c), (b″), (d). A target restored to a point before activation shows `incoming` or `ready` and is **re-run** (`rerun_move`, `engram_cleanup_namespace`, the copy again from the retained source, `reconcile_in`);
-one restored after activation is an ordinary shard restore; nothing is ever merged into a target that has served writes. Cleanup needs `now() ≥ activated_at + 24 h` and a completed **full** target backup that started after activation; no content or timeline check exists. The API routes a request that hits `moved_out` from the
-`WrongShardOrEpoch{MOVED_OUT}` detail, so (d) is on no read path; between (c) and (b″) there is no owner, the simplest way to make "at most one writable owner" true; a failure before (a″) rolls back (3.3.1) and thaws the source.
+one restored after activation is an ordinary restore; nothing is ever merged into a target that has served writes. Cleanup needs 24 h after activation and a completed **full** target backup that started after it; there is no content or timeline check. The API routes from the `WrongShardOrEpoch{MOVED_OUT}` detail, so (d) is on no read path; between (c) and (b″) there is no owner; a failure before (a″) rolls back and thaws the source.
 
 ### 3.3 Shard schema (identical on every shard)
 
@@ -304,15 +292,11 @@ exists off the insert-only class, or if an insert-only table lacks `(namespace_i
 remain the expunge's and the DDL's. Every insert-only table has `ins_seq bigint NOT NULL DEFAULT nextval('engram_ins_seq')`, drawn at insert, not commit, so it is commit-ordered only within the writer lifetime;
 `engram_seq_sample()` records `(now(), nextval)` in the ring `engram_seq_log` every minute (7 days kept) and `engram_seq_floor(ts)` returns the sample at or before `ts − 10 min` (0 on a new shard) for
 the stats sweeper, `BeginSnapshot` and the consolidation watermark, each on its own shard. The sequence is **per shard** and the loader copies `ins_seq` verbatim, so the mover calls `engram_seq_advance(W_final)`
-on the target **once**, at the start of the frozen copy (`setval` to `p_to + 10 000` only when that exceeds `last_value`; the slack absorbs concurrent `nextval`s, N167), so copied rows sort below everything the target inserts later (N147). Rejected: `created_at` or UUIDv7 ids as a sequence key; namespace-scoped sequences.
+on the target **once**, at the start of the frozen copy (`setval` to `p_to + 10 000` only when that exceeds `last_value`; the slack absorbs concurrent `nextval`s, N167), so copied rows sort below everything the target inserts later (N147). 
 
-**Restore and failover (N123, N134, N161, N163).** The restored or promoted shard comes up with `listen_addresses`
-restricted. It first settles every open move that names it by the catalog CAS (3.2): `cutover →
-rolled_back` (only under the rule of N161(4)), or, if it reads `committed`, it completes (c), (b″) and (d) itself (`reconcile_out`). Only then does every row go
-`frozen/restore` (a namespace with a `committed` move or a catalog `deleting` state is skipped; a moved-in namespace restored before its activation is re-run, 3.2, while the shard's other namespaces reopen),
-`engramctl restore replay` apply the delete intents verbatim (recorded epochs kept, N150) from the replay floor − 10
-min, per subject in `prev_operation_id` chain order, and `restore_done` bump the epoch. The floor is `min(catalog.shards.replay_floor, the restore targets listed under _control/restores/{shard}/)`:
-it is outside the restorable state, never raised while intents are retained (35 days), and the blob listing is its only mirror (N163(4)). A restored source re-runs `engram_cleanup_namespace` for every `moved_out` row past `committed` (`restore cleanup-moved-out`, part of `restore_done`).
+**Restore and failover (N123, N134, N161, N163).** The restored or promoted shard comes up with `listen_addresses` restricted. It first settles every open move that names it by the catalog CAS (3.2). Then every row goes `frozen/restore` (a namespace with a `committed` move or a catalog `deleting` state is skipped; a moved-in namespace restored before activation is re-run while the other namespaces reopen),
+`engramctl restore replay` applies the delete intents verbatim (recorded epochs kept, N150) from the replay floor − 10 min, per subject in `prev_operation_id` chain order, and `restore_done` bumps the epoch. The floor is `min(catalog.shards.replay_floor, the restore targets listed under _control/restores/{shard}/)`: outside the restorable state, never raised while intents are retained (35 days), the blob listing its only mirror (N163(4)).
+A restored source re-runs `engram_cleanup_namespace` for every `moved_out` row past `committed` (`restore cleanup-moved-out`).
 
 **Schedulers** read `schedulable_namespaces` (`state = 'active'`); Expunge and the index jobs read `purgeable_namespaces`, which also
 excludes a namespace with an open move (Plan to done). Their writes go through `WithNamespaceTx(write)` and `engramlint sql` checks the
@@ -484,27 +468,14 @@ SELECT index_state, statement FROM engram_hnsw_ddl('fact_vectors', $ns, $model, 
 SELECT statement FROM engram_hnsw_ddl('fact_vectors', $ns, $model, 'drop');     -- DROP INDEX CONCURRENTLY IF EXISTS fv_…
 ```
 
-`vector_indexes` is the machine `requested → building → ready`, or `failed` (and `dropping`). The
-stats sweeper inserts `requested` at ≥ 2,000 vectors of the current model (or retries `failed`) and
-`drop` below 1,000; the runner takes a lease (`building`, `lease_until`; an expired lease is
-re-leased), **reads `index_state` and drops an `invalid` index before every build (never `IF NOT
-EXISTS`: it would accept an invalid index and leave the namespace on the exact path)**, builds,
-and marks `ready` with `rows_at_build`. Builds are serialised per shard with `maintenance_work_mem =
-2.4 KB × vectors` (≤ 5 GB) and `shm_size = 8g`, and the runner refuses to start one while
-`engram_old_snapshots` is non-empty (a backend `xmin` older than 5 min). Names are deterministic,
-so `rollback_target` and namespace-delete `DropIndexes` drop by name and orphans cannot hide.
-Queries that must match the partial-index predicate carry the namespace id and model as literals
-(`plan_cache_mode = force_custom_plan`). On a move target the indexes are built under the freeze, **after** the verified copy (N160): the mover inserts `vector_indexes` requests for every `(vector table, current model)` with ≥ 2,000 copied vectors, the runner serves them at priority regardless of `purgeable_namespaces`, and
-`ready_target` and `reconcile_in` wait for them. `engram_move_indexes_valid(ns)` is true iff every request row names (by the deterministic name of `engram_hnsw_ddl`) an index that is `indisvalid ∧ indisready`; there is no row-count ratio, because a valid index built on a static copy holds every row.
-The ownership trigger refuses `ready` otherwise.
+`vector_indexes` is the machine `requested → building → ready`, or `failed` (and `dropping`). The stats sweeper inserts `requested` at ≥ 2,000 vectors of the current model (or retries `failed`) and `drop` below 1,000; the runner takes a lease (`building`, `lease_until`), **reads `index_state` and drops an `invalid` index before every build
+(never `IF NOT EXISTS`: it would accept an invalid index and leave the namespace on the exact path)**, builds, and marks `ready` with `rows_at_build`. Builds are serialised per shard (`maintenance_work_mem = 2.4 KB × vectors`, ≤ 5 GB; `shm_size = 8g`) and refused while `engram_old_snapshots` is non-empty. Names are deterministic, so rollback and namespace delete drop by name.
+Queries that must match the partial-index predicate carry the namespace id and model as literals (`plan_cache_mode = force_custom_plan`). **On a move target** the indexes are built under the freeze, after the verified copy (N160): the mover requests every `(vector table, current model)` with ≥ 2,000 copied vectors, the runner serves them at priority, and `ready_target`/`reconcile_in` wait for `engram_move_indexes_valid(ns)`:
+every request row names, by the deterministic name, an index that is `indisvalid ∧ indisready` (no row-count ratio: a valid index built on a static copy holds every row).
 
-**Hygiene (N138, N152): the partition is the unit.** The purge increments `vector_indexes.purged_since_build`. A touched index is **due** at
-`max(1 % of rows_at_build, 2 000)` purged elements (`engram_index_hygiene_due`; the 2 k floor binds below 200 k rows). When any index on a vector
-partition is due, the runner rebuilds **every** touched index on it (`engram_index_partition_hygiene`; `engram_hnsw_ddl(…, 'rebuild')` is
-`REINDEX INDEX CONCURRENTLY`, preceded by a `DROP INDEX CONCURRENTLY` row per `<name>_ccnew*` leftover) and only then runs one `VACUUM (INDEX_CLEANUP ON)` of the
-partition; a weekly pass and one after each namespace delete apply the rule to partitions with dead tuples and no due index. Vector partitions carry
-`vacuum_index_cleanup = off` permanently, so autovacuum never repairs a graph (repair costs about 1× a rebuild at 0.2 % purged, 2× at 1 %, 5 to 6× at 4 %). **N166:** a neighbour graph is rebuilt only at `purged_since_build ≥ 0.05 % × rows_at_build` (≥ 50), below that the vacuum repairs it; a rebuild is a WAL burst (≈ 1.5 to 1.8 KB per vector), started only while archive lag < 30 s and `pg_wal` headroom ≥ 2 × the burst, and the next purge batches wait `burst ÷ 25 MB/s`.
-**Purges pause for the rebuild set:** the runner holds `engram_partition_purge_key(partition)` exclusively from selection until `VACUUM` has started; purge batches take it shared (`engram_try_partition_purge_shared`) and skip that partition. `engram_old_snapshots` counts client backends only (N152).
+**Hygiene (N138, N152, N166): the partition is the unit.** The purge increments `vector_indexes.purged_since_build`. A touched index is **due** at `max(1 % of rows_at_build, 2 000)` purged elements (`engram_index_hygiene_due`). When any index on a vector partition is due, the runner rebuilds **every** touched index on it (`engram_index_partition_hygiene`; `engram_hnsw_ddl(…, 'rebuild')` is
+`REINDEX INDEX CONCURRENTLY`, preceded by a `DROP INDEX CONCURRENTLY` per `<name>_ccnew*` leftover) and only then runs one `VACUUM (INDEX_CLEANUP ON)`; vector partitions carry `vacuum_index_cleanup = off`, so autovacuum never repairs a graph. A neighbour graph is rebuilt only at `purged_since_build ≥ 0.05 % × rows_at_build` (≥ 50), below that the vacuum repairs it;
+a rebuild is a WAL burst (≈ 1.5 to 1.8 KB per vector), started only while archive lag < 30 s and `pg_wal` headroom ≥ 2 × the burst, and the next purge batches wait `burst ÷ 25 MB/s`. **Purges pause for the rebuild set:** the runner holds `engram_partition_purge_key(partition)` exclusively from selection until `VACUUM` has started; purge batches take it shared (`engram_try_partition_purge_shared`) and skip that partition.
 
 **Ordinary indexes on partitioned tables (P-10)** added later follow `engram_partitioned_index_ddl(parent, index_name, columns, using,
 where)`: `CREATE INDEX … ON ONLY` the parent (invalid), then per partition `CREATE INDEX CONCURRENTLY` and `ALTER INDEX … ATTACH
@@ -662,7 +633,7 @@ CREATE TABLE fact_hidden (namespace_id uuid, tenant_id text, memory_id uuid, hid
   'deleting'` with the content columns cleared (summary blob to `blob_tombstones`), one `document_tombstones` row
   (`up_to_version`; `event_seq` stamped by the final outbox statement), one `deletion_log` row, one outbox event, commit; **then** the intent put,
   then the ack. A duplicate attempt finds the document `deleting`, returns the **existing operation** (never `NOT_FOUND`) and re-puts the marker's own intent. Nothing else is touched.
-- `Invalidate(f)` = under the subject lock of `engram_memory_subject(ns, f)` (a fact whose row is gone is `NOT_FOUND`), held by the caller until the intent is put (N150, N159), **one** marker transaction: `fact_hidden (cause 'invalidate', invalidation_op = operation_id)` for `f` **and** every live fact of the subject
+- `Invalidate(f)` = under the subject lock of `engram_memory_subject(ns, f)` (`NOT_FOUND` if the fact row is gone), held until the intent is put (N150, N159), **one** marker transaction: `fact_hidden (cause 'invalidate', invalidation_op = operation_id)` for `f` **and** every live fact of the subject
   (`engram_invalidation_twins`: same document, same `content_hash`), `curation_log` rows with the same `operation_id`, **one** `deletion_log` row (`memory_ids`), one intent, one outbox event. A twin created later by re-extraction gets its row from the lazy `curation_log` re-application at `CommitChunk`, stamped with the **same** `invalidation_op`.
   `Restore(g)` for any `g` of the subject = the same lock plus the exclusive derivation lock: `engram_restore_resolve` yields `I = fact_hidden(g).invalidation_op`; `DELETE fact_hidden WHERE invalidation_op = I`, `DELETE derived_hidden WHERE cause_kind = 'invalidation' AND cause_id = ANY (those ids)`, a `curation_log('restore')` row (so `CommitChunk` does not re-apply it), one `deletion_log` row, one intent.
   **Restore is exact by construction** (the set it removes is the set the invalidation and its lazy twins wrote; nothing is looked up by current hidden state) and the rows survive the purge of their fact; the `reextract` row is untouched. `NOT_INVALIDATED` = no `invalidate` row for any fact of the subject. **The purge of a deleted document** deletes its covered facts' `invalidate` rows and `reason`
@@ -833,7 +804,7 @@ namespace across moves. Rejected: one credential per cell; per-namespace credent
 
 Blobs are immutable: a changed input gets a new key, never an overwrite, which makes a move's prefix copy
 idempotent (copy-if-absent). Only the caches are content-addressed (a loss is a recompute); every other blob
-has exactly one owner row and dies with it. A move **pre-warms** the owner-keyed blobs (`ver/`, `ledger/`) by listing before the freeze (immutable and keyed, so nothing to verify), copies every other key referenced by a copied row
+has exactly one owner row and dies with it. A move **pre-warms** the owner-keyed blobs (`ver/`, `ledger/`) by listing before the freeze (immutable and keyed), copies every other key referenced by a copied row
 (`page_versions.markdown_blob_key`, export manifests and parts) under the freeze, and **checks existence of each on the target before cutover** (one key per copied row, H-8); caches (`xcache`, `ecache`, `staging`, `consolidate/`) are not copied. Deletion is
 always asynchronous through `blob_tombstones`, so the ack never waits on the blob store. The shard's pgBackRest
 repository lives under `_backups/shard-{id}/` outside every tenant prefix (N23).
@@ -862,16 +833,13 @@ pointer 4 B, index entry header 8 B; B-tree fill is sized as measured (N165), no
 
 The `(namespace_id, ins_seq)` indexes on the insert-only tables add ≈ **12 %** (N154; only their tail is hot). At the **5.5 M target** the shard holds
 ≈ **112 GB**; at the **10 M hard cap** ≈ **203 GB**; the **600 GB** volume leaves room for the WAL archive queue, one
-`REINDEX CONCURRENTLY` of the largest index, a pgBackRest spool and a move target's copy. `fact_links` cannot be smaller
-at 300 M rows of three UUIDs (D1 fixes UUIDv7); the practical lever is the link cap (section 5). Capacity signals use
+`REINDEX CONCURRENTLY` of the largest index, a pgBackRest spool and a move target's copy. `fact_links` cannot be smaller at 300 M rows of three UUIDs (D1); the lever is the link cap (section 5). Capacity signals use
 relation bytes per namespace (hidden and unpurged rows included), not `live_facts`; `ShardNearCapacity` pages at 70 % of
-the volume. Derived-version history grows with churn: a rebuild adds ≈ 13 KB, and superseded versions older than `H = 90 days` that no `as_of ≥ now − H` can serve
-are compacted to stubs by `DerivedPurge` (N157).
+the volume. Derived-version history grows with churn (a rebuild adds ≈ 13 KB); superseded versions older than `H = 90 days` are compacted to stubs by `DerivedPurge` (N157).
 
 **Instance and hot set (N165).** 8 vCPU, **128 GB RAM**, `shared_buffers = 32 GB`, container limit 112 GB,
-`effective_cache_size = 96 GB`, **local NVMe ≥ 50 k IOPS**. B-tree fill is **measured**: ≈ 52 % for per-namespace ascending keys in a shared partition (UUIDv7 PKs, `ins_seq` indexes, `fact_vectors_model_idx`, `facts_mentioned_idx`, the link PK at 101 B per row), ≈ 69 % for random keys (the reverse link index, 123 B per row): the B-tree term is × 1.7,
-the link indexes ≈ **224 B per link**, and no `REINDEX` is scheduled for fill. The hop is index-only, so the link heap is not hot. Hot set at **5.5 M**: HNSW 11.3 + vector heaps 11.3 + `facts` heap 4.4 + BM25 2.2 + B-trees and `ins_seq` tail ≈ 5 + link indexes ≈ **37** + chunk/observation vectors ≈ 3 ≈ **74 GB** against ≈ 80 to 96 GB of cache
-(≈ 88 GB at 6.5 M). **Decision (N165): target 5.5 M, hard cap 10 M**; R37's trigger applies. M0.6 builds its indexes **in production insertion order** (never bulk load plus `CREATE INDEX`); a measured hot set at 6.5 M ≤ 80 GB returns the target to 6.5 M by a register revision. Fallback: the 192 GB instance (154 shards, 77 hosts).
+`effective_cache_size = 96 GB`, **local NVMe ≥ 50 k IOPS**. B-tree fill is **measured**: ≈ 52 % for per-namespace ascending keys in a shared partition (UUIDv7 PKs, `ins_seq` indexes, the link PK at 101 B per row), ≈ 69 % for random keys (the reverse link index, 123 B per row): the B-tree term is × 1.7 and the link indexes ≈ **224 B per link**; no `REINDEX` is scheduled for fill. The hop is index-only, so the link heap is not hot. Hot set at **5.5 M**: HNSW 11.3 + vector heaps 11.3 + `facts` heap 4.4 + BM25 2.2 + B-trees and `ins_seq` tail ≈ 5 + link indexes ≈ **37** + chunk/observation vectors ≈ 3 ≈ **74 GB** against ≈ 80 to 96 GB of cache
+(≈ 88 GB at 6.5 M). **Decision (N165): target 5.5 M, hard cap 10 M**; R37's trigger applies. M0.6 builds its indexes **in production insertion order**; a measured hot set at 6.5 M ≤ 80 GB returns the target to 6.5 M by a register revision; fallback: the 192 GB instance.
 
 **IOPS budget (MID recall; M0.6 re-derives it with the real arm SQL, the graph arm, the exact path, rows for 10 % and 1 % tag
 filters and an old `as_of`).**
@@ -887,11 +855,10 @@ filters and an old `as_of`).**
 
 Write cost: `CommitChunk` ≈ 10 inserts into a ≤ 1 M-element index ≈ 2 to 5 ms of HNSW; retire, invalidate and delete markers
 cost **0 HNSW work**; the purge's hygiene is ≈ 0.35 ms per vector.
-**Filtered arms and connections (N164).** An exact arm costs ≈ 4 buffers and ≈ 6.6 µs per eligible row (≈ 42 k buffers, ≈ 65 ms at θ = 10 k); HNSW under correlation ≈ 50 k buffers. A recall with any vector arm at `E ≥ θ` is **filtered**: p95 ≤ 1 s, a second semaphore of 4 per API process, `RecallStats.filtered`; ≤ 20 % of recalls are assumed to be.
-A MID recall holds ≈ 425 connection-ms over six arm transactions: ≈ 24 Erlangs on a recall pool of 32 (pool wait ≤ 8 ms p95). pgbouncer serves `engram_app` (recall pool **32**), `engram_worker` (**8**) and direct `engram_subject` connections (2 per API process, `pg_advisory_lock` only), ≈ **57** of `max_connections` 100; keepalives 10 s / 5 s / 3 and `tcp_user_timeout = 30 s` free a vanished host's session locks in ≈ 30 s (N167).
-**WAL (N166).** The HNSW write path is full-page-image dominated: `WAL ≈ pages_touched_distinct × 6.5 KB + inserts × 8 KB` per checkpoint interval, ≈ **180 KB per fact**, ≈ 15 GB/day/shard at average fill and ≈ 150 GB/day at the 1 M facts/day backfill peak. `checkpoint_timeout = 30 min`, `max_wal_size = 16 GB`, `checkpoint_completion_target = 0.9`, `wal_compression = zstd` (crash recovery ≤ 20 min; M1.7 measures it).
-Backups: daily full, a differential at **32 GB** of WAL (N157) or 6 h; repository ≈ 1.5 TB per shard, 4 to 5 TB in a backfill (§6.8); **RTO ≤ 60 min** with no move term (N161). Purge, `DerivedPurge` and cleanup are paced to ≤ 25 MB/s.
-Fleet: 4 shards per 512 GB host, 8 hosts per cell, **182 shards (6 cells), 46 hosts** for 1 B facts; online fill ≈ 67 days.
+**Filtered arms and connections (N164).** An exact arm costs ≈ 4 buffers and ≈ 6.6 µs per eligible row (≈ 42 k buffers, ≈ 65 ms at θ = 10 k), HNSW under correlation ≈ 50 k buffers. A recall with any vector arm at `E ≥ θ` is **filtered**: p95 ≤ 1 s, 4 arms per API process, ≤ 20 % of recalls assumed.
+A MID recall holds ≈ 425 connection-ms over six arm transactions (≈ 24 Erlangs on a recall pool of 32, pool wait ≤ 8 ms p95); pgbouncer serves `engram_app` (**32**), `engram_worker` (**8**) and direct `engram_subject` connections (2 per API process), ≈ **57** of `max_connections` 100; keepalives and `tcp_user_timeout = 30 s` free a dead host's session locks in ≈ 30 s (N167).
+**WAL (N166).** The HNSW write path is full-page-image dominated: `WAL ≈ pages_touched_distinct × 6.5 KB + inserts × 8 KB` per checkpoint interval, ≈ **180 KB per fact** (≈ 15 GB/day at average fill, ≈ 150 GB/day at the backfill peak). `checkpoint_timeout = 30 min`, `max_wal_size = 16 GB`, `checkpoint_completion_target = 0.9`, `wal_compression = zstd`.
+Backups: daily full, a differential at **32 GB** of WAL (N157) or 6 h; repository ≈ 1.5 TB per shard (4 to 5 TB in a backfill, §6.8); **RTO ≤ 60 min** with no move term (N161). Fleet: 4 shards per 512 GB host, 8 hosts per cell, **182 shards (6 cells), 46 hosts** for 1 B facts.
 
 **Vacuum, freeze and bloat plan.**
 
@@ -1280,8 +1247,8 @@ SELECT count(*), bit_xor(hashtextextended(<pk>::text, 0)) FROM t WHERE namespace
 SELECT * FROM engram_verify_fk($1);   -- target; + owner-keyed blob existence per copied row; then BuildIndexes (engram_move_indexes_valid) and the consumer-cursor wait (<= 120 s)
 ```
 
-A mismatch re-copies the mismatching tables once, a second mismatch rolls back (`MoveVerifyFailed`), and so does the window deadline (`thaw_move`, delete target rows, drop target indexes by name). After cutover, cleanup runs `engram_hnsw_ddl` `drop`, then `engram_cleanup_namespace($1, 10000)` until it returns 0 (P-19), as `engram_move`
-on the `moved_out` row, once the N161 gate holds. The source blob prefix goes after the 28-day backup window. M1.5 replaces the planning rates (1,000 facts/s, 3,000 vectors/s) with measurements.
+A mismatch re-copies the mismatching tables once, a second one rolls back (`MoveVerifyFailed`), and so does the window deadline (`thaw_move`, delete target rows, drop target indexes by name). Cleanup runs `engram_hnsw_ddl` `drop`, then `engram_cleanup_namespace($1, 10000)` until it returns 0 (P-19) on the `moved_out` row, once the N161 gate holds;
+the source blob prefix goes after the 28-day backup window. M1.5 measures the planning rates (1,000 facts/s, 3,000 vectors/s).
 
 **Outbox relay** (`engram_relay`, direct connection): `SELECT … FROM outbox WHERE seq > $hwm ORDER BY seq LIMIT 500`; gap probe `WHERE seq = ANY ($gaps)`;
 `UPDATE outbox_cursors SET last_seq = $n, gaps = $j WHERE consumer = $c` (batched to 1/s). Retention (admin): `DELETE FROM outbox` in 10,000-row `seq`
@@ -1298,17 +1265,17 @@ admin RPC, D4). The **stats sweeper** refreshes `namespace_stats` (visible-fact 
 | Alternative | Why rejected (one line) |
 |---|---|
 | Flags on the vectored row (`retired_at`, `live`, partial `WHERE live` HNSW); a shared partition HNSW with per-namespace partials "in a band" | a retire rewrites a 2.4 KB tuple and re-indexes it; cost grows with 1/selectivity and vacuum repair is shard-wide (N112) |
-| `STORAGE EXTERNAL` for vectors; 6.5 M, 8 M or 10 M facts in 128 GB of RAM | TOAST probes on every exact scan; the hot set is ≈ 88 GB at 6.5 M (B-tree fill is ≈ 52 % to 69 %, not 90 %) and ≈ 100 GB at 8 M against ≈ 80 to 96 GB of cache (N114, N165) |
+| `STORAGE EXTERNAL` for vectors; 6.5 M, 8 M or 10 M facts in 128 GB of RAM | TOAST probes on every exact scan; the hot set is ≈ 88 GB at 6.5 M (B-tree fill is 52 to 69 %, not 90 %) against ≈ 80 to 96 GB of cache (N114, N165) |
 | Vectors on the content row, replaced by `ReembedChunk` | breaks insert-only; no versioned re-embed (N111) |
 | Lineage tables and a lineage fixpoint; per-version bitmaps; a derived-version flag stamped at delete time; a synchronous cascade at delete | closures under "shown = tainted" are most of the namespace, a stamped set drifts, a cascade grows with the document and races its writers; the read-time predicate and the O(1) marker have none of this (N115, N117) |
-| `synchronous_commit = on` with a standby for shard deletes or for the catalog; an intent put before the marker commits | a synchronous standby blocks when it is down (as configured the catalog's did not even start, and a cancelled wait commits asynchronously anyway); an orphan intent would delete content acknowledged later (N122, N163). The catalog reconciles from the shards instead |
-| A foreign key from evidence rows or from `fact_hidden` to `facts`; hiding derived content with `fact_hidden(reextract)`; deleting hidden derived versions outright; the memory id as the curation subject | REPLACE then the chunk purge erased the evidence a later `DeleteDocument` needs, and the cascade erased an acknowledged `Invalidate` (C-1, C-2); a prompt bump would hide every dependent; deletion breaks the D9 range rule; a lazy twin is outside every recorded id set. Evidence dies with its version, a purged version is a stub, the subject is `(document_id, content_hash)` (N135, N136, N145, N162) |
+| `synchronous_commit = on` with a standby for shard deletes or the catalog; an intent put before the marker commits | a synchronous standby blocks when it is down (the catalog's did not even start); an orphan intent would delete content acknowledged later (N122, N163) |
+| A foreign key from evidence rows or from `fact_hidden` to `facts`; hiding derived content with `fact_hidden(reextract)`; deleting hidden derived versions outright; the memory id as the curation subject | REPLACE then the chunk purge erased evidence a later `DeleteDocument` needs, and the cascade erased an acknowledged `Invalidate` (C-1, C-2); a prompt bump would hide every dependent; deletion breaks the D9 range rule; a lazy twin is outside any recorded id set (N135, N136, N145, N162) |
 | CAS before the idempotency check; a version-numbered page blob key | a retry of a committed commit lost the CAS and deleted its own blob, or advanced `current_version` to a phantom (C-1, N144) |
 | Content-addressed ledger and version bodies with reference counting | a reverse index, check-at-delete and an adoption race; owner-keyed blobs cost only cross-document dedup (N104) |
 | `created_at` or UUIDv7 ids as a sequence key; namespace-scoped sequences | not commit-ordered, absent on several tables; `ins_seq` per shard, advanced once across a move (N137, N147) |
 | `CREATE INDEX … IF NOT EXISTS` retries; index DDL by several roles; autovacuum repair of graphs; per-index hygiene | an invalid index is silently accepted; one runner checks `indisvalid`; repair costs 1× to 6× a rebuild and the partition is the vacuum unit (N138, N152) |
 | The catalog as the intent store; a `BYPASSRLS` loader role | same HA question and workers stay off the catalog (D4); nothing bound loaded rows to the namespace (N91) |
-| Moving by outbox replay or dual write; a dirty pre-copy with a delta, catch-up rounds, `PreVerify`, a merge into a target that served writes; indexes built on a pre-copy; serving a moved namespace from the exact path | a second write path to fence; "what is missing" is what rounds 4 to 6 could not answer safely, and a serving target has legitimately deleted rows; the exact path is 2.7 s and 2 GB per arm at 1 M. Freeze, copy a static source, verify by equality; HNSW builds inside the window (N153, N160, N161) |
+| Moving by outbox replay or dual write; a dirty pre-copy with a delta, catch-up, `PreVerify`, a merge into a target that served writes; indexes built on a pre-copy; serving a moved namespace from the exact path | a second write path; "what is missing" is what rounds 4 to 6 could not answer safely, a serving target has legitimately deleted rows, and the exact path is 2.7 s and 2 GB per arm at 1 M (N153, N160, N161) |
 | `FOR SHARE` on facts or the ownership row as the fence; a blocking shared fence | facts cannot be locked meaningfully, compatible lockers churn multixacts, a queued shared request holds its connection (N82, N120) |
 | Exclusive takers that retry every 5 s; one lock-key form for all three locks | a retry storm (one 35 s attempt instead); cross-kind collisions over-serialise (N82, N113) |
 | Generated columns (`live`, `fact_type_code`, `tag_count`) | rewrite-only migrations on partitioned tables and column-list drift; there are none left (P-10) |
@@ -1329,12 +1296,10 @@ admin RPC, D4). The **stats sweeper** refreshes `namespace_stats` (visible-fact 
 - Section 9: `engramctl index` is the one process holding `engram_migrate` at run time; shard roles run `synchronous_commit = local`, the catalog has an asynchronous standby and reconciles from the shards (N163); DSNs, pools (N164) and 30 s timeouts are in §9.1; restore and failover follow 3.3.1.
 - Intent objects are put **after** the marker commits and before the ack (3.6); `engramctl restore replay` reads them from `min(replay_floor, blob listing) − 10 min` (N163). Section 8's static RLS check allows `relay_read_all` on `outbox` only; tables without `namespace_id` are exactly `shard_meta`, `outbox_cursors`, `ownership_transitions`, `engram_seq_log` and `goose_db_version`.
 
-**Round-6 changes** (`reviews/round-6.md`; rows of D25):
+**Round-6 changes** (`reviews/round-6.md`; D25):
 
 | Register | Change in §3 and the SQL |
 |---|---|
-| N160, N161 | freeze-then-copy: `move_state` `planned → frozen → copied → cutover → …`; `namespace_moves` gains `w_est_seconds`, `window_seconds`, `freeze_deadline`, loses `t_copy`, `t_pre`, `w_pre`, `w_plan`, `activated_timeline`, `reconciled_in_at`, `cleanup_reconciled_at`, `source_content_*`, `target_content_*`; `done` CHECK = 24 h + post-activation full backup; `engram_move_indexes_valid`; `rerun_move`; `ownership.w_final` |
-| N162 | `fact_hidden.invalidation_op`, `curation_log.operation_id`, `deletion_log.subject_class` and the encoded subject indexed by `ins_seq`; `engram_memory_subject`, `engram_restore_resolve`, `engram_purge_document_invalidations` |
-| N163 | asynchronous catalog standby, `committed_replicated_at`; `replay_floor_mirror`/`_effective` deleted |
-| N164, N165, N166 | `= ANY` on the HNSW path, θ = 10 k, filtered class; `UNION ALL` index-only hop, 5.5 M target, §3.7 restated; WAL budget, `engram_partition_purge_key` |
-| N167 | `engram_seq_advance` forward by `p_to + 10 000`; keepalives; the `(b′)` sequence check |
+| N160, N161 | freeze-then-copy: `move_state` `planned → frozen → copied → …`; `namespace_moves` gains `w_est_seconds`, `window_seconds`, `freeze_deadline`, loses `t_copy`, `t_pre`, `w_pre`, `w_plan`, `activated_timeline`, `reconciled_in_at`, `source_content_*`, `target_content_*`; `done` = 24 h + post-activation backup; `engram_move_indexes_valid`; `rerun_move`; `ownership.w_final` |
+| N162 | `fact_hidden.invalidation_op`, `curation_log.operation_id`, `deletion_log.subject_class` + encoded subject by `ins_seq`; `engram_restore_resolve`, `engram_purge_document_invalidations` |
+| N163 to N167 | async catalog standby, `committed_replicated_at`, `replay_floor_mirror` deleted; `= ANY` on the HNSW path, θ = 10 k; index-only `UNION ALL` hop, 5.5 M, §3.7; WAL, `engram_partition_purge_key`; `engram_seq_advance` by `p_to + 10 000` |

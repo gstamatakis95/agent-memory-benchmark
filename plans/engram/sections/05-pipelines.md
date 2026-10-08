@@ -1353,17 +1353,23 @@ role. **A run is per tombstone `(document_id, up_to_version)`:** every predicate
    for the indexes it touched (the expunge's own bookkeeping, one writer); a touched HNSW is **due**
    at `purged_since_build ≥ max(1 % × rows_at_build, 2,000)` (the 2 k floor binds only below
    200 k rows). **The partition is the hygiene unit:** when any index on a vector partition is due,
-   the index runner (`engram_index_partition_hygiene`) rebuilds **every** HNSW on that partition with `purged_since_build > 0`
+   the index runner (`engram_index_partition_hygiene`) rebuilds the neighbour graph of every HNSW on that partition
+   with `purged_since_build ≥ 0.05 % × rows_at_build` (≥ 50 elements; below that the partition vacuum repairs it at
+   ≈ ¼× a rebuild, N166)
    (`engram_hnsw_ddl(…, 'rebuild')` = `REINDEX INDEX CONCURRENTLY`, after dropping any
    `<name>_ccnew*` leftover; a crash mid-rebuild is repaired the same way) and only then runs one
    `VACUUM (INDEX_CLEANUP ON)` of the partition, never earlier while an un-rebuilt touched graph sits
-   on it (`Storage_PerIndexHygiene.cfg` must fail `RebuildBeforeRepair`). A weekly partition
+   on it (`Storage_PerIndexHygiene.cfg` must fail `RebuildBeforeRepair`). **The rebuild set is protected from purges** (N166(6)):
+   the runner takes a per-partition advisory key exclusively from selection until `VACUUM` has started, and purge
+   batches take it shared with a try-lock and skip that partition meanwhile
+   (`Storage_PurgeDuringRebuildSet.cfg` must fail `RebuildBeforeRepair`). A weekly partition
    hygiene, and one after every namespace delete on the partition, applies the same rule to
    partitions with dead tuples and no due index (small namespaces without an HNSW). Vector
    partitions carry `vacuum_index_cleanup = off` permanently, so autovacuum never repairs a graph
    (repair costs ≈ 1× a rebuild at 0.2 % dead, 2× at 1 %, 5–6× at 4 %, and a partition vacuum reads
-   every HNSW on it); rebuild WAL (≈ 1.5–1.8 KB per vector, ≈ 1.7 GB and ≈ 6 min for a 1 M-vector
-   namespace every 10 k purged facts) is paced by the purge budget (25 MB/s, shared); hygiene is
+   every HNSW on it); a rebuild writes its graph in one burst at the end (≈ 1.5–1.8 KB per vector), which is
+   **debt, not paced**: the runner starts one only while archive lag is under 30 s and `pg_wal` headroom is at
+   least twice the expected burst, and the next purge batches wait `burst ÷ 25 MB/s` (N166(4)); hygiene is
    budgeted at ≈ 0.35 ms per vector. A namespace delete is `DROP INDEX` with no graph repair
    (§5.4.3).
 4. **Finish**: `expunge_state = 'purged'`, outbox `DocumentDeleted{PURGED}`, operation
@@ -1545,7 +1551,7 @@ that follows a replace still finds every version derived from the replaced text.
 | `PurgeBatch` | activity | predicate deletes; `expunge_progress` `(unit, table)`; WAL-paced (≤ 25 MB/s) | `P-frozen` | shared try-lock, `active` @ epoch; consumer cursors past the tombstone's `event_seq`; paused during a move | write tx | `EntityUpserted` (alias recompute) |
 | `DerivedPurge` (stubs, transcripts) | activity | version row replaced by a stub in one tx; `expunge_progress`; WAL-paced | `P-frozen` | shared try-lock, `active` @ epoch; admin role | admin tx | — |
 | `PurgeBlobs` | activity | key set derived; `xcache` only when unreferenced **and** older than `xcache_grace` (N100) | `P-blob` then `P-db` | shared try-lock, `active` @ epoch; ledger rows under `engram_admin` | write tx + admin tx | — |
-| `ReindexHygiene` (request only) | activity | `vector_indexes.purged_since_build` ≥ `max(1 % × rows_at_build, 2 k)` on any index of the partition; the index runner rebuilds every touched HNSW of the partition (`REINDEX INDEX CONCURRENTLY`), then runs one `VACUUM (INDEX_CLEANUP ON)` (N152) | `P-db` | admin role writes the request; the index runner (`engram_migrate`) executes it | admin tx | — |
+| `ReindexHygiene` (request only) | activity | `vector_indexes.purged_since_build` ≥ `max(1 % × rows_at_build, 2 k)` on any index of the partition; the index runner rebuilds the touched HNSWs of the partition that cross 0.05 % (`REINDEX INDEX CONCURRENTLY`), then runs one `VACUUM (INDEX_CLEANUP ON)` (N152, N166) | `P-db` | admin role writes the request; the index runner (`engram_migrate`) executes it | admin tx | — |
 | `Finish` / `MarkOperation` | activity | monotone state | `P-db` | shared try-lock, `active` @ epoch | write tx | `DocumentDeleted{PURGED}` |
 | `FreezeDelete` (namespace, tenant) | API / activity | predicate update (`active → frozen/delete`, N101) | `P-db` | role `engram_app` | write tx | `NamespaceDeleted` |
 | `DrainWorkflows` | activity (namespace) | terminate is idempotent | `P-temporal` | — | none | — |
@@ -1699,8 +1705,8 @@ source `operations` rows (N97) with no cross-cluster protocol.
    `engram_try_ns_fence($1)`, aborts unless the ownership row is `('incoming', e + 1)` and sets
    `session_replication_role = replica` (N91; the ownership trigger is `ENABLE ALWAYS`, RLS still
    applies). `<cols>` comes from `pg_attribute WHERE attgenerated = '' AND NOT attisdropped ORDER BY
-   attname` and includes `ins_seq`. The source is static, so there is no floor, no catch-up, no
-   merge-diff and no `ins_seq` range anywhere in the move; the excluded class is re-derived on the
+   attname` and includes `ins_seq`. The source is static, so no `ins_seq` range or floor is a
+   protocol input anywhere in the move; the excluded class is re-derived on the
    target (`token_usage_events` is copied once). The target builds **no HNSW during the copy**; a
    crashed copy resumes at `(table, last_key)` because ranges are idempotent upserts.
 5. **`VerifyFrozen`** on the complete copy: per table `count(*)` and

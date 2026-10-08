@@ -1,0 +1,27 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 96 and seed 4075286136343471029 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30278] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Durability.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Durability
+Starting... (2026-10-07 23:19:44)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-07 23:19:44.
+Progress(13) at 2026-10-07 23:19:47: 825,501 states generated (825,501 s/min), 270,725 distinct states found (270,725 ds/min), 146,083 states left on queue.
+Progress(19) at 2026-10-07 23:20:47: 28,683,370 states generated (27,857,869 s/min), 7,916,972 distinct states found (7,646,247 ds/min), 3,121,101 states left on queue.
+Progress(20) at 2026-10-07 23:21:47: 56,521,263 states generated (27,837,893 s/min), 14,718,464 distinct states found (6,801,492 ds/min), 4,840,783 states left on queue.
+Progress(21) at 2026-10-07 23:22:47: 83,636,701 states generated (27,115,438 s/min), 20,588,438 distinct states found (5,869,974 ds/min), 4,928,839 states left on queue.
+Progress(23) at 2026-10-07 23:23:47: 109,532,066 states generated (25,895,365 s/min), 25,016,683 distinct states found (4,428,245 ds/min), 2,248,437 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.3E-4
+  based on the actual fingerprints:  val = 1.2E-4
+117776042 states generated, 26113068 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 25.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 10 and the 95th percentile is 3).
+Finished in 04min 26s at (2026-10-07 23:24:10)

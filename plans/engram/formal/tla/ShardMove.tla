@@ -30,11 +30,13 @@
 (*                           ignores the open move                         *)
 (*   TimelineCheck=FALSE     Freeze/(c) on a stale session are allowed     *)
 (*   ReconcileVerify=FALSE   no count/hash verify (needs Margin < Life)    *)
+(*   FencedSteps=FALSE       mover steps (copy, reconcile, (b')) do not    *)
+(*                           check the rows they observed                  *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS NRows, Clients, Life, Margin, MaxT, MaxEp, MaxRestore, MaxBak,
-          UseReady, ReconcileOnRestore, TimelineCheck, ReconcileVerify
+          UseReady, ReconcileOnRestore, TimelineCheck, ReconcileVerify, FencedSteps
 
 Src == "s1"
 Tgt == "s2"
@@ -51,6 +53,9 @@ vars == <<cat, mp, own, fin, store, mut, bak, used, ca, committed, lost,
 Row(st, ep) == [st |-> st, ep |-> ep]
 IdleW == [ph |-> "idle", r |-> 0, sh |-> Src, age |-> 0]
 Holders(s) == {c \in Clients : wr[c].ph = "hold" /\ wr[c].sh = s}
+\* Every mover step is a compare-and-set on the rows it observed (source and target).
+Fenced == ~FencedSteps \/ (own[Src].st \in {"active", "frozen"} /\ own[Tgt].st = "incoming")
+
 Verified == ~ReconcileVerify \/ (store[Src] = store[Tgt] /\ mut[Src] = mut[Tgt])
 
 TypeOK ==
@@ -118,14 +123,14 @@ Plan ==
 
 \* Dirty range copy: any non-empty part of what Src has and Tgt lacks (READ COMMITTED ranges).
 CopyRange ==
-  /\ mp = "copying" /\ own[Src].st \in {"active", "frozen"} /\ own[Tgt].st = "incoming"
+  /\ mp = "copying" /\ Fenced
   /\ \E X \in SUBSET (store[Src] \ store[Tgt]) :
        /\ X # {} /\ store' = [store EXCEPT ![Tgt] = @ \cup X]
   /\ UNCHANGED <<cat, mp, own, fin, mut, bak, used, ca, committed, lost, wr, cc, now, Tc, mtl, tl, nRestore, nBak,
                  frozenSet, frozenMut, actSet, actMut, zcut>>
 
 CopyMut ==
-  /\ mp = "copying" /\ own[Src].st \in {"active", "frozen"} /\ own[Tgt].st = "incoming" /\ mut' = [mut EXCEPT ![Tgt] = mut[Src]]
+  /\ mp = "copying" /\ Fenced /\ mut' = [mut EXCEPT ![Tgt] = mut[Src]]
   /\ UNCHANGED <<cat, mp, own, fin, store, bak, used, ca, committed, lost, wr, cc, now, Tc, mtl, tl, nRestore, nBak,
                  frozenSet, frozenMut, actSet, actMut, zcut>>
 
@@ -141,7 +146,7 @@ Freeze ==
 
 \* Under freeze: re-copy immutable rows created since Tc - Margin, merge the mutable cell in full.
 Reconcile ==
-  /\ mp = "frozen" /\ own[Src].st = "frozen" /\ own[Tgt].st = "incoming"   \* every mover step is fenced on both rows
+  /\ mp = "frozen" /\ Fenced /\ (own[Src].st = "frozen" \/ ~FencedSteps)
   /\ store' = [store EXCEPT ![Tgt] = @ \cup {r \in store[Src] : ca[r] + Margin >= Tc}]
   /\ mut' = [mut EXCEPT ![Tgt] = mut[Src]]
   /\ mp' = "reconciled"
@@ -149,7 +154,7 @@ Reconcile ==
                  frozenSet, frozenMut, actSet, actMut, zcut>>
 
 MakeReady ==
-  /\ mp = "reconciled" /\ own[Src].st = "frozen" /\ own[Tgt].st = "incoming" /\ Verified
+  /\ mp = "reconciled" /\ Fenced /\ (own[Src].st = "frozen" \/ ~FencedSteps) /\ Verified
   /\ IF UseReady
        THEN /\ own' = [own EXCEPT ![Tgt].st = "ready"] /\ mp' = "ready"
             /\ UNCHANGED <<actSet, actMut>>

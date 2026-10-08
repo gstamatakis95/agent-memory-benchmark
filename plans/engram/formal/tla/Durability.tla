@@ -28,8 +28,8 @@
 (*                    lost and the second loses again.  TRUE: the floor    *)
 (*                    never moves later (min over all restores, kept while *)
 (*                    intents are retained).                               *)
-(* Margin < Lat (or a replay slower than Margin - Lat followed by a second *)
-(* restore) loses commits that fall outside the replay window.             *)
+(* A Margin below the longest intent-to-commit latency (Margin 0, Lat 2 in *)
+(* Durability_NarrowWindow.cfg) loses commits outside the replay window.   *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences
 
@@ -137,14 +137,18 @@ Hidden(s) ==
 \* Every acknowledged op has a durable intent.
 AckImpliesIntent == \A o \in OpIds : ops[o].ph = "acked" => o \in intents
 
-\* Whenever the shard serves, a subject whose last op was acked shows exactly that op's result:
-\* acked deletes and invalidations survive, an acked Restore is not undone by an older Invalidate.
-AckedDeleteSurvives ==
-  sst = "active" =>
-    \A s \in Subjects :
-      LET L == {i \in OnSubj(s) : \A j \in OnSubj(s) : j <= i} IN
-      (L # {} /\ ops[CHOOSE i \in L : TRUE].ph = "acked") =>
-        (Hidden(s) <=> ops[CHOOSE i \in L : TRUE].kind # "res")
+\* A subject whose last op was acked shows exactly that op's result while the shard serves.
+LastAckedShown(s) ==
+  LET L == {i \in OnSubj(s) : \A j \in OnSubj(s) : j <= i} IN
+  (L # {} /\ ops[CHOOSE i \in L : TRUE].ph = "acked") =>
+    (Hidden(s) <=> ops[CHOOSE i \in L : TRUE].kind # "res")
+
+\* Acknowledged deletes survive restore and failover.
+AckedDeleteSurvives == sst = "active" => LastAckedShown("y")
+
+\* Invalidate/Restore pairs: replay in name order makes the last state win, so an acked Restore is
+\* not undone by an older Invalidate and an acked Invalidate is not undone by an older Restore.
+IntentOrderLastWins == sst = "active" => LastAckedShown("x")
 
 \* When reads reopen after a restore, every acked in-window intent is applied.
 RestoreReplaysIntents ==

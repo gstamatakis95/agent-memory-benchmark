@@ -1,0 +1,49 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 54 and seed 3892170168482126980 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 2269] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Storage.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Storage
+Starting... (2026-10-07 23:50:25)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-07 23:50:26.
+Error: Invariant VectorGenerationConsistent is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ idx = {}
+/\ ingested = {}
+/\ payload = <<0, 0, 0>>
+/\ marked = {}
+/\ vec = {}
+/\ content = {}
+/\ cur = 1
+/\ snap = {}
+
+State 2: <Insert line 44, col 3 to line 46, col 55 of module Storage>
+/\ idx = {}
+/\ ingested = {1}
+/\ payload = <<0, 0, 0>>
+/\ marked = {}
+/\ vec = {}
+/\ content = {1}
+/\ cur = 1
+/\ snap = {}
+
+State 3: <Flip line 79, col 3 to line 82, col 63 of module Storage>
+/\ idx = {}
+/\ ingested = {1}
+/\ payload = <<0, 0, 0>>
+/\ marked = {}
+/\ vec = {}
+/\ content = {1}
+/\ cur = 2
+/\ snap = {1}
+
+36 states generated, 30 distinct states found, 21 states left on queue.
+The depth of the complete state graph search is 4.
+The average outdegree of the complete state graph is 5 (minimum is 4, the maximum 6 and the 95th percentile is 6).
+Finished in 00s at (2026-10-07 23:50:26)

@@ -390,7 +390,10 @@ CREATE TABLE shard_meta (
   schema_version      integer NOT NULL CHECK (schema_version >= 1),
   applied_at          timestamptz NOT NULL DEFAULT now(),
   engram_min_version  text NOT NULL DEFAULT '',
-  engram_max_version  text NOT NULL DEFAULT ''
+  engram_max_version  text NOT NULL DEFAULT '',
+  -- N134: monotone replay floor for delete intents. Each restore or failover lowers it to
+  -- min(replay_floor, its restore target); only a completed replay raises it (to NULL).
+  replay_floor        timestamptz
 );
 
 CREATE TRIGGER shard_meta_singleton BEFORE INSERT ON shard_meta

@@ -1,0 +1,28 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 97 and seed -3025353563944316095 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 31880] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module ShardMove
+Starting... (2026-10-07 23:31:39)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-07 23:31:40.
+Progress(11) at 2026-10-07 23:31:43: 564,804 states generated (564,804 s/min), 153,606 distinct states found (153,606 ds/min), 91,329 states left on queue.
+Progress(17) at 2026-10-07 23:32:43: 23,037,327 states generated (22,472,523 s/min), 4,969,391 distinct states found (4,815,785 ds/min), 1,647,598 states left on queue.
+Progress(19) at 2026-10-07 23:33:43: 46,098,719 states generated (23,061,392 s/min), 9,251,033 distinct states found (4,281,642 ds/min), 1,941,177 states left on queue.
+Progress(22) at 2026-10-07 23:34:43: 69,155,871 states generated (23,057,152 s/min), 13,142,490 distinct states found (3,891,457 ds/min), 1,423,793 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 6.4E-5
+  based on the actual fingerprints:  val = 1.0E-5
+88022416 states generated, 16472880 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 28.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 15 and the 95th percentile is 3).
+Finished in 03min 57s at (2026-10-07 23:35:37)

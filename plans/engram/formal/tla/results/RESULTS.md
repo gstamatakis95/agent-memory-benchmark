@@ -1,42 +1,56 @@
-# TLC results (real runs, TLC 2.18 via de.hhu.stups:tlatools:1.1.0, Java 21, 4 workers, 6 GB heap)
-| cfg | bounds | result | generated | distinct | depth | wall |
-| Outbox.cfg | 3 writers, 2 ns, 2 consumers, MaxSeq 5, Timeout 2, Watch 4, 1 crash, symmetry | PASS (TypeOK, NoLossSafety, PerNamespaceOrder, OnlyCommittedDelivered, IdempotentConsumerState) | 17,243,719 | 5,557,863 | 39 | 1m38s |
-| Outbox_Live.cfg | 2 writers, 2 ns, 2 consumers, MaxSeq 4, Timeout 2, Watch 4, 1 crash, no symmetry | PASS incl. NoLossLive | 1,342,866 | 486,937 | 31 | 40s |
-| Outbox_NoWatch.cfg | Watch 0 | FAIL NoLossSafety at state 7: w1 draws 1, w2 draws 2 & commits, relay sees gap at 1, declares 1 aborted, w1 commits 1 -> lost | - | - | 7 | 1s |
-| Outbox_Watch1x.cfg | Watch 2 = Timeout | FAIL NoLossSafety at state 9: gap watched at age 0, two ticks -> watch age 2 = Watch, declared; writer age 2 = Timeout still allowed to commit -> commits -> lost | 213,172 | 106,588 | 9 | 3s |
-| Consolidation_VolatileProposal.cfg | NFacts 4, Obs 2, 2 crashes, 1 delete, DurableProposal FALSE | FAIL ExactlyOnceEffect at state 6: ProposeOk(create o1) -> ApplyAtomic(key (B,1) = create o1) -> Crash (proposal lost) -> ProposeOk(update o1) -> MarkDone: final proposal op1 = update o1 but effect recorded under key 1 is create o1; update never applied | - | - | 6 | 2s |
-| Consolidation_NonAtomicKey.cfg | same, AtomicKeyRecord FALSE | FAIL ExactlyOnceEffect at state 5: ApplyEffectOnly(op1) -> Crash (pending key lost) -> ApplyEffectOnly(op1) again: applyCount = 2 | - | - | 5 | 2s |
-| AsOf.cfg | 3 facts, 2 obs, MaxTime 3, 2 versions, EffectiveFromInputs TRUE, symmetry | PASS (TypeOK, NoLeak, EffectiveCoversCited, OlderVersionStable) | 1,687,878 | 332,776 | 8 | 1m22s (contended) |
-| AsOf_CitedOnly.cfg | same, EffectiveFromInputs FALSE | FAIL NoLeak at state 4: f1@1, f2@2 inserted; Consolidate(o1, batch {f1,f2}, cited {f1}) -> eff 1; recall(T=1) serves a version derived from f2 (mentioned 2) | 103 | 32 | 4 | 1s |
-| DocLifecycle_NoCommitCheck.cfg | 2 docs, 2 hashes, 2 obs, tx index, CommitChecksVersion FALSE | FAIL VersionsConsistent at state 5: StartRetain d1 v1, StartRetain, Delete(d1) acked, CommitChunk(d1,v1,h) resurrects content of a deleted version (then NoDeletedContentRecalled) | 273 | 149 | 5 | 1s |
-| DocLifecycle_NoFinalizeCheck.cfg | same, FinalizeChecksNewer FALSE | FAIL VersionsConsistent at state 7: v1 commits h1; v2 starts and commits h2; Finalize(v1) retires h2 (not in v1); Finalize(v2) marks v2 active with h2 retired | 8,047 | 3,081 | 7 | 3s |
-| DocLifecycle_CitedOnly.cfg | same, ApplyCheck "cited" | FAIL NoDeletedContentRecalled at state 8: ConsolidateRead snapshots facts of d1,d2; Delete(d1) acked; ConsolidateApply keeps the op with sources filtered to d2's facts but text derived from d1's | 732 | 347 | 8 | 3s |
-| DocLifecycle_NoApplyCheck.cfg | same, ApplyCheck "none" | FAIL NoObservationCitesDeletedAfterAck at state 6: read, Delete acked, apply cites the deleted fact | 1,221 | 563 | 6 | 2s |
-| DocLifecycle_UnfilteredIndex.cfg | same, async index, FilterIndexByStore FALSE | FAIL NoDeletedContentRecalled at state 6: CommitChunk, Relay (index has f), Delete acked (store retired f, index not yet), recall returns f from the index | 906 | 432 | 6 | 2s |
-| ShardMove_NoBarrier.cfg | 2 shards, 1 ns, 2 clients, 1 wf, 2 writes, epochs<=2, 1 move, CopyBarrier FALSE | FAIL NoLossNoDup at state 12: x1 begins (seq 1), x2 begins (seq 2) and commits, Plan, Copy (p0 = 2 with x1 still holding the fence), x1 commits at the active source, Freeze, Drained (nothing > 2), CutTarget, CutSource, CutCatalog: target lacks x1 | - | - | 12 | 1s |
-| ShardMove_D5Order.cfg | 2 shards, 1 ns, 2 clients, 1 wf, 2 writes, epochs<=2, CutoverOrder d5 | FAIL ReadsFresh at state 8: Plan, Copy, Freeze, Drained, CutTarget, CutCatalog (catalog -> target while source row still frozen), Read by a stale client accepted at the frozen source although the catalog's shard is the target (misrouted read) | 10,474 | 1,523 | 8 | 3s |
-| ShardMove_NoBarrier.cfg (re-run after Read fix) | as above | FAIL NoLossNoDup at state 12 (same trace) | 20,202 | 2,789 | 12 | 2s |
-| Consolidation.cfg (full bounds: 4 facts, 2 obs, 2 crashes, 1 delete, symmetry) | safety only | INCOMPLETE: capped at 560 s with no violation after 66,544,363 generated / 16,517,034 distinct states at depth 9, 13.3M states still queued (state space too large for the CI cap; exhaustive results come from Consolidation_Mid / Consolidation_Live) | 66,544,363 | 16,517,034 | >=9 | 560s cap |
-| Consolidation_Live.cfg (minimal: 2 facts, 1 obs, 1 crash, 1 delete, no symmetry) | safety + RoundTerminates | PASS | 62,991 | 19,108 | 12 | 4s |
-| DocLifecycle.cfg / DocLifecycle_Tx.cfg (first design run, before ND-11) | design knobs | FAIL ObservationHasSources at depth 8/9: d1 v1 commits h1, v2 starts+commits h2, ConsolidateRead/Apply cites (d1,h1), FinalizeVersion(d1,v2) retires h1 -> live observation cites a REPLACE-retired fact. Register gap: D8 cascades observation sources only on Delete, D12's trigger fires only when source rows are removed. Fix ND-11 (sources kept during grace, purge cascades, invariant = source rows exist). | 280,663 / 81,110 | 92,821 / 27,497 | 8 / 9 | 7s / 4s |
-| DocLifecycle_* counterexamples re-run after ND-11 | 2 docs, 2 hashes, 2 obs | NoCommitCheck FAIL VersionsConsistent depth 5; NoFinalizeCheck FAIL VersionsConsistent depth 7; CitedOnly FAIL NoDeletedContentRecalled depth 9; NoApplyCheck FAIL NoObservationCitesDeletedAfterAck depth 6; UnfilteredIndex FAIL NoDeletedContentRecalled depth 5 | - | - | - | <=3s each |
-| DocLifecycle_Live.cfg (minimal: 1 doc, 2 hashes, 1 obs, 1 consolidation, async, no symmetry) | NoDeletedContentRecalled, ObservationHasSources + IndexConverges | PASS | 108,665 | 23,771 | 14 | 3s |
-| DocLifecycle_Live.cfg (2 docs x 2 hashes x 1 obs, first cut) | liveness | INCOMPLETE: capped at 560 s, 15.5M distinct states, no violation | 65,232,573 | 15,561,586 | >=15 | 560s cap |
-| DocLifecycle_Tx.cfg (full bounds, first re-run) | design | MODEL BUG (not design): TypeOK violated at depth 11 because ncons was incremented by ConsolidateApply while only ConsolidateRead checked the bound (three concurrent reads). Fixed by counting at read time. No other invariant violated in 6.8M distinct states. | 22,048,793 | 6,800,447 | 12 | 5m29s |
-| DocLifecycle.cfg (async, full bounds, re-run) | design | INCOMPLETE: capped at 560 s, 10.9M distinct states, no violation (same ncons model bug latent) | 36,540,880 | 10,922,004 | >=12 | 560s cap |
-| ShardMove.cfg (full bounds, first run) | design safety | INCOMPLETE: capped at 560 s, 8.8M distinct states, no violation; but Replay was (wrongly) disabled in state frozen, so replay-after-freeze was never explored -- superseded by ShardMove_Mid after the fix | 128,288,004 | 8,792,181 | >=21 | 560s cap |
-| ShardMove_Live.cfg (first run) | MoveTerminates | MODEL BUG (not design): liveness violated -- after Freeze with a committed write above p0 the mover stutters forever because Replay was enabled in {catching_up, drained} instead of {catching_up, frozen}. Fixed; re-run below. | - | - | 17 | 4s |
-| ShardMove (all configs before MaxSeq) | - | MODEL BUG (not design): nextSeq grew without bound through begin/abort retry cycles (depth 713 with one write), so the ShardMove state space was infinite and the "capped" ShardMove.cfg run (8.8M distinct states, no violation) could never have completed. Fixed by bounding draws with MaxSeq (4 for safety configs, 3 for liveness); all ShardMove results below are on the bounded spec. | - | - | - | - |
-| ShardMove_Mid.cfg (bounded spec: 2 shards, 1 ns, 2 clients, 1 wf, 3 writes, epochs<=3, 1 move, 1 crash, MaxSeq 4, symmetry) | TypeOK, SingleWritableOwner, WritesOnlyAtOwner, NoLossNoDup, NoDupAnywhere, ReadsFresh | PASS | 4,532,796 | 507,282 | 31 | 38s |
-| ShardMove_Live.cfg (bounded spec: 1 ns, 2 clients, 1 wf, 2 writes, epochs<=2, 1 move, 1 crash, MaxSeq 3, no symmetry) | NoLossNoDup, ReadsFresh, SingleWritableOwner, WritesOnlyAtOwner + MoveTerminates | PASS | 655,704 | 81,804 | 26 | 20s |
-| ShardMove_NoBarrier.cfg (bounded spec) | NoLossNoDup | FAIL as intended, trace depth 12 (same trace as before) | 17,461 | 2,295 | 12 | 2s |
-| ShardMove_D5Order.cfg (bounded spec) | ReadsFresh | FAIL as intended, trace depth 8 (Plan, Copy, Freeze, Drained, CutTarget, CutCatalog, Read at frozen source) | 9,797 | 1,396 | 8 | 2s |
+# TLC results
 
-## Addendum (2026-10-01, runs completed after the section was written; 4 workers, 10 GB heap, 4 h cap)
+Real runs of every configuration under `formal/tla/`, TLC 2.18 (`de.hhu.stups:tlatools:1.1.0`), OpenJDK 21,
+4 workers, 10 GB heap, 4 cores, 30-minute cap. Raw logs are the `<config>.log` files next to this file.
+`expected` is what the configuration is for: a design configuration must end with "No error has been found";
+a must-fail configuration must end with the named invariant violated; `generated`/`distinct`/`depth` are TLC's
+own counters (for a violation, the work done before the counterexample was found; `depth` is then the number of states in the
+counterexample, otherwise the depth of the complete state graph). Section 7 of the plan interprets the results.
 
-| cfg | result |
-|---|---|
-| `Consolidation_Mid.cfg` | **PASS** — 148,630,249 generated / 33,962,836 distinct, depth 17, 27 min 35 s (`Consolidation_Mid.log`) |
-| `DocLifecycle_Mid.cfg` | **INCOMPLETE** — runner died after 1 h 28 min at 482,968,071 generated / 135,432,679 distinct (depth 14, 97 M states queued, 16 GB of on-disk queue), no violation (`DocLifecycle_Mid.partial.log`) |
-| `ShardMove.cfg` (full bounds, final bounded spec) | **PASS** — 360,448,591 generated / 23,299,998 distinct, depth 42, 25 min 38 s (`ShardMove.log`) |
-| `DocLifecycle_TxMid.cfg`, `DocLifecycle_Tx.cfg`, `DocLifecycle.cfg`, `Consolidation.cfg` (full bounds) | **NOT COMPLETED** on this machine (4 cores, 15 GB RAM): their `_Mid` variants already exceed 1e8 distinct states; they are the nightly 30-minute-cap set, reported as INCOMPLETE until the bounds are shrunk per N77 |
+| config | expected | result | generated | distinct | depth | time |
+|---|---|---|---|---|---|---|
+| `Outbox.cfg` | all hold | PASS | 17,243,719 | 5,557,863 | 39 | 01min 35s |
+| `Outbox_Live.cfg` | all hold | PASS | 1,342,866 | 486,937 | 31 | 38s |
+| `Outbox_NoWatch.cfg` | violates `NoLossSafety` | FAIL as intended: NoLossSafety | 5,526 | 3,721 | 7 | 00s |
+| `Outbox_Watch1x.cfg` | violates `NoLossSafety` | FAIL as intended: NoLossSafety | 233,325 | 113,111 | 9 | 01s |
+| `Consolidation.cfg` | all hold | PASS | 10,864,684 | 2,426,544 | 18 | 56s |
+| `Consolidation_Live.cfg` | all hold | PASS | 65,555 | 20,404 | 12 | 02s |
+| `Consolidation_VolatileProposal.cfg` | violates `ExactlyOnceEffect` | FAIL as intended: ExactlyOnceEffect | 8,238 | 4,351 | 6 | 01s |
+| `Consolidation_NonAtomicKey.cfg` | violates `ExactlyOnceEffect` | FAIL as intended: ExactlyOnceEffect | 523 | 424 | 5 | 00s |
+| `Storage.cfg` | all hold | PASS | 12,872,199 | 1,478,807 | 36 | 06min 40s |
+| `Storage_Update.cfg` | violates `ContentImmutable` | FAIL as intended: ContentImmutable | 16 | 16 | 3 | 00s |
+| `Storage_FlipEarly.cfg` | violates `VectorGenerationConsistent` | FAIL as intended: VectorGenerationConsistent | 36 | 30 | 3 | 00s |
+| `Storage_PurgeUnmarked.cfg` | violates `PurgeNeedsMarker` | FAIL as intended: PurgeNeedsMarker | 23 | 21 | 3 | 00s |
+| `Derivation.cfg` | all hold | PASS | 7,659,307 | 2,133,161 | 29 | 01min 35s |
+| `Derivation_Page.cfg` | all hold | PASS | 81,273,512 | 22,215,959 | 28 | 16min 53s |
+| `Derivation_Live.cfg` | all hold | PASS | 314,063 | 87,830 | 24 | 11s |
+| `Derivation_RestoreNoLock.cfg` | all hold | PASS | 8,115,973 | 2,159,112 | 29 | 01min 34s |
+| `Derivation_NoLock.cfg` | violates `NoDeletedDerivationServed` | FAIL as intended: NoDeletedDerivationServed | 2,595 | 1,125 | 9 | 01s |
+| `Derivation_MatInvalid.cfg` | violates `RestoreExact` | FAIL as intended: RestoreExact | 9,669 | 3,905 | 11 | 01s |
+| `Derivation_EffCited.cfg` | violates `AsOfNoLeak` | FAIL as intended: AsOfNoLeak | 904 | 449 | 6 | 00s |
+| `Derivation_TombByDocId.cfg` | violates `NoOverHiding` | FAIL as intended: NoOverHiding | 106 | 74 | 4 | 00s |
+| `Durability.cfg` | all hold | PASS | 117,776,042 | 26,113,068 | 25 | 04min 26s |
+| `Durability_AckBeforeIntent.cfg` | violates `AckImpliesIntent` | FAIL as intended: AckImpliesIntent | 410 | 308 | 4 | 00s |
+| `Durability_ReopenEarly.cfg` | violates `AckedDeleteSurvives` | FAIL as intended: AckedDeleteSurvives | 37,706 | 14,919 | 9 | 01s |
+| `Durability_UnorderedReplay.cfg` | violates `IntentOrderLastWins` | FAIL as intended: IntentOrderLastWins | 3,750,201 | 1,131,357 | 14 | 11s |
+| `Durability_NarrowWindow.cfg` | violates `AckedDeleteSurvives` | FAIL as intended: AckedDeleteSurvives | 167,915 | 59,829 | 11 | 02s |
+| `Durability_RetargetRestore.cfg` | violates `AckedDeleteSurvives` | FAIL as intended: AckedDeleteSurvives | 663,981 | 225,321 | 11 | 04s |
+| `ShardMove.cfg` | all hold | PASS | 88,022,416 | 16,472,880 | 28 | 03min 57s |
+| `ShardMove_Live.cfg` | all hold | PASS | 2,760,289 | 578,804 | 25 | 31s |
+| `ShardMove_ZeroMargin.cfg` | all hold | PASS | 2,780,467 | 582,960 | 25 | 30s |
+| `ShardMove_UnfencedSteps.cfg` | all hold | PASS | 142,521,064 | 21,636,679 | 28 | 05min 49s |
+| `ShardMove_NoTimelineCheck.cfg` | all hold | PASS | 90,507,928 | 16,472,880 | 28 | 03min 55s |
+| `ShardMove_NoReady.cfg` | violates `RollbackPossibleBeforeC` | FAIL as intended: RollbackPossibleBeforeC | 29,389 | 8,505 | 9 | 01s |
+| `ShardMove_RestoreNoReconcile.cfg` | violates `RestoreReconciles` | FAIL as intended: RestoreReconciles | 26,869 | 7,923 | 8 | 01s |
+| `ShardMove_NoVerify.cfg` | violates `NoLossNoDup` | FAIL as intended: NoLossNoDup | 587,653 | 159,846 | 10 | 03s |
+
+Bounds, in one line each (the constants are in the `.cfg` files):
+
+- `Derivation.cfg`: 3 facts (`f1 = (d1,v1)`, `f2 = (d1,v2)`, `f3 = (d2,v1)`), 2 observations x 3 versions, 2 deletes, 2 curation operations, 5 routed writes, 1 writer, symmetry on observations.
+- `Derivation_Page.cfg`: 1 observation x 2 versions, 1 page x 2 versions, 2 deletes, 2 curation operations, 5 routed writes.
+- `Derivation_Live.cfg`: 1 observation x 2 versions, 4 routed writes, safety plus `ExpungeCompletes`.
+- `ShardMove.cfg`: 3 rows, 2 clients, writer lifetime 1, margin 1, 3 ticks, epochs <= 4, 1 restore/failover, 1 extra backup.
+- `Durability.cfg`: 3 operations, 5 ticks, `Lat` 2, `Margin` 2, 2 restores.
+- `Storage.cfg`: 3 rows, 3 embedding generations.
+- `Consolidation.cfg`: 3 facts, 1 observation, 2 crashes, 1 delete (the 4-fact and 2-observation variants were stopped after about ten minutes with the queue still growing).
+- `Outbox.cfg`: 3 writers, 2 namespaces, 2 consumers, 5 seqs, timeout 2, watch 4, 1 relay crash.

@@ -1,0 +1,39 @@
+# Expected outcome of every TLC configuration (read by the nightly job and by `formal-quick`).
+# pass                 : TLC must end with 'No error has been found' (design configurations and experiments).
+# violates <Invariant> : TLC must end with exactly that invariant violated (must-fail configurations).
+# A timeout is INCOMPLETE: neither pass nor fail.
+
+Outbox.cfg	pass
+Outbox_Live.cfg	pass
+Outbox_NoWatch.cfg	violates NoLossSafety
+Outbox_Watch1x.cfg	violates NoLossSafety
+Consolidation.cfg	pass
+Consolidation_Live.cfg	pass
+Consolidation_VolatileProposal.cfg	violates ExactlyOnceEffect
+Consolidation_NonAtomicKey.cfg	violates ExactlyOnceEffect
+Storage.cfg	pass
+Storage_Update.cfg	violates ContentImmutable
+Storage_FlipEarly.cfg	violates VectorGenerationConsistent
+Storage_PurgeUnmarked.cfg	violates PurgeNeedsMarker
+Derivation.cfg	pass
+Derivation_Page.cfg	pass
+Derivation_Live.cfg	pass
+Derivation_RestoreNoLock.cfg	pass
+Derivation_NoLock.cfg	violates NoDeletedDerivationServed
+Derivation_MatInvalid.cfg	violates RestoreExact
+Derivation_EffCited.cfg	violates AsOfNoLeak
+Derivation_TombByDocId.cfg	violates NoOverHiding
+Durability.cfg	pass
+Durability_AckBeforeIntent.cfg	violates AckImpliesIntent
+Durability_ReopenEarly.cfg	violates AckedDeleteSurvives
+Durability_UnorderedReplay.cfg	violates IntentOrderLastWins
+Durability_NarrowWindow.cfg	violates AckedDeleteSurvives
+Durability_RetargetRestore.cfg	violates AckedDeleteSurvives
+ShardMove.cfg	pass
+ShardMove_Live.cfg	pass
+ShardMove_ZeroMargin.cfg	pass
+ShardMove_UnfencedSteps.cfg	pass
+ShardMove_NoTimelineCheck.cfg	pass
+ShardMove_NoReady.cfg	violates RollbackPossibleBeforeC
+ShardMove_RestoreNoReconcile.cfg	violates RestoreReconciles
+ShardMove_NoVerify.cfg	violates NoLossNoDup

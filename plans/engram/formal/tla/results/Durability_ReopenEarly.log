@@ -1,0 +1,129 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 25 and seed -6886877223396116612 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 961] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Durability.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Durability
+Starting... (2026-10-07 23:43:17)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-07 23:43:18.
+Error: Invariant AckedDeleteSurvives is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ rp = 0
+/\ ops = << [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 0
+/\ t = 0
+/\ intents = {}
+/\ dbq = <<>>
+/\ nRestore = 0
+/\ sst = "active"
+
+State 2: <Tick line 98, col 3 to line 99, col 64 of module Durability>
+/\ rp = 0
+/\ ops = << [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 0
+/\ t = 1
+/\ intents = {}
+/\ dbq = <<>>
+/\ nRestore = 0
+/\ sst = "active"
+
+State 3: <Tick line 98, col 3 to line 99, col 64 of module Durability>
+/\ rp = 0
+/\ ops = << [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 0
+/\ t = 2
+/\ intents = {}
+/\ dbq = <<>>
+/\ nRestore = 0
+/\ sst = "active"
+
+State 4: <Issue line 65, col 3 to line 71, col 53 of module Durability>
+/\ rp = 0
+/\ ops = << [subj |-> "y", kind |-> "del", at |-> 2, ph |-> "new", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 1
+/\ t = 2
+/\ intents = {}
+/\ dbq = <<>>
+/\ nRestore = 0
+/\ sst = "active"
+
+State 5: <PutIntent line 74, col 3 to line 76, col 58 of module Durability>
+/\ rp = 0
+/\ ops = << [subj |-> "y", kind |-> "del", at |-> 2, ph |-> "new", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 1
+/\ t = 2
+/\ intents = {1}
+/\ dbq = <<>>
+/\ nRestore = 0
+/\ sst = "active"
+
+State 6: <Commit line 80, col 3 to line 84, col 57 of module Durability>
+/\ rp = 0
+/\ ops = << [subj |-> "y", kind |-> "del", at |-> 2, ph |-> "committed", ct |-> 2],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 1
+/\ t = 2
+/\ intents = {1}
+/\ dbq = <<1>>
+/\ nRestore = 0
+/\ sst = "active"
+
+State 7: <Ack line 87, col 3 to line 90, col 62 of module Durability>
+/\ rp = 0
+/\ ops = << [subj |-> "y", kind |-> "del", at |-> 2, ph |-> "acked", ct |-> 2],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 1
+/\ t = 2
+/\ intents = {1}
+/\ dbq = <<1>>
+/\ nRestore = 0
+/\ sst = "active"
+
+State 8: <Restore line 103, col 3 to line 107, col 43 of module Durability>
+/\ rp = 0
+/\ ops = << [subj |-> "y", kind |-> "del", at |-> 2, ph |-> "acked", ct |-> 2],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 1
+/\ t = 2
+/\ intents = {1}
+/\ dbq = <<>>
+/\ nRestore = 1
+/\ sst = "restoring"
+
+State 9: <Reopen line 121, col 3 to line 123, col 62 of module Durability>
+/\ rp = 0
+/\ ops = << [subj |-> "y", kind |-> "del", at |-> 2, ph |-> "acked", ct |-> 2],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0],
+   [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0] >>
+/\ nIssued = 1
+/\ t = 2
+/\ intents = {1}
+/\ dbq = <<>>
+/\ nRestore = 1
+/\ sst = "active"
+
+37706 states generated, 14919 distinct states found, 9615 states left on queue.
+The depth of the complete state graph search is 10.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 10 and the 95th percentile is 7).
+Finished in 01s at (2026-10-07 23:43:18)
+Error: when writing the disk (StatePoolWriter.run):
+/tmp/claude-0/-home-user-agent-memory-benchmark/a107d6f0-fd2b-54b8-98a3-af39320729f0/scratchpad/tlc/meta_Durability_ReopenEarly/26-10-07-23-43-17/0 (No such file or directory)

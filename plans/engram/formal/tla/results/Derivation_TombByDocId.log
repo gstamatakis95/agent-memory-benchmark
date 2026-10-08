@@ -1,0 +1,117 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 60 and seed -166004966106815907 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30124] (Linux 6.18.44-fc-v77 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Derivation
+Starting... (2026-10-07 23:18:08)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-07 23:18:08.
+Error: Invariant NoOverHiding is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ nCur = 0
+/\ ms = [d1 |-> "none", d2 |-> "none"]
+/\ nDel = 0
+/\ matDocs = {}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ vers = (o1 :> <<>> @@ o2 :> <<>>)
+/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "idle"
+/\ lockX = FALSE
+/\ born = {}
+/\ wr = ( w1 :>
+      [ n |-> o1,
+        ph |-> "idle",
+        mode |-> "root",
+        cf |-> {},
+        co |-> {},
+        sf |-> {},
+        so |-> {} ] )
+/\ budget = 5
+
+State 2: <Ingest line 131, col 3 to line 133, col 110 of module Derivation>
+/\ nCur = 0
+/\ ms = [d1 |-> "none", d2 |-> "none"]
+/\ nDel = 0
+/\ matDocs = {}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ vers = (o1 :> <<>> @@ o2 :> <<>>)
+/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "idle"
+/\ lockX = FALSE
+/\ born = {1}
+/\ wr = ( w1 :>
+      [ n |-> o1,
+        ph |-> "idle",
+        mode |-> "root",
+        cf |-> {},
+        co |-> {},
+        sf |-> {},
+        so |-> {} ] )
+/\ budget = 5
+
+State 3: <DeleteDocument line 136, col 3 to line 138, col 100 of module Derivation>
+/\ nCur = 0
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
+/\ matDocs = {}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ vers = (o1 :> <<>> @@ o2 :> <<>>)
+/\ tomb = [d1 |-> 1, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "idle"
+/\ lockX = FALSE
+/\ born = {1}
+/\ wr = ( w1 :>
+      [ n |-> o1,
+        ph |-> "idle",
+        mode |-> "root",
+        cf |-> {},
+        co |-> {},
+        sf |-> {},
+        so |-> {} ] )
+/\ budget = 5
+
+State 4: <Ingest line 131, col 3 to line 133, col 110 of module Derivation>
+/\ nCur = 0
+/\ ms = [d1 |-> "pending", d2 |-> "none"]
+/\ nDel = 1
+/\ matDocs = {}
+/\ matSnap = {}
+/\ gone = {}
+/\ dh = {}
+/\ vers = (o1 :> <<>> @@ o2 :> <<>>)
+/\ tomb = [d1 |-> 1, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "idle"
+/\ lockX = FALSE
+/\ born = {1, 2}
+/\ wr = ( w1 :>
+      [ n |-> o1,
+        ph |-> "idle",
+        mode |-> "root",
+        cf |-> {},
+        co |-> {},
+        sf |-> {},
+        so |-> {} ] )
+/\ budget = 5
+
+106 states generated, 74 distinct states found, 48 states left on queue.
+The depth of the complete state graph search is 6.
+The average outdegree of the complete state graph is 3 (minimum is 1, the maximum 6 and the 95th percentile is 6).
+Finished in 00s at (2026-10-07 23:18:08)

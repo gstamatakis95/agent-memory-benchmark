@@ -1250,7 +1250,7 @@ sequenceDiagram
 | Namespace delete while a move is copying | Rejected at the API (`NAMESPACE_BUSY`); the operator aborts the move first | no interleaving |
 | A move starts while an expunge is pending | `StartMove` sets `move_epoch`; every expunge activity returns `paused`; the markers are copied or reconciled with the namespace and the expunge resumes on the target (§5.5) | the move sees only the rows inserted after its copy began (N124) |
 | Delete of a 100 k-fact document | The marker transaction is the same few statements as for one fact; the purge removes ≈ 100 k facts and ≈ 3 M links in 1,000-row batches over minutes | deletable through the API; invisible from the ack |
-| Primary fails right after a delete ack | The intent object exists; the promoted or restored shard comes up `frozen/restore` and replays every intent newer than `restore_point − 10 min` before reads reopen (§5.5.5) | RPO 0 for acknowledged deletes (N122) |
+| Primary fails right after a delete ack | The intent object exists; the promoted or restored shard comes up `frozen/restore` and replays every intent newer than `replay_floor − 10 min` (the minimum restore target since the last completed replay, N134) before reads reopen (§5.5.5) | RPO 0 for acknowledged deletes (N122) |
 | Invalidate, then the observation is rebuilt, then Restore | The rebuild wrote a new root version without the fact; Restore deleted the marker and the `derived_hidden(invalidation)` rows; the older hidden versions are visible again at their `as_of` | curation is reversible and exact |
 | `StreamSnapshot(version = n − 1)` after the ack | The version is `expired` → `PreconditionFailed{SNAPSHOT_EXPIRED}`; the client applies the next delta (with delete records) or takes a full snapshot | no acknowledged delete served through an old export |
 | Retain into the deleted document id | Allowed at once (see the retain row above); a second delete of the re-used id inserts a second tombstone with a higher `up_to_version` (it is part of the key) | no new row is ever covered by an older tombstone |
@@ -1548,7 +1548,7 @@ failover runs this sequence, in order:
    session's timeline with the catalog at `Freeze` and at (c), and the relay every 10 s, so a
    zombie primary can be neither frozen nor cut over.
 4. **Replay the delete intents** (N122): `engramctl restore replay` lists each hosted namespace's
-   intent objects with `deleted_at ≥ restore_point − 10 min` and applies them in name order through
+   intent objects with `deleted_at ≥ replay_floor − 10 min` (`replay_floor` = minimum restore target since the last completed replay, persisted per shard and only lowered by a new restore, N134) and applies them in name order through
    the admin variant of the marker transaction (same statements, fence bypassed while
    `frozen/restore`), last state per subject wins (so a `Restore` after an `Invalidate` is
    honoured); the shard listens only on a restricted `listen_addresses` until `restore_done`, and

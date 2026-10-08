@@ -119,11 +119,13 @@ CopyDone == (store[src] \cup mk[src]) \subseteq cdn /\ cex
 Verified == ~ReconcileVerify \/ (store[src] = store[tgt] /\ mk[src] = mk[tgt] /\ ex[tgt] <= ex[src])
 CopyPhase == IF CopyBeforeFreeze THEN mp = "planned" ELSE (mp = "frozen" /\ SrcFrozen)
 
-\* Rows that the intact source can still supply (not an RPO loss).
+\* Rows that the move preserves although the shard that held them loses its tail (not an RPO loss): the target's copy
+\* of the source rows is repairable from the intact source; the source's frozen rows live on the target copy once the
+\* commit is durable (replicated, or acted on by (c)).  A commit that is neither is not a promise (N163(3)).
 Recoverable(s) ==
   IF cleaned THEN {}
   ELSE IF s = tgt /\ cm \in {"committed", "done"} THEN frozenSet
-  ELSE IF s = src /\ (cm \in {"committed", "done"} \/ mp \in {"cut", "tactive", "done"}) THEN frozenSet
+  ELSE IF s = src /\ (rep \/ cm = "done" \/ mp \in {"cut", "tactive", "done"}) THEN frozenSet
   ELSE {}
 
 TypeOK ==
@@ -348,13 +350,14 @@ CatFlip ==
   /\ cm' = IF mp = "tactive" THEN "done" ELSE cm
   /\ UNCHANGED <<mtl, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV>>
 
-\* Re-run (N161(2)): the restore reconcile found a target whose restored row is none, incoming or ready although the
-\* catalog move is committed.  Wipe, FrozenCopy from the retained (static) source, VerifyFrozen, BuildIndexes,
+\* Re-run (N161(2)): the restore reconcile found a target whose restored row is not active at the move's epoch (incoming
+\* or ready; also none, a restore point that predates Plan, which N161(2) does not list) although the catalog move is
+\* committed.  Wipe, FrozenCopy from the retained (static) source, VerifyFrozen, BuildIndexes,
 \* reconcile_in to active, then the intent replay of the acknowledged deletes (`\ gone`).  RerunMerges is the
 \* rejected variant: a union on top of the replayed target, which re-adds the rows the target deleted.
 Rerun ==
   /\ rr /\ Settled /\ ~cleaned
-  /\ own[tgt].st \in {"none", "incoming", "ready"} /\ own[src].st \in {"frozen", "moved_out"}
+  /\ ~(own[tgt].st = "active" /\ own[tgt].ep >= me) /\ own[src].st \in {"frozen", "moved_out"}
   /\ LET cp == IF RerunMerges THEN store[tgt] \cup store[src] ELSE store[src] IN
      /\ store' = [store EXCEPT ![tgt] = IF RerunMerges THEN cp ELSE cp \ gone]
      /\ mk' = [mk EXCEPT ![tgt] = IF RerunMerges THEN mk[tgt] \cup mk[src] ELSE mk[src] \ gone]
@@ -457,9 +460,9 @@ CatalogRestore ==
   /\ nCat < MaxCat /\ cm \in {"committed", "done"} /\ Settled
   /\ cm' = "open"
   /\ cat' = IF cat.sh = tgt THEN [sh |-> src, ep |-> me - 1] ELSE cat
-  /\ cdirty' = ShardTruth
+  /\ cdirty' = ShardTruth /\ rep' = FALSE                \* the commit is gone from the catalog, so it is no promise any more
   /\ nCat' = nCat + 1
-  /\ UNCHANGED <<MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, rr, CpV, tlc>>
+  /\ UNCHANGED <<MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rr, CpV, tlc>>
 
 \* engramctl catalog reconcile --from-shards: the routing row from the unique owner, the move row from the source's
 \* moved_out or the target's active row.
@@ -483,7 +486,8 @@ DerivedCommitted(s) ==
 ReconcileDesign(s) ==
   /\ own[s].st = "restoring"
   /\ LET cmE == IF ShardTruth /\ cm = "open" /\ DerivedCommitted(s) THEN "committed" ELSE cm IN
-     LET needRerun == s = tgt /\ ~cleaned /\ cmE \in {"committed", "done"} /\ fin[tgt].st \in {"none", "incoming", "ready"} IN
+     LET needRerun == s = tgt /\ ~cleaned /\ cmE \in {"committed", "done"}
+                      /\ ~(fin[tgt].st = "active" /\ fin[tgt].ep >= me) IN       \* none, incoming, ready, or a row of an earlier life
      IF needRerun                                          \* committed, but the target came back before activation: re-run
        THEN /\ cm' = cmE /\ rr' = TRUE
             /\ own' = [own EXCEPT ![s].st = "replaying"]
@@ -530,7 +534,7 @@ ReconcileDesign(s) ==
                THEN store' = [store EXCEPT ![src] = {}] /\ mk' = [mk EXCEPT ![src] = {}] /\ ex' = [ex EXCEPT ![src] = 0]
                ELSE UNCHANGED DatV
           /\ UNCHANGED <<idx, actSet, actMk>>
-  /\ UNCHANGED <<mtl, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, cdirty, CpV, TlV>>
+  /\ UNCHANGED <<mtl, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, rep, cdirty, CpV, TlV>>
 
 \* Bug variant: trust the backup row, bump the epoch if it says active, ignore the open move.
 ReconcileNaive(s) ==
@@ -598,11 +602,11 @@ SourceStaticUnderFreeze ==
     (store[src] = frozenSet /\ mk[src] = frozenMk /\ ex[src] = frozenEx)
 
 \* Before the point of no return the source is still the owner and holds every committed row (bar restore
-\* RPO loss), so Rollback loses nothing.
+\* RPO loss and rows deleted on the active target of an earlier move), so Rollback loses nothing.
 RollbackPossibleBeforeC ==
   mp \in PreC =>
     /\ own[src].st \in {"active", "frozen", "restoring", "replaying"}
-    /\ (committed \ lost) \subseteq store[src]
+    /\ ((committed \ lost) \ gone) \subseteq store[src]
 
 \* `incoming` and `ready` accept nothing: the target is never writable before the CAS.
 NoWriteToTargetBeforeC == mp \in PreC => own[tgt].st # "active"

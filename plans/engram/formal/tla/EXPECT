@@ -12,11 +12,13 @@ Consolidation_Live.cfg	pass
 Consolidation_VolatileProposal.cfg	violates ExactlyOnceEffect
 Consolidation_NonAtomicKey.cfg	violates ExactlyOnceEffect
 Storage.cfg	pass
+Storage_Gens.cfg	pass
 Storage_Update.cfg	violates ContentImmutable
 Storage_FlipEarly.cfg	violates VectorGenerationConsistent
 Storage_PurgeUnmarked.cfg	violates PurgeNeedsMarker
 Storage_AutoRepair.cfg	violates RebuildBeforeRepair
 Storage_PerIndexHygiene.cfg	violates RebuildBeforeRepair
+Storage_PurgeDuringRebuildSet.cfg	violates RebuildBeforeRepair
 Derivation.cfg	pass
 Derivation_Page.cfg	pass
 Derivation_Retire.cfg	pass
@@ -34,6 +36,8 @@ Derivation_TombByDocId.cfg	violates NoOverHiding
 Derivation_CasBeforeIdem.cfg	violates NoPhantomVersion
 Derivation_CascadeHidden.cfg	violates NoGhostInvalidatedServed
 Derivation_MatSignalOnly.cfg	violates MaterializeComplete
+Derivation_RestoreOnlySelf.cfg	violates RestoreExact
+Derivation_RestoreByVisibleTwin.cfg	violates RestoreExact
 Durability.cfg	pass
 Durability_Chain.cfg	pass
 Durability_IntentBeforeCommit.cfg	violates NoUnackedEffectOnLaterAck
@@ -56,19 +60,18 @@ ShardMove_Live.cfg	pass
 ShardMove_ActiveWriters.cfg	pass
 ShardMove_Twice.cfg	pass
 ShardMove_TgtRestore.cfg	pass
-ShardMove_ZeroMargin.cfg	pass
 ShardMove_UnfencedSteps.cfg	violates NoLossNoDup
-ShardMove_NoTimelineCheck.cfg	pass
 ShardMove_NoReady.cfg	violates RollbackPossibleBeforeC
 ShardMove_RestoreNoReconcile.cfg	violates RestoreReconciles
 ShardMove_NoVerify.cfg	violates NoLossNoDup
 ShardMove_StampAfterCut.cfg	violates OneOwner
-ShardMove_IdKeyedRecopy.cfg	violates MoveTerminatesActive
-ShardMove_MergeNoDeletes.cfg	violates MoveTerminatesActive
-ShardMove_SweepNotPaused.cfg	violates MoveTerminatesActive
+ShardMove_SweepNotPaused.cfg	violates SourceStaticUnderFreeze
 ShardMove_CleanupNoBackup.cfg	violates CleanupSafe
 ShardMove_NoSeqAdvance.cfg	violates CopiedBelowTargetSeq
-ShardMove_NoSeqAdvanceTwice.cfg	violates MoveTerminatesActive
-ShardMove_VerifyBeforeCatchUp.cfg	violates MoveTerminatesActive
 ShardMove_CatalogLossNoShardTruth.cfg	violates NoLossNoDup
-ShardMove_CleanupTimeGate.cfg	violates NoLossNoDup
+ShardMove_UnionRepair.cfg	violates NoResurrect
+ShardMove_CleanupBackupBeforeActivate.cfg	violates NoLossNoDup
+ShardMove_CopyBeforeFreeze.cfg	violates NoLossNoDup
+ShardMove_RerunMerges.cfg	violates NoResurrect
+ShardMove_ReadyBeforeIndex.cfg	violates ServedFromIndex
+ShardMove_CutOnUnreplicatedCommit.cfg	violates NoLossNoDup

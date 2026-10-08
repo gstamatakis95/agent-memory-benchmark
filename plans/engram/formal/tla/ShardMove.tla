@@ -482,53 +482,56 @@ ApplyReconcile ==
   /\ UNCHANGED <<MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, CpV, TlV>>
 
 \* What the ownership rows say about the catalog's move (N146): the source row moved_out, or the target row active at
-\* the move's epoch, can only exist after the CAS committed.
+\* the move's epoch or later, can only exist after the CAS committed.
 DerivedCommitted(s) ==
-  IF s = tgt THEN own[src].st = "moved_out" \/ fin[tgt] = Row("active", me)
+  IF s = tgt THEN own[src].st = "moved_out" \/ (fin[tgt].st = "active" /\ fin[tgt].ep >= me)
   ELSE own[tgt].st = "active" \/ fin[src] = Row("moved_out", me)
 
-\* Settle the open move against the catalog, then take the final row.  With ShardTruth the catalog row is first
-\* re-derived from the ownership rows.
+\* Settle the move against the catalog, then take the final row.  With ShardTruth the catalog row is first re-derived
+\* from the ownership rows.  Every act on an arbiter outcome waits for its replication (N171(2)): the abort CAS
+\* of the reconcile is its own step, the thaw follows once `rolled_back` is replicated.
 ReconcileDesign(s) ==
   /\ own[s].st = "restoring"
   /\ LET cmE == IF ShardTruth /\ cm = "open" /\ DerivedCommitted(s) THEN "committed" ELSE cm IN
-     LET needRerun == s = tgt /\ ~cleaned /\ cmE \in {"committed", "done"}
-                      /\ ~(fin[tgt].st = "active" /\ fin[tgt].ep >= me) IN       \* none, incoming, ready, or a row of an earlier life
-     IF needRerun                                          \* committed, but the target came back before activation: re-run
-       THEN /\ cm' = cmE /\ rr' = TRUE
-            /\ own' = [own EXCEPT ![s].st = "replaying"]
-            /\ UNCHANGED <<mp, cat, fin, store, mk, ex, idx, actSet, actMk>>
-     ELSE IF cmE = "open"                                  \* before the point of no return: abort CAS, roll back
-       THEN /\ cm' = "rolled_back" /\ mp' = "rolled_back" /\ rr' = FALSE
+     LET seen == cm # "committed" \/ rep \/ ~CutNeedsReplicated IN            \* a read `committed` is acted on once replicated
+     IF cmE = "open"                                       \* the rows show no commit (N161(4)): abort CAS
+       THEN /\ cm' = "rolled_back" /\ mp' = "aborting" /\ rep' = FALSE
+            /\ UNCHANGED <<own, cat, fin, DatV, idx, actSet, actMk>>
+     ELSE IF cm = "rolled_back" /\ mp = "aborting"         \* the thaw, once `rolled_back` is replicated
+       THEN /\ rep \/ ~ThawNeedsReplicated
+            /\ cm' = cm /\ mp' = "rolled_back" /\ rep' = rep
             /\ store' = [store EXCEPT ![tgt] = {}] /\ mk' = [mk EXCEPT ![tgt] = {}] /\ ex' = [ex EXCEPT ![tgt] = 0]
             /\ idx' = [idx EXCEPT ![tgt] = FALSE]
             /\ IF s = src
                  THEN /\ cat' = [sh |-> src, ep |-> cat.ep + 1]               \* owner restored: epoch bump
                       /\ fin' = [fin EXCEPT ![src] = Row("active", cat.ep + 1)]
                       /\ own' = [own EXCEPT ![src].st = "replaying", ![tgt] = Row("none", 0)]
-                 ELSE /\ cat' = IF mp = "early_flipped" THEN [sh |-> src, ep |-> own[src].ep] ELSE cat
+                 ELSE /\ cat' = IF cat.sh = tgt THEN [sh |-> src, ep |-> own[src].ep] ELSE cat
                       /\ fin' = [fin EXCEPT ![tgt] = Row("none", 0)]
                       /\ own' = [own EXCEPT ![tgt].st = "replaying",
                                             ![src] = IF @.st = "frozen" THEN Row("active", @.ep) ELSE @]
             /\ UNCHANGED <<actSet, actMk>>
-     ELSE IF cmE = "committed"                             \* committed: complete (c), (b''), (d) here; no epoch bump
-       THEN /\ rr' = rr
-            /\ IF s = tgt                                  \* restored active: ordinary, the data is the backup
-                 THEN /\ cat' = [sh |-> tgt, ep |-> me] /\ cm' = "done" /\ mp' = "done"
-                      /\ fin' = [fin EXCEPT ![tgt] = Row("active", me)]
-                      /\ own' = [own EXCEPT ![tgt].st = "replaying", ![src] = Row("moved_out", me)]
-                      /\ UNCHANGED <<DatV, idx, actSet, actMk>>
-                 ELSE LET tgtAct == own[tgt].st \in {"active", "ready"} IN
-                      /\ cat' = IF tgtAct THEN [sh |-> tgt, ep |-> me] ELSE cat
-                      /\ cm' = IF tgtAct THEN "done" ELSE "committed"
-                      /\ mp' = IF tgtAct THEN "done" ELSE "cut"
-                      /\ fin' = [fin EXCEPT ![src] = Row("moved_out", me)]
-                      /\ own' = [own EXCEPT ![src].st = "replaying",
-                                            ![tgt] = IF @.st = "ready" THEN Row("active", me) ELSE @]
-                      /\ actSet' = IF own[tgt].st = "ready" THEN store[tgt] ELSE actSet
-                      /\ actMk' = IF own[tgt].st = "ready" THEN mk[tgt] ELSE actMk
-                      /\ UNCHANGED <<DatV, idx>>
-     ELSE /\ mp' = mp /\ cm' = cm /\ rr' = rr              \* no open move
+     ELSE IF s = tgt /\ cmE \in {"committed", "done"}      \* N169: an ordinary restore after (c)/(d), at a new epoch
+       THEN /\ seen
+            /\ LET ne == IF cat.sh = tgt THEN cat.ep + 1 ELSE me + 1 IN
+               /\ cat' = [sh |-> tgt, ep |-> ne] /\ cm' = "done" /\ mp' = "done"
+               /\ fin' = [fin EXCEPT ![tgt] = Row("active", ne)]
+            /\ own' = [own EXCEPT ![tgt].st = "replaying", ![src] = Row("moved_out", me)]
+            /\ actSet' = store[tgt] /\ actMk' = mk[tgt]            \* the restored data, `gone` replayed
+            /\ UNCHANGED <<rep, DatV, idx>>
+     ELSE IF cmE = "committed"                             \* the source: complete (c) here; no epoch bump
+       THEN /\ seen
+            /\ LET tgtAct == own[tgt].st \in {"active", "ready"} IN
+               /\ cat' = IF tgtAct THEN [sh |-> tgt, ep |-> me] ELSE cat
+                  /\ cm' = IF tgtAct THEN "done" ELSE "committed"
+                  /\ mp' = IF tgtAct THEN "done" ELSE "cut"
+                  /\ fin' = [fin EXCEPT ![src] = Row("moved_out", me)]
+                  /\ own' = [own EXCEPT ![src].st = "replaying",
+                                        ![tgt] = IF @.st = "ready" THEN Row("active", me) ELSE @]
+                  /\ actSet' = IF own[tgt].st = "ready" THEN store[tgt] ELSE actSet
+                  /\ actMk' = IF own[tgt].st = "ready" THEN mk[tgt] ELSE actMk
+            /\ UNCHANGED <<rep, DatV, idx>>
+     ELSE /\ mp' = mp /\ cm' = cm                         \* no open move
           /\ IF cat.sh = s                                 \* owner: new epoch
                THEN /\ cat' = [sh |-> s, ep |-> cat.ep + 1]
                     /\ fin' = [fin EXCEPT ![s] = Row("active", cat.ep + 1)]
@@ -539,8 +542,8 @@ ReconcileDesign(s) ==
           /\ IF s = src /\ cleaned /\ cat.sh = tgt
                THEN store' = [store EXCEPT ![src] = {}] /\ mk' = [mk EXCEPT ![src] = {}] /\ ex' = [ex EXCEPT ![src] = 0]
                ELSE UNCHANGED DatV
-          /\ UNCHANGED <<idx, actSet, actMk>>
-  /\ UNCHANGED <<mtl, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, rep, cdirty, CpV, TlV>>
+          /\ UNCHANGED <<rep, idx, actSet, actMk>>
+  /\ UNCHANGED <<mtl, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, cdirty, rview, CpV, TlV>>
 
 \* Bug variant: trust the backup row, bump the epoch if it says active, ignore the open move.
 ReconcileNaive(s) ==
@@ -561,11 +564,12 @@ RestoreDone(s) ==
 
 -----------------------------------------------------------------------------
 Copying == (\E r \in Rows : CopyStep(r)) \/ CopyEx
-Forward == Freeze \/ Copying \/ VerifyFrozen \/ Recopy \/ BuildIndex \/ MakeReady \/ CommitCAS \/ Replicated
-           \/ Cut \/ Stamp \/ Activate \/ CatFlip \/ Rerun \/ CatalogReconcile
+Forward == Freeze \/ Copying \/ VerifyFrozen \/ Recopy \/ BuildIndex \/ MoveBackup \/ MakeReady \/ CommitCAS
+           \/ Replicated \/ AbortReplicated \/ Thaw \/ Cut \/ Stamp \/ Activate \/ CatFlip
+           \/ (\E s \in Shards : ReadShard(s)) \/ ApplyReconcile
 Recovery == \E s \in Shards : Reconcile_(s) \/ RestoreDone(s)
 Clientstep == \E c \in Clients : Commit(c)
-Forced == VerifyAbort \/ WindowTimeout
+Forced == VerifyAbort \/ WindowTimeout \/ AbortRetry
 Faults == \E r \in Rows : CopyFault(r)
 
 Next == Plan \/ Forward \/ Rollback \/ Reconnect \/ Tick \/ Cleanup \/ SweepEx \/ Faults
@@ -592,9 +596,10 @@ SingleWriter ==
 \* accepted RPO loss and not deleted on the target is on an active owner (N146).
 ActiveStores == UNION {store[s] : s \in {s2 \in Shards : own[s2].st = "active"}}
 NoLossNoDup ==
-  /\ mp \in {"tactive", "done", "early", "early_flipped"} => (actSet = frozenSet /\ actMk = frozenMk)
+  /\ mp \in {"tactive", "done", "early", "early_flipped"} =>
+       ((frozenSet \ gone) \subseteq actSet /\ actSet \subseteq frozenSet /\ (frozenMk \ gone) \subseteq actMk /\ actMk \subseteq frozenMk)
   /\ (cleaned /\ own[tgt].st = "active") => (frozenSet \ gone) \subseteq store[tgt]
-  /\ (Settled /\ mp \in Final /\ ~rr) => ((committed \ lost) \ gone) \subseteq ActiveStores
+  /\ (Settled /\ mp \in Final) => ((committed \ lost) \ gone) \subseteq ActiveStores
 
 \* A row deleted on the active target is never again in any active store: no repair re-adds it (N161).
 NoResurrect == gone \cap ActiveStores = {}
@@ -604,7 +609,7 @@ ServedFromIndex == \A s \in Shards : own[s].st \in {"ready", "active"} => idx[s]
 
 \* Under the freeze the source's rows do not change (N160(2)).
 SourceStaticUnderFreeze ==
-  (own[src].st = "frozen" /\ mp \in {"frozen", "copied", "built", "ready", "committed"}) =>
+  (own[src].st = "frozen" /\ mp \in {"frozen", "copied", "built", "backed", "ready", "committed"}) =>
     (store[src] = frozenSet /\ mk[src] = frozenMk /\ ex[src] = frozenEx)
 
 \* Before the point of no return the source is still the owner and holds every committed row (bar restore
@@ -630,13 +635,13 @@ RestoreReconciles ==
          /\ own[t].st \notin {"active", "ready"}
          /\ own[t].st = "moved_out" => own[t].ep <= own[s].ep
 
-\* Whenever no recovery is running, no re-run is pending and no move is mid-flight, exactly one shard is the writable owner.
+\* Whenever no recovery is running, no move is mid-flight, exactly one shard is the writable owner.
 OneOwner ==
-  (Settled /\ mp \in Final /\ ~rr) => Cardinality({s \in Shards : own[s].st = "active"}) = 1
+  (Settled /\ mp \in Final) => Cardinality({s \in Shards : own[s].st = "active"}) = 1
 
 \* ... and the catalog names it at its epoch (once reconciled); while (d) is pending the CAS can still succeed.
 CatalogNamesOwnerAfterDone ==
-  (Settled /\ ~cdirty /\ ~rr) =>
+  (Settled /\ ~cdirty) =>
     /\ mp \in Final => (own[cat.sh].st = "active" /\ own[cat.sh].ep = cat.ep)
     /\ mp = "tactive" => cat \in {[sh |-> src, ep |-> me - 1], [sh |-> tgt, ep |-> own[tgt].ep]}
 

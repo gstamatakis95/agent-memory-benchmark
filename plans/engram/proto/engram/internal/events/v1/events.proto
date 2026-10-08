@@ -215,6 +215,7 @@ message DocumentDeleted {
   // Removed in the D22 redesign (decisions N115, N117, N128): the id lists
   // and counts of the synchronous cascade.
   reserved 2 to 6, 8 to 15;
+  reserved "fact_ids", "chunk_ids", "observations_marked_stale", "observations_retired", "pages_marked_stale", "page", "page_count", "ids_elided", "fact_count", "chunk_count", "observations_marked_stale_count", "observations_retired_count", "pages_marked_stale_count";
 }
 
 // DocumentTagsUpdated: UpdateDocumentTags changed the filter tags of a

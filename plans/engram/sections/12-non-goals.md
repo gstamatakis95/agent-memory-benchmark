@@ -33,7 +33,7 @@ items contradict a register decision.
 | NG25 | Per-request model selection by clients | not now | Models are configured per operation at system/tenant/namespace level (D12); a per-request override is a cost-control hole. |
 | NG26 | Training, fine-tuning or hosting models | not ever | Engram consumes models through the gateway; it has no GPU and no training data pipeline. |
 | NG27 | An end-user chat product or agent runtime | not ever | Engram is the memory behind an agent, reached by gRPC/Connect/MCP; the agent loop (other than the bounded Reflect, D12) belongs to the caller. |
-| NG28 | Caching recall results (a "semantic cache" keyed by query) | not ever | Recall is ≈ 224 ms on the critical path (N54, N164) and its inputs change per chunk commit (D16); a result cache would reintroduce the staleness the read barrier removes. |
+| NG28 | Caching recall results (a "semantic cache" keyed by query) | not ever | Recall is ≈ 236 ms on the critical path (N54, N176) and its inputs change per chunk commit (D16); a result cache would reintroduce the staleness the read barrier removes. |
 | NG29 | Streaming ingestion of live transcripts (token-by-token `Retain`) | not now | Items are whole documents or appends (D8 `APPEND`); a streaming front end would buffer into those. |
 | NG30 | Guaranteed ordering or visibility across namespaces or shards | not ever | D16: no relationship whatsoever; anything that needs it must live in one namespace. |
 | NG31 | Backing up blob objects | not ever | The blob store is durable by contract (A-O12); delete intents (N122) and the expunge's blob tombstones make deletes durable (§9.3). |
@@ -52,11 +52,9 @@ items contradict a register decision.
 | NG44 | Cross-document deduplication of stored bodies | not now | Blobs are owner-keyed (N104): one key per owner row, deleted with it. The price is storage for identical bodies in different documents; identical bodies of one document already create no version. Reopening needs a refcounted design and the adoption race of A55. |
 | NG45 | RPO 0 for a delete the client never saw acknowledged | not ever | Intent after commit (N122): a committed-but-unacknowledged marker is live but may be lost by a restore, and the client's retry re-applies it (R38, A56). |
 | NG46 | MCP tools for namespace lifecycle (`create_namespace`, `update_namespace`, `delete_namespace`), `stream_snapshot`, and any `memory.admin.v1` service | not ever | The generated MCP surface is an allow-list (§4.6, N157): namespace lifecycle, mission, directives and disposition are admin calls, not agent tools (Hindsight's `create/delete_directive` and `get/update_bank` have no MCP counterpart); binary snapshot parts do not fit a tool result and agents sync with `engram-sync`. The generator fails the build for an RPC that is neither allowed nor listed under `omit:`. |
-| NG47 | Online namespace moves without a write freeze (a live dirty copy with catch-up, reconcile or merge) | not ever | Three rounds produced a blocker or major from every dirty-copy variant (N160, N168). A move freezes writes (reads continue) for a bounded, size-proportional window; the price is a read-only namespace for up to `W_est` (≈ 25 min per 1 M live facts at the planning rates; hours only on operator-scheduled windows, N160). |
+| NG47 | Online namespace moves without a write freeze (a live dirty copy with catch-up, reconcile or merge) | not ever | Every dirty-copy variant produced a blocker or major (N160, N168). A move freezes writes (reads continue) for a bounded, size-proportional window; the price is a read-only namespace for up to `W_est` (≈ 26 min per 1 M live facts at the planning rates; up to 8 h on operator-scheduled windows, N173). |
 
 **Reopening a non-goal.** A "not now" row is reopened by a register row in D18 naming the
 phase and the owning engineer, plus a §11.1 risk row for what it adds to the critical path;
 a "not ever" row is reopened only by changing the register decision it cites, which means
-re-running the affected §7 model checks and §8 tiers before the plan is updated. The table
-is deliberately longer than the list of things we will build in phase 4: saying no in
-writing is cheaper than saying it in a review.
+re-running the affected §7 model checks and §8 tiers before the plan is updated. Saying no in writing is cheaper than saying it in a review.

@@ -1,6 +1,6 @@
 # Engram: implementation plan for a Go + Postgres agent-memory service
 
-**Status:** design plan, v1.5 (2026-10-08, after six adversarial reviews: `reviews/round-1.md` to `reviews/round-6.md`; register D20 (round 1), D21, D22 (N111 to N134), D23 (N135 to N143), D24 (N144 to N159), D25 (round 6, N160 to N168)). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
+**Status:** design plan, v1.6 (2026-10-08, after seven adversarial reviews: `reviews/round-1.md` to `reviews/round-7.md`; register D20 (round 1), D21, D22 (N111 to N134), D23 (N135 to N143), D24 (N144 to N159), D25 (N160 to N168), D26 (round 7, N169 to N178)). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
 **Scope:** everything needed to build, verify and operate a Hindsight-class long-term memory service in Go,
 exposed as gRPC (`memory.v1`), with PostgreSQL 16 as the per-shard system of record, Temporal for
 asynchronous work, an AI gateway for every model call and blob storage for large or immutable data.
@@ -18,21 +18,11 @@ changed only the mechanisms that acted outside the predicate's assumptions (D23)
 the facts it names and re-extraction is a write; one commit rule for every writer of a derived
 version; hard delete reaches derived artefacts; intents are put after the marker commits and the
 replay floor lives in the catalog; moves re-copy by an insertion sequence and are arbitrated by a
-catalog CAS; and the shard was sized from a measured hot set. Round 5 found no blocker (D24) and its fixes were mostly sound, but the shard-move protocol (dirty copy, reconcile,
-`PreVerify`, `ReconcileIn`, cleanup gate) had now produced a blocker or major in rounds 4, 5 and 6, each fix adding a floor
-or a repair the next review broke. Round 6 (D25, N160 to N168) therefore does not patch it: **the move is
-freeze-then-copy**. The namespace is read-only for a bounded, size-proportional window (unattended only when the
-estimate is ≤ 10 min, operator-scheduled windows up to 4 h), every row is copied from a static source, verification is
-equality on a static set, and nothing is ever merged into a target that has served writes (a target restored to before
-its activation is re-copied, not repaired). The rest of D25: the curation subject is `(document_id, content_hash)`, so
-twins are one chain; the catalog has **one asynchronous hot standby** and reconciles from the shards on every promotion
-and restore; filtered recalls are their own class (θ = 10 k, p95 ≤ 1 s, own semaphore); the hot set is restated with
-measured B-tree fill, so the shard is **5.5 M facts target / 10 M cap** on the same 128 GB instance (182 shards, 6 cells
-for 1 B facts); WAL is budgeted as full-page-image dominated; connections get TCP keepalives. The six TLA+ specifications (`Outbox`, `Consolidation`, `Storage`, `Derivation`,
-`Durability`, `ShardMove`) are **written and model-checked** with their must-fail configurations;
-§7.1 states what each omits, and the Phase 0 spec work is the written must-fail manifest, invariant code and trace converter (M0.7), with each Go twin built in
-the milestone of its subject.
-The committed scope is now **≈ 84.25 ew against 78 ew of capacity** (6.25 ew over, MVP in week 24,
+catalog CAS; and the shard was sized from a measured hot set. Round 5 found no blocker (D24). Round 6 (D25, N160 to N168) replaced the shard-move protocol, which had produced a blocker or major in three rounds, with **freeze-then-copy**: the namespace is read-only for a bounded, size-proportional window (unattended only when the
+estimate is ≤ 10 min, operator-scheduled windows up to 8 h), every row is copied from a static source, and verification is
+equality on a static set. The rest of D25: the curation subject is `(document_id, content_hash)`; the catalog has **one asynchronous hot standby** and reconciles from the shards on every promotion and restore; filtered recalls are their own class (θ = 10 k, p95 ≤ 1 s); the shard is **5.5 M facts target / 10 M cap** on the same 128 GB instance (182 shards, 6 cells
+for 1 B facts). Round 7 (D26, N169 to N178) found every major in a recovery path around that core, so it removed recovery paths: **the target is backed up before the commit point**, so a post-commit target is an ordinary restore and the re-run is deleted; the cleanup gate is a schema fact at the entry to `cleaning`; one replicated-ack helper serves every catalog outcome a shard or a client acts on (N169 to N172). The six TLA+ specifications are **written and model-checked** with their must-fail configurations; §7.1 states what each omits, and Phase 0 spec work (M0.7) is the must-fail manifest, invariant code and trace converter.
+The committed scope is now **≈ 85.25 ew against 78 ew of capacity** (7.25 ew over, MVP in week 24,
 Phase 2 exit in week 29, stated in §10).
 
 ## How to read this plan
@@ -78,7 +68,7 @@ Phase 2 exit in week 29, stated in §10).
 - **Recall makes no LLM calls.** Five arms (semantic, BM25, graph, temporal, raw chunks) run with `as_of`,
   tag and type filters and the **visibility predicate** applied inside each arm; RRF (k = 60, exact
   rational arithmetic), a cross-encoder rerank on 50 pairs at the default budget, bounded boosts and
-  token-budget packing follow. The budget is a critical-path sum, 224 ms p95 at MID, and a skipped rerank
+  token-budget packing follow. The budget is a critical-path sum, 236 ms p95 at MID, and a skipped rerank
   is an SLO breach, not a degradation.
 - **Delete is an O(1) soft marker; physical work is asynchronous.** `DeleteDocument` commits one
   tombstone transaction in the shard, puts an intent object to blob storage (strongly consistent,
@@ -94,7 +84,7 @@ Phase 2 exit in week 29, stated in §10).
   `Invalidate`/`Restore` insert and delete one marker, so `Restore` is exact.
 - **Durability without synchronous replication of the shards.** Every shard role commits with
   `synchronous_commit = local`, so a commit cannot hang on a standby; the small, off-hot-path catalog has one
-  asynchronous hot standby, and every promotion or restore first reconciles it from the shards (N163). **Acknowledged** deletes and invalidations have RPO 0: the
+  asynchronous hot standby, every client-acknowledged catalog write waits for the standby's replay (N171), and every promotion or restore first reconciles it from the shards (N163). **Acknowledged** deletes and invalidations have RPO 0: the
   intent object is put after the marker commits and before the ack, and a restore or failover replays
   the intents verbatim with their recorded epochs, per subject in chain order, from a floor kept in the
   catalog and the blob-side `_control/restores/` objects (`frozen/restore` until the replay finishes); a committed-but-unacknowledged delete may be lost
@@ -104,8 +94,7 @@ Phase 2 exit in week 29, stated in §10).
   from the static source, verified by count and key-hash equality, the target's indexes are built, and
   cutover goes through a `ready` state with a single point of no return, the **catalog CAS
   `cutover → committed`** (checked as replicated before the source is fenced). Rollback exists at every
-  step before it and at the window deadline; cleanup waits 24 h plus a post-activation backup; a target
-  restored to before its activation is re-copied from the retained source, never merged.
+  step before it and at the window deadline; the target is backed up before the commit point, so a restored target takes the ordinary restore path; cleanup waits 24 h after activation.
 - **Time travel is exact for facts, observations and their evidence, and for chunks subject to a stated rule (N85).**
   Every fact and chunk carries `mentioned_at` = the item timestamp, set by the server; observations are
   versioned with `effective_at = max(mentioned_at over every fact rendered to the writer, effective_at of
@@ -118,12 +107,12 @@ Phase 2 exit in week 29, stated in §10).
   specifications are written and model-checked, each with must-fail configurations whose logs are in
   `formal/tla/results/`; four Lean 4 developments exist but are not type-checked here (§7). §7.1 lists the
   prose mechanisms each spec omits.
-- **Size:** about **123.5 engineer-weeks** in total; the committed six-month scope for three engineers is
-  Phases 0 to 2, **≈ 84.25 ew** against 78 ew of capacity (conformance and measurements, the MVP with
+- **Size:** about **124.5 engineer-weeks** in total; the committed six-month scope for three engineers is
+  Phases 0 to 2, **≈ 85.25 ew** against 78 ew of capacity (conformance and measurements, the MVP with
   moves behind an admin flag, the expunge and delete-intent log, consolidation, Reflect and
   `RetainBackfill`), so the MVP lands in week 24 and the Phase 2 exit in week 29; pages, export,
   multi-cell and most of the formal tooling are a separate 39.25-ew track. One shard holds **5.5 M facts**
-  (10 M hard cap, 600 GB, NVMe ≥ 50 k IOPS), one API + worker stack serves up to 32 shards, and 1 B
+  (10 M hard cap, 600 GB, ≈ 138 GB at the target and ≈ 248 GB at the cap, NVMe ≥ 50 k IOPS), one API + worker stack serves up to 32 shards, and 1 B
   facts is 182 shards in 6 cells: **≈ 67 days to fill online** at 3.5 gateway calls per chunk and
   600 RPM per cell, ≈ $160 k at list prices (Table 6.8-B); `RetainBackfill` through the batch API is a
   launch prerequisite.

@@ -21,16 +21,11 @@ every write (D2, D5), a transactional outbox is the only propagation mechanism (
 vectors or BM25 text are written once and only ever purged, and visibility is a **read-time
 predicate over small marker sets**: a delete is one committed marker row plus one intent object at
 the ack and a throttled asynchronous `Expunge` does the physical work afterwards (N113,
-N115–N119). Round 4 (D23) kept that core and closed the edges: evidence rows outlive the facts they
-name, so a replace or a re-extraction is a write and a later delete still finds every derived
-version (N135); every writer of a derived version commits under one rule (N120); and a delete
-survives restore because its intent is put after the marker commits and replayed per subject in
-chain order against a floor that lives in the catalog (N122, N134). Round 5 (D24) made a derived-version
-commit decide its own idempotency before the base compare-and-set (N144), an invalidation independent of the fact row (N145)
-and the filtered semantic plan cost-based (N151). Round 6 (D25) removed the machinery that kept breaking: a move is
-**freeze, then copy, then verify** (N160, N161), the curation subject is `(document_id, content_hash)` (N162), the catalog's
-standby is asynchronous and reconciled from the shards (N163), filtered arms are their own class with θ = 10 k (N164), and the shard
-target is 5.5 M facts (N165).
+N115–N119). Round 4 (D23) kept that core and closed its edges: a replace or a re-extraction is a write that a later delete
+still finds (N135), and a delete survives restore because its intent is replayed per subject against a catalog floor (N122, N134).
+Round 5 (D24) made a derived-version commit decide its own idempotency first (N144) and the filtered semantic plan cost-based (N151).
+Round 6 (D25) made a move **freeze, then copy, then verify** (N160, N161), gave curation the subject `(document_id, content_hash)` (N162),
+made the catalog standby asynchronous and reconciled from the shards (N163), and set θ = 10 k (N164) and a 5.5 M-fact shard target (N165). Round 7 (D26) deleted the re-run: the target is backed up before the commit point (N169) and the catalog acks wait for replay (N171).
 
 **The four binaries (D1).** Separate images; each owns a disjoint set of responsibilities.
 
@@ -39,7 +34,7 @@ target is 5.5 M facts (N165).
 | `engram-api` | gRPC + Connect on one h2c port; `authz.Interceptor`; `catalog.Resolver` cache; `router.ShardRouter` with one pgbouncer recall pool of 32 per shard in its cell (N164); synchronous paths: `Recall`, `Retain` ack (ledger + operation + `StartWorkflow`), the delete/invalidate **marker transaction** (tombstone, then the intent object, O(1)), `Get/List/Invalidate/Restore`, `NamespaceService`, `OperationService`, `ExportService.StreamSnapshot`, `PageService` reads, admin services; quota token buckets; cross-cell forwarding (phase 3). | Any LLM call except the recall reranker and the query embedding; any background loop. | N stateless replicas behind Envoy; caches are per-process and safe to lose. |
 | `engram-worker` | Temporal worker polling `shard-{id}` for every shard in its cell (2 pollers/queue, D3); all workflows and activities (`RetainDocument`, `Consolidate`, `Expunge`, `PageRefresh`, `ExportSnapshot`, `Move`, `TenantDelete`, `RetainBackfill`, `ReembedNamespace`); the per-shard outbox relay (advisory-lock elected, D6); the move executor (activities of `move/{ns}/{epoch}`); the daily outbox trimmer. | Serving client RPCs; catalog calls on the hot path (D4: workflow inputs carry `(namespace_id, tenant_id, shard_id, epoch)`). | M replicas; any replica can host any queue of the cell; relays self-elect per shard. |
 | `engram-mcp` | MCP server (streamable HTTP) exposing per-namespace endpoints `/mcp/{tenant_id}/{namespace_id}`; tool definitions derived from `memory.v1` protos; forwards the caller's JWT unchanged to `engram-api` over gRPC (D13). | Any authz decision, any storage access. | Stateless; scaled independently of the core. |
-| `engramctl` | Operator CLI: shard provisioning (create DB, roles, extensions, partitions, RLS policies), per-shard migration rollout, catalog registration, move start/status/rollback, backups/restores with epoch bump and delete-intent replay, the index-runner daemon (`engramctl index`, the one process that holds the index-DDL role and builds, rebuilds and drops the per-namespace indexes, N138), source cleanup after the move grace, outbox trim, cache flush. | Anything a client can do through the public API. | Run by humans/CI against the admin gRPC surface (`memory.admin.v1`) and, for DDL, directly against catalog and shard DBs with an admin role. |
+| `engramctl` | Operator CLI: shard provisioning (create DB, roles, extensions, partitions, RLS policies), per-shard migration rollout, catalog registration, move start/status/rollback, backups/restores with epoch bump and delete-intent replay, the index-runner daemon (`engramctl index`, the one process that holds the index-DDL role and builds, rebuilds and drops the per-namespace indexes, N138), source cleanup after the 24 h gate, outbox trim, cache flush. | Anything a client can do through the public API. | Run by humans/CI against the admin gRPC surface (`memory.admin.v1`) and, for DDL, directly against catalog and shard DBs with an admin role. |
 
 **External infrastructure** (assumed to exist; we configure, we do not build):
 
@@ -429,7 +424,7 @@ returns `min(cap, |visible|)`; at or above θ it runs the namespace's own **part
 index runner, `plan_cache_mode = force_custom_plan`, `ef_search` = the arm cap) as an iterative scan
 with `hnsw.max_scan_tuples = max(20 000, min(4 × ef_search / s, 100 000))`, never below pgvector's default, and with `document_id = ANY ($1)` for the allowed documents (a hashed array inside the index scan; the exact path keeps the 500-document array/subquery rule); if the scan
 exhausts short of the cap and `E ≤ 4 θ` the arm re-runs the exact path in the same transaction, and
-`RecallStats.partial` is reachable only above `4 θ` eligible rows. A recall with any vector arm at `E ≥ θ` is the **filtered class** (`RecallStats.filtered`): p95 ≤ 1 s, its arms pass a second semaphore of 4 per API process per shard, and the 300 ms SLO is stated for recalls with every vector arm below θ. The graph arm runs from Go, **one statement per hop** (an index-only `UNION ALL` of the source and destination branches), with a 100 ms sub-budget at HIGH (N165). Arm transactions run with `enable_seqscan = off` and no parallel workers, so a
+`RecallStats.partial` is reachable only above `4 θ` eligible rows. A recall with any vector arm at `E ≥ θ` is the **filtered class** (`RecallStats.filtered`): p95 ≤ 1 s, its arms pass a second semaphore of 2 per API process per shard (P = 4 processes, N176), and the 300 ms SLO is stated for recalls with every vector arm below θ. The graph arm runs from Go, **one statement per hop** (an index-only `UNION ALL` of the source and destination branches), with a 100 ms sub-budget at HIGH (N165). Arm transactions run with `enable_seqscan = off` and no parallel workers, so a
 partition scan cannot be chosen; `fact_type` is copied onto `fact_vectors` so the type filter runs
 inside the scan. A query visits only its own namespace's graph and there is no shared index. The temporal arm probes two-sided around
 `query_timestamp` on the btree `(namespace_id, occurred_start)` (nearest N before and after, N =
@@ -461,8 +456,8 @@ N54; A-2 for gateway rerank latency, A-R1 for rerank throughput):**
 | Cross-encoder rerank on top 0 / **50** / 150 (LOW / MID / HIGH, N53), default `bge-reranker-base`, `bge-reranker-v2-m3` as a per-namespace upgrade | 90 ms | skipped if remaining deadline < **106 ms** (= rerank p95 90 + pack 3 + stream 5 + 8, N106) → `stage=FUSED`; **the skip rate is an SLO breach, not a degradation** (N53) when the client deadline is ≥ 300 ms: it is a p99 property of the pre-rerank path (skip only if that path exceeds `deadline − 106 ms` = 194 ms), M0.5 measures that path's p95/p99 and M1.2 judges < 1 % against it; skipping at client deadlines below 300 ms is by design |
 | Boosts + packing (tiktoken `cl100k_base`) | 3 ms | never skipped |
 | Streaming overhead (batches of 10, trailing `RecallStats`) | 5 ms | — |
-| Pool wait for the per-arm transactions (arm semaphore of 32 per process per shard, ρ ≈ 0.75 on a recall pool of 32, N155, N164) | ≤ 8 ms | Erlang-C pool-wait p95; `PoolSaturation` alerts at wait p95 ≥ 50 ms |
-| **Total (critical path)** | **≈ 224 ms** (216 ms of stages + the pool-wait term) | target p95 < 300 ms at 50 QPS/shard for unfiltered recalls (the SLO assumes a client deadline ≥ 300 ms); 76 ms of headroom |
+| Pool wait for the per-arm transactions (arm semaphore of 32 per process per shard, ρ ≈ 0.75 on a recall pool of 32, N155, N164) | ≈ 20 ms | maximum over six parallel arm acquisitions (≈ 4.5 ms per arm), Erlang-C p95; A ≤ 24 is the alert line; `PoolSaturation` alerts at wait p95 ≥ 50 ms |
+| **Total (critical path)** | **≈ 236 ms** (216 ms of stages + the pool-wait term) | target p95 < 300 ms at 50 QPS/shard for unfiltered recalls (the SLO assumes a client deadline ≥ 300 ms); 64 ms of headroom |
 
 Sizing the reranker (N53, review F-6): 50 QPS/shard × 32 shards = 1 600 recalls/s per cell ×
 50 pairs = **80 k pairs/s per cell** that the gateway must sustain at 90 ms p95 (assumption
@@ -578,12 +573,12 @@ orphan intent would delete content acknowledged later).
 
 A namespace move is **freeze, then copy, then verify, then cut over** (D5, N160, N161): `Plan` (with a blob pre-warm) →
 `Freeze` → `Drain` → one sequence advance → copy **every table** from the now-static source by primary-key ranges, WAL-paced →
-`VerifyFrozen` (count and primary-key hash per table, equality on a static set) → `BuildIndexes` under the freeze → wait for the
+`VerifyFrozen` (count and primary-key hash per table, equality on a static set) → `BuildIndexes` under the freeze → `MoveBackup` (an incremental backup of the target, N169) → wait for the
 outbox consumers → cutover with a `ready` state and a catalog CAS as the point of no return, with a rollback at every step
 before it. A move is an operator tool for rebalancing: rare, allowed to take hours, and the namespace is read-only for the
 whole window (reads continue; writes get `NamespaceFrozen{retry_after, frozen_until_estimate}`). Plan computes a window
-estimate (≈ 25 min per 1 M live facts at the planning rates); the rebalancer starts a move unattended only at 10 min or less,
-larger ones need an operator-scheduled window (default maximum 4 h), and a move that has not passed the CAS by its freeze
+estimate (≈ 26 min per 1 M live facts at the planning rates); the rebalancer starts a move unattended only at 10 min or less (≈ 350 k facts),
+larger ones need an operator-scheduled window of at least max(1.5 × estimate, estimate + 10 min) (default 4 h, cap 8 h), and a move that has not passed the CAS by its freeze
 deadline rolls back by itself. Nothing is ever merged into a target that has served writes.
 
 ```mermaid
@@ -594,15 +589,17 @@ flowchart TB
   S["Sequence advanced past the source's final value, once"]
   C["FrozenCopy: every table by PK ranges from the static source, WAL-paced"]
   V["VerifyFrozen: count and PK hash per table, VerifyFK, blobs"]
-  IX["BuildIndexes under the freeze, consumer-cursor wait"]
+  IX["BuildIndexes under the freeze"]
+  MB["MoveBackup: incremental backup of the target, complete and archived"]
+  CW["Consumer-cursor wait"]
   B1["b1: target incoming to ready (nothing routes to ready)"]
-  A2["a2: catalog CAS cutover to committed - POINT OF NO RETURN, then wait for the standby to replay it"]
+  A2["a2: catalog CAS cutover to committed - POINT OF NO RETURN, then wait for the standby to replay it and re-read"]
   CS["c: source frozen/move to moved_out with target hint"]
   B2["b2: target ready to active"]
   CD["d: catalog flip"]
-  RS["Restart workflows on the target, cleanup after 24 h and a post-activation backup (moved_out row stays, source blobs kept 28 days)"]
+  RS["Restart workflows on the target, cleanup after the 24 h gate (moved_out row stays, source blobs kept 28 days)"]
   RB["Rollback: CAS cutover to rolled_back, abort_move, thaw_move, unready_target, return_abort"]
-  P --> F --> D --> S --> C --> V --> IX --> B1 --> A2 --> CS --> B2 --> CD --> RS
+  P --> F --> D --> S --> C --> V --> IX --> MB --> CW --> B1 --> A2 --> CS --> B2 --> CD --> RS
   F -.->|"failure"| RB
   C -.->|"freeze deadline"| RB
   V -.->|"second mismatch"| RB
@@ -615,12 +612,11 @@ Safety: writes need the fence and `active` at the caller's epoch; nothing routes
 equality on a static set and duplication by primary keys. The point of no return is a **catalog CAS** `cutover → committed`,
 not a statement on the source, because the arbiter must sit where the restore reads it: a restore or failover reconcile CASes
 `cutover → rolled_back` only after reading both ownership rows, and exactly one of the two CASes wins. Because the catalog's
-standby is asynchronous (N163), the mover waits until the standby has replayed the CAS before (c). The mover compares its
+standby is asynchronous (N163), every shard action on an arbiter outcome (the cut, the thaw, the rollback) waits until the standby has replayed it and re-reads the row (N171). The mover compares its
 session's timeline with the catalog at `Freeze`, at the CAS and at (c), so a zombie primary can be neither frozen nor cut over
 (N123). Restore and failover first settle every open move against the catalog, then bring the shard up `frozen/restore` and
-replay the delete intents (N122, N123, N134; §5.5.5). A target restored after the CAS is an ordinary restore if its row is
-`active`, and is wiped and re-copied from the retained source if it is `incoming` or `ready`; the source is cleaned up 24 h after
-activation and a full target backup that started after it (N161). The full step list, step table and crash table are §5.5.
+replay the delete intents (N122, N123, N134; §5.5.5). A target restored after the CAS is always an ordinary restore (`incoming`, `ready` or `active → frozen/restore`), because the
+move backup precedes the commit point (N169); the source is cleaned up 24 h after activation (N170). The full step list, step table and crash table are §5.5.
 
 ### 1.7 Where every shard-scoped resource lives
 
@@ -678,16 +674,11 @@ specs can state in a few lines: the read-time predicate over evidence segments (
 no-derivation-lock configuration that must fail), delete intents (`Durability.tla`:
 `AckImpliesIntent`, `RestoreReplaysIntents`) and the freeze-then-copy move
 (`ShardMove.tla`: `SingleWriter`, `NoLossNoDup`, `RollbackPossibleBeforeC`, `ZombieCannotCutOver`).
-Round 4 added the failure modes the round-3 specs could not express and a must-fail configuration
-for each (N141): a REPLACE purge that deleted the evidence a later delete needed, a page commit that
-re-verified nothing, a stored consolidation proposal applied over a newer root version, a replay
-floor raised after a reopen, an intent put before its commit, and a move whose arbiter was stamped
-after the cut. Round 5 added the failure modes the round-4 specs had modelled too kindly, again with a must-fail configuration
-each (N144 to N150, N152): a retried page commit that ran its compare-and-set before its idempotency check, an
-invalidation erased by a chunk purge, a catalog restore that lost `committed` or the lowered floor, a replay that
-stamped the bumped epoch, and hygiene that vacuumed before rebuilding. Round 6 rewrote the move spec for
-freeze-then-copy and added must-fail configurations for a repair by union that resurrects a delete, a cleanup before a
-post-activation backup, a cut on an unreplicated catalog commit and a `Restore` that undoes only one twin (N168). None of
+Rounds 4 to 7 each added the failure modes the previous specs had modelled too kindly, every one with a must-fail
+configuration (N141, N144 to N150, N152, N168, N178): a REPLACE purge that deleted evidence a later delete needed, a
+retried page commit that ran its compare-and-set first, a catalog restore that lost `committed`, hygiene that vacuumed
+before rebuilding, a repair by union that resurrects a delete, a cut on an unreplicated catalog commit, a target restored
+to a pre-copy backup, a thaw on an unreplicated abort and a promotion during the freeze. None of
 them changes the consistency promises above; each changes how a promise is kept.
 
 **Failure domains.** "Degrades" means the operation completes with reduced function and says
@@ -697,7 +688,7 @@ so in the response; "fails" means a typed error with `RetryInfo`.
 |---|---|---|---|---|---|---|
 | One shard's Postgres | fails (`UNAVAILABLE`) for namespaces on that shard | fails at ack (ledger row cannot commit) | fails | workflows on `shard-{id}` retry with backoff, no data loss | a move *into* that shard stalls in `frozen` and rolls back at its freeze deadline; a move *out of* it stalls | only namespaces on that shard (≈ 150 of 10 000+); other shards unaffected |
 | One shard's Postgres: **primary failover** (N123) | brief `UNAVAILABLE` while the replica is promoted; reads stay closed until the intent replay finishes; no stale reads (the epoch bump fences old executions) | acknowledged retains survive up to the RPO of ≤ 60 s of WAL; the runbook (§9.6) reconciles open moves against the catalog, registers the new timeline, bumps every namespace's epoch to e + 1, comes up `frozen/restore`, and **restarts every in-flight workflow at e + 1 from its `operations` row** (the N97 procedure), so acknowledged retains do not end `FAILED` | acknowledged deletes and invalidations survive with RPO 0: `engramctl restore replay` re-applies every intent object newer than `replay_floor − 10 min` (the catalog's never-raised floor, N134) verbatim and per subject in chain order before reads reopen (N122); a committed but unacknowledged delete may be lost and is re-applied by the client's retry; no synchronous standby exists on shards | restarted from `operations` at e + 1 | an open move is rolled back (before the catalog CAS (a″)) or the reconcile completes it and the restored source row becomes `moved_out(target, e+1)` (after it) | only namespaces on that shard |
-| Catalog Postgres (primary and asynchronous standby) | serves existing namespaces from cache **indefinitely** (`catalog_stale` gauge; `deleting`/quota freshness degrade); only misses fail `UNAVAILABLE`; negative entries expire after 10 min (D4 as amended) | same; the workflow itself never needs the catalog | same | unaffected (workflow inputs carry shard/epoch) | cannot plan or cut over; in-flight moves pause before `cutover` and roll back if the freeze deadline is hit | namespaces not yet cached by the serving API replicas (new or rare) — never the fleet; promotion is automated (30 s unreachable) and runs `catalog reconcile --from-shards` first, so a commit the asynchronous standby had not replayed is re-derived from the shards' ownership rows before the catalog serves writes (N163); a move waits for the standby to replay its commit before (c), so a down standby stalls moves and `CatalogStandbyDown` pages at 60 s |
+| Catalog Postgres (primary and asynchronous standby) | serves existing namespaces from cache **indefinitely** (`catalog_stale` gauge; `deleting`/quota freshness degrade); only misses fail `UNAVAILABLE`; negative entries expire after 10 min (D4 as amended) | same; the workflow itself never needs the catalog | same | unaffected (workflow inputs carry shard/epoch) | cannot plan or cut over; in-flight moves pause before `cutover` and roll back if the freeze deadline is hit | namespaces not yet cached by the serving API replicas (new or rare) — never the fleet; promotion is automated (30 s unreachable) and runs `catalog reconcile --from-shards` first, so a commit the asynchronous standby had not replayed is re-derived from the shards' ownership rows before the catalog serves writes (N163); routing, moves and shard-side deletes are re-derived from the shards; every other catalog write is acknowledged only once replicated (N171), so a down standby fails client-acknowledged catalog writes `UNAVAILABLE`, stalls moves at `committed`/`rolled_back` (`MoveFrozenPastDeadline` pages, never a rollback) and `CatalogStandbyDown` pages at 60 s |
 | AI gateway | degrades: embedding miss drops the dense arms, rerank skipped (`stage=FUSED`); lexical/temporal/graph/chunk-BM25 still answer | ack succeeds; extraction/embedding activities retry with backoff (`PermanentLLMError` only on 4xx schema/model errors); operation stays `RUNNING` | unaffected | stall and retry; Reflect fails (`UNAVAILABLE`) since it is LLM-bound | unaffected | everything LLM-bound is delayed, nothing is lost |
 | Temporal | unaffected | ack fails `UNAVAILABLE` (step 2 in §1.4) — rejected alternative: ack and rely solely on the sweeper, which would silently extend the visibility lag | the marker commits (the delete is effective); the expunge is delayed | stall | stall | write-side latency only |
 | Blob store | unaffected (recall reads Postgres only) | fails at ack when the body exceeds the inline limit (raw blob `Put` precedes the tx); extraction proceeds without cache (cache errors are logged, never fatal) | **the marker commits (the delete is effective) but the ack waits for the intent put, which retries; the client sees `UNAVAILABLE` and retries, and the duplicate attempt re-puts the intent** (N122), so no delete is acknowledged that restore could not replay; an already-acked delete's blob purge retries | page refresh cannot persist markdown → retries | copy phase stalls | large-document ingest, pages and the delete/invalidate ack |

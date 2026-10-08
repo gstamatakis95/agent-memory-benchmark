@@ -1006,8 +1006,6 @@ class (extract, routing, write, page refresh, each Reflect iteration); workflows
 counts prompt + completion tokens of every call above through `token_usage` (PD-1 / N25); the
 per-call caps in the first table bound the worst case of one activity.
 
-### Round-6 changes
+### Round-7 changes
 
-| Item | Removed | Added |
-|---|---|---|
-| Fill (§6.8, Table 6.8-B) | 154 shards, 5 cells, 14.5 chunks/s, ≈ 80 days (≈ 120 at A-F = 4); a per-shard row at 6.5 M facts | 182 shards, 6 cells, 17.4 chunks/s, ≈ 67 days (≈ 100 at A-F = 4); a per-shard row at 5.5 M facts, ≈ $860 (N165) |
+None. The §6.8 fill figures (182 shards, 6 cells, ≈ 67 days) are unchanged by D26 (N176).

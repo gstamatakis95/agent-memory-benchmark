@@ -70,8 +70,9 @@ buf push --label "v$(cat VERSION)"        # publishes both modules to the BSR
 `v1.0.0` ships a pull request is compared with the merge target (`main`) and only
 the push-to-main job uses `main@HEAD~1` (decisions N139, N157); each intended
 break needs a `buf-breaking-exception` label on the pull request and a
-changelog entry, and the breaks of rounds 3, 4 and 6 are listed in plan section
-4.5. From `v1.0.0` on the baseline is the latest release tag
+changelog entry, and the breaks of rounds 3 to 7 are listed in plan section
+4.5. CI also runs `buf breaking --config WIRE_JSON` against the first tagged tree
+(renames with reserved names pass; N177). From `v1.0.0` on the baseline is the latest release tag
 (`.git#tag=proto/v1.0.0,subdir=…`), a failure blocks the merge and the only
 override is a `v2` package. Every top-level internal payload carries
 `schema_version = 2`.

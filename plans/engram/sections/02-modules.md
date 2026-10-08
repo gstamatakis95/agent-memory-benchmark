@@ -63,7 +63,7 @@ Four ideas carry the design; everything else is a detail of one of them.
    concurrently calls `Session.Tx`, which opens its own pooled connection, sets the scope GUCs, runs the
    read fence (`active` or `frozen/move`) and the arm's `SET LOCAL`s (`enable_seqscan = off`, no parallel
    workers, `hnsw.ef_search`, N138). One connection runs one statement at a time, so a shared
-   transaction would serialise the arms and the 224 ms path could not hold; a semaphore admits at most 32 concurrent arm transactions per API process per shard, 4 of them filtered arms (N155, N164).
+   transaction would serialise the arms and the 236 ms path could not hold; a semaphore admits at most 32 concurrent arm transactions per API process per shard, 2 of them filtered arms (N155, N164, N176).
 2. The planner is a `pipeline.Pipeline[*recall.State]` whose first stage is a DAG scheduler and whose
    remaining stages run in order; each records a `StageTiming`:
 3. `Retrieve` — a DAG over named nodes. `visibility` loads, once, the two marker sets
@@ -289,8 +289,8 @@ type Deleter interface {
 	DeleteDocument(ctx context.Context, sc authz.RequestScope, doc id.DocumentID, o DeleteOptions) (*memoryv1.DeleteDocumentResponse, error) // DeleteOptions{OperationID, ExpectedVersion id.DocVersion (compared inside the marker tx)}
 	DeleteNamespace(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirmName string) (*memoryv1.DeleteNamespaceResponse, error) // keeps the client's operation_id
 	DeleteTenant(ctx context.Context, sc authz.RequestScope, op id.OperationID, confirm id.TenantID) (*adminv1.DeleteTenantResponse, error)       // acks after the catalog row and the tenant intent; fences asynchronously
-	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // subject (document_id, content_hash) lock held until the intent put + help-previous (N150, N159, N162); hides every live fact of the subject under one invalidation_op, one deletion_log row, one intent; a second Invalidate changes no visibility but still writes its own row and intent (N143)
-	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // subject lock + help-previous (N159), then the exclusive derivation lock: 40 s deadline cap; removes the rows carrying the invalidation's stamp (N162); a repeated Restore also writes its own row and intent (N143)
+	Invalidate(ctx context.Context, sc authz.RequestScope, fact id.FactID, reason string) (*memoryv1.Memory, error)                               // subject lock → exclusive document lock (CommitChunk holds it shared) held until the intent put + help-previous (N150, N159, N162, N174); hides every live fact of the subject under its one invalidation_op (reused when invalidate rows exist; recorded on deletion_log and the intent); a second Invalidate changes no visibility but writes its own row and intent (N143)
+	Restore(ctx context.Context, sc authz.RequestScope, fact id.FactID) (*memoryv1.Memory, error)                                                // subject lock → exclusive document lock → exclusive derivation lock (N174): 40 s deadline cap; removes the rows with the invalidation's stamp (N162); a purged fact resolves its subject from curation_log (N174); a repeated Restore writes its own row and intent (N143)
 }
 
 // OperationWaiter implements WaitOperation: park on Temporal's workflow-result long-poll (≤ MaxOpenWaits per
@@ -357,7 +357,7 @@ Owns the `engram_catalog` tables (D4) and the in-process `Resolver` (LRU 100 k, 
 unreachable, only misses fail `UNAVAILABLE` — F-21). The catalog database has **one asynchronous hot
 standby** (N163): everything it arbitrates is also derivable from the shards' ownership rows, so **every promotion and
 every restore runs `engramctl catalog reconcile --from-shards` before the catalog serves writes**, and the one step that
-acts irreversibly on a catalog commit, the move's (c), first waits for the standby to replay that commit. *Pattern: Repository for the control plane,
+acts irreversibly on a catalog outcome (the move's (c), thaw, rollback) first waits for the standby to replay it and re-reads the row (N171): routing, moves and shard-side deletes are re-derived from the shards, every other acknowledged catalog write waits for replay (`catalog.AckAfterReplay`). *Pattern: Repository for the control plane,
 split by capability so no interface passes five methods; the Resolver is a read-through cache.*
 
 ```go
@@ -377,20 +377,27 @@ type NamespaceAdmin interface { // NamespaceService.ListNamespaces / UpdateNames
 	List(ctx context.Context, t id.TenantID, q NamespaceQuery) ([]Entry, string, error)
 	Update(ctx context.Context, ns id.NamespaceID, p NamespacePatch, etag string) (*Entry, error)
 }
-type Moves interface { // the move ledger: every transition is a CAS on the current state (five methods; the backup bookkeeping is MoveBackups)
-	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID, p PlanParams) (*MoveRow, error) // source_system_id, source_timeline_id, w_est_seconds, window_seconds recorded; refused when w_est > window or an unattended move exceeds 10 min (MovePrecondition{WINDOW_REQUIRED}, N160)
+type Moves interface { // the move ledger: every transition is a CAS on the current state (five methods; the rest is MoveBackups, Replication)
+	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID, p PlanParams) (*MoveRow, error) // source_system_id, source_timeline_id, w_est_seconds, window_seconds recorded; refused unless window ≥ max(1.5 × w_est, w_est + 10 min), cap 8 h, or an unattended move exceeds 10 min (PreconditionFailed{MOVE_WINDOW_REQUIRED | MOVE_WINDOW_TOO_SHORT}, N173)
 	Advance(ctx context.Context, m id.MoveID, from, to fsm.MoveState) error              // stamps frozen_at and freeze_deadline = frozen_at + max(1.5 × w_est, w_est + 10 min), capped by window_seconds, on planned → frozen
 	Commit(ctx context.Context, p CommitParams) error                                   // (a″) CAS cutover → committed WHERE move_id, state = 'cutover' AND the verified source/target shards, epochs, timeline AND the catalog namespace row (source, e, frozen) (N143): THE point of no return; ErrLost if a rollback or restore won the row (N125) or any verified value changed
 	
 	Cutover(ctx context.Context, p CutoverParams) error                                 // step (d) only: shard, epoch, state, NOTIFY; success also when already (target, e + 1)
 	Rollback(ctx context.Context, m id.MoveID, reason string) error                     // CAS cutover → rolled_back (or any earlier state); ErrCommitted if (a″) won
 }
-type MoveBackups interface { // what Cleanup's gate reads (N161): activated_at + 24 h and a post-activation full target backup, nothing else
-	RecordTargetBackup(ctx context.Context, m id.MoveID, startedAt, completedAt time.Time) error // sets target_backup_started_at / target_backup_at, only for a FULL backup that STARTED after activated_at
-	CleanupGate(ctx context.Context, m id.MoveID, now time.Time) (CleanupGate, error)            // Open() reports the unmet condition (ErrGraceOpen | ErrBackupPending); the `done` CHECK repeats it
+type MoveBackups interface { // what the `cutover → …` CHECK reads (N169(1)): the move backup; the 24 h cleanup gate is a trigger on `committed → cleaning` (N170)
+	RecordMoveBackup(ctx context.Context, m id.MoveID, startedAt, completedAt time.Time) error // move_backup_started_at / move_backup_at; only for a completed, archived incremental
+	RecordTimeline(ctx context.Context, m id.MoveID, systemID uint64, timelineID int32) error    // the target's system_identifier/timeline at the backup (N123)
 }
+type Replication interface { // catalog_replicated(lsn) and the commit LSN (N171(1))
+	Replicated(ctx context.Context, lsn LSN) (bool, error) // a streaming standby has replay_lsn ≥ lsn
+	CommitLSN(ctx context.Context) (LSN, error)            // pg_current_wal_lsn() after COMMIT, same session
+}
+// catalog.AckAfterReplay decorates the catalog write path (N171(3)): CreateTenant, UpdateTenant, UpdateTenantLimits, DeleteTenant,
+// CreateNamespace, UpdateNamespace, DeleteNamespace's `deleting` row, StartMove, CleanupMove and the idempotency_keys row each writes
+// ack only after Replicated(CommitLSN); on timeout UNAVAILABLE{RetryInfo 2 s}, the retry idempotent by key. Step-writes do not wait.
 type Reconciler interface { // engramctl catalog reconcile --from-shards: the first step of every catalog promotion and restore (N163)
-	FromShards(ctx context.Context, rows []OwnershipObservation) (*ReconcileReport, error) // the shards' ownership rows are the source of truth (a moved_out source with a hint ⇒ the move is at least committed; no target row and no moved_out source ⇒ rolled_back); raises each epoch to max over its shard rows
+	FromShards(ctx context.Context, rows []OwnershipObservation) (*ReconcileReport, error) // the shards' ownership rows are the source of truth (a moved_out source with a hint ⇒ the move is at least committed; no target row and no moved_out source ⇒ rolled_back); raises each epoch to the max over its `active`/`frozen/*` rows and a `moved_out` row's target_epoch (N172)
 }
 type MoveReader interface { // MoveService.GetMove / ListMoves
 	Get(ctx context.Context, m id.MoveID) (*MoveRow, error)
@@ -567,7 +574,7 @@ type DirectConn interface {
 // SubjectLocker (N150, N159, N162) is the second interface the Store implementation satisfies (Store itself stays at five methods).
 // Lock takes the SESSION-level subject lock pg_advisory_lock(engram_subject_lock_key(ns, subject)) on a dedicated direct
 // connection of the `engram_subject` alias (2 per API process per shard, a role holding only pg_advisory_lock on the subject
-// key space; ≈ 57 of max_connections 100 with N164's table). The lease is taken with pg_try_advisory_lock polled every 50 ms
+// key space; 61 = 53 + 2P of max_connections 100 at P = 4, N176). The lease is taken with pg_try_advisory_lock polled every 50 ms
 // for at most 3 s, so one blocked lease never holds a slot; pool exhaustion is an immediate retryable UNAVAILABLE. The marker
 // writer holds the lease from before its marker transaction until the intent put and the marker re-read are done; Release is
 // called on every exit path and a crashed handler's lease dies with its connection (tcp_user_timeout 30 s). The lease is outside
@@ -585,9 +592,9 @@ type Stores interface { For(s id.ShardID) (Store, bool); Local() []id.ShardID }
 // ReadSession is the scope of one request on one shard. It holds no connection; every Tx opens its own, so arms
 // that run concurrently (N54) never share one (a pgx connection executes one statement at a time). A semaphore shared
 // by the process admits at most 32 concurrent arm transactions per shard (N155, N164: the `engram_app` pgbouncer recall pool
-// is 32 and API-only, the worker has its own `engram_worker` pool of 8), and a second semaphore of 4 inside it admits the
-// filtered arms (E ≥ θ) so they cannot take more than a quarter of the pool; TestReadSession_ConcurrentArms asserts both
-// bounds and ≤ 320 connection-ms per MID recall.
+// is 32 and API-only, the worker has its own `engram_worker` pool of 8), and a second semaphore of 2 inside it admits the
+// filtered arms (E ≥ θ) (≤ 8 of 32 at P = 4); TestReadSession_ConcurrentArms asserts both bounds and records ≈ 425
+// connection-ms per MID recall, alerting above 1.25×.
 type ReadSession interface {
 	Scope() id.Scope
 	// Tx runs fn in ONE short READ transaction on its own pooled connection: SET LOCAL scope GUCs, the read fence
@@ -829,7 +836,7 @@ exact(E)); only above `4 θ` does it return what it has with `RecallStats.partia
 `Nested Loop Semi Join` and no `Join Filter` on `document_id`); on the **exact path** the 500-document rule applies:
 one array constant up to 500 documents and `document_id IN (SELECT unnest($1))` above, which is correct there (namespace and model stay
 constants for the partial-index proof). **Filtered arms are their own class** (N164): a recall with any vector arm at
-`E ≥ θ` is counted as filtered (`RecallStats.filtered`), has p95 ≤ 1 s and passes the second arm semaphore (4 per API process per
+`E ≥ θ` is counted as filtered (`RecallStats.filtered`), has p95 ≤ 1 s and passes the second arm semaphore (2 per API process per
 shard). The observation arm has its own estimate (`namespace_stats.observations_by_tag`)
 and tests tags inside the scan (`observation_version_vectors.obs_tags`, copied at insert); the chunk arm uses the fact
 estimate of its documents. A namespace below 2,000 vectors has no index and always takes the exact path. The arm's
@@ -997,11 +1004,11 @@ embedding arrives, the graph arm in two waves of 30 ms from the lexical and sema
 other arm gets `min(ArmDeadline, remaining − rerankReserve − packReserve)`. **Rerank is skipped when
 the remaining deadline is below 106 ms** (= rerank p95 90 + pack 3 + stream 5 + 8, N106); at client
 deadlines ≥ 300 ms a skip counts against the rerank-skip SLO (N53), below 300 ms it is by design. The
-critical path is 224 ms p95 at MID (216 ms of stages plus a ≤ 8 ms pool-wait term, N54, N164). The graph arm is driven from Go, **one statement per hop** in the arm's read transaction (a cut at the sub-budget keeps the completed hops); the HIGH graph arm (1,000 nodes, 2 hops) has an explicit 100 ms sub-budget (N165). Filtered arms are a separate class with their own SLO and semaphore (N164). While markers are `pending` the observation and page arms pay a
+critical path is 236 ms p95 at MID (216 ms of stages plus a ≈ 20 ms pool-wait term, N54, N164, N176). The graph arm is driven from Go, **one statement per hop** in the arm's read transaction (a cut at the sub-budget keeps the completed hops); the HIGH graph arm (1,000 nodes, 2 hops) has an explicit 100 ms sub-budget (N165). Filtered arms are a separate class with their own SLO and semaphore (N164). While markers are `pending` the observation and page arms pay a
 per-candidate lookup and the skip SLO is suspended for the namespace (N119). Under `as_of` the chunk
 arm adds `embedding_effective_at ≤ T`, headers are empty, entity names are suppressed; the version served
 for an observation or page is the one current at `T`, or nothing when it is hidden (N117). *Test seam:* rapid properties mirror the Lean theorems (RRF permutation invariance, packing
-within budget, boost in [0.75, 1.25]); a fake-clock test asserts the 224 ms path and the 106 ms
+within budget, boost in [0.75, 1.25]); a fake-clock test asserts the 236 ms path and the 106 ms
 reserve; leakage tests assert nothing hidden or future in any arm.
 
 #### 2.2.14 `internal/consolidate` — facts → observations (two stages)
@@ -1240,7 +1247,7 @@ after the watch window.
 #### 2.2.19 `internal/move` — namespace move saga (D5)
 
 The D5 protocol as Temporal workflow `move/{ns}/{epoch}` on `shard-{target}` (N2): **freeze, then copy every table
-from the static source, verify by equality, build the indexes under the freeze, then cut over with a `ready` state and a
+from the static source, verify by equality, build the indexes and take the move backup under the freeze, then cut over with a `ready` state and a
 catalog CAS** (N160, N161, N125). *Pattern: **Saga** with a **state machine** — every step is idempotent,
 every step before the catalog CAS (a″) has a compensation, and (a″) is the point of no return. It is the only
 code path that holds two shard handles.*
@@ -1256,13 +1263,16 @@ type Fence struct { Ns id.NamespaceID; Tenant id.TenantID; Source, Target id.Sha
 // Activities are split by phase so each interface stays small (≤ 5 methods). Every activity first re-checks the fence
 // against the catalog row and both ownership rows and the source session's system_identifier/timeline (MoveFenced).
 // Every STEP, including the catalog CAS, is then a compare-and-set on the exact rows it verified (N143, ShardMove_UnfencedSteps):
-// each ownership edge is `UPDATE namespace_ownership … WHERE namespace_id AND state, freeze_reason, epoch, move_id = <the verified values>`,
-// and Moves.Commit adds the verified source/target shards, epochs and timeline to its WHERE; zero rows = MoveFenced, the step stops (TestMove_CatalogCAS).
+// each ownership edge is `UPDATE namespace_ownership … WHERE namespace_id AND state, freeze_reason, epoch, move_id = <verified values>`;
+// Moves.Commit adds the verified shards, epochs and timeline; zero rows = MoveFenced, the step stops (TestMove_CatalogCAS).
 type Copier interface {
-	Plan(ctx context.Context, f Fence) (*PlanResult, error)               // plan_target / start_move edges; records system_id, timeline, W_est; pauses expunge and schedulers; blob pre-warm (the only pre-freeze work)
-	FrozenCopy(ctx context.Context, f Fence) (*CopyResult, error)         // engram_seq_advance(W_final) once, then every table of all three classes by PK ranges ≤ 100 k rows, 4 streams, WAL-paced; resumable at (table, last_key)
-	VerifyFrozen(ctx context.Context, f Fence) (*workflowv1.VerifyFrozenReport, error) // count + PK hash per table over the whole namespace on both sides, VerifyFK, blob existence; one re-copy of mismatching tables, then MoveVerifyFailed
-	BuildIndexes(ctx context.Context, f Fence) (*workflowv1.BuildIndexesReport, error) // under the freeze: request the target's partial indexes, wait for engram_move_indexes_valid (indisvalid ∧ indisready); a failed build retries once
+	Plan(ctx context.Context, f Fence) (*PlanResult, error)               // plan_target / start_move edges; records system_id, timeline, W_est; pauses expunge; blob pre-warm (the only pre-freeze work)
+	FrozenCopy(ctx context.Context, f Fence) (*CopyResult, error)         // engram_seq_advance(W_final) once, then classes 1 and 2 and token_usage_events once by PK ranges ≤ 100 k rows, 4 streams, WAL-paced; resumable at (table, last_key)
+	VerifyFrozen(ctx context.Context, f Fence) (*workflowv1.VerifyFrozenReport, error) // per PK range (≤ 100 k rows, bit_xor combined in Go, each statement inside the 30 s role timeout) and per-table counts, VerifyFK, blob existence; one re-copy of mismatching tables, then MoveVerifyFailed
+}
+type Readier interface {
+	BuildIndexes(ctx context.Context, f Fence) (*workflowv1.BuildIndexesReport, error) // under the freeze (maintenance_work_mem = min(2.4 KB × v, 24 GB), shm 32g): request the target's partial indexes for every table, wait for engram_move_indexes_valid; a failed build retries once
+	MoveBackup(ctx context.Context, f Fence) (*workflowv1.MoveBackupResult, error)  // pgBackRest incremental of the target, complete with its last WAL archived, then RecordMoveBackup (N169)
 	AwaitConsumers(ctx context.Context, f Fence) error                    // every source outbox consumer cursor past the namespace's final max(seq), bound 120 s
 }
 type Freezer interface {
@@ -1272,39 +1282,36 @@ type Freezer interface {
 type Cutover interface {
 	Begin(ctx context.Context, f Fence) error          // (a) intent only
 	ReadyTarget(ctx context.Context, f Fence) error    // (b′) ready_target; the ownership trigger refuses `ready` unless engram_move_indexes_valid and last_value > w_final (N147, N160)
-	Commit(ctx context.Context, f Fence) error         // (a″) catalog Moves.Commit: CAS cutover → committed on the VERIFIED source/target rows — THE point of no return; then waits until the catalog standby's replay_lsn passed the commit LSN (≤ 10 s per attempt, N163)
+	Commit(ctx context.Context, f Fence) error         // (a″) catalog Moves.Commit: CAS cutover → committed on the VERIFIED source/target rows — THE point of no return; then waits for Replicated(CommitLSN) (≤ 10 s per attempt) and re-reads the row (N171)
 }
-type Handover interface { // only after Commit returned (the mover read `committed`, replicated)
+type Handover interface { // only after Commit returned; (c) is fenced on the source row and the replicated `committed` only (N169(4))
 	Source(ctx context.Context, f Fence) error         // (c) cutover_c: frozen/move → moved_out + target hint
-	ActivateTarget(ctx context.Context, f Fence) error // (b″) activate_target, retried indefinitely; stamps activated_at
+	ActivateTarget(ctx context.Context, f Fence) error // (b″) activate_target, retried indefinitely; stamps activated_at, clears move_id; a target already past ready under the catalog `committed` counts as done by the reconcile
 	Catalog(ctx context.Context, f Fence) error        // (d) shard, epoch, state, NOTIFY — retried indefinitely
 }
 type Closer interface {
-	Restart(ctx context.Context, f Fence, d *DrainResult) error // ns/{ns}/op/{op} on shard-{target}, TERMINATE_IF_RUNNING, memo epoch e+1; singleton-backed kinds (DELETE_DOCUMENT, CONSOLIDATE, REFRESH_PAGE) by SignalWithStart; reconcile loop
-	Cleanup(ctx context.Context, f Fence) error                 // the worker activity that DRIVES the batches once the gate holds (N161): DROP INDEX by name, engram_cleanup_namespace on the source, the moved-out ROWS; then the CleanupMove RPC records done; the source blob prefix only after the 28-day window; the moved_out row stays
-	Rollback(ctx context.Context, f Fence, why string) error   // only before (a″): wins the cutover → rolled_back CAS first; run by the workflow at the freeze deadline (MoveWindowExceeded); see the table
-	Rerun(ctx context.Context, f Fence) (*RerunResult, error)  // the TARGET restored to a point before activation (restored row incoming/ready): wipe it (engram_cleanup_namespace, drop indexes, rerun_move), then FrozenCopy, VerifyFrozen, BuildIndexes from the retained moved_out source, then reconcile_in (incoming → ready → active) and the intent replay (N161); never a merge
+	Restart(ctx context.Context, f Fence, d *DrainResult) error // ns/{ns}/op/{op} on shard-{target}, TERMINATE_IF_RUNNING, memo epoch e+1; singleton-backed kinds by SignalWithStart
+	Cleanup(ctx context.Context, f Fence) error                 // the worker activity that DRIVES the batches once the row reads `cleaning` (N170): DROP INDEX by name, engram_cleanup_namespace on the source; then the CleanupMove RPC records done; the source blob prefix at finished_at + 28 d; the moved_out row stays
+	Rollback(ctx context.Context, f Fence, why string) error   // only before (a″): wins the cutover → rolled_back CAS, waits for it to replicate (MoveFenced otherwise), then thaws; run at the freeze deadline (MoveWindowExceeded); after (a″) the page MoveFrozenPastDeadline instead (N171); see the table
 }
 type Orchestrator interface { // MoveService (api imports move, N157)
 	Start(ctx context.Context, ns id.NamespaceID, target id.ShardID, o StartOptions) (*Ref, error) // o.EstimateOnly returns Ref.WindowEstimate without planning
 	Status(ctx context.Context, m id.MoveID) (*Status, error)
 	Abort(ctx context.Context, m id.MoveID) error // rollback before (a″), else an error
-	Cleanup(ctx context.Context, m id.MoveID, o CleanupOptions) (*CleanupResult, error) // MoveService.CleanupMove: checks the N161 gate on the catalog row (catalog.MoveBackups.CleanupGate), refuses with FAILED_PRECONDITION until it holds, records `done` and blob_gc_after; the Closer.Cleanup activity drives the row batches (N167, A-3)
+	Cleanup(ctx context.Context, m id.MoveID) (*CleanupResult, error) // MoveService.CleanupMove: takes `committed → cleaning` (the schema trigger refuses before activated_at + 24 h), records `done` after the last batch; Closer.Cleanup drives the batches (N167, N170)
 }
 ```
 
 | Step | Compensation (what `Rollback` runs when this step has completed) |
 |---|---|
 | `Plan` | `rollback_target` (delete the target rows and ownership row; for a move back onto a `moved_out` shard `return_abort` restores the permanent fence value); `abort_move` on the source; the pre-warmed blob prefix is deleted in the background |
-| `Freeze` | `thaw_move` first (allowed while the target is unreachable), then the above |
-| `Drain`, `FrozenCopy`, `VerifyFrozen`, `BuildIndexes`, `AwaitConsumers` | the same (copied rows and indexes are discarded; the workflows recorded by `Drain` restart on the source queue) |
+| `Freeze` | `thaw_move` first (allowed while the target is unreachable; after a replicated `rolled_back`), then the above |
+| `Drain`, `FrozenCopy`, `VerifyFrozen`, `BuildIndexes`, `MoveBackup`, `AwaitConsumers` | the same (copied rows and indexes are discarded; the workflows recorded by `Drain` restart on the source queue) |
 | `ReadyTarget` (b′), `Begin` (a) | the CAS `cutover → rolled_back`, `unready_target` (at next contact if the target is down), then `thaw_move` and the above |
 | `Commit` (a″) onward | none: the move completes forward (by the mover or by the restore reconcile); a reverse move is an ordinary new move |
 
-`catalog.MoveBackups` records the backup facts the cleanup gate reads; a source restored before cleanup re-runs `engram_cleanup_namespace` for `moved_out` rows of a move past `committed` (`restore cleanup-moved-out`). `StartOptions` carries `Window` (default and maximum 4 h; required above `W_est` of 10 min unless the caller is the rebalancer, which starts a move unattended only at `W_est ≤ 10 min`), `FreezeNotBefore`, `EstimateOnly`, `DrainWait` (15 s, max 60 s), `CopyRangeRows` 100 000, `CopyStreams` 4, `CleanupGrace` 24 h, `SourceBlobGrace` 28 d and the cutover retry (100 ms ×1.5 → 1 s within 60 s; (b″) and (d) unlimited). `W_est = rows / R_copy + vectors / R_build + verify + blob delta` with the planning rates `R_copy` ≈ 1,000 facts/s and `R_build` ≈ 3,000 vectors/s (≈ 25 min per 1 M live facts; M1.5 replaces them with measurements); the freeze deadline is `frozen_at + max(1.5 × W_est, W_est + 10 min)`, capped by the window. *Test seam:* a model-based test from
-`ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: writers refused `NamespaceFrozen` and resumed on the target with no pre-freeze row lost or duplicated (`TestMove_FrozenWindow`), a dropped range detected and re-copied once (`TestMove_VerifyCatchesFault`), rollback at the deadline with the source thawed and the target empty (`TestMove_WindowExceeded`), rollback from every step before (a″), a restore racing `Commit` for the
-same row, a zombie primary with a stale timeline, `(c)` waiting for the replicated commit (`TestMove_CutWaitsForReplicatedCommit`), a target restored before activation re-copied once with no duplicate and no resurrected delete (`TestMove_TargetRestoredBeforeActivation`), after activation restored ordinarily (`TestMove_TargetRestoredAfterActivation`), cleanup refused until a post-activation backup exists (`TestMove_CleanupWaitsForPostActivationBackup`); a chaos test kills the worker in every phase and between (a″)
-and (b″) (`TestMove_FailoverBetweenCAndD`).
+A target restored or failed over after the move backup is always an ordinary restore (N169(2)); `restore cleanup-moved-out` handles `done` moves only (N170). `StartOptions` carries `Window` (default 4 h, cap 8 h, at least max(1.5 × `W_est`, `W_est` + 10 min); required above 10 min, ≈ 350 k facts, except for the rebalancer), `FreezeNotBefore`, `EstimateOnly`, `DrainWait` (15 s, max 60 s), `CopyRangeRows` 100 000, `CopyStreams` 4 and the cutover retry. `W_est` (≈ 26 min per 1 M live facts) is §5.5's (N173). *Test seam:* a model-based test from
+`ShardMove.tla` with `MemoryCatalog` and two `FakeTx` shards: writers refused `NamespaceFrozen` and resumed on the target with nothing lost or duplicated (`TestMove_FrozenCopy`), a dropped range detected (`TestMove_VerifyFrozenCatchesFault`, `TestMove_VerifyPerRange`), indexes for every table (`TestMove_IndexesRequestedForEveryTable`), rollback at the deadline (`TestMove_WindowDeadlineRollback`), a short window refused (`TestMove_PlanRefusesOversizedWindow`), no thaw before the abort replicated (`TestMove_RollbackWaitsForReplicatedAbort`), a restore racing `Commit`, the cut waiting for the move backup (`TestMove_CutWaitsForMoveBackup`) and the replicated commit (`TestMove_CutWaitsForReplicatedCommit`), a target restored after the move backup (`TestMove_TargetRestoredAfterMoveBackup`) and a PITR before it refused (`TestMove_TargetPITRBeforeMoveBackup`), expunge paused from Plan to activation (`TestMove_ExpungeStaysPaused`), `cleaning` refused before 24 h (`TestMove_CleanupGateAtEntry`); chaos: `TestMove_FailoverBetweenCAndD`.
 
 #### 2.2.20 `internal/export` — snapshots for local agentic search (phase 3)
 
@@ -1666,8 +1673,8 @@ type).
 |---|---|---|---|
 | Extraction concurrency | 32 in flight per `RetainDocument`; 32 per worker process across workflows (`gateway` per-model semaphore); one `quota.Reserve` per call | workflow semaphore + `gateway.RateLimiter` | D3 formula; more only burns the RPM cap |
 | Embedding concurrency | 64 in flight per process; `EmbedBatch` ≤ 64 texts per call; prefixes `search_document: ` / `search_query: ` | `gateway.RateLimiter` | cheap and fast; the cap protects the gateway |
-| Per-shard Postgres pools | pgbouncer aliases on each shard: `engram_app` recall pool **32** (API only), `engram_worker` pool **8** (worker, same role), and the direct `engram_subject` connections (2 per API process); `max_connections` 100 holds ≈ 57 (32 + 8 + 4 + admin 2 + move 4 + relay 1 + migrate 1 + runner 1; §9.1, N164) | `router.Options.PoolSize`, pgbouncer config | D3 cell bound |
-| Recall arm parallelism | one short read transaction (`ReadSession.Tx`) per concurrently running arm, one pooled connection each; a MID recall holds ≈ 425 connection-ms over six arm transactions (≈ 21 Erlangs at 50 QPS plus ≈ 3 of filtered arms: 24 on a pool of 32, ρ ≈ 0.75); a semaphore admits ≤ 32 concurrent arm transactions per API process per shard, so `N − 1` processes carry a rollout, and a second one admits ≤ 4 filtered arms (pool wait ≤ 8 ms p95 on the 224 ms path; N114, N155, N164); ≤ 50 QPS per shard target | `recall.Planner`, `store.ReadSession` | keeps the pool below saturation (`PoolSaturation` wait p95 < 50 ms) |
+| Per-shard Postgres pools | pgbouncer aliases on each shard: `engram_app` recall pool **32** (API only), `engram_worker` pool **8** (worker, same role), and the direct `engram_subject` connections (2 per API process, P = 4); `max_connections` 100 holds 61 = 53 + 2P at P = 4 (32 + 8 + subject 2P + admin 2 + move 4 + relay 1 + migrate 1 + runner 1; §9.1, N164, N176) | `router.Options.PoolSize`, pgbouncer config | D3 cell bound |
+| Recall arm parallelism | one short read transaction (`ReadSession.Tx`) per concurrently running arm, one pooled connection each; a MID recall holds ≈ 425 connection-ms over six arm transactions (≈ 21 Erlangs at 50 QPS plus ≈ 3 of filtered arms: 24 on a pool of 32, ρ ≈ 0.75); a semaphore admits ≤ 32 concurrent arm transactions per API process per shard, so `N − 1` processes carry a rollout, and a second one admits ≤ 2 filtered arms (pool wait ≈ 20 ms p95 on the 236 ms path; N114, N155, N164, N176); ≤ 50 QPS per shard target | `recall.Planner`, `store.ReadSession` | keeps the pool below saturation (`PoolSaturation` wait p95 < 50 ms) |
 | Visibility sets | two indexed selects per recall (`doc_tomb`, `chunk_tomb`; `fact_hidden` is a per-candidate anti-join); marker cap 16 k rows of one kind before the alert; degraded-mode lookup ≤ 20 ms per arm | `store.MarkerReader` | N116, N119 |
 | Rerank depth | 0 / 50 / 150 pairs by budget (N53), ≤ 300 per gateway call (D15), one call per recall; skipped below a 106 ms remaining deadline (N106) | `recall.GatewayReranker` | the reranker is a sized dependency |
 | Graph arm | two seeded waves × 30 ms, shared node budget 100/300/1000; one statement per hop from Go, the HIGH arm (1,000 nodes, 2 hops) with a 100 ms sub-budget | `recall.Planner`, `store.GraphReader.Hop` | N54 critical path, N165 |
@@ -1680,7 +1687,7 @@ type).
 | Consolidation | route 8 facts per call; ≤ 100 facts per round; one write call per touched observation; ≤ 50 root rebuilds per round; one round in flight per namespace; rebuilds only while markers are pending | `Consolidate` workflow (singleton id), `config.Consolidation` | D12, N121 |
 | Expunge | one per namespace, at most two per shard; purge in 1,000-row batches paced to ≤ 25 MB/s of WAL behind the consumer-cursor check; SLAs materialize ≤ 15 min, purge ≤ 24 h, index ≤ 48 h; `ExpungeMaterializeSlow` pages at 900 s | `expunge.Expunger`, `engram_expunge_oldest_pending_seconds` | N119 |
 | Reflect | ≤ 10 iterations, ≤ 100 k context tokens, ≤ 300 s, tool deadline 10 s, ≤ 4 concurrent reflects per namespace; one `Reserve` per iteration | `reflectagent.Caps`, api semaphore | D12, N130 |
-| Move | freeze, then copy every table from the static source in primary-key ranges of ≤ 100,000 rows, 4 parallel streams, WAL-paced at 25 MB/s; `VerifyFrozen` and the index build under the freeze; freeze deadline `frozen_at + max(1.5 × W_est, W_est + 10 min)` capped by the operator window (default maximum 4 h), automatic rollback at the deadline; catalog CAS as the point of no return; ≤ 4 moves per cell, one per namespace; cutover (b″) and (d) retried indefinitely | `move.StartOptions` | N160, N161, N125 |
+| Move | freeze, then copy every table from the static source in primary-key ranges of ≤ 100,000 rows, 4 parallel streams, WAL-paced at 25 MB/s; `VerifyFrozen`, the index build and the move backup under the freeze; freeze deadline `frozen_at + max(1.5 × W_est, W_est + 10 min)` capped by the operator window (default 4 h, cap 8 h), automatic rollback at the deadline; `MoveBackup` before the cut; catalog CAS as the point of no return; ≤ 4 moves per cell, one per namespace; cutover (b″) and (d) retried indefinitely | `move.StartOptions` | N160, N161, N125 |
 | Fence acquisition | writers never wait (`pg_try_advisory_xact_lock_shared`, refusal → `NamespaceFrozen{200 ms}`); exclusive takers (fence, document lock, derivation lock) make one attempt with `lock_timeout` 35 s; role defaults 2 s (`engram_app`), 10 s (`engram_move`, `engram_admin`), 30 s statement and idle timeouts on every outbox-writing role | `store.Store.InNamespace`, role defaults | N82: no pooled connection waits behind a queued freeze |
 | Derivation lock | shared by every writer of derived versions; exclusive for `Materialize` and `Restore`, one 35 s attempt | `store.Derived` | N120 |
 | Subject lock | every marker writer takes the session-level `engram_subject_lock_key(ns, subject)` (subject `class:key`, N162) on a direct `engram_subject` connection before its marker transaction and holds it until the intent put and the marker re-read; polled try-lock ≤ 3 s; help-previous under it | `store.SubjectLocker`, `intent.HelpPrevious` | N150, N159 |
@@ -1690,13 +1697,10 @@ type).
 | Query embedding LRU | 10,000 entries per process, keyed `(namespace_id, sha256("search_query: " + text))` | `recall.QueryEmbedder` | repeat queries skip the 25 ms hop |
 | Streaming / request size | `Recall` batches of 10; `StreamSnapshot` 1 MiB parts; `Retain` ≤ 100 items, ≤ 8 MiB total, ≤ 1 MiB per item, raw body > 64 KiB to blob (N7) | `api` helpers | D10, D12 |
 
-### Round-6 changes
+### Round-7 changes
 
 | Register | What changed in this section |
 |---|---|
-| N160, N161 | `move` is freeze-then-copy: `Copier` = `Plan`, `FrozenCopy`, `VerifyFrozen`, `BuildIndexes`, `AwaitConsumers`; `Closer.Rerun` replaces `ReconcileIn`; `PreVerify`, `AwaitIndexes`, `Reconcile`, the floors and the content and timeline checks are deleted; `catalog.MoveBackups` is `RecordTargetBackup` + `CleanupGate`; `StartOptions` gains `Window`, `FreezeNotBefore`, `EstimateOnly` |
-| N162 | `id.Subject{Class, Key}`; the memory subject is `(document_id, content_hash)`; `Markers.Hide/Unhide` work on the subject with one `invalidation_op` stamp; chain tip by `ins_seq` |
-| N163 | asynchronous catalog standby; `catalog.Reconciler` runs on every promotion and restore; `Cutover.Commit` waits for the replicated LSN; `ReplayFloor` loses its generated columns |
-| N164, N165 | pools 32/8 and the `engram_subject` alias; arm semaphores 32 and 4 (filtered); θ = 10 k; `= ANY` on the HNSW path; 224 ms path; `GraphReader.Hop` (one statement per hop, `UNION ALL`) |
-| N166 | hygiene rebuild threshold 0.05 %, WAL and archive-lag guards, purge pause for the rebuild set |
-| N167 | `move.Orchestrator.Cleanup` (4 methods); `SnapshotLister.Manifest`, `pages.Reader.ByName`; `engram.worker` scope and `MethodPolicy.AltScope/CellBound`; `UpdateTenantLimits`; MCP `DataClients`/`AdminClients`; depguard leaves and `pages → recall` |
+| N169, N170 | `Closer.Rerun`, `RerunResult`, `CleanupOptions`, `CleanupGrace`, `CleanupGate` deleted; `Copier` split into `Copier` and `Readier`; `MoveBackups{RecordMoveBackup, RecordTimeline}`; `Cleanup(ctx, id.MoveID)` |
+| N171, N172 | `catalog.Replication`, `catalog.AckAfterReplay`; owner-row epochs |
+| N173 to N177 | `W_est` and window cap; per-range verify; document lock in curation; 236 ms path, P = 4, 61 connections; §8 test names |

@@ -28,11 +28,12 @@
 -- list in the "Table classes" block below and checked by the self-check and by `engramlint sql`;
 -- N113 and section 3 render from it, no hand-written class list exists.
 --   insert-only   nextval('engram_ins_seq') at INSERT, index (namespace_id, ins_seq); only the expunge deletes from it,
---                 paused from Plan to done
+--                 paused from Plan to activation (activate_target clears move_id)
 --   mutable       rows that are updated or deleted in place (markers, stats, quotas)
 --   expiring      re-derived on the target (token_usage_events is copied once and verified count <=)
 --   shard-local   not namespace data: identity, outbox, the sequence ring
--- A move copies every class alike from a frozen, static source (N160): the classes drive no move step. ins_seq,
+-- A move copies classes 1 and 2, plus token_usage_events once (verified count <=); vector_indexes, namespace_stats and
+-- caches are re-derived (N175). ins_seq,
 -- engram_seq_log (sampled every minute) and engram_seq_floor(ts) remain for the stats sweeper, the export watermark
 -- and the consolidation watermark (ins_seq is commit-ordered only within the writer lifetime).
 --
@@ -91,7 +92,7 @@
 --   state = 'active' AND epoch = $epoch. Exclusive takers (freeze, delete freeze, restore) make ONE
 --   attempt with lock_timeout = 35 s, longer than any legal 30 s writer. Marker transactions
 --   (delete, invalidate, restore) take no lock beyond the shared fence. Readers take no lock and
---   accept 'active' and 'frozen'/'move' only. Three disjoint lock key spaces (N113):
+--   accept 'active' and 'frozen'/'move' only. Independent hashes in one key space (N113):
 --     namespace fence      one-argument  pg_*_advisory_*lock(hashtextextended(ns::text, 0))
 --     derivation lock      one-argument  pg_*_advisory_*lock(hashtextextended(ns::text, 1))   (N120)
 --     document lock        two-argument  pg_*_advisory_*lock(hashtext(ns::text), hashtext(doc))
@@ -100,7 +101,8 @@
 --   The SUBJECT lock is SESSION-level, taken by the API handler on a dedicated direct connection BEFORE a marker
 --   transaction and released only after the intent put and the marker re-read; it is a different key from the
 --   per-document lock the marker transaction itself takes inside (a pooled transaction would otherwise wait for its
---   own caller). Order: subject lock -> fence -> document / derivation lock.
+--   own caller). Order: subject lock -> fence -> document / derivation lock. Invalidate and Restore (N174) also take the
+--   document lock EXCLUSIVE (CommitChunk holds it shared), so the lazy re-application never interleaves with them.
 --   One- and two-argument advisory locks are different lock tags (objsubid 1 vs 2), so no
 --   cross-kind collision exists. FOR SHARE is used on no row (immutable facts cannot be locked
 --   meaningfully; compatible row lockers churn multixacts).
@@ -200,7 +202,7 @@ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
                       WHERE e ->> 'kind' IN ('update', 'merge') AND jsonb_typeof(e -> 'base_version') IS DISTINCT FROM 'number');
 $$;
 
--- Advisory-lock keys (N113): three disjoint key spaces. IMMUTABLE so calls are inlined. A hash
+-- Advisory-lock keys (N113): independent hashes in one key space. IMMUTABLE. A hash
 -- collision only over-serialises two namespaces or documents, never under-fences one.
 CREATE FUNCTION engram_ns_fence_key(ns uuid) RETURNS bigint
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT hashtextextended(ns::text, 0) $$;
@@ -436,6 +438,10 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
 
+  IF t.edge = 'freeze_delete' AND OLD.move_id IS NOT NULL THEN   -- N177: a namespace with an open move answers NAMESPACE_BUSY
+    RAISE EXCEPTION 'namespace % has an open move', NEW.namespace_id
+      USING ERRCODE = '55006';
+  END IF;
   IF t.edge = 'return_move' AND (EXISTS (SELECT 1 FROM ingest_ledger l WHERE l.namespace_id = NEW.namespace_id)
                                  OR EXISTS (SELECT 1 FROM documents d WHERE d.namespace_id = NEW.namespace_id)
                                  OR EXISTS (SELECT 1 FROM facts f WHERE f.namespace_id = NEW.namespace_id)) THEN
@@ -444,9 +450,8 @@ BEGIN
   END IF;
   -- N160(5), N125 (b'): nothing becomes 'ready' before (1) every requested partial HNSW index of the namespace is
   -- indisvalid AND indisready (the first recall after activation must not be a whole-namespace exact scan) and (2) this
-  -- shard's engram_ins_seq has passed the source's final value w_final (N147). The same two preconditions guard the
-  -- admin re-entry edge reconcile_in (a re-run copy, N161(2)).
-  IF NEW.state = 'ready' AND t.edge IN ('ready_target', 'reconcile_in') THEN
+  -- shard's engram_ins_seq has passed the source's final value w_final (N147).
+  IF NEW.state = 'ready' AND t.edge = 'ready_target' THEN
     IF NOT engram_move_indexes_valid(NEW.namespace_id) THEN
       RAISE EXCEPTION 'namespace % has vector indexes that are not valid and ready (N160)', NEW.namespace_id USING ERRCODE = '55006';
     END IF;
@@ -546,9 +551,10 @@ DECLARE
 BEGIN
   SELECT last_value INTO v FROM engram_ins_seq;
   IF p_to + 10000 > v THEN
-    v := setval('engram_ins_seq', p_to + 10000);
+    PERFORM setval('engram_ins_seq', p_to + 10000);
     PERFORM engram_seq_sample();
   END IF;
+  SELECT last_value INTO v FROM engram_ins_seq;   -- N177: after the sample, in both branches
   RETURN v;
 END $$;
 
@@ -609,12 +615,8 @@ CREATE TABLE namespace_ownership (
 --   target_effect on (target_shard_id, target_epoch): none, set = cutover (c) / reconcile_out
 --     (target shard differs, target_epoch = epoch + 1), clear, restore = return_abort (the hint of
 --     the permanent fence value comes back from namespace_moves).
--- Rollback edges before the point of no return: abort_move (before freeze), thaw_move (after
--- freeze), unready_target (after (b')), return_abort (onto a shard that had a moved_out row).
--- After the point of no return a target restored to a point before its activation is RE-RUN (N161(2)): rerun_move
--- (engram_admin, ready -> incoming) wipes the 'ready' marker so engram_cleanup_namespace (incoming only) and the
--- copy can run again from the retained source; reconcile_in then re-admits incoming -> ready -> active under the
--- same two preconditions as (b') and only while the catalog move is committed/cleaning. Nothing is ever merged.
+-- Rollback edges before (a''): abort_move (before freeze), thaw_move (after freeze), unready_target (after (b')),
+-- return_abort (onto a shard that had a moved_out row). After (a'') a restored target is an ordinary restore (N169(2)).
 CREATE TABLE ownership_transitions (
   edge           text NOT NULL,
   role_name      text NOT NULL,
@@ -640,17 +642,16 @@ INSERT INTO ownership_transitions (edge, role_name, from_state, from_reason, to_
   ('abort_move',      'engram_move',  'active',   NULL,      'active',    NULL,      'same',    'close',    'none',  'rollback before the freeze'),
   ('abort_move',      'engram_admin', 'active',   NULL,      'active',    NULL,      'same',    'close',    'none',  'restore/failover reconcile (N123)'),
   ('freeze_move',     'engram_move',  'active',   NULL,      'frozen',    'move',    'same',    'none',     'none',  'D5 freeze: reads continue'),
-  ('freeze_delete',   'engram_app',   'active',   NULL,      'frozen',    'delete',  'same',    'none',     'none',  'namespace delete, before the ack (N122); no outgoing edge except deletion'),
+  ('freeze_delete',   'engram_app',   'active',   NULL,      'frozen',    'delete',  'same',    'none',     'none',  'namespace delete, before the ack (N122); needs move_id IS NULL (activate_target clears it, N177); no outgoing edge except deletion'),
   ('freeze_restore',  'engram_admin', 'active',   NULL,      'frozen',    'restore', 'same',    'none',     'none',  'restore or failover (N123)'),
+  ('freeze_restore',  'engram_admin', 'incoming', NULL,      'frozen',    'restore', 'same',    'none',     'none',  'N169(2): restored move target'),
+  ('freeze_restore',  'engram_admin', 'ready',    NULL,      'frozen',    'restore', 'same',    'none',     'none',  'N169(2): as above'),
   ('restore_delete',  'engram_admin', 'frozen',   'restore', 'frozen',    'delete',  'same',    'none',     'none',  'replay of a namespace/tenant delete intent onto a restored shard (N122, C-13); no pass through active'),
   ('thaw_move',       'engram_move',  'frozen',   'move',    'active',    NULL,      'same',    'close',    'none',  'rollback after the freeze'),
   ('thaw_move',       'engram_admin', 'frozen',   'move',    'active',    NULL,      'same',    'close',    'none',  'restore/failover reconcile: the move is rolled back (N123)'),
   ('ready_target',    'engram_move',  'incoming', NULL,      'ready',     NULL,      'same',    'none',     'none',  'cutover (b''): nothing routes to ready'),
   ('unready_target',  'engram_move',  'ready',    NULL,      'incoming',  NULL,      'same',    'none',     'none',  'rollback after (b'')'),
-  ('rerun_move',      'engram_admin', 'ready',    NULL,      'incoming',  NULL,      'same',    'none',     'none',  'N161(2): a target restored to a point before activation shows ready; it goes back to incoming so its rows can be wiped and the copy re-run from the retained source (admin only; nothing is merged)'),
-  ('reconcile_in',    'engram_admin', 'incoming', NULL,      'ready',     NULL,      'same',    'none',     'none',  'N161(2): the re-run copy is verified and its indexes valid; only while the catalog move is committed/cleaning; same preconditions as ready_target'),
-  ('reconcile_in',    'engram_admin', 'ready',    NULL,      'active',    NULL,      'same',    'close',    'none',  'N161(2): the re-run target serves; incoming -> ready -> active, never through a state that routes before the copy is complete'),
-  ('cutover_c',       'engram_move',  'frozen',   'move',    'moved_out', NULL,      'same',    'none',     'set',   'cutover (c), the point of no return; clears freeze_reason'),
+  ('cutover_c',       'engram_move',  'frozen',   'move',    'moved_out', NULL,      'same',    'none',     'set',   'cutover (c), after (a'''') was read and replicated (N171); clears freeze_reason'),
   ('activate_target', 'engram_move',  'ready',    NULL,      'active',    NULL,      'same',    'close',    'none',  'cutover (b''''): the row already carries e + 1'),
   ('return_move',     'engram_move',  'moved_out', NULL,     'incoming',  NULL,      'greater', 'retarget', 'clear', 'a later move back to this shard; data rows must be gone'),
   ('return_abort',    'engram_move',  'incoming', NULL,      'moved_out', NULL,      'any',     'close',    'restore', 'rollback of a move back: the permanent fence value returns (H-22)'),
@@ -841,7 +842,7 @@ CREATE TABLE outbox_skipped (
 -- epoch (N143): the namespace epoch the marker committed under, copied into the intent object. Replay applies a
 -- subject's intents in chain order and SKIPS an intent whose epoch is older than that of an entry of the same
 -- subject already applied (here or by an earlier replay step), so a stale intent can never override a later one.
--- A second Invalidate or Restore of the same fact is NOT a silent no-op: it writes its own row (fresh operation_id,
+-- N174: Invalidate reuses the invalidation_op of the subject's fact_hidden(invalidate) rows; this row records it. A second Invalidate or Restore of the same fact is NOT a silent no-op: it writes its own row (fresh operation_id,
 -- prev_operation_id = the subject's last entry) and its own intent, although visibility does not change.
 -- N150: epoch is ALWAYS the intent's recorded epoch (a replay keeps it; the guard compares recorded epochs only);
 -- applied_epoch is the epoch a replay committed under (informational). The subject is (class, id) independent of the
@@ -871,6 +872,7 @@ CREATE TABLE deletion_log (
   replay_outcome text CHECK (replay_outcome IS NULL OR replay_outcome IN ('applied', 'skipped')),   -- N159: settled by a replay
   operation_id  uuid,
   prev_operation_id uuid,
+  invalidation_op uuid,                            -- N174: the tag an Invalidate used
   effect        jsonb NOT NULL CHECK (jsonb_typeof(effect) = 'object'),   -- {up_to_version} | {memory_ids}
   deleted_at    timestamptz NOT NULL DEFAULT now(),
   ins_seq       bigint NOT NULL DEFAULT nextval('engram_ins_seq'),
@@ -2394,7 +2396,8 @@ $$;
 -- SECURITY DEFINER, owned by engram_migrate: engram_move has no DELETE on source data and cannot
 -- bypass RLS, so this is the only way a move frees the source. EXECUTE is granted to engram_move and
 -- engram_admin only. It refuses unless the ownership row is moved_out (source cleanup after cutover
--- (c)) or incoming (target rollback). Each call deletes at most p_batch rows from the first
+-- (c)) or incoming (target rollback); it runs only while the catalog row reads 'cleaning', and `restore cleanup-moved-out`
+-- calls it for 'done' moves only (N170). Each call deletes at most p_batch rows from the first
 -- non-empty table in FK order and returns the count; 0 means done. The outer DELETE carries
 -- namespace_id (P-19). Run engram_hnsw_ddl(..., 'drop') FIRST: the namespace's partial indexes are
 -- dropped with DROP INDEX CONCURRENTLY, so no HNSW graph is repaired row by row (N112).
@@ -2406,15 +2409,17 @@ DECLARE
   v_state ownership_state;
   v_tbl   text;
   v_n     bigint;
+  -- content before markers; `engramlint sql` checks c_order is a topological order of pg_constraint (chunk_tombstones: FK)
   c_order constant text[] := ARRAY[
     'observation_version_vectors', 'fact_vectors', 'chunk_vectors', 'page_version_vectors',
-    'derived_hidden', 'expunge_progress', 'curation_log', 'fact_hidden', 'chunk_tombstones', 'document_tombstones',
+    'expunge_progress',
     'page_version_inputs', 'page_version_meta', 'page_sources', 'page_versions', 'pages',
     'observation_version_sources', 'observation_inputs', 'observation_version_meta', 'observation_sources',
     'fact_consolidation', 'consolidation_state', 'consolidation_applied', 'consolidation_proposals',
     'consolidation_batches', 'observation_versions', 'observations',
     'entity_mentions', 'fact_links', 'facts', 'entity_aliases', 'entities',
-    'document_version_chunks', 'chunks', 'document_versions', 'ingest_ledger', 'documents',
+    'document_version_chunks', 'chunk_tombstones', 'chunks', 'document_versions', 'ingest_ledger', 'documents',
+    'derived_hidden', 'curation_log', 'fact_hidden', 'document_tombstones',   -- markers after the content they mark (N170(3))
     'export_snapshots', 'token_usage_events', 'token_usage', 'quota_counters', 'batch_jobs', 'tag_counts',
     'idempotency_keys', 'operations', 'vector_indexes', 'namespace_models', 'namespace_stats'];
 BEGIN
@@ -2588,15 +2593,13 @@ LANGUAGE sql STABLE AS $$
     LEFT JOIN vector_indexes i ON i.namespace_id = p_ns AND i.vector_table = n.t AND i.embedding_model = cur.embedding_model;
 $$;
 
--- N160(5): are all of a namespace's REQUESTED vector indexes usable? True iff every vector_indexes row of the namespace
--- (the mover requests one per (vector table, current model) with >= 2,000 copied vectors; a row being dropped is
--- ignored) names an index, by the deterministic name of engram_hnsw_ddl, that is indisvalid AND indisready. A valid index
--- built on a static copy contains every row by construction, so there is no row-count ratio. Precondition of
--- ready_target / reconcile_in (checked by engram_check_ownership on the catalog rows, not on a flag) and of the first
--- recall after activation. SECURITY DEFINER (reads pg_index across RLS for the mover/admin; EXECUTE is not granted to app/relay).
+-- N175: true iff every (vector table, current model) with >= 2,000 copied vectors (index-only PK count) has a
+-- vector_indexes request (not 'dropping') whose index, by the name of engram_hnsw_ddl, is indisvalid AND indisready;
+-- zero request rows is false. Precondition of ready_target. SECURITY DEFINER.
 CREATE FUNCTION engram_move_indexes_valid(p_ns uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
-  SELECT NOT EXISTS (
+  SELECT EXISTS (SELECT 1 FROM vector_indexes i WHERE i.namespace_id = p_ns AND i.state <> 'dropping')
+     AND NOT EXISTS (
     SELECT 1 FROM vector_indexes i
      WHERE i.namespace_id = p_ns AND i.state <> 'dropping'
        AND NOT EXISTS (
@@ -2642,12 +2645,16 @@ LANGUAGE sql STABLE AS $$
      AND t.chunk_id <> ALL (m.c);
 $$;
 
--- N162: the encoded curation subject of a fact, resolved from facts inside the marker transaction. NULL when the fact row is
--- gone (purged after the 1 h retire grace): Invalidate then returns NOT_FOUND.
+-- N174(3): the curation subject of a fact, from facts, else the latest curation_log row of the memory_id; NULL if neither.
 CREATE FUNCTION engram_memory_subject(p_ns uuid, p_memory uuid) RETURNS text
 LANGUAGE sql STABLE AS $$
-  SELECT engram_subject_id('memory', f.document_id || ':' || encode(f.content_hash, 'hex'))
-    FROM facts f WHERE f.namespace_id = p_ns AND f.memory_id = p_memory;
+  SELECT engram_subject_id('memory', s.document_id || ':' || encode(s.content_hash, 'hex'))
+    FROM (SELECT f.document_id, f.content_hash, 1 AS pr FROM facts f
+           WHERE f.namespace_id = p_ns AND f.memory_id = p_memory
+          UNION ALL
+          (SELECT c.document_id, c.content_hash, 2 FROM curation_log c
+            WHERE c.namespace_id = p_ns AND c.memory_id = p_memory ORDER BY c.ins_seq DESC LIMIT 1)) s
+   ORDER BY s.pr LIMIT 1;
 $$;
 
 -- N162: what Restore(g) does, resolved exactly by tag. status:
@@ -3193,7 +3200,7 @@ BEGIN
   END IF;
   IF (SELECT count(DISTINCT edge) FROM ownership_transitions
        WHERE edge IN ('ready_target', 'unready_target', 'activate_target', 'return_abort', 'reconcile_out',
-                      'abort_move', 'thaw_move', 'cutover_c', 'restore_delete', 'reconcile_in', 'rerun_move')) <> 11 THEN
+                      'abort_move', 'thaw_move', 'cutover_c', 'restore_delete')) <> 9 THEN
     RAISE EXCEPTION 'ownership_transitions lacks cutover or rollback edges (N125)';
   END IF;
 

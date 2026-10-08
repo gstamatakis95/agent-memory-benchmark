@@ -1070,9 +1070,9 @@ message ExportResult {
 // Protocol (freeze-then-copy, decisions N160, N161): plan with the blob
 // pre-warm, freeze, drain, one sequence advance, copy every table from the
 // static source by primary-key ranges, VerifyFrozen, BuildIndexes under the
-// freeze, wait for the outbox consumers, cutover with a `ready` state and a
-// catalog CAS as the point of no return, restart, cleanup after 24 h and a
-// post-activation backup.
+// freeze, MoveBackup, wait for the outbox consumers, cutover with a `ready` state and a
+// catalog CAS as the point of no return, restart, cleanup after 24 h. A move
+// backup of the target precedes the cut (decision N169).
 message MoveInput {
   // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
@@ -1090,19 +1090,18 @@ message MoveInput {
   // the window deadline below.
   reserved 12;
   reserved "freeze_watchdog";
-  // W_est computed by Plan (rows / R_copy + vectors / R_build + verify + blob
-  // delta) and the operator window, at most 4 h. The freeze deadline is
+  // W_est computed by Plan (rows / R_copy + build(vectors) + bytes / R_backup
+  // + verify, decision N173) and the operator window, at most 8 h. The freeze
+  // deadline is
   // `frozen_at + max(1.5 × W_est, W_est + 10 min)`, capped by the window; the
   // workflow rolls back at the deadline unless the catalog CAS (a″) committed.
   google.protobuf.Duration window_estimate = 13;
   google.protobuf.Duration window = 14;
   // Do not freeze before this time (a scheduled window).
   google.protobuf.Timestamp freeze_not_before = 15;
-  // 0 for the original run; n for the n-th re-run of the copy on a target
-  // restored to a point before its activation (decision N161): the workflow id
-  // is `move/{namespace_id}/{epoch}/rerun/{n}`, Plan is skipped, and the copy
-  // starts with a wipe of the target.
-  uint32 rerun_attempt = 16;
+  // Removed in v1.0.0-rc8 (decision N169): `uint32 rerun_attempt = 16`.
+  reserved 16;
+  reserved "rerun_attempt";
 }
 
 // CopyProgress is the FrozenCopy activity's heartbeat and resume payload
@@ -1127,8 +1126,8 @@ enum CutoverStep {
   CUTOVER_STEP_UNSPECIFIED = 0;
   // (b′) target `incoming → ready`; rollback still possible.
   CUTOVER_STEP_READY_TARGET = 1;
-  // (c) source `frozen/move → moved_out`, executed only after (a″) was read
-  // and the catalog standby replayed it (decision N163).
+  // (c) source `frozen/move → moved_out`, after (a″) was read and replicated
+  // (decision N171).
   CUTOVER_STEP_MOVED_OUT_SOURCE = 2;
   // (b″) target `ready → active`.
   CUTOVER_STEP_ACTIVE_TARGET = 3;
@@ -1142,8 +1141,10 @@ enum CutoverStep {
 // the complete copy of the static source, per table count(*) and
 // bit_xor(hashtextextended(pk::text, 0)) over the whole namespace on both
 // sides, VerifyFK on the target, and the owner-keyed blob existence of every
-// copied row (copy-if-absent). A mismatch re-copies the mismatching tables
-// once and re-verifies; a second mismatch rolls the move back.
+// copied row (copy-if-absent). Hashes are taken per primary-key range
+// (`bit_xor` combined in Go) with per-table counts. A mismatch re-copies the
+// mismatching tables once and re-verifies; a second mismatch rolls the move
+// back.
 message VerifyFrozenReport {
   // Tables whose count or hash differ (empty = match); the excluded class
   // is checked as `count(*)` on the target <= the source's.
@@ -1155,6 +1156,15 @@ message VerifyFrozenReport {
   int32 attempts = 5;
   // Tables re-copied after the first mismatch.
   repeated string tables_recopied = 6;
+}
+
+// MoveBackupResult is the MoveBackup activity's result (decision N169): a
+// pgBackRest incremental of the target that completed with its last WAL
+// segment archived; `RecordMoveBackup` stores the two times.
+message MoveBackupResult {
+  google.protobuf.Timestamp started_at = 1;
+  google.protobuf.Timestamp completed_at = 2;
+  string backup_label = 3;
 }
 
 // BuildIndexesReport is the BuildIndexes activity's result (decision N160): the
@@ -1223,8 +1233,8 @@ message MoveResult {
   int32 verify_attempts = 7;
 
   // Removed in the D22 redesign (decision N124): `int64 events_replayed = 3`.
-  // Removed in v1.0.0-rc7 (decision N160): `int64 rows_recopied = 6` (there is
-  // no re-copy under the freeze).
+  // Removed in v1.0.0-rc7 (decision N160): `int64 rows_recopied = 6`; the
+  // per-table re-copy is reported in `VerifyFrozenReport.tables_recopied`.
   reserved 3, 6;
   reserved "events_replayed", "rows_recopied";
 }

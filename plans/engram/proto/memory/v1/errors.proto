@@ -261,6 +261,8 @@ enum OperationConflictReason {
   // hash within the retention window (ALREADY_EXISTS).
   OPERATION_CONFLICT_REASON_IDEMPOTENCY_KEY_REUSED = 1;
   // The namespace has a delete or move cutover in progress (ABORTED).
+  // DeleteNamespace during an open move answers this with RetryInfo 30 s
+  // (decision N177).
   OPERATION_CONFLICT_REASON_NAMESPACE_BUSY = 3;
   // A refresh of the same page is already running (ABORTED).
   OPERATION_CONFLICT_REASON_PAGE_REFRESHING = 4;
@@ -298,8 +300,9 @@ message Precondition {
   // because source and target shards run different schema versions),
   // "MOVE_WINDOW_REQUIRED" (StartMove of a namespace whose window estimate
   // exceeds the 10 min an unattended move may take, without an operator
-  // `window`) and "MOVE_WINDOW_TOO_SHORT" (the estimate exceeds the given
-  // `window`; decision N160).
+  // `window`) and "MOVE_WINDOW_TOO_SHORT" (the given `window` is below
+  // max(1.5 W_est, W_est + 10 min); cap 8 h; decision N173).
+  // "MOVE_TOO_LARGE" is reserved for a future per-namespace cap and unused.
   string type = 1;
   // Resource the precondition applies to (id).
   string subject = 2;

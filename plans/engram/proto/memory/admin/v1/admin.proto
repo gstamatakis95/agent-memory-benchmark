@@ -126,10 +126,11 @@ service ShardService {
 service MoveService {
   // StartMove plans a move and starts the move executor in engram-worker.
   // Plan computes the window estimate W_est from the namespace's stats. The
-  // rebalancer starts a move unattended only at W_est <= 10 min; above that
-  // the caller must pass an explicit `window` (FAILED_PRECONDITION
-  // {MOVE_WINDOW_REQUIRED} otherwise) and the call is refused when W_est
-  // exceeds it ({MOVE_WINDOW_TOO_SHORT}); the default maximum window is 4 h.
+  // rebalancer starts a move unattended only at W_est <= 10 min (about 350 k
+  // facts); above that the caller must pass an explicit `window`
+  // (PreconditionFailed MOVE_WINDOW_REQUIRED otherwise), and the call is
+  // refused (MOVE_WINDOW_TOO_SHORT) unless window >= max(1.5 W_est, W_est +
+  // 10 min); the window is capped at 8 h, the default is 4 h (decision N173).
   // `estimate_only` returns the estimate without planning. One move per
   // namespace at a time (ABORTED + OperationConflict). Scope engram.operator.
   rpc StartMove(StartMoveRequest) returns (StartMoveResponse);
@@ -143,30 +144,26 @@ service MoveService {
   }
   // RollbackMove aborts a move that has not passed its point of no return
   // (the catalog CAS (a″) `cutover → committed`, decision N125): before
-  // Freeze the source is `abort_move`d; after Freeze it is thawed first (also
-  // while the target is unreachable: a `ready` target accepts nothing and is
-  // un-readied at its next contact); after the target reached `ready` the
-  // rollback first wins the `cutover → rolled_back` CAS and the target goes
-  // back to `incoming`; then the target's copied rows, indexes and ownership
-  // row are deleted. Onto a shard that had a `moved_out` row the permanent
+  // Freeze the source is `abort_move`d; after Freeze the rollback wins the
+  // `rolled_back` CAS, waits until the standby replayed it (`MoveFenced`
+  // otherwise, decision N171), thaws the source (also while the target is
+  // unreachable: a `ready` target accepts nothing and is un-readied at its
+  // next contact) and the target goes back to `incoming`; then the target's
+  // copied rows, indexes and ownership row are deleted. Onto a shard that had a `moved_out` row the permanent
   // fence value is restored. The executor takes the same path by itself at
   // the freeze deadline (MoveWindowExceeded, decision N160). After (a″) a
   // rollback is a new move back (FAILED_PRECONDITION).
   rpc RollbackMove(RollbackMoveRequest) returns (RollbackMoveResponse);
-  // CleanupMove records the move DONE once the cleanup gate holds (decision
-  // N161): 24 h after activation AND a full backup of the target shard that
-  // started after activation has completed (`Move.activated_at`,
-  // `target_backup_started_at`, `target_backup_at`); before that it is
-  // refused with FAILED_PRECONDITION. There is no content check and no
-  // timeline check. The physical work is driven by the cleanup activity,
-  // which holds both shard handles: it drops the namespace's partial indexes
-  // on the source shard by their deterministic names and deletes its rows
-  // (`engram_cleanup_namespace`, batched); this RPC only validates the gate
-  // and writes the catalog `done` row. The source blob prefix is kept until
-  // the 28-day backup window has passed (`Move.source_blobs_gc_after`,
-  // decision N123) so that a PITR to a point before the move-in can still
-  // recover it. The `moved_out` ownership row stays forever. Scope
-  // engram.worker (cell-bound, decision N167) or engram.operator. Idempotent.
+  // CleanupMove takes `committed -> cleaning` under the 24 h gate (decision
+  // N170: `now() >= Move.activated_at + 24 h`; FAILED_PRECONDITION before
+  // that) and records `done` after the last batch. The physical work is
+  // driven by the cleanup activity, which holds both shard handles: it drops
+  // the namespace's partial indexes on the source shard by their
+  // deterministic names and deletes its rows (`engram_cleanup_namespace`,
+  // batched, only while the row reads `cleaning`). The source blob prefix is
+  // kept until `finished_at + 28 d` (decision N123). The `moved_out`
+  // ownership row stays forever. Scope engram.worker (cell-bound, decision
+  // N167) or engram.operator. Idempotent.
   rpc CleanupMove(CleanupMoveRequest) returns (CleanupMoveResponse);
 }
 
@@ -541,8 +538,9 @@ message ReleaseNamespaceResponse {
 // MoveState follows decision D5 (freeze-then-copy, decision N160): planned →
 // frozen → copied → cutover → committed → cleaning → done, or rolled_back
 // before the point of no return (the catalog CAS `cutover → committed`,
-// decision N125). Drain, the copy, VerifyFrozen and BuildIndexes all run in
-// FROZEN; COPIED means they finished and the consumer-cursor wait is next.
+// decision N125). Drain, the copy, VerifyFrozen, BuildIndexes and MoveBackup
+// all run in FROZEN; COPIED means verify, indexes, move backup and consumer
+// wait are all done (decision N175).
 enum MoveState {
   MOVE_STATE_UNSPECIFIED = 0;
   // Plan done: catalog row, target `incoming`, source `start_move`, blob
@@ -555,8 +553,8 @@ enum MoveState {
   reserved 2, 3, 9;
   reserved "MOVE_STATE_COPYING", "MOVE_STATE_CATCHING_UP", "MOVE_STATE_RECONCILING";
   // Source frozen (`frozen/move`, reads continue): drain, copy of every table
-  // from the static source, VerifyFrozen, BuildIndexes. Bounded by the freeze
-  // deadline.
+  // from the static source, VerifyFrozen, BuildIndexes, MoveBackup. Bounded
+  // by the freeze deadline.
   MOVE_STATE_FROZEN = 4;
   // Cutover sub-steps (b′) and (a″) pending; see Move.cutover_step. Rollback
   // still possible.
@@ -567,8 +565,8 @@ enum MoveState {
   // The catalog CAS (a″) was taken: the point of no return. Sub-steps (c),
   // (b″) and (d) run; the move can only complete (decision N125).
   MOVE_STATE_COMMITTED = 10;
-  // Copy verified by equality, indexes valid, consumers past the final seq:
-  // ready for cutover (decision N160).
+  // Verify, indexes, move backup and consumer wait all done: ready for
+  // cutover (decisions N160, N175).
   MOVE_STATE_COPIED = 11;
 }
 
@@ -577,8 +575,8 @@ enum CutoverStep {
   CUTOVER_STEP_UNSPECIFIED = 0;
   // (b′) target `incoming → ready`; rollback is still possible.
   CUTOVER_STEP_READY_TARGET = 1;
-  // (c) source `frozen/move → moved_out`, executed only after (a″) was read
-  // and the catalog standby replayed it (decision N163).
+  // (c) source `frozen/move → moved_out`, after (a″) was read and replicated
+  // (decision N171).
   CUTOVER_STEP_MOVED_OUT_SOURCE = 2;
   // (b″) target `ready → active`, retried indefinitely.
   CUTOVER_STEP_ACTIVE_TARGET = 3;
@@ -620,7 +618,8 @@ message MoveProgress {
   // rows_copied / rows_estimated is the progress fraction.
   int64 rows_estimated = 18;
   // VerifyFrozen attempts run (1, or 2 after one mismatch re-copied the
-  // mismatching tables; a second mismatch rolls the move back).
+  // mismatching tables, reported in VerifyFrozenReport.tables_recopied; a
+  // second mismatch rolls the move back).
   int32 verify_attempts = 19;
 }
 
@@ -650,39 +649,38 @@ message Move {
   // True once the catalog CAS (a″) committed (state COMMITTED or later);
   // RollbackMove is refused from then on.
   bool past_point_of_no_return = 15;
-  // Earliest time at which the source blob prefix may be deleted: 28 days
-  // after cleanup, the backup window (decision N123).
-  google.protobuf.Timestamp source_blobs_gc_after = 16;
-  // The cleanup gate (decision N161) has exactly these inputs: `activated_at`
-  // (target `ready → active`) plus 24 h, and the first FULL target backup that
-  // started after activation (`target_backup_started_at`) and has completed
-  // (`target_backup_at`). No content check, no timeline check.
-  google.protobuf.Timestamp target_backup_at = 17;
+  // Removed in v1.0.0-rc8 (decision N170): `source_blobs_gc_after = 16`
+  // (derived: `finished_at + 28 d`).
+  reserved 16;
+  reserved "source_blobs_gc_after";
+  // Completion of the move backup (decision N169): a pgBackRest incremental of
+  // the target, complete with its last WAL segment archived, before (b′).
+  google.protobuf.Timestamp move_backup_at = 17;
   // Removed in v1.0.0-rc7 (decisions N160, N161): `reconciled_in_at = 18`,
   // `cleanup_reconciled_at = 19` and `target_content_checked_at = 20` (the
   // ReconcileIn repair and the cleanup-time content gate).
   reserved 18 to 20;
   reserved "reconciled_in_at", "cleanup_reconciled_at", "target_content_checked_at";
-  // W_est: the window estimate computed by Plan, rows / R_copy + vectors /
-  // R_build + verify + blob delta (planning rates 1,000 facts/s and 3,000
-  // vectors/s, about 25 min per 1 M live facts).
+  // W_est: the window estimate computed by Plan, rows / R_copy + build(vectors)
+  // + bytes / R_backup + verify (decision N173, about 26 min per 1 M live
+  // facts).
   google.protobuf.Duration window_estimate = 21;
-  // The operator window the move was started with (default maximum 4 h);
-  // StartMove refuses when window_estimate exceeds it.
+  // The operator window the move was started with (default 4 h, cap 8 h);
+  // StartMove refuses unless window >= max(1.5 W_est, W_est + 10 min).
   google.protobuf.Duration window = 22;
   // frozen_at + max(1.5 × W_est, W_est + 10 min), capped by the window: the
   // move rolls back at this time unless it passed (a″) (MoveWindowExceeded).
   // Also the `frozen_until_estimate` carried by NamespaceFrozen.
   google.protobuf.Timestamp freeze_deadline = 23;
-  // Target `ready → active`; the clock of the 24 h cleanup grace.
+  // Target `ready → active`; the 24 h cleanup gate counts from it (N170).
   google.protobuf.Timestamp activated_at = 24;
-  // Start of the full target backup that gates cleanup.
-  google.protobuf.Timestamp target_backup_started_at = 25;
-  // Times the copy was re-run on a target restored to a point before its
-  // activation (wipe and re-copy from the retained `moved_out` source,
-  // decision N161); a target restored after activation is an ordinary
-  // restore and does not count.
-  int32 rerun_count = 26;
+  // Start of the move backup.
+  google.protobuf.Timestamp move_backup_started_at = 25;
+  // Removed in v1.0.0-rc8 (decision N169): `target_backup_at = 17` and
+  // `target_backup_started_at = 25` (renamed above, same numbers) and
+  // `int32 rerun_count = 26` (the re-run is deleted).
+  reserved 26;
+  reserved "target_backup_at", "target_backup_started_at", "rerun_count";
 
   reserved 100 to 199;
 }
@@ -702,8 +700,8 @@ message StartMoveRequest {
   bool resume = 6;
   // The window the operator grants: the longest the namespace may stay
   // read-only. Required when the window estimate exceeds 10 min (the
-  // rebalancer's unattended limit); the default and maximum is 4 h. The
-  // freeze deadline is capped by it (decision N160).
+  // rebalancer's unattended limit); the default is 4 h, the cap 8 h, and it
+  // must be >= max(1.5 W_est, W_est + 10 min) (decision N173).
   google.protobuf.Duration window = 7;
   // Do not freeze before this time (a scheduled window). Plan and the blob
   // pre-warm run at once; the freeze waits.
@@ -773,16 +771,15 @@ message RollbackMoveResponse {
   reserved 100 to 199;
 }
 
-// CleanupMoveRequest records the cleanup of a move in state CLEANING once the
-// gate of decision N161 holds: the rows were purged by the cleanup activity,
-// the blob prefix goes only after the backup window. The source's `moved_out`
-// ownership row is never deleted (decision N93).
+// CleanupMoveRequest takes a committed move to CLEANING under the 24 h gate
+// (decision N170); the activity purges the rows and records DONE after the
+// last batch. The blob prefix goes at `finished_at + 28 d`. The source's
+// `moved_out` ownership row is never deleted (decision N93).
 message CleanupMoveRequest {
   memory.v1.RequestMeta meta = 1;
   string move_id = 2;
-  // Removed in v1.0.0-rc7 (decision N161): `bool skip_grace = 3`. The catalog
-  // `done` CHECK requires 24 h after activation, so the grace cannot be
-  // shortened.
+  // Removed in v1.0.0-rc7 (decision N161): `bool skip_grace = 3`; the 24 h gate
+  // cannot be shortened.
   reserved 3;
   reserved "skip_grace";
 

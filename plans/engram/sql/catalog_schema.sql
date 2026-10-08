@@ -1,16 +1,11 @@
 -- =============================================================================
 -- Engram catalog (control plane) schema
 -- Database: engram_catalog (one small PostgreSQL 16 instance + ONE ASYNCHRONOUS HOT STANDBY, D4, N163)
---   synchronous_standby_names = '', synchronous_commit = on (local). The catalog arbitrates moves and holds the
---   replay floor and the 'deleting' state, but EVERYTHING it holds is also derivable from the shards, so there is no
---   synchronous standby (N146(1) is withdrawn: as configured it did not start, and after a promotion every catalog
---   write blocked). Instead `engramctl catalog reconcile --from-shards` runs as the FIRST step of every promotion and
---   every restore, before the alias flips (the shards' ownership rows are the truth: source moved_out => move >=
---   committed; target active without a frozen/move or moved_out source and no catalog move => done; no target row and
---   no moved_out source => rolled_back; shard frozen/delete => deleting; every namespace's epoch is raised to
---   max(epoch over its shard rows)). The ONE step that acts irreversibly on a catalog commit, move step (c), waits
---   until the standby's replay_lsn >= the commit LSN of the cutover -> committed CAS (pg_stat_replication, 10 s per
---   attempt, retried while the row reads 'committed'). A catalog restore from backup (RPO 60 s) is the only lossy path.
+--   synchronous_standby_names = '', synchronous_commit = on (local). Everything the catalog holds is also derivable from
+--   the shards: `engramctl catalog reconcile --from-shards` runs first in every promotion and restore (source moved_out =>
+--   move >= committed; target active without a frozen/move or moved_out source => done; no target row and no moved_out
+--   source => rolled_back; shard frozen/delete => deleting; epoch rule: see namespaces, N172). An outcome a shard or a client acts on is acted on only
+--   after catalog_replicated(commit LSN) (N171). A catalog restore from backup (RPO 60 s) is the only lossy path.
 -- Plain SQL, PostgreSQL 16, schema public (section 9 wraps it as migrations/catalog/0001_init.sql).
 -- No extensions required (gen_random_uuid() is core). Apply as the owner role catalog_migrate.
 --
@@ -42,15 +37,12 @@ CREATE TYPE tenant_state    AS ENUM ('active', 'suspended', 'deleting', 'deleted
 CREATE TYPE isolation_mode  AS ENUM ('shared', 'dedicated');
 CREATE TYPE shard_state     AS ENUM ('provisioning', 'active', 'full', 'draining', 'readonly', 'retired');
 CREATE TYPE namespace_state AS ENUM ('creating', 'active', 'moving', 'frozen', 'restoring', 'deleting', 'deleted');
--- 'restoring' (N64, review F-23): the shard is being restored from backup; the shard-side
--- ownership rows are frozen with freeze_reason = 'restore' and surface as NamespaceFrozen.
--- A client can therefore tell a restore from a move ('frozen').
--- move_state (D5, N125, N160): freeze, then copy everything from the static source.
--- planned -> frozen (source write-fenced; reads continue) -> copied (FrozenCopy + VerifyFrozen + BuildIndexes done)
--- -> cutover ((b') target ready) -> committed (a'') the catalog CAS cutover -> committed, the POINT OF NO RETURN ->
--- (c) source moved_out, (b'') target active, (d) catalog flip -> cleaning -> done. rolled_back is reachable from
--- every state up to and including cutover, and from no later one: restore and failover CAS cutover -> rolled_back,
--- and exactly one of the two CASes wins (N123, N161(4)). The trigger catalog_check_move_transition enforces the edges.
+-- 'restoring' (N64): the shard is being restored; its ownership rows are frozen/restore and surface as NamespaceFrozen.
+-- move_state (D5, N125, N160): planned -> frozen (source write-fenced; reads continue) -> copied (copy, verify, indexes, move
+-- backup, consumer wait done) -> cutover ((b') target ready) -> committed ((a'') the CAS, the point of no return; then (c),
+-- (b''), (d)) -> cleaning -> done. rolled_back is reachable up to and including cutover, and from no later state; restore
+-- and failover CAS cutover -> rolled_back and exactly one of the two CASes wins (N123, N161(4)). The trigger
+-- catalog_check_move_transition enforces the edges.
 CREATE TYPE move_state      AS ENUM ('planned', 'frozen', 'copied', 'cutover', 'committed',
                                      'cleaning', 'done', 'rolled_back');
 
@@ -134,8 +126,8 @@ CREATE TABLE shards (
   timeline_id           integer,                   -- N123: pg_control_checkpoint().timeline_id; the mover compares its session's value at Freeze and (c), the relay every 10 s
   dedicated_tenant_id   text REFERENCES tenants (tenant_id),   -- NULL = shared pool
   max_namespaces        integer NOT NULL DEFAULT 120 CHECK (max_namespaces > 0),
-  soft_cap_facts        bigint  NOT NULL DEFAULT 5500000,     -- N114/N165/D3: 5.5 M live facts target (hot set about 74 GB with the index-only UNION ALL hop and measured B-tree fill; returns to 6.5 M only if M0.6 measures <= 80 GB)
-  hard_cap_facts        bigint  NOT NULL DEFAULT 10000000,    -- 10 M hard cap (was 12 M)
+  soft_cap_facts        bigint  NOT NULL DEFAULT 5500000,     -- N114/N165/D3: 5.5 M live facts target (hot set about 74 GB, footprint about 138 GB; 225 GB per 10 M; 6.5 M only if M0.6 measures <= 80 GB)
+  hard_cap_facts        bigint  NOT NULL DEFAULT 10000000,    -- 10 M hard cap (about 248 GB)
   volume_bytes          bigint  NOT NULL DEFAULT 600000000000 CHECK (volume_bytes > 0),   -- 600 GB local NVMe; ShardNearCapacity pages at 70 % of it (relation bytes, N114)
   namespaces_count      integer NOT NULL DEFAULT 0 CHECK (namespaces_count >= 0),
   facts_estimate        bigint  NOT NULL DEFAULT 0 CHECK (facts_estimate >= 0),
@@ -188,6 +180,8 @@ CREATE TABLE namespaces (
   CHECK ((state = 'deleted') = (deleted_at IS NOT NULL))
 );
 
+-- Reconcile epoch rule (N172): epoch = max over a namespace's active and frozen/* shard rows and a moved_out row's
+-- target_epoch; incoming and ready rows never contribute (they carry e + 1 for the whole freeze window).
 -- tenant-unique name, reusable after delete
 CREATE UNIQUE INDEX namespaces_tenant_name_uq ON namespaces (tenant_id, name) WHERE state <> 'deleted';
 CREATE INDEX namespaces_shard_idx  ON namespaces (shard_id, state);
@@ -200,25 +194,21 @@ CREATE TRIGGER namespaces_touch BEFORE UPDATE ON namespaces
   FOR EACH ROW EXECUTE FUNCTION catalog_touch_updated_at();
 
 -- -----------------------------------------------------------------------------
--- namespace_moves: one row per move attempt (D5, N125, N160, N161). At most one live move per namespace.
--- It is also the ARBITER of restore and failover (N123, N125): the catalog CAS
+-- namespace_moves: one row per move attempt (D5, N125, N160). At most one live move per namespace.
+-- It is also the ARBITER of restore and failover (N123): the catalog CAS
 --   UPDATE ... SET state = 'committed' WHERE move_id = $1 AND state = 'cutover'
--- is the point of no return. A restored or promoted shard CASes cutover -> rolled_back only after reading both
--- ownership rows in the same reconcile and finding neither moved_out on the source nor active at the move's epoch
--- on the target (N161(4)); if it reads 'committed' it completes (c), (b'') and (d) itself (reconcile_out). Exactly
--- one CAS wins and the loser stops. Cutover order: (b') the target row goes incoming -> ready (ready_at); (a'') the
--- CAS above (committed_at), followed by the replicated-LSN wait of N163(3); (c) the source row goes frozen/move ->
--- moved_out carrying target_shard_id / target_epoch (moved_out_at, informational), executed only after the mover READ
--- 'committed' and the standby replayed it; (b'') the target row goes ready -> active (activated_at); (d) the catalog
--- flip WHERE epoch = e AND state = 'frozen', with "already (target, e + 1)" as the only idempotent success.
--- Every step is a compare-and-set on the exact ownership rows the mover verified (N143): the CAS adds the verified
--- shards, from_epoch, source_system_id / source_timeline_id and requires the namespaces row to still be
--- (source, from_epoch, 'frozen').
--- Window (N160): the namespace is read-only from frozen_at to the thaw/cutover; freeze_deadline = frozen_at +
--- max(1.5 * w_est, w_est + 10 min), capped by window_seconds; at the deadline the move rolls back (MoveWindowExceeded).
--- Cleanup gate (N161(1)): 'done' needs 24 h after activation AND a FULL target backup that STARTED after activation
--- and has completed. No content check, no timeline check, no ReconcileIn: a backup that started after activation holds
--- the complete copy (it finished before 'ready'), and what the target wrote or deleted since is its own.
+-- is the point of no return (a''). A restored or promoted shard CASes cutover -> rolled_back only after reading both
+-- ownership rows and finding neither moved_out on the source nor active at the move's epoch on the target (N161(4));
+-- if it reads 'committed' it completes (c), (b'') and (d) (reconcile_out). Exactly one CAS wins. Every shard action on
+-- an arbiter outcome (thaw, unready_target, rollback_target, reconcile_out, (c)) waits catalog_replicated (10 s per
+-- attempt) and re-reads the row (N171(2)). Order: (b') target incoming -> ready; (a'') the CAS; (c) source frozen/move
+-- -> moved_out, fenced on the source row and the replicated 'committed' only; (b'') target ready -> active (clears
+-- move_id); (d) catalog flip WHERE epoch = e AND state = 'frozen', "already (target, e + 1)" its only idempotent success.
+-- Window (N173): read-only from frozen_at; freeze_deadline <= frozen_at + window_seconds, window_seconds >=
+-- max(1.5 * w_est, w_est + 10 min), cap 8 h; before (a'') the deadline rolls back (MoveWindowExceeded), after it the
+-- page MoveFrozenPastDeadline (N171(4)), never a rollback.
+-- Cleanup gate (N170): committed -> cleaning needs now() >= activated_at + 24 h, enforced once, in
+-- catalog_check_move_transition. The move backup (N169) precedes 'cutover'; nothing else is checked.
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespace_moves (
   move_id                uuid PRIMARY KEY,
@@ -229,10 +219,10 @@ CREATE TABLE namespace_moves (
   from_epoch             bigint NOT NULL CHECK (from_epoch >= 1),
   to_epoch               bigint NOT NULL,
   state                  move_state NOT NULL DEFAULT 'planned',
-  source_system_id       bigint,                    -- N123: recorded at Plan; every later source activity fails MoveFenced on mismatch
+  source_system_id       bigint,                    -- N123: a mismatch fails MoveFenced
   source_timeline_id     integer,
-  w_est_seconds          integer NOT NULL CHECK (w_est_seconds >= 0),   -- N160: W_est = rows/R_copy + vectors/R_build + verify + blob delta, computed at Plan
-  window_seconds         integer NOT NULL CHECK (window_seconds > 0 AND window_seconds <= 14400),   -- N160: the operator window (default maximum 4 h); StartMove refuses when w_est > window
+  w_est_seconds          integer NOT NULL CHECK (w_est_seconds >= 0),   -- N173(1): rows/R_copy + build(vectors) + bytes/R_backup + verify; about 26 min per 1 M facts
+  window_seconds         integer NOT NULL CHECK (window_seconds > 0 AND window_seconds <= 28800),   -- N173(3): the operator window (cap 8 h, default 4 h)
   w_final                bigint,                    -- N147: the source's nextval under the freeze; the target is advanced past it once at the start of FrozenCopy ((b') checks last_value > w_final)
   terminated_workflows   text[] NOT NULL DEFAULT '{}',  -- workflow ids terminated at drain, restarted on the target (N97)
   error                  text,
@@ -240,14 +230,15 @@ CREATE TABLE namespace_moves (
   created_at             timestamptz NOT NULL DEFAULT now(),
   updated_at             timestamptz NOT NULL DEFAULT now(),
   frozen_at              timestamptz,
-  freeze_deadline        timestamptz,               -- N160: frozen_at + max(1.5 * w_est, w_est + 10 min), capped by window_seconds; rollback at the deadline
+  freeze_deadline        timestamptz,               -- N173(3): at most frozen_at + window_seconds
   ready_at               timestamptz,               -- (b') target incoming -> ready; rollback still possible (unready_target)
   committed_at           timestamptz,               -- (a'') the catalog CAS cutover -> committed: the point of no return
-  committed_replicated_at timestamptz,              -- N163(3): the standby's replay_lsn passed the CAS commit LSN; informational, (c) waits for it
+  committed_replicated_at timestamptz,              -- N171(2): the standby replayed the 'committed' CAS; (c) waits for it
+  rolled_back_replicated_at timestamptz,            -- N171(2): the standby replayed the 'rolled_back' CAS; thaw / unready_target / rollback_target wait for it
   moved_out_at           timestamptz,               -- (c) on the source; informational (the arbiter is committed_at)
   activated_at           timestamptz,               -- (b'') target ready -> active
-  target_backup_started_at timestamptz,             -- N161(1): start of the FULL target backup that gates cleanup
-  target_backup_at       timestamptz,               -- N161(1): completion of that backup (catalog.MoveBackups)
+  move_backup_started_at timestamptz,               -- N169(1): start of the pgBackRest incremental of the target
+  move_backup_at         timestamptz,               -- N169(1): that incremental complete, with its last WAL segment archived, before (b') (catalog.MoveBackups)
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
   CHECK (to_epoch = from_epoch + 1),
@@ -257,15 +248,12 @@ CREATE TABLE namespace_moves (
   CHECK (state NOT IN ('committed', 'cleaning', 'done') OR committed_at IS NOT NULL),
   CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL),
   CHECK (ready_at IS NULL OR w_final IS NOT NULL),                                     -- N147: no 'ready' before the target's sequence passed W_final
-  CHECK (w_est_seconds <= window_seconds),                                             -- N160: StartMove refuses when W_est > window
-  CHECK (created_by <> 'rebalancer' OR w_est_seconds <= 600),                          -- N160: unattended only when W_est <= 10 min
-  -- N161(1): the cleanup gate is time plus a post-activation full backup, nothing else.
-  CHECK (state <> 'done' OR (
-         activated_at IS NOT NULL
-         AND target_backup_started_at IS NOT NULL AND target_backup_at IS NOT NULL
-         AND target_backup_started_at > activated_at
-         AND target_backup_at >= target_backup_started_at
-         AND finished_at IS NOT NULL AND finished_at >= activated_at + interval '24 hours'))
+  CHECK (window_seconds >= greatest(1.5 * w_est_seconds, w_est_seconds + 600)),        -- N173(3): StartMove refuses a shorter window
+  CHECK (freeze_deadline IS NULL OR freeze_deadline <= frozen_at + window_seconds * interval '1 second'),
+  CHECK (created_by <> 'rebalancer' OR w_est_seconds <= 600),                          -- N173: unattended only when W_est <= 10 min
+  CHECK (state NOT IN ('cutover', 'committed', 'cleaning', 'done') OR move_backup_at IS NOT NULL),   -- N169(1): the backup precedes the commit point
+  CHECK (moved_out_at IS NULL OR committed_replicated_at IS NOT NULL),                 -- N171(2)
+  CHECK (state <> 'done' OR finished_at IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX namespace_moves_live_uq ON namespace_moves (namespace_id)
@@ -282,6 +270,10 @@ LANGUAGE plpgsql AS $$
 BEGIN
   IF NEW.state = OLD.state THEN
     RETURN NEW;
+  END IF;
+  IF OLD.state = 'committed' AND NEW.state = 'cleaning'
+     AND (OLD.activated_at IS NULL OR now() < OLD.activated_at + interval '24 hours') THEN
+    RAISE EXCEPTION 'cleanup gate: move % is not 24 h past activation', OLD.move_id USING ERRCODE = '23514';
   END IF;
   IF (OLD.state, NEW.state) IN (
        ('planned', 'frozen'), ('frozen', 'copied'), ('copied', 'cutover'),
@@ -492,3 +484,12 @@ GRANT EXECUTE ON FUNCTION pick_shard(text) TO catalog_app;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO catalog_admin;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO catalog_admin;
+
+-- N171(1): true iff a streaming standby replayed p_lsn (false with none). p_lsn = pg_current_wal_lsn() read after COMMIT
+-- in the same session (an upper bound). catalog_admin holds no pg_read_all_stats (config lint checks it).
+CREATE FUNCTION catalog_replicated(p_lsn pg_lsn) RETURNS boolean
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS $$
+  SELECT coalesce(bool_or(replay_lsn >= p_lsn), false) FROM pg_stat_replication WHERE state = 'streaming'
+$$;
+REVOKE ALL ON FUNCTION catalog_replicated(pg_lsn) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION catalog_replicated(pg_lsn) TO catalog_admin, catalog_app;

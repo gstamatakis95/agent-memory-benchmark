@@ -1652,16 +1652,16 @@ source `operations` rows (N97) with no cross-cluster protocol.
    unique index on live moves (`MovePrecondition`, non-retryable); `namespaces.state = 'moving'`;
    `NOTIFY`. Target: the `plan_target` edge inserts `namespace_ownership(…, epoch = e + 1, state =
    'incoming', move_id)`; a target that once held the namespace has a permanent `moved_out` row,
-   advanced by `return_move` (`moved_out → incoming`: strictly greater epoch, no data rows
-   present). Source: `start_move` sets `move_id` and `move_epoch = e + 1`, which **pauses the
-   expunge and every shard-wide scheduler for the namespace**. Plan records the source's
+   advanced by `return_move` (`moved_out → incoming`: greater epoch, no data rows). Source:
+   `start_move` sets `move_id` and `move_epoch = e + 1`, which **pauses the expunge and every
+   shard-wide scheduler for the namespace** until activation. Plan records the source's
    `system_identifier`/`timeline_id` (every later source activity fails `MoveFenced` on mismatch,
-   N123), refuses unless the per-table column-list hashes of source and target match, and computes
+   N123), refuses unless the per-table column-list hashes match, and computes
    the **window estimate** (N173) `W_est = rows / R_copy + build(vectors) + bytes / R_backup +
    verify` from `namespace_stats`: `R_copy` ≈ 1,000 facts/s (the 25 MB/s WAL pace at ≈ 25 KB per
    fact), `R_backup` ≈ 200 MB/s on ≈ 25 KB per fact, verify ≈ 60 s per 1 M, `build(v) = v / 3,000`
-   per s in memory plus 3 ms per vector beyond it: **≈ 26 min per 1 M live facts**; M1.5 measures
-   `R_copy`, `R_build` in and out of memory and `R_backup`. The rebalancer starts a move
+   per s in memory plus 3 ms per vector beyond it: **≈ 26 min per 1 M live facts** (M1.5 measures
+   the rates). The rebalancer starts a move
    unattended only at `W_est ≤ 10 min` (≈ 350 k facts) and ranks candidates by `W_est`; above that
    `StartMove` requires an operator `window` (`PreconditionFailed{MOVE_WINDOW_REQUIRED}` otherwise)
    and refuses unless `window ≥ max(1.5 × W_est, W_est + 10 min)`
@@ -1775,14 +1775,13 @@ source `operations` rows (N97) with no cross-cluster protocol.
 10. **`Cleanup`** (N170): `workflow.Sleep` until `activated_at + 24 h`, then the `CleanupMove` admin RPC
     (scope `engram.worker`, cell-bound, N167) takes **`committed → cleaning`**: that transition is the
     gate (the catalog trigger requires `now() ≥ activated_at + 24 h`; the move backup already precedes
-    `committed`, so nothing else is checked, and there is no comparison of a serving target with the
-    source). Only while the row reads `cleaning` does the cleanup activity, which holds both shard
+    `committed`, so nothing else is checked). Only while the row reads `cleaning` does the cleanup activity, which holds both shard
     handles, drop the namespace's partial indexes on the source by their deterministic names and run
     `engram_cleanup_namespace` in batches (its outer `DELETE` carries `namespace_id`, N131; content
-    before markers, so an interrupted cleanup never leaves unmarked content); the RPC then records
-    `done` after the last batch. The `moved_out` ownership row is **never** deleted (a later move
-    back uses `moved_out → incoming`); the source blob prefix goes at `finished_at + 28 d` (N123),
-    and a differential backup of the source follows the row deletes (N119).
+    before markers); the RPC then records
+    `done` after the last batch. The `moved_out` row is **never** deleted (a later move back uses
+    `moved_out → incoming`); source blobs go at `finished_at + 28 d` (N123); a differential
+    backup of the source follows (N119).
 11. **`Rollback`** (any failure before (a″): the freeze deadline, `MoveVerifyFailed`, a failed
     index build or move backup, a missing blob, a consumer wait that did not finish, or `engramctl move abort`;
     it runs by itself at the deadline). It first CASes `cutover → rolled_back` when the move was at

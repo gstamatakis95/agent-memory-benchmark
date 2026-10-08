@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 55 and seed 7747575318672850298 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30757] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 81 and seed -3387390597067910353 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 5823] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,13 +10,14 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 12:53:53)
+Starting... (2026-10-08 16:33:19)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 12:53:54.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 16:33:19.
 Error: Invariant NoPhantomVersion is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -24,6 +25,7 @@ State 1: <Initial predicate>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -62,8 +64,9 @@ State 1: <Initial predicate>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
+State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -71,6 +74,7 @@ State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -86,7 +90,7 @@ State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
 /\ props = {}
-/\ born = {1}
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -109,8 +113,9 @@ State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 3: <Propose line 266, col 3 to line 277, col 54 of module Derivation>
+State 3: <Propose line 286, col 3 to line 297, col 54 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -118,6 +123,7 @@ State 3: <Propose line 266, col 3 to line 277, col 54 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -132,8 +138,8 @@ State 3: <Propose line 266, col 3 to line 277, col 54 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
-/\ born = {1}
+/\ props = {[n |-> o1, mode |-> "root", cf |-> {3}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -156,8 +162,9 @@ State 3: <Propose line 266, col 3 to line 277, col 54 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 4: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
+State 4: <Pick line 300, col 3 to line 303, col 65 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -165,6 +172,7 @@ State 4: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -179,55 +187,8 @@ State 4: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
-/\ born = {1, 3}
-/\ matV0 = {}
-/\ matTodo = {}
-/\ wr = ( w1 :>
-      [ ph |-> "idle",
-        p |->
-            [ n |-> o1,
-              mode |-> "root",
-              cf |-> {},
-              co |-> {},
-              base |-> 0,
-              exp |-> 0 ] ] @@
-  w2 :>
-      [ ph |-> "idle",
-        p |->
-            [ n |-> o1,
-              mode |-> "root",
-              cf |-> {},
-              co |-> {},
-              base |-> 0,
-              exp |-> 0 ] ] )
-/\ budget = 0
-
-State 5: <Pick line 280, col 3 to line 283, col 65 of module Derivation>
-/\ nCur = 0
-/\ ms = [d1 |-> "none", d2 |-> "none"]
-/\ nDel = 0
-/\ matOwe = {}
-/\ matDocs = {}
-/\ sig = FALSE
-/\ cv = (o1 :> 0)
-/\ matSnap = {}
-/\ ginv = {}
-/\ gone = {}
-/\ dh = {}
-/\ ctomb = {}
-/\ vers = (o1 :> <<>>)
-/\ hidRe = {}
-/\ nRet = 0
-/\ itag = <<0, 0, 0, 0>>
-/\ tomb = [d1 |-> 0, d2 |-> 0]
-/\ hidden = {}
-/\ matPhase = "idle"
-/\ mat = {}
-/\ lockX = FALSE
-/\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
-/\ born = {1, 3}
+/\ props = {[n |-> o1, mode |-> "root", cf |-> {3}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -235,7 +196,7 @@ State 5: <Pick line 280, col 3 to line 283, col 65 of module Derivation>
         p |->
             [ n |-> o1,
               mode |-> "root",
-              cf |-> {1},
+              cf |-> {3},
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] @@
@@ -250,8 +211,9 @@ State 5: <Pick line 280, col 3 to line 283, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 6: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
+State 5: <Verify line 317, col 3 to line 322, col 65 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -259,6 +221,7 @@ State 6: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -273,8 +236,8 @@ State 6: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
 /\ mat = {}
 /\ lockX = FALSE
 /\ hw = (o1 :> 0)
-/\ props = {[n |-> o1, mode |-> "root", cf |-> {1}, co |-> {}, base |-> 0, exp |-> 0]}
-/\ born = {1, 3}
+/\ props = {[n |-> o1, mode |-> "root", cf |-> {3}, co |-> {}, base |-> 0, exp |-> 0]}
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -282,7 +245,7 @@ State 6: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
         p |->
             [ n |-> o1,
               mode |-> "root",
-              cf |-> {1},
+              cf |-> {3},
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] @@
@@ -297,8 +260,9 @@ State 6: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 7: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
+State 6: <Commit line 338, col 3 to line 360, col 85 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -306,23 +270,24 @@ State 7: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
 /\ vers = ( o1 :>
       << [ root |-> 1,
-           finp |-> {1},
+           finp |-> {3},
            oinp |-> {},
-           gfinp |-> {1},
+           gfinp |-> {3},
            goinp |-> {},
            st |-> "live",
-           eff |-> 1,
+           eff |-> 2,
            base |-> 0,
            ck |->
                [ n |-> o1,
                  mode |-> "root",
-                 cf |-> {1},
+                 cf |-> {3},
                  co |-> {},
                  base |-> 0,
                  exp |-> 0 ] ] >> )
@@ -336,7 +301,7 @@ State 7: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
 /\ lockX = FALSE
 /\ hw = (o1 :> 1)
 /\ props = {}
-/\ born = {1, 3}
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -344,7 +309,7 @@ State 7: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
         p |->
             [ n |-> o1,
               mode |-> "root",
-              cf |-> {1},
+              cf |-> {3},
               co |-> {},
               base |-> 0,
               exp |-> 0 ] ] @@
@@ -359,8 +324,9 @@ State 7: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 8: <RetryCommit line 347, col 3 to line 354, col 89 of module Derivation>
+State 7: <RetryCommit line 367, col 3 to line 374, col 101 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -368,23 +334,24 @@ State 8: <RetryCommit line 347, col 3 to line 354, col 89 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 2)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
 /\ ctomb = {}
 /\ vers = ( o1 :>
       << [ root |-> 1,
-           finp |-> {1},
+           finp |-> {3},
            oinp |-> {},
-           gfinp |-> {1},
+           gfinp |-> {3},
            goinp |-> {},
            st |-> "live",
-           eff |-> 1,
+           eff |-> 2,
            base |-> 0,
            ck |->
                [ n |-> o1,
                  mode |-> "root",
-                 cf |-> {1},
+                 cf |-> {3},
                  co |-> {},
                  base |-> 0,
                  exp |-> 0 ] ] >> )
@@ -398,7 +365,7 @@ State 8: <RetryCommit line 347, col 3 to line 354, col 89 of module Derivation>
 /\ lockX = FALSE
 /\ hw = (o1 :> 1)
 /\ props = {}
-/\ born = {1, 3}
+/\ born = {3}
 /\ matV0 = {}
 /\ matTodo = {}
 /\ wr = ( w1 :>
@@ -421,8 +388,8 @@ State 8: <RetryCommit line 347, col 3 to line 354, col 89 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-82 states generated, 50 distinct states found, 12 states left on queue.
-The depth of the complete state graph search is 9.
-The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 3 and the 95th percentile is 3).
-Finished in 00s at (2026-10-08 12:53:54)
+74 states generated, 45 distinct states found, 10 states left on queue.
+The depth of the complete state graph search is 8.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 3 and the 95th percentile is 3).
+Finished in 00s at (2026-10-08 16:33:19)
 elapsed 20s

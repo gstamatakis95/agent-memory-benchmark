@@ -38,6 +38,8 @@ Derivation_CascadeHidden.cfg	violates NoGhostInvalidatedServed
 Derivation_MatSignalOnly.cfg	violates MaterializeComplete
 Derivation_RestoreOnlySelf.cfg	violates RestoreExact
 Derivation_RestoreByVisibleTwin.cfg	violates RestoreExact
+Derivation_LazyTwinNoLock.cfg	violates RestoreExact
+Derivation_LazyTagFromLastLog.cfg	violates RestoreExact
 Durability.cfg	pass
 Durability_Chain.cfg	pass
 Durability_IntentBeforeCommit.cfg	violates NoUnackedEffectOnLaterAck
@@ -60,18 +62,19 @@ ShardMove_Live.cfg	pass
 ShardMove_ActiveWriters.cfg	pass
 ShardMove_Twice.cfg	pass
 ShardMove_TgtRestore.cfg	pass
+ShardMove_TgtRestore2.cfg	pass
 ShardMove_UnfencedSteps.cfg	violates NoLossNoDup
 ShardMove_NoReady.cfg	violates RollbackPossibleBeforeC
 ShardMove_RestoreNoReconcile.cfg	violates RestoreReconciles
 ShardMove_NoVerify.cfg	violates NoLossNoDup
 ShardMove_StampAfterCut.cfg	violates OneOwner
 ShardMove_SweepNotPaused.cfg	violates SourceStaticUnderFreeze
-ShardMove_CleanupNoBackup.cfg	violates CleanupSafe
 ShardMove_NoSeqAdvance.cfg	violates CopiedBelowTargetSeq
 ShardMove_CatalogLossNoShardTruth.cfg	violates NoLossNoDup
 ShardMove_UnionRepair.cfg	violates NoResurrect
-ShardMove_CleanupBackupBeforeActivate.cfg	violates NoLossNoDup
 ShardMove_CopyBeforeFreeze.cfg	violates NoLossNoDup
-ShardMove_RerunMerges.cfg	violates NoResurrect
 ShardMove_ReadyBeforeIndex.cfg	violates ServedFromIndex
 ShardMove_CutOnUnreplicatedCommit.cfg	violates NoLossNoDup
+ShardMove_NoMoveBackup.cfg	violates NoLossNoDup
+ShardMove_ThawOnUnreplicatedAbort.cfg	violates NoLossNoDup
+ShardMove_CatalogLossDuringFreeze.cfg	violates CatalogNamesOwnerAfterDone

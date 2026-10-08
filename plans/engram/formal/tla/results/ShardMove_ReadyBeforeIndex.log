@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 122 and seed -7582434163055284697 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30344] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 115 and seed -771729312806398036 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 4000] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -12,11 +12,11 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module ShardMove
-Starting... (2026-10-08 12:51:33)
+Starting... (2026-10-08 16:14:18)
 Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
 (Use the -nowarning option to disable this warning.)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 12:51:33.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 16:14:18.
 Error: Invariant ServedFromIndex is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -56,10 +56,12 @@ State 1: <Initial predicate>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 0, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -78,7 +80,7 @@ State 1: <Initial predicate>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
+State 2: <Plan line 223, col 3 to line 237, col 101 of module ShardMove>
 /\ sqt = <<0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
@@ -115,10 +117,12 @@ State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 0, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -137,7 +141,7 @@ State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 3: <Freeze line 241, col 3 to line 247, col 134 of module ShardMove>
+State 3: <Freeze line 242, col 3 to line 248, col 134 of module ShardMove>
 /\ sqt = <<0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
@@ -174,10 +178,12 @@ State 3: <Freeze line 241, col 3 to line 247, col 134 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -196,7 +202,7 @@ State 3: <Freeze line 241, col 3 to line 247, col 134 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 4: <CopyEx line 260, col 3 to line 263, col 121 of module ShardMove>
+State 4: <CopyEx line 261, col 3 to line 264, col 121 of module ShardMove>
 /\ sqt = <<0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
@@ -233,10 +239,12 @@ State 4: <CopyEx line 260, col 3 to line 263, col 121 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -292,10 +300,12 @@ State 5: <VerifyFrozen line 277, col 3 to line 279, col 98 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -314,7 +324,7 @@ State 5: <VerifyFrozen line 277, col 3 to line 279, col 98 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 6: <MakeReady line 294, col 3 to line 300, col 138 of module ShardMove>
+State 6: <MakeReady line 302, col 3 to line 309, col 138 of module ShardMove>
 /\ sqt = <<0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
@@ -351,10 +361,12 @@ State 6: <MakeReady line 294, col 3 to line 300, col 138 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -373,8 +385,8 @@ State 6: <MakeReady line 294, col 3 to line 300, col 138 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-232 states generated, 97 distinct states found, 35 states left on queue.
+297 states generated, 120 distinct states found, 46 states left on queue.
 The depth of the complete state graph search is 7.
-The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 3 and the 95th percentile is 3).
-Finished in 00s at (2026-10-08 12:51:34)
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 4 and the 95th percentile is 3).
+Finished in 00s at (2026-10-08 16:14:18)
 elapsed 20s

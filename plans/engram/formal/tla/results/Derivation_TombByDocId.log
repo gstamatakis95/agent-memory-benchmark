@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 113 and seed 7565755994929226542 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 31583] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 19 and seed 4728792199029642105 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 5765] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,13 +10,14 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 12:58:34)
+Starting... (2026-10-08 16:32:59)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 12:58:34.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 16:32:59.
 Error: Invariant NoOverHiding is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -24,6 +25,7 @@ State 1: <Initial predicate>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -62,8 +64,9 @@ State 1: <Initial predicate>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
+State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -71,6 +74,7 @@ State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -109,8 +113,9 @@ State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 3: <DeleteDocument line 181, col 3 to line 184, col 54 of module Derivation>
+State 3: <DeleteDocument line 188, col 3 to line 191, col 54 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "pending", d2 |-> "none"]
 /\ nDel = 1
 /\ matOwe = {}
@@ -118,6 +123,7 @@ State 3: <DeleteDocument line 181, col 3 to line 184, col 54 of module Derivatio
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -156,8 +162,9 @@ State 3: <DeleteDocument line 181, col 3 to line 184, col 54 of module Derivatio
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 4: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
+State 4: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "pending", d2 |-> "none"]
 /\ nDel = 1
 /\ matOwe = {}
@@ -165,6 +172,7 @@ State 4: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -203,8 +211,8 @@ State 4: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-58 states generated, 39 distinct states found, 19 states left on queue.
+48 states generated, 35 distinct states found, 17 states left on queue.
 The depth of the complete state graph search is 5.
-The average outdegree of the complete state graph is 2 (minimum is 1, the maximum 4 and the 95th percentile is 4).
-Finished in 00s at (2026-10-08 12:58:34)
+The average outdegree of the complete state graph is 3 (minimum is 1, the maximum 4 and the 95th percentile is 4).
+Finished in 00s at (2026-10-08 16:32:59)
 elapsed 20s

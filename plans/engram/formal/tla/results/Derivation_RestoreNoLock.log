@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 114 and seed -1828783880923222054 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 31407] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 72 and seed -7119977061223377196 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 4356] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/Derivation.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/Sequences.tla
@@ -10,13 +10,14 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module Derivation
-Starting... (2026-10-08 12:57:34)
+Starting... (2026-10-08 16:18:58)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 12:57:34.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 16:18:58.
 Error: Invariant RestoreExact is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -24,6 +25,7 @@ State 1: <Initial predicate>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -62,8 +64,9 @@ State 1: <Initial predicate>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
+State 2: <Ingest line 182, col 3 to line 185, col 60 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -71,6 +74,7 @@ State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -109,8 +113,9 @@ State 2: <Ingest line 175, col 3 to line 178, col 60 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 1
 
-State 3: <Propose line 266, col 3 to line 277, col 54 of module Derivation>
+State 3: <Propose line 286, col 3 to line 297, col 54 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -118,6 +123,7 @@ State 3: <Propose line 266, col 3 to line 277, col 54 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -156,8 +162,9 @@ State 3: <Propose line 266, col 3 to line 277, col 54 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 4: <Pick line 280, col 3 to line 283, col 65 of module Derivation>
+State 4: <Pick line 300, col 3 to line 303, col 65 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -165,6 +172,7 @@ State 4: <Pick line 280, col 3 to line 283, col 65 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -203,8 +211,9 @@ State 4: <Pick line 280, col 3 to line 283, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 5: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
+State 5: <Verify line 317, col 3 to line 322, col 65 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -212,6 +221,7 @@ State 5: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 0)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -250,8 +260,9 @@ State 5: <Verify line 297, col 3 to line 302, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 6: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
+State 6: <Commit line 338, col 3 to line 360, col 85 of module Derivation>
 /\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -259,6 +270,7 @@ State 6: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {}
+/\ lastOp = 0
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -312,8 +324,9 @@ State 6: <Commit line 318, col 3 to line 340, col 73 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 7: <Invalidate line 188, col 3 to line 195, col 65 of module Derivation>
+State 7: <Invalidate line 197, col 3 to line 207, col 69 of module Derivation>
 /\ nCur = 1
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -321,6 +334,7 @@ State 7: <Invalidate line 188, col 3 to line 195, col 65 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {}
+/\ lastOp = 1
 /\ ginv = {3}
 /\ gone = {}
 /\ dh = {}
@@ -374,8 +388,9 @@ State 7: <Invalidate line 188, col 3 to line 195, col 65 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 8: <MatBegin line 379, col 3 to line 386, col 38 of module Derivation>
+State 8: <MatBegin line 399, col 3 to line 406, col 50 of module Derivation>
 /\ nCur = 1
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {3}
@@ -383,6 +398,7 @@ State 8: <MatBegin line 379, col 3 to line 386, col 38 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {}
+/\ lastOp = 1
 /\ ginv = {3}
 /\ gone = {}
 /\ dh = {}
@@ -436,8 +452,9 @@ State 8: <MatBegin line 379, col 3 to line 386, col 38 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 9: <MatScan line 390, col 3 to line 396, col 134 of module Derivation>
+State 9: <MatScan line 410, col 3 to line 416, col 134 of module Derivation>
 /\ nCur = 1
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {3}
@@ -445,6 +462,7 @@ State 9: <MatScan line 390, col 3 to line 396, col 134 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {<<o1, 1, 1, <<"inv", 3>>>>}
+/\ lastOp = 1
 /\ ginv = {3}
 /\ gone = {}
 /\ dh = {}
@@ -498,8 +516,9 @@ State 9: <MatScan line 390, col 3 to line 396, col 134 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 10: <Restore line 202, col 3 to line 213, col 57 of module Derivation>
+State 10: <Restore line 214, col 3 to line 225, col 69 of module Derivation>
 /\ nCur = 2
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -507,6 +526,7 @@ State 10: <Restore line 202, col 3 to line 213, col 57 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {<<o1, 1, 1, <<"inv", 3>>>>}
+/\ lastOp = 1
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {}
@@ -560,8 +580,9 @@ State 10: <Restore line 202, col 3 to line 213, col 57 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-State 11: <MatWrite line 399, col 3 to line 402, col 139 of module Derivation>
+State 11: <MatWrite line 419, col 3 to line 422, col 139 of module Derivation>
 /\ nCur = 2
+/\ lz = [f |-> 0, tag |-> 0]
 /\ ms = [d1 |-> "none", d2 |-> "none"]
 /\ nDel = 0
 /\ matOwe = {}
@@ -569,6 +590,7 @@ State 11: <MatWrite line 399, col 3 to line 402, col 139 of module Derivation>
 /\ sig = FALSE
 /\ cv = (o1 :> 1)
 /\ matSnap = {}
+/\ lastOp = 1
 /\ ginv = {}
 /\ gone = {}
 /\ dh = {<<o1, 1, 1, <<"inv", 3>>>>}
@@ -622,8 +644,8 @@ State 11: <MatWrite line 399, col 3 to line 402, col 139 of module Derivation>
               exp |-> 0 ] ] )
 /\ budget = 0
 
-1296 states generated, 415 distinct states found, 60 states left on queue.
+1805 states generated, 556 distinct states found, 75 states left on queue.
 The depth of the complete state graph search is 12.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 4 and the 95th percentile is 3).
-Finished in 00s at (2026-10-08 12:57:34)
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 4).
+Finished in 00s at (2026-10-08 16:18:58)
 elapsed 20s

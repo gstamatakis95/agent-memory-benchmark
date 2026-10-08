@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 54 and seed 9175517069624922818 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 29658] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 108 and seed 8966778366061326153 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 3285] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -12,20 +12,23 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module ShardMove
-Starting... (2026-10-08 12:47:33)
+Starting... (2026-10-08 16:10:17)
 Implied-temporal checking--satisfiability problem has 1 branches.
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 12:47:33.
-Progress(29) at 2026-10-08 12:47:36: 125,927 states generated, 23,174 distinct states found, 0 states left on queue.
-Checking temporal properties for the complete state space with 23174 total distinct states at (2026-10-08 12:47:36)
-Finished checking temporal properties in 00s at 2026-10-08 12:47:36
+Finished computing initial states: 1 distinct state generated at 2026-10-08 16:10:18.
+Checking temporal properties for the current state space with 34146 total distinct states at (2026-10-08 16:10:21)
+Finished checking temporal properties in 00s at 2026-10-08 16:10:21
+Progress(25) at 2026-10-08 16:10:21: 176,386 states generated (176,386 s/min), 34,146 distinct states found (34,146 ds/min), 2,268 states left on queue.
+Progress(31) at 2026-10-08 16:10:21: 224,803 states generated, 40,898 distinct states found, 0 states left on queue.
+Checking temporal properties for the complete state space with 40898 total distinct states at (2026-10-08 16:10:21)
+Finished checking temporal properties in 00s at 2026-10-08 16:10:22
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
-  calculated (optimistic):  val = 1.3E-10
-  based on the actual fingerprints:  val = 2.1E-11
-125927 states generated, 23174 distinct states found, 0 states left on queue.
-The depth of the complete state graph search is 29.
+  calculated (optimistic):  val = 4.1E-10
+  based on the actual fingerprints:  val = 1.2E-10
+224803 states generated, 40898 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 31.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 3).
-Finished in 03s at (2026-10-08 12:47:36)
+Finished in 04s at (2026-10-08 16:10:22)
 elapsed 20s

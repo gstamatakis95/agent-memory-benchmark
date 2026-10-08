@@ -1,8 +1,7 @@
 ## 7. Formal verification
 
 Scope: the six TLA+ specifications under `formal/tla/` and the four Lean 4 modules under `formal/lean/Engram/`;
-what TLC reported on them after the round-6 amendment (D25: N160 to N163, N166(6), N168; `ShardMove.tla` is rewritten
-for freeze-then-copy; N161 and N163 also leave assumption lines in 7.1); how the Go code is kept faithful to them; what is not formalised; how it is wired into CI. Every number below is copied from a log in `formal/tla/results/` (summary
+what TLC reported on them after the round-7 amendment (D26: N169 to N178; `ShardMove.tla` gains the move backup, the split abort and the split reconcile; `Derivation.tla` gains the document lock); how the Go code is kept faithful to them; what is not formalised; how it is wired into CI. Every number below is copied from a log in `formal/tla/results/` (summary
 in `RESULTS.md`, which also holds the full table).
 
 Tooling: TLC 2.18 (`de.hhu.stups:tlatools:1.1.0`), OpenJDK 21, 4 workers, 10 GB heap, 4 cores, 30-minute cap per
@@ -14,7 +13,7 @@ configuration. Lean 4 is not available in the planning environment; the Lean fil
 | Spec | Register | Question the model answers | Prose mechanisms this spec omits (C-21) |
 |---|---|---|---|
 | `Derivation.tla` | N113, N115 to N121, N133, N135, N136, N144, N145 | Can a deleted, invalidated or superseded fact reach a reader through a fact, an observation version or a page version, at any `as_of`, with the markers as the only synchronous write, and is nothing else hidden? Does a retried commit leave `current_version` naming a version that exists, does an acknowledged invalidation outlive the purge of its fact, is the owed Materialize found from the markers rather than from a signal, and does `Restore` undo exactly the set an invalidation (and its lazy twins) wrote? | LLM text (a version's text is its evidence set plus its base's); `proof_count` and retirement; the marker-set size alerts; `stale_write`/`stale_delete` flags; the pacing of Materialize and Purge; one fact per chunk; the consolidation scheduler; the attempt-unique markdown blob key and its `NOT EXISTS` deletion rule (N144) and the export `hidden_overlay` (N145(4)) are tested, not modelled |
-| `ShardMove.tla` | D5, N123 to N125, N137, N160 to N163 | Freeze, copy of a static source, verify by equality, the index bit, the catalog CAS and the replicated-LSN gate on (c), cleanup, restore and failover of either shard during and after a move, a promoted or restored catalog, a target restored to before its activation (re-run) or after it, deletes on the active target, a second move: one owner, no loss, no duplicate, no resurrected delete, a started move completes. | One namespace; blob pre-warm and copy, `return_abort`; the window estimate and the copy's parallel streams and key ranges; which indexes are requested (A3); reads at `frozen/move`; drain of workflows; the relay's cursor wait; the 24 h timer (cleanup is an action); the timeline check is a guard, not a zombie primary; PITR to before a move-in (C-22) |
+| `ShardMove.tla` | D5, N123 to N125, N137, N160 to N163, N169 to N172, N175, N178 | Freeze, copy of a static source, verify by equality, the index bit, the move backup, the catalog CAS and the replicated-LSN gate on (c) and on the thaw, cleanup, restore and failover of either shard during and after a move (a target restored after the commit point is an ordinary restore), a promoted or restored catalog and the reconcile's reads interleaved with mover steps, deletes on the active target, a second move: one owner, no loss, no duplicate, no resurrected delete, a started move completes. | One namespace; blob pre-warm and copy, `return_abort`; the window estimate and the copy's parallel streams and key ranges; which indexes are requested (A3); reads at `frozen/move`; drain of workflows; the relay's cursor wait; the 24 h timer (cleanup is an action); the timeline check is a guard, not a zombie primary; a deliberate PITR of the target to before its move backup (N169(5)) and the N123 recovery move; T7-3 is accounted as RPO (N171(5)) |
 | `Durability.tla` | N122, N134, N146, N150 | Is every acknowledged delete or invalidation still in force when reads reopen after a restore or failover (also after the catalog was restored), and is no unacknowledged effect applied over a later acknowledged write, with overlapping requests on one fact? | Tenant and namespace intents (one subject kind per config); the catalog `deleting` edge; the 35-day retention; intent content is a set of versions, not `up_to_version` arithmetic |
 | `Storage.tla` | N111 to N113, N138, N152, N166(6) | Content rows never change after insert, a model flip never exposes a row without a vector, dead index entries leave only through a rebuild and the hygiene unit is the partition (a vacuum waits until every touched graph on it is rebuilt; a rebuild is snapshot-then-publish and a vacuum start-then-collect, and purges skip the partition from the selection of the rebuild set until the vacuum has started), the index converges. | HNSW internals and recall; the index runner's lease; a partition is a set of per-namespace graphs |
 | `Outbox.tla` | D6, N80 | No committed event is lost through sequence gaps; per-namespace order; the 2 x timeout watch horizon. | Kafka, consumer lag, batching |
@@ -28,21 +27,23 @@ configurations are part of the deliverable and run in CI (N141). Bounds were shr
 finished in under 30 minutes (the longest: `Durability.cfg` 27.5 minutes, `Durability_Chain.cfg` 13, `ShardMove.cfg` 7; all
 others under 7; the reductions are listed in 7.2.6).
 
-**Assumptions of the D25 models** (what the specs take as given; each is a sentence a reader can falsify):
+**Assumptions of the D26 models** (what the specs take as given; each is a sentence a reader can falsify):
 
-- **A1 (N146, N163), the catalog.** A catalog commit that the one asynchronous standby has replayed (`rep` in
-  `ShardMove.tla`) survives a *promotion*; one that has not is lost by it (`CatalogLoss`), which is why (c) is the only
-  step that waits for the flag. A catalog **restore from backup** keeps nothing: `Durability.tla` and `ShardMove.tla`
-  revert the floor and `cm`/`cat` (`CatalogRestore`), and the design recovers from state outside the catalog: the
-  replay reads `min(fl, blobFloor)` (the blob-store record is written before each replay and only lowered) and
-  `engramctl catalog reconcile --from-shards` re-derives routing and the move row from the ownership rows before any
-  shard fault (the model never interleaves a shard restore with a dirty catalog). The blob store's strong consistency
-  (7.5) is what makes the floor record lossless.
-- **A2 (N161), the target after the CAS.** A pre-activation target is re-copied from the static source (wipe, copy,
-  verify, index, then the intent replay of the acknowledged deletes); a post-activation target is never repaired from
-  it, and nothing is merged. The source rows are intact until the cleanup, which needs a full target backup that
-  started after activation. The target's acknowledged deletes (`gone`) are durable (intents) and re-applied by every
-  restore and by the re-run; deletes without an intent (sweeps, purges) are re-derived by their schedulers and are not
+- **A1 (N146, N163, N171), the catalog.** A catalog outcome (`committed` or `rolled_back`) that the one asynchronous
+  standby has replayed (`rep` in `ShardMove.tla`) survives a *promotion*; one that has not is lost by it
+  (`CatalogLoss`, which reverts the row to `open` and starts the reconcile). Every shard action on an arbiter outcome
+  ((c), the thaw, the restore reconcile's completion) waits for `rep` and re-reads the row. The reconcile is the only
+  catalog access while it runs (`cdirty`); its reads of the ownership rows (`ReadShard`) and the derivation
+  (`ApplyReconcile`) are separate steps, so shard-side mover steps interleave. A catalog **restore from backup** keeps
+  nothing: `Durability.tla` and `ShardMove.tla` revert the floor and `cm`/`cat` (`CatalogRestore`, which also resets
+  `rep`: T7-3, a catalog restore combined with a source restore, is an RPO loss, N171(5)); the design recovers from state
+  outside the catalog (the replay reads `min(fl, blobFloor)`; the reconcile re-derives routing and the move row from the
+  ownership rows before any shard fault). The blob store's strong consistency (7.5) makes the floor record lossless.
+- **A2 (N169), the target after the commit point.** The target is backed up before (b') (`MoveBackup`), so a restore of
+  the target to its latest archived point lands at or after a complete copy; afterwards it is an ordinary restore: the
+  reconcile completes (c) and (d), the target activates at a new epoch with its backup's data, and the acknowledged
+  deletes (`gone`, durable intents) are re-applied. Nothing is merged and the source is never read again. The cleanup
+  gate is that backup. Deletes without an intent (sweeps, purges) are re-derived by their schedulers and are not
   modelled. Repeated faults hit one shard; a fault of **both** copies of a row before it is re-replicated is an RPO
   loss outside the model.
 - **A3 (N160(5)), readiness at cutover.** `ShardMove.tla` has one index bit per shard: `BuildIndex` sets it under the
@@ -73,9 +74,12 @@ with rows owed (the markers; an unstamped one with nothing owed is stamped at on
 of acknowledged invalidations; `CascadeHidden` restores the old foreign key (purges drop `fact_hidden`). `Served(T)` is the SQL rule of N117: the version current at `T`, served
 only if visible. A ghost copy of each version's real derivation (its inputs plus its base's) states the truth the
 invariants are checked against. D25 (N162): `f1` and its re-extraction twin `f4` are one subject; `itag[f]` is
-`fact_hidden.invalidation_op`; `Invalidate(f)` hides the fact and its live twins in one step under one id, `LazyTwin(f)`
-is a re-extraction of an invalidated fact (the twin is born hidden, with the id), and `Restore(g)` removes every row
-that carries the id of `g` (and those facts' `derived_hidden` rows) and nothing else.
+`fact_hidden.invalidation_op`; `Invalidate(f)` hides the fact and its live twins in one step under one id, and
+`Restore(g)` removes every row that carries the id of `g` (and those facts' `derived_hidden` rows) and nothing else.
+D26 (N174): `Invalidate` reuses the tag of the subject's existing rows (a repeated `Invalidate` is enabled on a hidden
+fact), and the lazy twin of a re-extraction is two steps, `LazyTwinRead` (a `CommitChunk` holding the document lock
+shared reads the subject's tag) and `LazyTwinCommit` (the twin is born hidden, with that tag); with `DocLock`,
+`Invalidate` and `Restore` wait for the twin in flight.
 
 *Invariants.* `NoDeletedDerivationServed`, `NoInvalidatedDerivationServed`, `RestoreExact`, `NoOverHiding`,
 `AsOfNoLeak`, `MaterializeComplete`, and the round-4 additions `EvidenceOutlivesFacts`, `BaseCurrentAtCommit`,
@@ -106,6 +110,8 @@ REPLACE and re-extraction are left to the first), `Derivation_Live.cfg`. Must-fa
 | `_MatSignalOnly` | Materialize is enabled only by the post-ack signal, which is lost | `MaterializeComplete` | r5 C-2: an unstamped invalidation is never found |
 | `_RestoreOnlySelf` | `Restore(g)` un-hides only `g` | `RestoreExact` | r6 C-4 (N162): the twin hidden with it stays hidden |
 | `_RestoreByVisibleTwin` | `Restore` resolves the twins by current state | `RestoreExact` | r6 C-4: a twin also hidden by re-extraction keeps its invalidate row |
+| `_LazyTwinNoLock` | `DocLock = FALSE`: `Invalidate`/`Restore` take no exclusive document lock | `RestoreExact` | r7 C7-4 (N174(1)): `LazyTwinRead`, `Restore`, `LazyTwinCommit` leaves a hidden twin under a removed tag (6 states) |
+| `_LazyTagFromLastLog` | `TagFromLastLog`: a repeated `Invalidate` logs a fresh id; the lazy twin reads the log's last id | `RestoreExact` | r7 PG7-5 (N174(2)): the twin's tag is not the one `Restore` resolves (7 states) |
 
 *What the model changed or showed.*
 
@@ -118,112 +124,89 @@ REPLACE and re-extraction are left to the first), `Derivation_Live.cfg`. Must-fa
 3. **The derivation lock is needed because the read predicate looks only at pending tombstones** (N117). Evidence
    now survives `Purge`, so a late writer's version stays hidden while the tombstone is `pending` and is exposed
    exactly when it becomes `materialized`; `_NoLock` and `_PageNoVerify` fail at that edge.
-4. **Shared-lock holders do not serialise each other, so the base check must be a compare-and-set inside the
-   insert** (found by the design run). With the base verified in `Verify` only, two writers that picked proposals
-   against version 1 both verify and both commit; the second update lands on a base that a first commit has
-   already superseded (`BaseCurrentAtCommit` failed on the design configuration until `Commit` re-evaluated the
-   base). N120(3) must be written as `UPDATE observations SET current_version = v + 1 WHERE current_version =
-   base_version` (zero rows: discard), not as a read before the lock.
-5. Two checks that came out of building the model, not of a counterexample: a writer whose proposal was applied by
-   another writer must release the lock (the unique key refuses it), and a stub keeps `FailClosed` only if
-   version numbers are never reused.
-6. **Idempotency before the CAS is what N144 adds, and it matters through the blind root CAS** (r5 C-1). With
-   `$expected` on every writer a CAS-first order cannot advance the pointer on a retry (the CAS fails, the commit is
-   treated as lost and the run is repeated), so the phantom row of `page_full/v1` needs the D23 blind branch
-   (`engram_derivation_base_cas(p_base IS NULL)`) as well as the wrong order; `_CasBeforeIdem` sets both
-   (`CasFirst`, no `RootExpected`). What the order alone costs, the deletion of the committed version's markdown by
-   the "lost" branch, is below the model (the blob key rule is tested). Both halves of N144 therefore stay.
+4. **The base check must be a compare-and-set inside the insert** (found by the design run): with the base verified in
+   `Verify` only, two writers that picked proposals against version 1 both commit (`BaseCurrentAtCommit` failed until
+   `Commit` re-evaluated the base). N120(3) is `UPDATE observations SET current_version = v + 1 WHERE current_version =
+   base_version` (zero rows: discard).
+5. Two checks that came out of building the model: a writer whose proposal was applied by another writer must release
+   the lock, and a stub keeps `FailClosed` only if version numbers are never reused.
+6. **Idempotency before the CAS (N144) matters through the blind root CAS** (r5 C-1): `_CasBeforeIdem` sets both the
+   wrong order (`CasFirst`) and the blind branch (no `RootExpected`); both halves of N144 stay.
 7. **The owed Materialize needs a durable marker, and the invalidation row must outlive the fact** (r5 C-2).
-   `_CascadeHidden` reproduces the review's nine-state counterexample; with the marker independent of the fact row the
-   served text stays hidden whether or not Materialize has run, so `derived_hidden(invalidation)` rows matter for the
-   export overlay and for `Restore`, not for the read predicate. `MaterializeComplete` is therefore stated as "no
-   stranded work" (an unstamped invalidation with rows owed and no run in progress implies `MatBegin` is enabled) plus
-   "a stamp implies coverage" (the first draft of the stamp, written without the derivation lock for invalidations
-   that nothing cites, was refuted by the model: a writer that had verified before the `Invalidate` committed a version
-   citing the fact after the stamp, so the stamp waits for the shared holders like any batch); `_MatSignalOnly` fails the first half in eight steps (a committed version, Invalidate, LoseSignal).
+   `_CascadeHidden` reproduces the review's nine-state counterexample; `MaterializeComplete` is "no stranded work" plus
+   "a stamp implies coverage" (the stamp waits for the shared holders like any batch); `_MatSignalOnly` fails the first
+   half in eight steps.
 8. **`Restore` must be exact by tag** (r6 C-4, N162). With the invalidation id on every row it wrote, the lazy twin
    included, `Restore` needs no look-up by current hidden state; both variants that resolve the twin set at `Restore`
-   time (`_RestoreOnlySelf`, `_RestoreByVisibleTwin`) fail on the first twin.
-9. **`NoPhantomVersion` says "an existing row", not "a non-stub row".** `DerivedPurge` legitimately turns the current
-   version into a stub (the document it was derived from was deleted); N144's wording "existing, non-stub row of the
-   same root" cannot hold for that state and should read "existing row" (the stub is hidden by `FailClosed`).
+   time (`_RestoreOnlySelf`, `_RestoreByVisibleTwin`) fail on the first twin. D26 adds that the tag must be the subject's
+   one (`_LazyTagFromLastLog`) and that the lazy twin's read-to-commit span excludes the markers (`_LazyTwinNoLock`):
+   the exclusive document lock of N174 is load-bearing.
+9. **`NoPhantomVersion` says "an existing row", not "a non-stub row"**: `DerivedPurge` legitimately turns the current
+   version into a stub; N144's wording should read "existing row" (the stub is hidden by `FailClosed`).
 
-#### 7.2.2 `ShardMove.tla`: freeze, copy, verify, index, cut over, restore
+#### 7.2.2 `ShardMove.tla`: freeze, copy, verify, index, move backup, cut over, restore
 
 *Model.* Source `s1` and target `s2` (a second move swaps the roles). Per shard: insert-only rows (each with an
 `ins_seq` from the shard's sequence `sq[s]`), mutable keys (swept by an active source), a counter for the expiring class
 and **one index bit** `idx[s]` (A3). The catalog carries the move row `cm`, the namespace `(shard, epoch)` and the flag
-`rep` (the standby has replayed the commit). Mover: `Plan`; `Freeze` (the source is static from here; also the one
-`engram_seq_advance`); `CopyStep(r)`, `CopyEx` (only in `frozen`: a set difference, no floor, catch-up or merge);
-`CopyFault(r)` (a dropped row or a stale key); `VerifyFrozen` (equal row and key sets, `ex[Tgt] <= ex[Src]`; a mismatch
-re-copies once, a second one rolls back); `BuildIndex`; `MakeReady` (b', needs the index); `CommitCAS` (a'', retried when
-the commit is lost); `Replicated`; `Cut` (c, needs `committed` and `rep`); `Activate` (b''); `CatFlip` (d); `Cleanup`
-(needs a full target backup that started after activation); `Rollback`, `WindowTimeout` (rollback from `frozen`,
-`copied` or `built`); `Rerun`. Environment: writers before the freeze and after activation (never under it),
-`SrcDelete`, `SweepEx`, `TgtDelete(r)` (a legitimate delete on the active target; the row joins `gone`), `Backup`,
-`Restore` and `TgtRestore` (to the last backup, which may predate activation, or lossless failover; the acknowledged
-deletes in `gone` are re-applied, as the intent replay does), `CatalogLoss` (the standby is promoted and lacks an
-unreplicated commit), `CatalogRestore` (reverts `cm` and `cat`; `CatalogReconcile` re-derives them from the ownership
-rows before the next shard fault), `Reconcile_` (first re-derives `cm` from the ownership rows; `open`: abort CAS and roll
-back; `committed`: complete (c), (b''), (d), or mark a re-run when the target's restored row is not `active` at the move's
-epoch; no move: owner bump), `RestoreDone`.
+`rep` (the standby has replayed the outcome). Mover: `Plan`; `Freeze` (the source is static from here; also the one
+`engram_seq_advance`); `CopyStep(r)`, `CopyEx` (only in `frozen`: a set difference); `CopyFault(r)` (a dropped row: the
+target holds nothing before the copy, N175); `VerifyFrozen` (equal row and key sets, `ex[Tgt] <= ex[Src]`; a mismatch
+re-copies once, a second one aborts); `BuildIndex`; `MoveBackup` (`built` to `backed`: `bak[Tgt]` is the target's
+snapshot, N169); `MakeReady` (b', needs the index and, under `BackupBeforeCut`, the backup); `CommitCAS` (a''; retried
+when a promotion lost it); `Replicated`; `Cut` (c: source `frozen`, `cm = committed`, `rep`; no target conjunct);
+`Activate` (b''); `CatFlip` (d); `Cleanup` (needs `done` only: the gate is the move backup). Abort: `AbortCAS`
+(`rolled_back`, `mp = aborting`; from `WindowTimeout` in `frozen`/`copied`/`built`/`backed`, the second `VerifyFrozen`
+mismatch, or the operator), `AbortReplicated`, `Thaw` (needs `rolled_back` replicated and re-reads it; thaws the source,
+drops the target rows and index). Environment: writers before the freeze and after activation, `SrcDelete`, `SweepEx`,
+`TgtDelete(r)` (the row joins `gone`), `Backup`, `Restore` and `TgtRestore` (to the last backup or lossless failover;
+`gone` is re-applied), `CatalogLoss` (the standby is promoted without an unreplicated `committed` or `rolled_back`; the
+row reverts to `open`, the mover resumes from its pre-abort step, `cdirty` starts the reconcile), `CatalogRestore`
+(reverts `cm` and `cat`, resets `rep`), `ReadShard(s)` and `ApplyReconcile` (the reconcile; while `cdirty` no one else
+touches the catalog, shard-side steps interleave), `Reconcile_` (`open`: `AbortCAS`, then the thaw once replicated;
+`committed`: a source completes (c), (b''), (d); a target completes them and activates at a new epoch with its restored
+data, `gone` replayed; no move: owner bump), `RestoreDone`.
 
-*Invariants.* `SingleWriter`, `NoLossNoDup` (the target is activated with exactly the rows frozen at the source; after the
-cleanup an active target holds every frozen row it did not delete; once settled every acknowledged row that is not an
-accepted RPO loss and not deleted on the target is on an active owner), `RollbackPossibleBeforeC`,
-`NoWriteToTargetBeforeC`, `NoRouteToTargetBeforeC`, `ZombieCannotCutOver`, `RestoreReconciles`, `OneOwner`,
-`CatalogNamesOwnerAfterDone`, `CleanupSafe`, `CopiedBelowTargetSeq`, and new: `NoResurrect` (a row deleted on an active
-target is never again in an active store), `ServedFromIndex` (`ready` or `active` implies the index bit),
-`SourceStaticUnderFreeze`. Liveness: `MoveTerminates` and `FrozenBounded` (a `frozen` move reaches the commit point or
-rolls back); `MoveTerminatesActive` is gone: writers cannot run under the freeze and the only deterministic rollbacks left
-are the window deadline and a second `VerifyFrozen` mismatch.
+*Invariants.* `SingleWriter`, `NoLossNoDup` (the target is activated with the frozen rows, no more; a committed move
+whose source left `frozen` has a ready or active target holding them; after the cleanup an active target holds every
+frozen row it did not delete; once settled every acknowledged row that is not an accepted RPO loss and not deleted on
+the target is on an active owner), `RollbackPossibleBeforeC`, `NoWriteToTargetBeforeC`, `NoRouteToTargetBeforeC`,
+`ZombieCannotCutOver`, `RestoreReconciles`, `OneOwner`, `CatalogNamesOwnerAfterDone`, `CleanupSafe`,
+`CopiedBelowTargetSeq`, `NoResurrect`, `ServedFromIndex`, `SourceStaticUnderFreeze`. Liveness: `MoveTerminates` and
+`FrozenBounded`.
 
-*Configurations.* Design: `ShardMove.cfg` (2 rows, 1 client, writer lifetime 1, 2 ticks, freeze window 1 tick, 1 restore or
-failover of either shard, 1 extra backup, 1 copy fault, 1 catalog loss or restore; 28.2 M distinct states, 7 min 18 s),
-`_Live` (2 clients, both liveness properties; 2.3 M, 4 min 35 s), `_ActiveWriters` (2 clients, writers before and after, no
-fault; 23 k), `_Twice` (one row, two moves, the second from the first target after its cleanup; 28 k) and `_TgtRestore`
-(one row, one restore or promotion of the target after the commit point, one catalog restore, 2 backups; 1.6 M, 28 s).
-Must-fail, kept: `_UnfencedSteps`, `_NoReady`, `_RestoreNoReconcile`, `_NoVerify` (a copy fault nothing detects),
-`_StampAfterCut`, `_SweepNotPaused` (now `SourceStaticUnderFreeze`), `_CleanupNoBackup`, `_NoSeqAdvance`,
-`_CatalogLossNoShardTruth`; new:
+*Configurations.* Design: `ShardMove.cfg` (2 rows, 1 client, writer lifetime 1, 2 ticks, freeze window 1 tick, 1 restore or failover of either shard, 1 extra backup, 1 copy fault, 1 catalog loss or restore; 87.2 M distinct states, 23min 54s), `_Live` (2 clients, both liveness properties; 9.9 M, 21min 18s), `_ActiveWriters` (2 clients, writers before and after, no fault; 41 k), `_Twice` (one row, two moves, the second from the first target after its cleanup; 161 k), `_TgtRestore` (one row, one restore or promotion of the target after the commit point, one catalog restore, 2 backups; 2.9 M, 46s) and `_TgtRestore2` (as `_TgtRestore` with two moves, so the restored row can be a previous life's `moved_out`; 14.1 M, 03min 43s).
+Must-fail, kept: `_UnfencedSteps`, `_NoReady`, `_RestoreNoReconcile`, `_NoVerify`, `_StampAfterCut`, `_SweepNotPaused`
+(`SourceStaticUnderFreeze`), `_NoSeqAdvance`, `_CatalogLossNoShardTruth`, `_UnionRepair`, `_CopyBeforeFreeze`,
+`_ReadyBeforeIndex`, `_CutOnUnreplicatedCommit` (still fails although the promotion now runs the reconcile); new:
 
 | Config | Knob | Violates | Finding |
 |---|---|---|---|
-| `_UnionRepair` | a restored, serving target is repaired as `store[Tgt] u store[Src]` (the D24 `ReconcileIn`) | `NoResurrect` | N161: the target's own deletes look like missing rows; a deleted row comes back (17 states) |
-| `_RerunMerges` | a target restored to before activation is repaired by a union, not wipe-and-copy | `NoResurrect` | N161(2): the same after a restore to the pre-activation backup (19 states) |
-| `_CleanupBackupBeforeActivate` | the cleanup gate accepts a backup that started before activation | `NoLossNoDup` | N161(1): a backup taken during the copy is not a copy; a restore to it after the cleanup leaves a partial target |
-| `_CopyBeforeFreeze` | the copy runs from the unfrozen source, with no catch-up | `NoLossNoDup` | N160: rows committed after the copy are missing at cutover |
-| `_ReadyBeforeIndex` | `MakeReady` does not wait for the index | `ServedFromIndex` | N160(5): the first recall after activation would not use the HNSW |
-| `_CutOnUnreplicatedCommit` | (c) runs before the standby has the commit | `NoLossNoDup` | N163(3): the promotion loses the commit, the source is restored, the reconcile rolls back after the cut and wipes the target's copy |
+| `_NoMoveBackup` | `BackupBeforeCut = FALSE` | `NoLossNoDup` | N169(1): a target restored after the commit point to a pre-copy backup is activated without the moved rows (13 states) |
+| `_ThawOnUnreplicatedAbort` | `ThawNeedsReplicated = FALSE`, `MaxCat = 1` | `NoLossNoDup` | N171(2), C7-1: the abort is lost by a promotion, the mover commits on the new primary, the stale thaw wipes the target of a committed move (15 states) |
+| `_CatalogLossDuringFreeze` | `EpochFromAnyRow = TRUE` | `CatalogNamesOwnerAfterDone` | N172: a promotion while the source is frozen takes the epoch from the target's `incoming`/`ready` row (`e + 1`); the catalog names the owner at an epoch it does not hold and (d) never applies (12 states) |
 
 *What the model showed.*
 
-1. **Freeze-then-copy removes the dirty-copy failures, not the restore ones.** The seven D24 configurations about a
-   re-copy key, a merge, a verify order, a margin, a timeline gate or the sequence ring are gone with their machinery;
-   the move completes (`MoveTerminates`, `FrozenBounded`). What remains is what a restored shard does to a committed move.
-2. **The catalog CAS before (c) and the row-state guard on every mover step stay load-bearing** (`_StampAfterCut`,
-   `_UnfencedSteps`, `_RestoreNoReconcile`). `_StampAfterCut` fails only with `ShardTruth = FALSE`; with the re-derivation
-   of `cm` from the shards the stamp order is repaired too.
-3. **(c) is the one step that needs the commit to have survived** (`_CutOnUnreplicatedCommit`). After (c) the only
-   evidence of the move may be the source's `moved_out` row; a source restored to before (c) with a catalog that lost the
-   commit rolls back and wipes the target's complete copy. With the gate a lost commit is one no shard has acted on.
-   Accounting: rows a source restore loses are an RPO loss unless the commit was replicated or (c) has run; a catalog
-   *restore* withdraws that promise (`rep := FALSE`), since it restores from backup, not from the standby.
-4. **A catalog restore must be repaired from the shards before any shard fault** (`_CatalogLossNoShardTruth`): after (c)
-   the reconcile finds `committed` in the source's `moved_out` or the target's `active` row; without it the shard
-   reconcile trusts `open` and rolls back a cut move.
-5. **N161(2) is short by two cases.** A target whose restored row is not `active` at the move's epoch needs the re-run:
-   `incoming`, `ready`, and also `none`, a restore point that predates `Plan` (a small namespace moves within the 60 s
-   archive window); without it the reconcile activates an empty target. The re-run may also find the source still
-   `frozen` (the target was restored between (a'') and (c)); the mover's (c) needs a `ready` target and would wait
-   forever (`MoveTerminates` fails if `Rerun` demands a `moved_out` source), so `Rerun` takes (c) itself.
-6. **Nothing is merged** (`_UnionRepair`, `_RerunMerges`): a target that has served writes has legitimately deleted
-   rows. Wipe, copy and replay of the acknowledged deletes is exact.
-7. **The cleanup gate is "a full backup that started after activation", nothing more** (`_CleanupNoBackup`,
-   `_CleanupBackupBeforeActivate`); the time, content and timeline conditions of D24 are gone and the property holds,
-   because such a backup contains the complete copy. One advance under the freeze is enough (`_NoSeqAdvance`, `_Twice`).
-8. **A source that sweeps under the freeze is not static** (`_SweepNotPaused`), a copy from an unfrozen source without a
-   catch-up loses rows (`_CopyBeforeFreeze`), and `VerifyFrozen` is load-bearing against a copy fault (`_NoVerify`).
+1. **The move backup makes the target restore ordinary.** With `MoveBackup` before (b') every restore of the target after the commit
+   point lands at or after a complete copy, so it is the ordinary restore (`_TgtRestore`, `_TgtRestore2` with a previous
+   life's row); `_NoMoveBackup` is the proof that the backup is the load-bearing step. The reconcile never reads the
+   source's data after the commit point.
+2. **Every shard action on an arbiter outcome needs the replicated outcome** (`_CutOnUnreplicatedCommit`,
+   `_ThawOnUnreplicatedAbort`). The first run of the symmetric rule exposed a spec gap, not a design flaw: a
+   `rolled_back` counted as "replicated" for the source's `Recoverable` accounting; `rep` now counts only for `committed`.
+3. **The reconcile reads shard rows, not epochs of unowned rows** (`_CatalogLossDuringFreeze`); its reads interleave with
+   mover steps and the design survives that, provided that nobody else writes the catalog while the reconcile runs
+   (`cdirty`): a first model that let the mover flip (d) between the reads and the apply reverted the routing row.
+4. **Kept from D25:** the catalog CAS before (c) and the row-state guard on every mover step (`_StampAfterCut`,
+   `_UnfencedSteps`, `_RestoreNoReconcile`); a catalog restore must be repaired from the shards before any shard fault
+   (`_CatalogLossNoShardTruth`); nothing is merged (`_UnionRepair`); a source that sweeps under the freeze is not static
+   (`_SweepNotPaused`), a copy from an unfrozen source loses rows (`_CopyBeforeFreeze`), `VerifyFrozen` is load-bearing
+   (`_NoVerify`); one sequence advance under the freeze is enough (`_NoSeqAdvance`, `_Twice`).
+5. **Modelling choices (not design changes):** `NoLossNoDup` is stated on the moved rows (`actSet` is the target's rows
+   inside `frozenSet`, so post-activation writes of a restored target do not count as extra), and it gained the "committed
+   move with a ready or active target" conjunct, which is what the stale thaw of `_ThawOnUnreplicatedAbort` violates; a
+   restored shard reads as no owner in the reconcile's snapshot, so a shard's own reconcile never waits on the catalog's.
 
 #### 7.2.3 `Durability.tla`: acknowledged deletes survive restore and failover
 
@@ -351,35 +334,21 @@ state) is below the model's abstraction and is covered by `TestConsolidation_Per
 1. **Abstractions that matter.** One namespace, one fact per chunk, two to three writers, version caps of one to
    three; restores are "revert to the last backup" or lossless failover, not PITR; the mutable and expiring classes are
    sets and a counter; the promotion and the catalog restore are one event each, not a sequence of replica states;
-   repeated restores hit one shard (assumption A2); the freeze window is a tick count, not a clock. A bound bump is a
+   repeated restores hit one shard (assumption A2); the freeze window is a tick count, not a clock; the reconcile's
+   snapshot reads are per shard, but nobody else touches the catalog meanwhile (A1). A bound bump is a
    spec change reviewed as such.
 2. **`Derivation_Page.cfg` leaves REPLACE and re-extraction out** (the product with a page ran past 30 minutes);
-   `Derivation.cfg` covers both on observations only, and the page path is the same `Commit`. The retry of N144 is
-   in the design configurations that have no REPLACE (`Derivation.cfg`, `_Retire`, `_Page`, `_Live`); the must-fail
-   `_CasBeforeIdem` uses one observation and one proposal. The twin rule of N162 is exercised where a re-extraction is
-   possible (`_Retire` and the two `Restore` must-fail configurations).
+   `Derivation.cfg` covers the retry of N144 without them, and the twin rule and the document lock of N162 and N174 are
+   exercised where a re-extraction is possible (`_Retire` and the `Restore` and `LazyTwin` must-fail configurations).
 3. **Liveness runs forbid writer crashes** (`AllowAbortW = FALSE`): with crashes a writer can starve Materialize
    by re-taking the shared lock forever, which the 35 s single attempt and the retry make a latency issue, not a
    safety one.
-4. **Bounds reduced to keep every design configuration under 30 minutes** (the figures are in `results/RESULTS.md`).
-   D24: REPLACE, re-extraction and the two purges moved out of `Derivation.cfg` into `Derivation_Retire.cfg`;
-   `Durability_Chain.cfg` has no catalog restore. **D25: `Storage.cfg` has two embedding generations** (the three
-   generation product with snapshot-then-publish and start-then-collect ran 30 minutes to 2.8 M distinct states at
-   depth 22 with the queue still growing and was stopped), and the third generation is covered by `Storage_Gens.cfg`
-   with one row in each namespace. `ShardMove.cfg` needed no reduction (7 min 18 s: with a static source a move has
-   far fewer interleavings than the D24 dirty copy), `_Twice` keeps one row, and `Durability.cfg` keeps its D23
-   bounds (27.5 minutes, the closest to the cap).
-
-### 7.3 Lean 4 theorems
-
-Files under `formal/lean/Engram/`, Lean 4 core only (no Mathlib), **not type-checked**. `lakefile.lean`,
-`lean-toolchain` and `SORRY_BASELINE` (value 3) form the Lake skeleton (N142). `TagMatch.lean`: the six tag modes
-of D10, decidability, `anyStrict_imp_any`, `allStrict_imp_all`, `exact_imp_allStrict`, monotonicity of the strict
-modes, non-monotonicity of ANY and ALL (`decide`). `RRF.lean`: the fused score is invariant under arm reordering,
-per-arm monotonicity, `contribNat_antitone` (needs `0 < k`, which is why D10 fixes k = 60); `score_mono` and
-`score_le_bound` are `sorry`. `Packer.lean`: `pack_total_le`, `pack_sublist`, `keep_count`, `keep_append`,
-`keep_skip_oversize`; `kept_fits` is `sorry`. `TemporalWindow.lean`: overlap symmetry, containment order,
-`distanceTo` non-negativity, monotonicity, 1-Lipschitz. Three `sorry` in total, the checked-in baseline.
+4. **Bounds reduced to keep every design configuration under 30 minutes** (figures in `results/RESULTS.md`):
+   REPLACE, re-extraction and the two purges live in `Derivation_Retire.cfg`; `Durability_Chain.cfg` has no catalog
+   restore; `Storage.cfg` has two embedding generations (three ran past the cap at 2.8 M distinct states) and
+   `Storage_Gens.cfg` keeps the third with one row per namespace; `ShardMove_Twice` keeps one row. **D26:** no bound was
+   reduced, but `ShardMove.cfg` (23 min 54 s) and `_Live` (21 min 18 s) now sit close to the cap, as does
+   `Durability.cfg` (27.5 minutes).
 
 ### 7.4 Conformance: how the Go code stays faithful
 
@@ -394,10 +363,10 @@ is absent).
 
 | Spec | Go package and twin tests |
 |---|---|
-| `Derivation` | `internal/recall`, `internal/expunge`, `internal/consolidate`, `internal/pages`: `TestVisibility_AllSurfaces`, `TestVisibility_SegmentHiding`, `TestInvalidate_RestoreExact`, `TestAsOf_*`, `TestExpunge_DerivationLock`, `TestDelete_ReuseDocumentID`, `TestVisibility_AllSurfaces` (C-1), `TestDerivation_CommitRule` (C-2), `TestApply_BaseVersionCAS` (C-3), `TestReextract_Rebuilds` (C-6), `TestMaterialize_StampUnderLock` (C-7), `TestPageRefresh_CommitRetry` (r5 C-1), `TestInvalidate_SurvivesChunkPurge`, `TestInvalidate_RestoreUndoesTwinSet`, `TestInvalidate_LazyTwinRestored` (N162), `TestExpunge_SweeperFindsUnmaterialized`, `TestExport_OverlayBeforeMaterialize` (r5 C-2) |
-| `ShardMove` | `internal/move`: `TestMove_RollbackEveryStep`, `TestMove_ReadyState`, `TestMove_FrozenCopy`, `TestMove_VerifyFrozenCatchesFault`, `TestMove_WindowDeadlineRollback`, `TestMove_IndexesValidBeforeReady` (N160), `TestMove_CatalogCAS`, `TestMove_ZombieFenced`, `TestRestore_OpenMoves`, `TestMove_TwiceAndExport`, `TestMove_CleanupGateAtEntry`, `TestMove_TargetRestoredAfterMoveBackup`, `TestMove_TargetRestoredAfterActivation`, `TestRestore_SourceCleansMovedOut` (N161), `TestCatalog_PromotionRunsReconcile`, `TestMove_CutWaitsForReplicatedCommit`, `TestCatalog_ReconcileDerivesRouting` (N163); mover killed at every persisted state |
+| `Derivation` | `internal/recall`, `internal/expunge`, `internal/consolidate`, `internal/pages`: `TestVisibility_AllSurfaces`, `TestVisibility_SegmentHiding`, `TestInvalidate_RestoreExact`, `TestInvalidate_ConcurrentReextract`, `TestInvalidate_RepeatedReusesTag`, `TestAsOf_*`, `TestExpunge_DerivationLock`, `TestDelete_ReuseDocumentID`, `TestVisibility_AllSurfaces` (C-1), `TestDerivation_CommitRule` (C-2), `TestApply_BaseVersionCAS` (C-3), `TestReextract_Rebuilds` (C-6), `TestMaterialize_StampUnderLock` (C-7), `TestPageRefresh_CommitRetry` (r5 C-1), `TestInvalidate_SurvivesChunkPurge`, `TestInvalidate_RestoreUndoesTwinSet`, `TestInvalidate_LazyTwinRestored` (N162), `TestExpunge_SweeperFindsUnmaterialized`, `TestExport_OverlayBeforeMaterialize` (r5 C-2) |
+| `ShardMove` | `internal/move`: `TestMove_RollbackEveryStep`, `TestMove_ReadyState`, `TestMove_FrozenCopy`, `TestMove_VerifyFrozenCatchesFault`, `TestMove_WindowDeadlineRollback`, `TestMove_IndexesValidBeforeReady` (N160), `TestMove_CatalogCAS`, `TestMove_ZombieFenced`, `TestRestore_OpenMoves`, `TestMove_TwiceAndExport`, `TestMove_CleanupGateAtEntry`, `TestMove_TargetRestoredAfterMoveBackup`, `TestMove_TargetPITRBeforeMoveBackup`, `TestMove_CutWaitsForMoveBackup`, `TestMove_RollbackWaitsForReplicatedAbort`, `TestCatalog_ReconcileIgnoresIncomingEpoch`, `TestMove_VerifyPerRange`, `TestRestore_SourceCleansMovedOut` (N161), `TestCatalog_PromotionRunsReconcile`, `TestMove_CutWaitsForReplicatedCommit`, `TestCatalog_ReconcileDerivesRouting` (N163); mover killed at every persisted state |
 | `Durability` | `internal/intent`, `cmd/engramctl restore replay`: `TestIntent_AckImpliesIntent`, `TestIntent_DuplicateAttempt` (re-put of the committed marker's intent), `TestIntent_AckRereadsMarker`, `TestIntent_EpochGuard`, `TestRestore_ReplaysIntents`, `TestFailover_ReplaysIntents`, a double-restore case, `TestReplay_FloorFromBlob` (r5 C-3), `TestIntent_ReplayTwoOfSameSubject`, `TestIntent_ConcurrentCurationOneChain` (r5 C-7, C-8) |
-| `Storage` | `internal/store`, `internal/index`: `TestContent_InsertOnly`, `TestVectors_ModelGeneration`, `TestHNSW_PerNamespace`, `TestIndex_Hygiene`, `TestIndex_Hygiene` (N152: a partition with three namespaces purged at 0.2 %, 1 % and 0 %; N166(6): a neighbour touched once is not rebuilt and a purge during the rebuild set is skipped) |
+| `Storage` | `internal/store`, `internal/index`: `TestContent_InsertOnly`, `TestVectors_ModelGeneration`, `TestHNSW_PerNamespace`, `TestIndex_Hygiene` (N152: a partition with three namespaces purged at 0.2 %, 1 % and 0 %; N166(6): a neighbour touched once is not rebuilt and a purge during the rebuild set is skipped) |
 | `Outbox` | `internal/outbox`: relay with writers delayed by `pg_sleep`, `TestOutbox_Watch1x` |
 | `Consolidation` | `internal/consolidate`: `TestConsolidation_PersistedProposal`, `_AtomicKey`, `_TwoStage` |
 | Lean modules | `internal/recall` table and `rapid` tests (tags, fusion, packing, temporal window) |
@@ -425,7 +394,7 @@ behaviour is a behaviour of the spec and that every invariant held along it. M0.
 | `idx[s]`, `rep`, `cdn`/`rc` | `engram_move_indexes_valid(ns)` (`indisvalid and indisready` of the requested indexes); the standby's `replay_lsn >=` the CAS's commit LSN; the copy's per-table progress and the one re-copy of `VerifyFrozen` |
 | `sq[s]` | `engram_ins_seq` of shard `s`, raised once by `engram_seq_advance(W_final)` under the freeze |
 | `tlc[s]` | the shard's timeline id (a restore or promotion starts a new one) |
-| `tl`, `mtl`, `bak` | `catalog.shards.timeline_id`; the mover session's timeline; pgBackRest backup (`target_backup_started_at`) |
+| `tl`, `mtl`, `bak` (`MoveBackup`) | `catalog.shards.timeline_id`; the mover session's timeline; pgBackRest backup (`move_backup_started_at`, `move_backup_at`) |
 | `Durability.intents`, `dbq`, `fl`, `bf`, `ep` | `_control/deletes/...` objects; the shard `deletion_log` (its `epoch` is the recorded one); `catalog.shards.replay_floor`; the blob-store floor record `_control/replay_floor`; the namespace epoch |
 | `Storage.vec`, `cur`, `idx`, `pc[n]`, `rebuilt`, `lk`, `rsnap`, `dsn` | `fact_vectors`; the namespace's current model; the per-namespace partial HNSW; `vector_indexes.purged_since_build`; the partition hygiene round's list of rebuilt graphs; the partition advisory key; the rebuild's snapshot; the dead entries at `VACUUM` start |
 | `Outbox.*`, `Consolidation.*` | visible `outbox` rows, `outbox_cursors`; `consolidation_batches`, `consolidation_applied` |
@@ -439,8 +408,8 @@ behaviour is a behaviour of the spec and that every invariant held along it. M0.
 - **Temporal's guarantees**, **Postgres semantics** (snapshot isolation, advisory try-lock, `synchronous_commit =
   local`), **the blob store's strong consistency**: assumed as documented.
 - **Zombie primaries serving client writes**, instance-level failover and the relay's 10 s timeline check:
-  outside `ShardMove.tla`, which has the session timeline only as a guard (`ZombieCannotCutOver`); D25 removed the
-  `_NoTimelineCheck` experiment with the cleanup-time timeline check, so there is no must-fail configuration for it.
+  outside `ShardMove.tla`, which has the session timeline only as a guard (`ZombieCannotCutOver`); there is no
+  must-fail configuration for it.
 - **Multi-namespace interference in a move**, **reads during a move**, **blob copy**, **`return_abort`**:
   tested (`TestIso_Move_Epoch`, misroute suites), not modelled.
 - **Which indexes a move requests and when a build counts as failed (N160(5))**, **the attempt-unique markdown blob key
@@ -456,13 +425,16 @@ behaviour is a behaviour of the spec and that every invariant held along it. M0.
   must end with "No error has been found"; a must-fail configuration must end with "Invariant ... is violated" on
   the invariant named in its first comment line (or, for a liveness property, "Temporal properties were
   violated"); anything else fails the job. `formal/tla/EXPECT` lists the expected outcome of every configuration;
-  no configuration is an experiment any more (D25 deleted `ShardMove_ZeroMargin` and `_NoTimelineCheck`). A **timeout is
+  no configuration is an experiment. A **timeout is
   neither a failure nor a pass**: it is reported INCOMPLETE with the states and depth reached. A bound bump that
   pushes a design configuration over 30 minutes is a spec change reviewed as such.
 - **PR job `formal-quick`**: parses every spec with SANY and runs every must-fail configuration and every design
   configuration that finishes in under two minutes; the others (`Derivation.cfg`, `_Retire`, `_Page`, `Durability.cfg`,
   `Durability_Chain.cfg`, `ShardMove.cfg`, `ShardMove_Live.cfg`) run nightly and on PRs that touch their spec or its
   mapped Go files.
+- **Manifest** (`EXPECT`, N178): 75 configurations: `Outbox` 4, `Consolidation` 4, `Storage` 8 (both `Storage.cfg` and
+  `Storage_Gens.cfg`), `Derivation` 21, `Durability` 17, `ShardMove` 21 (design: `ShardMove`, `_Live`, `_ActiveWriters`,
+  `_Twice`, `_TgtRestore`, `_TgtRestore2`; the other 15 must fail).
 - **Lean**: `formal/lean/` is a Lake project (`lakefile.lean`, `lean-toolchain`); the PR job runs `lake build` and
   `scripts/sorry-count.sh`, which fails if the `sorry` count exceeds `formal/lean/SORRY_BASELINE` (3).
 - **Spec and test coupling**: `formal/MANIFEST.md` maps each `.tla` and `.lean` file to its Go test files (7.4);
@@ -470,7 +442,7 @@ behaviour is a behaviour of the spec and that every invariant held along it. M0.
   unless it carries the `formal-no-test-change` label with a justification.
 - **Trace validation** runs on the Postgres and chaos tests' traces in the integration job (`-workers 1`).
 
-All results of this section, as run after the D25 amendment (4 workers, 10 GB heap, one configuration at a time; `time` is TLC's own wall-clock; for a violation,
+All results of this section, as run after the D26 amendment (4 workers, 10 GB heap, one configuration at a time; `time` is TLC's own wall-clock; for a violation,
 `generated` and `distinct` are the work done before the counterexample and `depth` is its length):
 
 | config | expected | result | generated | distinct | depth | time |
@@ -491,25 +463,27 @@ All results of this section, as run after the D25 amendment (4 workers, 10 GB he
 | `Storage_AutoRepair.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 2,835 | 1,045 | 7 | 00s |
 | `Storage_PerIndexHygiene.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 136,244 | 32,732 | 15 | 01s |
 | `Storage_PurgeDuringRebuildSet.cfg` | violates `RebuildBeforeRepair` | FAIL: RebuildBeforeRepair (as intended) | 85,592 | 20,307 | 13 | 01s |
-| `Derivation.cfg` | all hold | PASS | 23,840,070 | 4,094,217 | 34 | 03min 49s |
-| `Derivation_Page.cfg` | all hold | PASS | 41,597,641 | 7,251,558 | 34 | 06min 39s |
-| `Derivation_Retire.cfg` | all hold | PASS | 22,613,082 | 3,773,679 | 30 | 02min 45s |
+| `Derivation.cfg` | all hold | PASS | 28,680,379 | 4,864,481 | 34 | 04min 09s |
+| `Derivation_Page.cfg` | all hold | PASS | 41,597,641 | 7,251,558 | 34 | 06min 15s |
+| `Derivation_Retire.cfg` | all hold | PASS | 28,632,580 | 4,718,290 | 31 | 03min 31s |
 | `Derivation_Live.cfg` | all hold | PASS | 390,901 | 117,292 | 31 | 17s |
-| `Derivation_NoLock.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 4,531 | 1,489 | 12 | 01s |
-| `Derivation_CascadeEvidence.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 6,481 | 2,580 | 9 | 01s |
-| `Derivation_PageNoVerify.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 49,274 | 13,275 | 13 | 02s |
-| `Derivation_StaleProposal.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 84,133 | 23,152 | 16 | 03s |
-| `Derivation_ReextractHides.cfg` | violates `ReextractKeepsDerivedVisible` | FAIL: ReextractKeepsDerivedVisible (as intended) | 490 | 215 | 7 | 00s |
-| `Derivation_RestoreNoLock.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,296 | 415 | 11 | 00s |
-| `Derivation_MatOnce.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,264 | 409 | 11 | 00s |
-| `Derivation_PurgeDropsStub.cfg` | violates `FailClosed` | FAIL: FailClosed (as intended) | 9,163 | 2,797 | 14 | 01s |
+| `Derivation_NoLock.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 6,206 | 1,999 | 11 | 01s |
+| `Derivation_CascadeEvidence.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 6,172 | 2,450 | 9 | 01s |
+| `Derivation_PageNoVerify.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 52,827 | 14,129 | 13 | 02s |
+| `Derivation_StaleProposal.cfg` | violates `NoDeletedDerivationServed` | FAIL: NoDeletedDerivationServed (as intended) | 95,978 | 26,276 | 16 | 02s |
+| `Derivation_ReextractHides.cfg` | violates `ReextractKeepsDerivedVisible` | FAIL: ReextractKeepsDerivedVisible (as intended) | 570 | 243 | 7 | 00s |
+| `Derivation_RestoreNoLock.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,805 | 556 | 11 | 00s |
+| `Derivation_MatOnce.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,699 | 526 | 11 | 00s |
+| `Derivation_PurgeDropsStub.cfg` | violates `FailClosed` | FAIL: FailClosed (as intended) | 9,951 | 2,991 | 13 | 01s |
 | `Derivation_EffCited.cfg` | violates `AsOfNoLeak` | FAIL: AsOfNoLeak (as intended) | 135 | 47 | 7 | 00s |
-| `Derivation_TombByDocId.cfg` | violates `NoOverHiding` | FAIL: NoOverHiding (as intended) | 58 | 39 | 4 | 00s |
-| `Derivation_CasBeforeIdem.cfg` | violates `NoPhantomVersion` | FAIL: NoPhantomVersion (as intended) | 82 | 50 | 8 | 00s |
-| `Derivation_CascadeHidden.cfg` | violates `NoGhostInvalidatedServed` | FAIL: NoGhostInvalidatedServed (as intended) | 2,610 | 823 | 9 | 01s |
-| `Derivation_MatSignalOnly.cfg` | violates `MaterializeComplete` | FAIL: MaterializeComplete (as intended) | 740 | 302 | 8 | 00s |
-| `Derivation_RestoreOnlySelf.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 501 | 252 | 6 | 00s |
-| `Derivation_RestoreByVisibleTwin.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 401 | 204 | 5 | 00s |
+| `Derivation_TombByDocId.cfg` | violates `NoOverHiding` | FAIL: NoOverHiding (as intended) | 48 | 35 | 4 | 00s |
+| `Derivation_CasBeforeIdem.cfg` | violates `NoPhantomVersion` | FAIL: NoPhantomVersion (as intended) | 74 | 45 | 7 | 00s |
+| `Derivation_CascadeHidden.cfg` | violates `NoGhostInvalidatedServed` | FAIL: NoGhostInvalidatedServed (as intended) | 1,426 | 551 | 9 | 00s |
+| `Derivation_MatSignalOnly.cfg` | violates `MaterializeComplete` | FAIL: MaterializeComplete (as intended) | 747 | 299 | 8 | 00s |
+| `Derivation_RestoreOnlySelf.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 430 | 236 | 5 | 00s |
+| `Derivation_RestoreByVisibleTwin.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 653 | 331 | 6 | 00s |
+| `Derivation_LazyTwinNoLock.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 687 | 279 | 6 | 01s |
+| `Derivation_LazyTagFromLastLog.cfg` | violates `RestoreExact` | FAIL: RestoreExact (as intended) | 1,692 | 712 | 7 | 01s |
 | `Durability.cfg` | all hold | PASS | 555,786,086 | 138,507,972 | 27 | 27min 32s |
 | `Durability_Chain.cfg` | all hold | PASS | 237,637,520 | 63,006,042 | 28 | 13min 25s |
 | `Durability_IntentBeforeCommit.cfg` | violates `NoUnackedEffectOnLaterAck` | FAIL: NoUnackedEffectOnLaterAck (as intended) | 771 | 409 | 8 | 00s |
@@ -527,23 +501,24 @@ All results of this section, as run after the D25 amendment (4 workers, 10 GB he
 | `Durability_ReplayStampsCurrentEpoch.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 6,120,798 | 1,911,045 | 14 | 14s |
 | `Durability_NoSubjectLock.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 30,215,391 | 9,242,180 | 16 | 01min 07s |
 | `Durability_NoHelpPrev.cfg` | violates `IntentOrderLastWins` | FAIL: IntentOrderLastWins (as intended) | 1,908,812 | 770,234 | 19 | 07s |
-| `ShardMove.cfg` | all hold | PASS | 112,413,371 | 28,152,715 | 39 | 07min 18s |
-| `ShardMove_Live.cfg` | all hold | PASS | 12,888,037 | 2,267,141 | 38 | 04min 35s |
-| `ShardMove_ActiveWriters.cfg` | all hold | PASS | 125,927 | 23,174 | 29 | 03s |
-| `ShardMove_Twice.cfg` | all hold | PASS | 96,873 | 27,923 | 37 | 04s |
-| `ShardMove_TgtRestore.cfg` | all hold | PASS | 6,309,063 | 1,576,137 | 30 | 28s |
-| `ShardMove_UnfencedSteps.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 1,914,200 | 424,613 | 13 | 09s |
-| `ShardMove_NoReady.cfg` | violates `RollbackPossibleBeforeC` | FAIL: RollbackPossibleBeforeC (as intended) | 375,681 | 86,201 | 11 | 03s |
-| `ShardMove_RestoreNoReconcile.cfg` | violates `RestoreReconciles` | FAIL: RestoreReconciles (as intended) | 201,764 | 45,875 | 10 | 02s |
-| `ShardMove_NoVerify.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 18,768 | 6,750 | 13 | 01s |
-| `ShardMove_StampAfterCut.cfg` | violates `OneOwner` | FAIL: OneOwner (as intended) | 342,707 | 78,293 | 11 | 03s |
-| `ShardMove_SweepNotPaused.cfg` | violates `SourceStaticUnderFreeze` | FAIL: SourceStaticUnderFreeze (as intended) | 1,360 | 391 | 6 | 01s |
-| `ShardMove_CleanupNoBackup.cfg` | violates `CleanupSafe` | FAIL: CleanupSafe (as intended) | 86,349 | 22,748 | 19 | 01s |
-| `ShardMove_NoSeqAdvance.cfg` | violates `CopiedBelowTargetSeq` | FAIL: CopiedBelowTargetSeq (as intended) | 6,799 | 2,319 | 10 | 01s |
-| `ShardMove_CatalogLossNoShardTruth.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 51,684 | 14,554 | 17 | 01s |
-| `ShardMove_UnionRepair.cfg` | violates `NoResurrect` | FAIL: NoResurrect (as intended) | 45,845 | 12,596 | 17 | 02s |
-| `ShardMove_CleanupBackupBeforeActivate.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 532,683 | 147,136 | 20 | 04s |
-| `ShardMove_CopyBeforeFreeze.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 15,311 | 5,222 | 11 | 01s |
-| `ShardMove_RerunMerges.cfg` | violates `NoResurrect` | FAIL: NoResurrect (as intended) | 51,838 | 14,252 | 19 | 01s |
-| `ShardMove_ReadyBeforeIndex.cfg` | violates `ServedFromIndex` | FAIL: ServedFromIndex (as intended) | 232 | 97 | 6 | 00s |
-| `ShardMove_CutOnUnreplicatedCommit.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 53,969 | 15,137 | 17 | 01s |
+| `ShardMove.cfg` | all hold | PASS | 344,976,010 | 87,171,824 | 44 | 23min 54s |
+| `ShardMove_Live.cfg` | all hold | PASS | 55,181,170 | 9,934,803 | 43 | 21min 18s |
+| `ShardMove_ActiveWriters.cfg` | all hold | PASS | 224,803 | 40,898 | 31 | 04s |
+| `ShardMove_Twice.cfg` | all hold | PASS | 561,820 | 160,860 | 40 | 14s |
+| `ShardMove_TgtRestore.cfg` | all hold | PASS | 11,049,318 | 2,886,548 | 34 | 46s |
+| `ShardMove_TgtRestore2.cfg` | all hold | PASS | 58,900,228 | 14,099,931 | 44 | 03min 43s |
+| `ShardMove_UnfencedSteps.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 5,347,455 | 1,143,794 | 15 | 23s |
+| `ShardMove_NoReady.cfg` | violates `RollbackPossibleBeforeC` | FAIL: RollbackPossibleBeforeC (as intended) | 356,829 | 74,585 | 12 | 03s |
+| `ShardMove_RestoreNoReconcile.cfg` | violates `RestoreReconciles` | FAIL: RestoreReconciles (as intended) | 696,169 | 145,605 | 12 | 04s |
+| `ShardMove_NoVerify.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 39,462 | 13,518 | 15 | 01s |
+| `ShardMove_StampAfterCut.cfg` | violates `OneOwner` | FAIL: OneOwner (as intended) | 3,299,000 | 692,018 | 14 | 14s |
+| `ShardMove_SweepNotPaused.cfg` | violates `SourceStaticUnderFreeze` | FAIL: SourceStaticUnderFreeze (as intended) | 1,042 | 295 | 6 | 00s |
+| `ShardMove_NoSeqAdvance.cfg` | violates `CopiedBelowTargetSeq` | FAIL: CopiedBelowTargetSeq (as intended) | 14,432 | 4,590 | 11 | 01s |
+| `ShardMove_CatalogLossNoShardTruth.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 312,954 | 85,921 | 20 | 03s |
+| `ShardMove_UnionRepair.cfg` | violates `NoResurrect` | FAIL: NoResurrect (as intended) | 110,849 | 31,372 | 18 | 02s |
+| `ShardMove_CopyBeforeFreeze.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 20,540 | 7,308 | 11 | 01s |
+| `ShardMove_ReadyBeforeIndex.cfg` | violates `ServedFromIndex` | FAIL: ServedFromIndex (as intended) | 297 | 120 | 6 | 00s |
+| `ShardMove_CutOnUnreplicatedCommit.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 449,031 | 128,348 | 22 | 04s |
+| `ShardMove_NoMoveBackup.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 27,446 | 9,132 | 13 | 01s |
+| `ShardMove_ThawOnUnreplicatedAbort.cfg` | violates `NoLossNoDup` | FAIL: NoLossNoDup (as intended) | 128,564 | 42,623 | 15 | 02s |
+| `ShardMove_CatalogLossDuringFreeze.cfg` | violates `CatalogNamesOwnerAfterDone` | FAIL: CatalogNamesOwnerAfterDone (as intended) | 2,701 | 1,092 | 12 | 00s |

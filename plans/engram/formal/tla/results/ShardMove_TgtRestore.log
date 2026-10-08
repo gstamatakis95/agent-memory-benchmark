@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 12 and seed -7945466922419421417 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 29780] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 91 and seed 5462090912993204126 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 3101] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -12,19 +12,19 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module ShardMove
-Starting... (2026-10-08 12:48:13)
+Starting... (2026-10-08 16:08:57)
 Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
 (Use the -nowarning option to disable this warning.)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 12:48:13.
-Progress(14) at 2026-10-08 12:48:16: 412,654 states generated (412,654 s/min), 128,060 distinct states found (128,060 ds/min), 46,684 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 16:08:58.
+Progress(13) at 2026-10-08 16:09:01: 267,171 states generated (267,171 s/min), 86,842 distinct states found (86,842 ds/min), 37,473 states left on queue.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
-  calculated (optimistic):  val = 4.0E-7
-  based on the actual fingerprints:  val = 1.2E-7
-6309063 states generated, 1576137 distinct states found, 0 states left on queue.
-The depth of the complete state graph search is 30.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 10 and the 95th percentile is 3).
-Finished in 28s at (2026-10-08 12:48:41)
-elapsed 40s
+  calculated (optimistic):  val = 1.3E-6
+  based on the actual fingerprints:  val = 1.1E-6
+11049318 states generated, 2886548 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 34.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 11 and the 95th percentile is 3).
+Finished in 46s at (2026-10-08 16:09:43)
+elapsed 60s

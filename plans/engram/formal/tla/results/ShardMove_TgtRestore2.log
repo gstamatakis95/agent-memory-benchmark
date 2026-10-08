@@ -1,0 +1,33 @@
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 35 and seed 1494871956943615821 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 6204] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
+Parsing file /tmp/Integers.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module ShardMove
+Starting... (2026-10-08 16:35:30)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-08 16:35:30.
+Progress(13) at 2026-10-08 16:35:33: 367,229 states generated (367,229 s/min), 107,302 distinct states found (107,302 ds/min), 49,287 states left on queue.
+Progress(29) at 2026-10-08 16:36:33: 16,698,668 states generated (16,331,439 s/min), 4,344,207 distinct states found (4,236,905 ds/min), 811,571 states left on queue.
+Progress(32) at 2026-10-08 16:37:33: 32,878,861 states generated (16,180,193 s/min), 8,507,610 distinct states found (4,163,403 ds/min), 1,466,347 states left on queue.
+Progress(35) at 2026-10-08 16:38:33: 48,888,525 states generated (16,009,664 s/min), 12,147,584 distinct states found (3,639,974 ds/min), 970,720 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 3.4E-5
+  based on the actual fingerprints:  val = 7.0E-6
+58900228 states generated, 14099931 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 44.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 10 and the 95th percentile is 3).
+Finished in 03min 43s at (2026-10-08 16:39:13)
+elapsed 240s

@@ -1,5 +1,5 @@
 TLC2 Version 2.18 of 20 March 2023
-Running breadth-first search Model-Checking with fp 27 and seed -6438691724117949774 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 30159] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 11 and seed 8353646547098726804 with 4 workers on 4 cores with 9102MB heap and 64MB offheap memory [pid: 3505] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.11 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/agent-memory-benchmark/plans/engram/formal/tla/ShardMove.tla
 Parsing file /tmp/Integers.tla
 Parsing file /tmp/FiniteSets.tla
@@ -12,9 +12,9 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module ShardMove
-Starting... (2026-10-08 12:50:33)
+Starting... (2026-10-08 16:11:37)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 12:50:33.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 16:11:38.
 Error: Invariant RollbackPossibleBeforeC is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -54,10 +54,12 @@ State 1: <Initial predicate>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 0, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -77,7 +79,7 @@ State 1: <Initial predicate>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
+State 2: <Plan line 223, col 3 to line 237, col 101 of module ShardMove>
 /\ sqt = <<0, 0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
@@ -114,10 +116,12 @@ State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 0, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -137,7 +141,7 @@ State 2: <Plan line 222, col 3 to line 236, col 84 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 3: <Freeze line 241, col 3 to line 247, col 134 of module ShardMove>
+State 3: <Freeze line 242, col 3 to line 248, col 134 of module ShardMove>
 /\ sqt = <<0, 0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
@@ -174,10 +178,12 @@ State 3: <Freeze line 241, col 3 to line 247, col 134 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -197,7 +203,7 @@ State 3: <Freeze line 241, col 3 to line 247, col 134 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 4: <CopyEx line 260, col 3 to line 263, col 121 of module ShardMove>
+State 4: <CopyEx line 261, col 3 to line 264, col 121 of module ShardMove>
 /\ sqt = <<0, 0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
@@ -234,10 +240,12 @@ State 4: <CopyEx line 260, col 3 to line 263, col 121 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -294,10 +302,12 @@ State 5: <VerifyFrozen line 277, col 3 to line 279, col 98 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -354,10 +364,12 @@ State 6: <BuildIndex line 289, col 3 to line 291, col 92 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -377,16 +389,78 @@ State 6: <BuildIndex line 289, col 3 to line 291, col 92 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 7: <MakeReady line 294, col 3 to line 300, col 138 of module ShardMove>
+State 7: <MoveBackup line 296, col 3 to line 299, col 117 of module ShardMove>
 /\ sqt = <<0, 0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
-      [ own |-> [st |-> "none", ep |-> 0],
+      [ own |-> [st |-> "incoming", ep |-> 2],
         store |-> {},
         mk |-> {},
         ex |-> 0,
-        sq |-> 0,
-        idx |-> FALSE ],
+        sq |-> 2,
+        idx |-> TRUE ],
+  s1 |->
+      [ own |-> [st |-> "active", ep |-> 1],
+        store |-> {},
+        mk |-> {},
+        ex |-> 0,
+        sq |-> 2,
+        idx |-> TRUE ] ]
+/\ src = "s1"
+/\ tlc = [s2 |-> 0, s1 |-> 0]
+/\ me = 2
+/\ mk = [s2 |-> {}, s1 |-> {}]
+/\ fzt = 0
+/\ mp = "backed"
+/\ mtl = 0
+/\ cc = (c1 :> [ep |-> 1, sh |-> "s1"] @@ c2 :> [ep |-> 1, sh |-> "s1"])
+/\ store = [s2 |-> {}, s1 |-> {}]
+/\ cm = "open"
+/\ now = 0
+/\ cleaned = FALSE
+/\ frozenMk = {}
+/\ gone = {}
+/\ nCat = 0
+/\ own = [s2 |-> [st |-> "incoming", ep |-> 2], s1 |-> [st |-> "frozen", ep |-> 1]]
+/\ actMk = {}
+/\ rc = 0
+/\ ex = [s2 |-> 0, s1 |-> 0]
+/\ rep = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
+/\ actSet = {}
+/\ cat = [ep |-> 1, sh |-> "s1"]
+/\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
+/\ used = {}
+/\ tl = 0
+/\ cdirty = FALSE
+/\ tgt = "s2"
+/\ committed = {}
+/\ frozenEx = 0
+/\ fin = [s2 |-> [st |-> "none", ep |-> 0], s1 |-> [st |-> "active", ep |-> 1]]
+/\ lost = {}
+/\ zcut = FALSE
+/\ cdn = {}
+/\ nMoves = 1
+/\ idx = [s2 |-> TRUE, s1 |-> TRUE]
+/\ cex = TRUE
+/\ nBak = 0
+/\ wr = ( c1 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] @@
+  c2 :> [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0] )
+/\ frozenSet = {}
+/\ nFault = 0
+
+State 8: <MakeReady line 302, col 3 to line 309, col 138 of module ShardMove>
+/\ sqt = <<0, 0>>
+/\ nRestore = 0
+/\ bak = [ s2 |->
+      [ own |-> [st |-> "incoming", ep |-> 2],
+        store |-> {},
+        mk |-> {},
+        ex |-> 0,
+        sq |-> 2,
+        idx |-> TRUE ],
   s1 |->
       [ own |-> [st |-> "active", ep |-> 1],
         store |-> {},
@@ -414,10 +488,12 @@ State 7: <MakeReady line 294, col 3 to line 300, col 138 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 1, sh |-> "s1"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -437,16 +513,16 @@ State 7: <MakeReady line 294, col 3 to line 300, col 138 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 8: <CatFlip line 344, col 3 to line 351, col 92 of module ShardMove>
+State 9: <CatFlip line 353, col 3 to line 360, col 92 of module ShardMove>
 /\ sqt = <<0, 0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
-      [ own |-> [st |-> "none", ep |-> 0],
+      [ own |-> [st |-> "incoming", ep |-> 2],
         store |-> {},
         mk |-> {},
         ex |-> 0,
-        sq |-> 0,
-        idx |-> FALSE ],
+        sq |-> 2,
+        idx |-> TRUE ],
   s1 |->
       [ own |-> [st |-> "active", ep |-> 1],
         store |-> {},
@@ -474,10 +550,12 @@ State 8: <CatFlip line 344, col 3 to line 351, col 92 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 2, sh |-> "s2"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -497,16 +575,16 @@ State 8: <CatFlip line 344, col 3 to line 351, col 92 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 9: <Refresh line 161, col 15 to line 163, col 109 of module ShardMove>
+State 10: <Refresh line 162, col 15 to line 164, col 109 of module ShardMove>
 /\ sqt = <<0, 0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
-      [ own |-> [st |-> "none", ep |-> 0],
+      [ own |-> [st |-> "incoming", ep |-> 2],
         store |-> {},
         mk |-> {},
         ex |-> 0,
-        sq |-> 0,
-        idx |-> FALSE ],
+        sq |-> 2,
+        idx |-> TRUE ],
   s1 |->
       [ own |-> [st |-> "active", ep |-> 1],
         store |-> {},
@@ -534,10 +612,12 @@ State 9: <Refresh line 161, col 15 to line 163, col 109 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 2, sh |-> "s2"]
 /\ sq = [s2 |-> 2, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -557,16 +637,16 @@ State 9: <Refresh line 161, col 15 to line 163, col 109 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 10: <Begin line 168, col 3 to line 174, col 108 of module ShardMove>
+State 11: <Begin line 169, col 3 to line 175, col 108 of module ShardMove>
 /\ sqt = <<2, 0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
-      [ own |-> [st |-> "none", ep |-> 0],
+      [ own |-> [st |-> "incoming", ep |-> 2],
         store |-> {},
         mk |-> {},
         ex |-> 0,
-        sq |-> 0,
-        idx |-> FALSE ],
+        sq |-> 2,
+        idx |-> TRUE ],
   s1 |->
       [ own |-> [st |-> "active", ep |-> 1],
         store |-> {},
@@ -594,10 +674,12 @@ State 10: <Begin line 168, col 3 to line 174, col 108 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 0, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 2, sh |-> "s2"]
 /\ sq = [s2 |-> 3, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {1}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -617,16 +699,16 @@ State 10: <Begin line 168, col 3 to line 174, col 108 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-State 11: <Commit line 177, col 3 to line 185, col 107 of module ShardMove>
+State 12: <Commit line 178, col 3 to line 186, col 107 of module ShardMove>
 /\ sqt = <<2, 0>>
 /\ nRestore = 0
 /\ bak = [ s2 |->
-      [ own |-> [st |-> "none", ep |-> 0],
+      [ own |-> [st |-> "incoming", ep |-> 2],
         store |-> {},
         mk |-> {},
         ex |-> 0,
-        sq |-> 0,
-        idx |-> FALSE ],
+        sq |-> 2,
+        idx |-> TRUE ],
   s1 |->
       [ own |-> [st |-> "active", ep |-> 1],
         store |-> {},
@@ -654,10 +736,12 @@ State 11: <Commit line 177, col 3 to line 185, col 107 of module ShardMove>
 /\ rc = 0
 /\ ex = [s2 |-> 1, s1 |-> 0]
 /\ rep = FALSE
-/\ rr = FALSE
+/\ rview = [s2 |-> [st |-> "unread", ep |-> 0], s1 |-> [st |-> "unread", ep |-> 0]]
 /\ actSet = {}
 /\ cat = [ep |-> 2, sh |-> "s2"]
 /\ sq = [s2 |-> 3, s1 |-> 2]
+/\ abp = "none"
+/\ abt = FALSE
 /\ used = {1}
 /\ tl = 0
 /\ cdirty = FALSE
@@ -677,8 +761,8 @@ State 11: <Commit line 177, col 3 to line 185, col 107 of module ShardMove>
 /\ frozenSet = {}
 /\ nFault = 0
 
-375681 states generated, 86201 distinct states found, 51603 states left on queue.
-The depth of the complete state graph search is 11.
-The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 11 and the 95th percentile is 7).
-Finished in 03s at (2026-10-08 12:50:36)
+356829 states generated, 74585 distinct states found, 41934 states left on queue.
+The depth of the complete state graph search is 12.
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 11 and the 95th percentile is 6).
+Finished in 03s at (2026-10-08 16:11:41)
 elapsed 20s

@@ -16,6 +16,7 @@ Storage_Update.cfg	violates ContentImmutable
 Storage_FlipEarly.cfg	violates VectorGenerationConsistent
 Storage_PurgeUnmarked.cfg	violates PurgeNeedsMarker
 Storage_AutoRepair.cfg	violates RebuildBeforeRepair
+Storage_PerIndexHygiene.cfg	violates RebuildBeforeRepair
 Derivation.cfg	pass
 Derivation_Page.cfg	pass
 Derivation_Live.cfg	pass
@@ -29,6 +30,9 @@ Derivation_MatOnce.cfg	violates RestoreExact
 Derivation_PurgeDropsStub.cfg	violates FailClosed
 Derivation_EffCited.cfg	violates AsOfNoLeak
 Derivation_TombByDocId.cfg	violates NoOverHiding
+Derivation_CasBeforeIdem.cfg	violates NoPhantomVersion
+Derivation_CascadeHidden.cfg	violates NoGhostInvalidatedServed
+Derivation_MatSignalOnly.cfg	violates MaterializeComplete
 Durability.cfg	pass
 Durability_Chain.cfg	pass
 Durability_IntentBeforeCommit.cfg	violates NoUnackedEffectOnLaterAck
@@ -42,9 +46,14 @@ Durability_AckBeforeIntent.cfg	violates AckImpliesIntent
 Durability_ClockOrder.cfg	violates IntentOrderLastWins
 Durability_UnorderedReplay.cfg	violates IntentOrderLastWins
 Durability_NoEpochGuard.cfg	violates IntentOrderLastWins
+Durability_CatalogLossNoBlobFloor.cfg	violates AckedDeleteSurvives
+Durability_ReplayStampsCurrentEpoch.cfg	violates IntentOrderLastWins
+Durability_NoSubjectLock.cfg	violates IntentOrderLastWins
 ShardMove.cfg	pass
 ShardMove_Live.cfg	pass
 ShardMove_ActiveWriters.cfg	pass
+ShardMove_Twice.cfg	pass
+ShardMove_TgtRestore.cfg	pass
 ShardMove_ZeroMargin.cfg	pass
 ShardMove_UnfencedSteps.cfg	violates NoLossNoDup
 ShardMove_NoTimelineCheck.cfg	pass
@@ -56,3 +65,8 @@ ShardMove_IdKeyedRecopy.cfg	violates MoveTerminatesActive
 ShardMove_MergeNoDeletes.cfg	violates MoveTerminatesActive
 ShardMove_SweepNotPaused.cfg	violates MoveTerminatesActive
 ShardMove_CleanupNoBackup.cfg	violates CleanupSafe
+ShardMove_NoSeqAdvance.cfg	violates CopiedBelowTargetSeq
+ShardMove_NoSeqAdvanceTwice.cfg	violates MoveTerminatesActive
+ShardMove_VerifyBeforeCatchUp.cfg	violates MoveTerminatesActive
+ShardMove_CatalogLossNoShardTruth.cfg	violates NoLossNoDup
+ShardMove_CleanupTimeGate.cfg	violates NoLossNoDup

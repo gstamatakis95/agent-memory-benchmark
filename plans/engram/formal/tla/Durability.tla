@@ -69,9 +69,11 @@
 (*                     marker transaction is TxnBegin (reads the subject's *)
 (*                     previous entry = prev_operation_id) and Commit.     *)
 (*   SubjectLock      TRUE   (design) TxnBegin waits while another         *)
-(*                     transaction of the subject is open (advisory lock   *)
-(*                     on the fact); FALSE: both read the same prev, the   *)
-(*                     chain forks and replay order is unspecified.        *)
+(*                     transaction of the subject is open or has not yet   *)
+(*                     put its intent (advisory lock on the fact, held     *)
+(*                     through the intent put); FALSE: both read the same  *)
+(*                     prev, the chain forks and replay order is           *)
+(*                     unspecified.                                        *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, Sequences
 
@@ -124,7 +126,11 @@ Issued == {i \in OpIds : ops[i].ph # "none"}
 Live(i) == ops[i].ph \in {"new", "committed"}
 
 -----------------------------------------------------------------------------
-LockHeld(s) == \E j \in OpIds : S(j) = s /\ ops[j].ph = "new" /\ ops[j].rd >= 0
+\* The subject lock is held from TxnBegin through the put of the transaction's own intent (a session-level advisory
+\* lock, not a transaction-level one): a successor must not commit, and so must not put its intent, while the
+\* predecessor's intent is still missing -- replay would apply the successor first (found by Durability_Chain).
+LockHeld(s) == \E j \in OpIds : S(j) = s /\ ((ops[j].ph = "new" /\ ops[j].rd >= 0)
+                                         \/ (ops[j].ph = "committed" /\ ops[j].obs = j /\ j \notin intents))
 
 Issue ==
   /\ nIssued < N /\ sst = "active"
@@ -208,27 +214,28 @@ RestoreTo(p) ==
   /\ fl' = IF FloorMode = "target" THEN p ELSE IF fl < p THEN fl ELSE p
   /\ bf' = IF bf < p THEN bf ELSE p                      \* the blob-store floor record, written before the replay (N146)
   /\ ep' = ep + 1
-  /\ UNCHANGED <<t, ops, intents, nIssued, cn, bf, nCat>>
+  /\ UNCHANGED <<t, ops, intents, nIssued, cn, nCat>>
 
 \* CatalogRestore: the catalog is restored from a backup (or fails over asynchronously) and its floor goes back to
-\* an earlier, higher value; the blob-store record is not affected.
+\* its initial (highest) value; the blob-store record is not affected.
 CatalogRestore ==
   /\ nCat < MaxCatLoss /\ fl < MaxT + 1
-  /\ \E v \in (fl + 1)..(MaxT + 1) : fl' = v
+  /\ fl' = MaxT + 1              \* the oldest value is the worst case: the replay window only narrows as the floor rises
   /\ nCat' = nCat + 1
   /\ UNCHANGED <<t, ops, intents, dbq, sst, nIssued, nRestore, cn, ep, bf>>
 
 RFloor == IF BlobFloor THEN (IF fl < bf THEN fl ELSE bf) ELSE fl
 InWindow(o) == o \in intents /\ ops[o].at + Margin >= RFloor
-Pending == {o \in intents : InWindow(o) /\ o \notin db}
+\* The epoch guard: an intent whose recorded epoch is older than that of an applied entry of its subject is
+\* skipped (it counts as settled; replay never applies it).
+Skipped(o) == EpochGuard /\ \E e \in Entries : (S(e.op) = S(o) /\ K(e.op) # "ret") /\ e.ep > ops[o].ep
+Pending == {o \in intents : InWindow(o) /\ o \notin db /\ ~Skipped(o)}
 
 Before(o, o2) == ops[o].at < ops[o2].at \/ (ops[o].at = ops[o2].at /\ o <= o2)
 
 \* Admin variant of the marker transaction: same effect, fence bypassed.
 Replay(o) ==
   /\ sst = "restoring" /\ o \in Pending
-  \* the guard compares RECORDED epochs: the entry's own (e.ep) against the intent's (N150)
-  /\ (EpochGuard => \A e \in Entries : (S(e.op) = S(o) /\ K(e.op) # "ret") => e.ep <= ops[o].ep)
   /\ CASE OrderMode = "chain" -> ops[o].prev = 0 \/ ops[o].prev \notin Pending
        [] OrderMode = "clock" -> \A o2 \in Pending : S(o2) = S(o) => Before(o, o2)
        [] OTHER -> TRUE

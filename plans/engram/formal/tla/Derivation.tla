@@ -448,8 +448,8 @@ AsOfNoLeak ==
 MaterializeComplete ==
   /\ \A d \in Docs : ms[d] \in {"materialized", "purged", "done"} =>
        \A x \in Versions : (GDeriv(x[1], x[2]) \cap Victims(d) # {}) => Perm(x[1], x[2])
-  \* N145(2): a stamped invalidation (materialized_at set) has its derived_hidden rows on every node ...
-  /\ \A f \in mat : \A n \in Nodes : RowsNode(n, {f}, {}) \subseteq dh
+  \* N145(2): a stamped invalidation (materialized_at set) is covered by derived_hidden rows (of any cause) on every node ...
+  /\ \A f \in mat : \A n \in Nodes : \A w \in 1..Len(vers[n]) : (f \in HitF(n, w, {f})) => RowCovered(n, w)
   \* ... and an unstamped one is never stranded: while one exists and no run is in progress, Materialize
   \* is enabled (found from the marker, not from a signal that may be lost).
   /\ (hidden \ mat # {} /\ matPhase = "idle") => MatWork

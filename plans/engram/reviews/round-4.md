@@ -2302,3 +2302,75 @@ Blockers C-1, C-2, C-3 → decisions 1, 2, 2. Majors C-4…C-11 → 4, 4, 1, 2, 
 5, 1, 6, 6, 6, 6; A-1…A-4 → 6, 3, 3, 3. Minors and nits → §7, the section naming them, or the Go API
 list. The round-3 principle is unchanged; each change is local to a writer, a purge target, a key or
 a budget, and each has a configuration that must fail without it.
+
+## Disposition (all 63 findings)
+
+Every finding maps to a register row (`00-decision-register.md`; D23 holds N135 to N141, rewritten rows keep their ids and carry "(rev. D23)"). The advice's proposed ids became: N135 evidence (N135), N136 commit rule (rewritten N120, N121), N137 derived purge (N136), N138 durability (rewritten N122, N123, N134), N139 moves (rewritten N124, N125, N104, plus N137 for the table classes), N140 plan (N138; shard size in N114, WAL pacing in N119), N141 minor folds (N139); N140 and N141 of the register are new (code API; specs and schedule). Nothing is rejected outright; where a recommended alternative was not taken, the Note says why. Two points go beyond the advice: a duplicate delete attempt re-puts the committed marker's own intent idempotently (a retry after a crash between commit and put would otherwise be acknowledged with no intent), and M0.4's Temporal gate is raised to the peak that §9 sizes for.
+
+**Judgement calls.** Shard size: 8 M target / 12 M cap / 600 GB / NVMe ≥ 50 k IOPS adopted (N114; the advice offers no better option, and 10 M in a 128 GB container is rejected because the hot set exceeds usable cache). Owner-keyed blobs: adopted, cross-document dedup of bodies is lost and paid in storage (N104). Intent after commit: an acknowledged delete or invalidation survives restore and failover; a committed-but-unacknowledged one may be lost, and the client's retry re-applies it (N122, D16).
+
+| Finding | Disposition | Register id | Note |
+|---|---|---|---|
+| C-1 | Accepted | N135, N113, N42 | Evidence tables lose the FK to `facts`; evidence dies with its version row. |
+| C-2 | Accepted | N120 | `CommitPageVersion` re-verifies under the shared lock against all open tombstones. |
+| C-3 | Accepted | N120, N121 | `base_version` recorded and checked; otherwise discard and re-route. Inheriting `root(base)` rejected: a visible but superseded base still overwrites a rebuild. |
+| C-4 | Accepted | N134, N122 | Floor never raised, held in the catalog. Raise-after-backup rejected: couples the floor to pgBackRest. |
+| C-5 | Accepted, modified | N122 | Intent put after the marker commit. Duplicate attempts re-put the committed marker's own intent (put-if-absent) instead of putting nothing. Separate `.committed` record rejected: two puts per delete. |
+| C-6 | Accepted | N135, N58, N119 | Re-extraction is a write; derived predicates read `invalidate` only; `REEXTRACTED_FACTS` purge after 1 h. |
+| C-7 | Accepted | N120, N133, N141 | Cause-tagged rows are the design; the `Restore` lock is load-bearing; `_RestoreNoLock` must fail. |
+| C-8 | Accepted | N137, N124, N113 | Three classes; `ins_seq` re-copy key; `idempotency_keys` and `observation_sources` move to merge-diff. |
+| C-9 | Accepted | N104 | Owner-keyed blobs. Reference counting rejected: reverse index plus adoption race. |
+| C-10 | Accepted | N125, N123 | Catalog CAS `cutover -> committed` is the point of no return; restore CASes `cutover -> rolled_back`. |
+| C-11 | Accepted | N121, N43 | Proposals keyed `(batch_key, attempt)`; no `DELETE`; batch `applied` state; all-skip batches stamp. |
+| C-12 | Accepted | N119 | `documents` row deleted only when no higher open tombstone and no version row remains. |
+| C-13 | Accepted | N123, N101, N122 | `restore_delete` edge; `deleting` namespaces excluded from the restore catalog flips. |
+| C-14 | Accepted | N117, N135 | SQL rule wins: version current at `T`; nothing served when hidden; retirement filtered by its own time. |
+| C-15 | Accepted | N135, N115 | `fact_hidden` keyed by cause; `Restore` deletes only `invalidate`. |
+| C-16 | Accepted | N122 | Per-subject `prev_operation_id` chain replaces clock order; no NTP bound needed. |
+| C-17 | Accepted | N115 | `expected_version` compared inside the marker transaction. |
+| C-18 | Accepted | N117, N135 | Predicates fail closed; DerivedPurge keeps stubs so the row always exists. |
+| C-19 | Accepted | N139, N133, N95 | Ids minted per attempt; 30 s timeouts on admin and move; watermark guard uses the relay's last `seq`. |
+| C-20 | Accepted | N124, N125 | `RetainBackfill` parents get an `operations` row; drain bound 120 s; `thaw_move` while the target is unreachable. |
+| C-21 | Accepted | N141 | Missing actions added to each spec; §7.1 states what each spec omits. |
+| C-22 | Accepted | N123 | Scratch move ends with an intent replay before `ready`. |
+| C-23 | Accepted | N113, N137 | Class list generated from `COMMENT ON TABLE` tags; `*_version_meta` are write-once inserts. |
+| P-1 | Accepted | N137, N124 | Same fix as C-8; whole-namespace checks move before the freeze; freeze formula restated. |
+| P-2 | Accepted | N135, N119, N116 | `REEXTRACTED_FACTS` purge; `fact_hidden(invalidate)` tested by anti-join, never an array. `chunk_extraction` join rejected: second currency mechanism. |
+| P-3 | Accepted | N138 | Exact path below θ, HNSW with `max_scan_tuples` above; seq scan forbidden in arm transactions. |
+| P-4 | Accepted | N138, N112, N119 | `purged_since_build` counter; rebuild at 1 % or 2 k; `vacuum_index_cleanup = off`. |
+| P-5 | Accepted | N114, D3 | Measured IOPS and hot set; NVMe ≥ 50 k IOPS; M0.6 re-derives the table. |
+| P-6 | Accepted | N119 | Purge paced to 25 MB/s of WAL; `wal_compression = zstd`; differential backup after deletes and moves. |
+| P-7 | Accepted | N138 | `maintenance_work_mem` per build, serialised builds, `shm_size = 8g`. |
+| P-8 | Accepted | N138 | `requested -> building -> ready` or `failed` with lease; invalid indexes dropped first; rollback drops by name. |
+| P-9 | Accepted | N133, N138 | Index runner holds `engram_migrate`; admin and move timeouts and pools; `engram_entity_fuzzy` revoked from relay and move. |
+| P-10 | Accepted | N126, N138 | Short `READ COMMITTED` ranges bounded by the `ins_seq` watermark; runner refuses builds under an old `backend_xmin`. |
+| P-11 | Accepted | N114, D3 | 12 M hard cap on a 600 GB volume; signals from relation bytes. |
+| P-12 | Accepted | N123, N122 | Blob gc skips namespaces mid-recovery; source blob prefix kept 28 days; one intent per namespace for a tenant delete. |
+| P-13 | Accepted | N122 | Same chain order as C-16. |
+| P-14 | Accepted | N139 | One exclusive document-lock timeout generated from the GUC table. |
+| P-15 | Accepted | N115 | The tombstone stores the delete event's `seq`. |
+| A-1 | Accepted | N138, N114 | Selectivity-aware plan; `fact_type` copied onto `fact_vectors`; post-Top-K filtering rejected (truncation). |
+| A-2 | Accepted | N136, D16 | `DerivedPurge` reduces covered versions to content-free stubs; transcripts purged. Outright deletion rejected: breaks the D9 range rule. |
+| A-3 | Accepted | N136, N115 | Marker clears content columns; DocumentService returns a tombstone view. |
+| A-4 | Accepted (option b) | N126, D16 | `hidden_overlay` in the manifest; "every part applies the predicate" deleted. Expiring on every `Invalidate` rejected: full re-sync per curation click. |
+| A-5 | Accepted | N140 | `ReadSession` with one short read transaction per arm. |
+| A-6 | Accepted | N140, N133 | Cycles broken (`outbox.Writer` in `store`, `internal/txn`, `router` free of `authz`); `Deps` completed; `workflows.Client` split. |
+| A-7 | Accepted | N136 | Per-kind workflow mapping; `DELETE_*` non-cancellable. |
+| A-8 | Accepted | N139 | CHECK lists generated from proto enums; one marker transaction. |
+| A-9 | Accepted | N139 | Baseline `main@HEAD~1` until `v1.0.0`; names reserved. |
+| A-10 | Accepted | N139 | One code per detail type, generated; `NAMESPACE_DELETING` for the delete freeze. |
+| A-11 | Accepted | N139, N122, N11 | 40 s caps for delete-class RPCs and `Restore`; `DeleteTenant` acks after catalog `deleting` plus the tenant intent. |
+| A-12 | Accepted | N139 | A new `operation_id` per retry. `RetryOperation` RPC not added. |
+| A-13 | Accepted | N139, N116 | Metadata filters resolve into `$allowed_docs` with a GIN index. |
+| A-14 | Accepted | N139, D12 | `page_versions.text` with BM25 and `page_version_vectors`. |
+| A-15 | Accepted | N139 | Constants generated by `make gen-docs`. |
+| A-16 | Accepted | N139, D3, N114, N130 | Sizes, Reflect $0.114, week 23 corrected; M0.4 gate covers the stated peak or §9 states the lower tested one. |
+| A-17 | Accepted | N139, D3 | Throughput formula with `N_workers`; gates name their gateway profile. |
+| A-18 | Accepted | N141 | M0.7 and M0.8 re-scoped; front matter and README follow §7.1; Lake skeleton added. |
+| A-19 | Accepted | N135, N117 | Zero-source versions not served; the empty-source retire is exempt from `Reserve`. |
+| A-20 | Accepted | N135, N115 | Same fix as C-15. |
+| A-21 | Accepted | N126, N119 | Debounced system `ExportSnapshot` after a delete expires the latest snapshot. |
+| A-22 | Accepted | N139, D12 | `search_pages` first forced step once pages exist; `GetDocumentBody`, `ListTags`, `UpdateDocumentTags` added. |
+| A-23 | Accepted | D13, N139 | `tenant.admin` tenant-bound; `engram.operator` fleet-wide with its own audience. |
+| A-24 | Accepted | N140, N133 | `reflectagent`, typed ids, `uuid` stated as the leaf dependency. |
+| A-25 | Accepted | N139, D2, D12, N116 | Register drift corrected in place; README still cites D22 only and is outside this edit. |

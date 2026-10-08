@@ -1,24 +1,19 @@
 // memory/v1/memory.proto
 //
-// MemoryService: the core write (Retain), read (Recall, GetMemory,
-// ListMemories, BatchGetMemories), reasoning (Reflect) and curation
-// (Invalidate, Restore) surface of Engram.
+// MemoryService: the core write (Retain), read (Recall, GetMemory, ListMemories, BatchGetMemories), reasoning (Reflect)
+// and curation (Invalidate, Restore) surface of Engram.
 //
 // Streaming decisions:
 //   * Retain is UNARY. Its ack means "the ingest-ledger row and the operation
-//     row are durable" (decision D16), nothing more; there is no incremental
-//     result to stream. Per-chunk visibility is observed through
-//     OperationService (GetOperation/WaitOperation), which keeps the
-//     long-lived state on the worker side instead of pinning a stream to one
-//     API replica for minutes behind a per-request load balancer.
+//     row are durable" (decision D16), nothing more; there is no incremental result to stream. Per-chunk visibility is
+//     observed through OperationService (GetOperation/WaitOperation), which keeps the long-lived state on the worker
+//     side instead of pinning a stream to one API replica for minutes behind a per-request load balancer.
 //   * Recall is SERVER-STREAMING: results are sent in rank order in flushes of
-//     10 after packing, followed by one trailing RecallStats message (decision
-//     D10). The honest rationale is that stats trailer and future progressive
-//     arms, not message size (a HIGH response is far below 4 MiB); a unary
-//     alias was rejected as a second contract test matrix (decision N129).
+//     10 after packing, followed by one trailing RecallStats message (decision D10). The honest rationale is that stats
+//     trailer and future progressive arms, not message size (a HIGH response is far below 4 MiB); a unary alias was
+//     rejected as a second contract test matrix (decision N129).
 //   * Reflect is SERVER-STREAMING: token deltas, tool calls/results and
-//     citations are emitted as they happen during a bounded agentic loop that
-//     may run for up to 300 s (decision D12).
+//     citations are emitted as they happen during a bounded agentic loop that may run for up to 300 s (decision D12).
 syntax = "proto3";
 
 package memory.v1;
@@ -32,146 +27,111 @@ import "memory/v1/operation.proto";
 
 option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
 
-// MemoryService is the primary data-plane service. Every method requires a
-// deadline, an `authorization: Bearer <jwt>` metadata entry whose `tenant_id`
-// claim equals `namespace.tenant_id` and whose `ns` allowlist contains
-// `namespace.namespace_id` (or whose `ns_group` claim names the namespace's
-// tenant-defined group, decision N65), and the scope noted per method.
+// MemoryService is the primary data-plane service. Every method requires a deadline, an `authorization: Bearer <jwt>`
+// metadata entry whose `tenant_id` claim equals `namespace.tenant_id` and whose `ns` allowlist contains
+// `namespace.namespace_id` (or whose `ns_group` claim names the namespace's tenant-defined group, decision N65), and
+// the scope noted per method.
 service MemoryService {
-  // Retain submits one or more items for asynchronous ingestion. Scope
-  // memory.write. Items are grouped by document_id; each distinct document_id
-  // becomes one document version and one Operation (kind RETAIN_DOCUMENT).
-  // The call returns as soon as the ingest-ledger rows and the operation rows
-  // are committed; facts become visible chunk by chunk afterwards. Not
-  // read-your-writes: use OperationService.WaitOperation as the read barrier
-  // (after SUCCEEDED, every fact of the operation's version is visible unless
-  // `superseded_by` is set; decision N127).
+  // Retain submits one or more items for asynchronous ingestion. Scope memory.write. Items are grouped by document_id;
+  // each distinct document_id becomes one document version and one Operation (kind RETAIN_DOCUMENT). The call returns
+  // as soon as the ingest-ledger rows and the operation rows are committed; facts become visible chunk by chunk
+  // afterwards. Not read-your-writes: use OperationService.WaitOperation as the read barrier (after SUCCEEDED, every
+  // fact of the operation's version is visible unless `superseded_by` is set; decision N127).
   rpc Retain(RetainRequest) returns (RetainResponse);
   // Recall runs the no-LLM retrieval pipeline (semantic, lexical, graph,
   // temporal and chunk arms in parallel → RRF k=60 → cross-encoder rerank →
   // bounded boosts → token-budget packing) and streams the packed results in
-  // rank order, then one RecallStats. Every arm applies the read-time
-  // visibility predicate over the namespace's delete and curation markers
-  // (decision N116), so a document delete or Invalidate is effective at its
-  // ack. Scope memory.read. Deadline ≤ 10 s.
+  // rank order, then one RecallStats. Every arm applies the read-time visibility predicate over the namespace's delete
+  // and curation markers (decision N116), so a document delete or Invalidate is effective at its ack. Scope
+  // memory.read. Deadline ≤ 10 s.
   rpc Recall(RecallRequest) returns (stream RecallResponse);
-  // Reflect answers a question with a bounded agentic loop over observations,
-  // facts and pages (forced searches first, then ≤ 10 free iterations,
-  // ≤ 100k context tokens, ≤ 300 s wall). Scope memory.read. Streams token
-  // deltas, tool steps, verified citations, the final answer and stats.
-  // Deadline ≤ 330 s.
+  // Reflect answers a question with a bounded agentic loop over observations, facts and pages (forced searches first,
+  // then ≤ 10 free iterations, ≤ 100k context tokens, ≤ 300 s wall). Scope memory.read. Streams token deltas, tool
+  // steps, verified citations, the final answer and stats. Deadline ≤ 330 s.
   rpc Reflect(ReflectRequest) returns (stream ReflectResponse);
-  // GetMemory fetches one fact, observation or chunk by id. Scope memory.read.
-  // An invalidated fact is FOUND and returned with invalidated_at set (it is
-  // hidden from Recall, Reflect and ListMemories only; decision N157, review
-  // A-15). Observation and page versions are read through the read side's
-  // derived readers, so GetMemory is served during a move freeze like any
-  // other read.
+  // GetMemory fetches one fact, observation or chunk by id. Scope memory.read. An invalidated fact is FOUND and
+  // returned with invalidated_at set (it is hidden from Recall, Reflect and ListMemories only; decision N157, review
+  // A-15). Observation and page versions are read through the read side's derived readers, so GetMemory is served
+  // during a move freeze like any other read.
   rpc GetMemory(GetMemoryRequest) returns (GetMemoryResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // ListMemories pages through memories with structural filters (no
-  // relevance ranking). Scope memory.read.
+  // ListMemories pages through memories with structural filters (no relevance ranking). Scope memory.read.
   rpc ListMemories(ListMemoriesRequest) returns (ListMemoriesResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // BatchGetMemories fetches up to 100 memories by id in one round trip;
-  // missing ids are reported, not errors. An invalidated fact is found (with
-  // invalidated_at set), exactly as in GetMemory; only an unknown id or one
-  // covered by a delete tombstone is missing (decision N157, review A-15).
-  // Scope memory.read.
+  // BatchGetMemories fetches up to 100 memories by id in one round trip; missing ids are reported, not errors. An
+  // invalidated fact is found (with invalidated_at set), exactly as in GetMemory; only an unknown id or one covered by
+  // a delete tombstone is missing (decision N157, review A-15). Scope memory.read.
   rpc BatchGetMemories(BatchGetMemoriesRequest) returns (BatchGetMemoriesResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // Invalidate soft-hides one FACT from Recall, Reflect and ListMemories
-  // (GetMemory still reads it, with invalidated_at set). The synchronous part is one committed `fact_hidden(invalidate)`
-  // marker row (decisions N115, N116) followed by the intent object (N122,
-  // put after the commit, before the ack): no row is updated and nothing is
-  // walked. The marker row does not depend on the fact row (no foreign key,
-  // N145): it survives the purge of the fact it names. The curation subject
-  // is the pair (document_id, content_hash) of the fact named (decision
-  // N162): the same transaction hides every live fact of the subject (the
-  // fact and its same-document, same-content twins) under one subject lock,
-  // stamps their markers with one invalidation id, writes one deletion-log
-  // row and one intent, and a twin created later by re-extraction is hidden
-  // with the same stamp. Every observation or page version whose evidence segment names
-  // the fact is hidden at read time by the same predicate (N117), and the
-  // affected observations are scheduled for a root rebuild. Exports are not
-  // expired by it; they honour it from the next snapshot and meanwhile
-  // through the manifest's hidden_overlay (decision N126). Reversible:
-  // Restore deletes the marker and nothing else encodes the invalidation, so
-  // it is exact. Invalidating an already invalidated fact succeeds and changes
-  // no visibility, but it still writes its own deletion-log row and intent
-  // (decisions N139, N143). The ack follows a re-read of the marker after the
-  // intent put; if a restore removed it, the call returns UNAVAILABLE and the
-  // client retries (decision N143). Scope memory.write. Milliseconds in the
-  // common case.
+  // Invalidate soft-hides one FACT from Recall, Reflect and ListMemories (GetMemory still reads it, with invalidated_at
+  // set). The synchronous part is one committed `fact_hidden(invalidate)` marker row (decisions N115, N116) followed by
+  // the intent object (N122, put after the commit, before the ack): no row is updated and nothing is walked. The marker
+  // row does not depend on the fact row (no foreign key, N145): it survives the purge of the fact it names. The
+  // curation subject is the pair (document_id, content_hash) of the fact named (decision N162): the same transaction
+  // hides every live fact of the subject (the fact and its same-document, same-content twins) under one subject lock,
+  // stamps their markers with one invalidation id, writes one deletion-log row and one intent, and a twin created later
+  // by re-extraction is hidden with the same stamp. Every observation or page version whose evidence segment names the
+  // fact is hidden at read time by the same predicate (N117), and the affected observations are scheduled for a root
+  // rebuild. Exports are not expired by it; they honour it from the next snapshot and meanwhile through the manifest's
+  // hidden_overlay (decision N126). Reversible:
+  // Restore deletes the marker and nothing else encodes the invalidation, so it is exact. Invalidating an already
+  // invalidated fact succeeds and changes no visibility, but it still writes its own deletion-log row and intent
+  // (decisions N139, N143). The ack follows a re-read of the marker after the intent put; if a restore removed it, the
+  // call returns UNAVAILABLE and the client retries (decision N143). Scope memory.write. Milliseconds in the common
+  // case.
   rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
-  // Restore deletes the `invalidate` markers that carry the same invalidation
-  // stamp as the named fact (the whole subject, twins included, decision
-  // N162) and the derived-hidden rows that carry their cause (decisions N115,
-  // N135); nothing is looked up by current hidden state, so it is exact. A
-  // `reextract` marker is never touched, so a restore cannot resurrect a
-  // stale extraction. It is possible after the fact's own row was purged,
-  // because the marker outlives it, but not after its document was deleted
-  // (NOT_FOUND{DOCUMENT_DELETED}: the delete purged the marker).
-  // Visibility flips at commit; the intent object follows, as for Invalidate.
-  // Restore takes the exclusive derivation lock and may wait for a running
-  // consolidation or page commit (one attempt of up to 35 s), so its deadline
-  // cap is 40 s (decision N139). Scope memory.write.
+  // Restore deletes the `invalidate` markers that carry the same invalidation stamp as the named fact (the whole
+  // subject, twins included, decision N162) and the derived-hidden rows that carry their cause (decisions N115, N135);
+  // nothing is looked up by current hidden state, so it is exact. A `reextract` marker is never touched, so a restore
+  // cannot resurrect a stale extraction. It is possible after the fact's own row was purged, because the marker
+  // outlives it, but not after its document was deleted (NOT_FOUND{DOCUMENT_DELETED}: the delete purged the marker).
+  // Visibility flips at commit; the intent object follows, as for Invalidate. Restore takes the exclusive derivation
+  // lock and may wait for a running consolidation or page commit (one attempt of up to 35 s), so its deadline cap is 40
+  // s (decision N139). Scope memory.write.
   rpc Restore(RestoreRequest) returns (RestoreResponse);
 }
 
-// RetainItem is one unit of raw input. Items sharing a document_id form one
-// document version, in list order.
+// RetainItem is one unit of raw input. Items sharing a document_id form one document version, in list order.
 message RetainItem {
-  // Raw text or markdown, 1 byte to 1 MiB (UTF-8). Stored verbatim in the
-  // append-only ingest ledger and in blob storage.
+  // Raw text or markdown, 1 byte to 1 MiB (UTF-8). Stored verbatim in the append-only ingest ledger and in blob
+  // storage.
   string content = 1;
-  // When the content was produced (e.g. the message time). Required. The
-  // server sets `mentioned_at` of every fact and chunk extracted from it to
-  // exactly this value: it is the only `as_of` key and cannot be overridden
-  // by the client or moved by the extractor (decision D9, review F-2). A
-  // source that quotes older material gets the older date in `said_at`.
-  // Timestamps within a document may regress (re-ingest, benchmark replays);
-  // they are accepted and clamped up to the running maximum when chunks are
-  // built (decision N86), and the operation result reports
+  // When the content was produced (e.g. the message time). Required. The server sets `mentioned_at` of every fact and
+  // chunk extracted from it to exactly this value: it is the only `as_of` key and cannot be overridden by the client or
+  // moved by the extractor (decision D9, review F-2). A source that quotes older material gets the older date in
+  // `said_at`. Timestamps within a document may regress (re-ingest, benchmark replays); they are accepted and clamped
+  // up to the running maximum when chunks are built (decision N86), and the operation result reports
   // OperationResult.timestamps_clamped.
   google.protobuf.Timestamp timestamp = 2;
-  // Free-text context given to the extractor ("chat with Alice about the
-  // Q3 plan"), ≤ 2 KiB. Not searchable; stored on the document version.
+  // Free-text context given to the extractor ("chat with Alice about the Q3 plan"), ≤ 2 KiB. Not searchable; stored on
+  // the document version.
   string context = 3;
-  // Client-chosen upsert key, ≤ 256 bytes, unique per namespace. Empty: the
-  // server mints an id and the item becomes a standalone document (its id is
-  // returned in RetainResponse.document_ids). When the request carries an
-  // operation_id the minted id is UUIDv5(operation_id, "item/" ‖ index), so
-  // a retry reproduces it (decision N127); without an operation_id it is a
-  // fresh UUIDv7 and the retain is NOT replay-safe.
+  // Client-chosen upsert key, ≤ 256 bytes, unique per namespace. Empty: the server mints an id and the item becomes a
+  // standalone document (its id is returned in RetainResponse.document_ids). When the request carries an operation_id
+  // the minted id is UUIDv5(operation_id, "item/" ‖ index), so a retry reproduces it (decision N127); without an
+  // operation_id it is a fresh UUIDv7 and the retain is NOT replay-safe.
   string document_id = 4;
-  // Tags of the item; ≤ 32 tags (decision N32), each 1-64 bytes, exact-match
-  // strings. Tags are item-level and live on the DOCUMENT: the document's tag
-  // set is the union over its items, and every fact and chunk is filtered
-  // through its document (decision N116). Filters, never security.
+  // Tags of the item; ≤ 32 tags (decision N32), each 1-64 bytes, exact-match strings. Tags are item-level and live on
+  // the DOCUMENT: the document's tag set is the union over its items, and every fact and chunk is filtered through its
+  // document (decision N116). Filters, never security.
   repeated string tags = 5;
-  // Free-form JSON object stored verbatim (≤ 16 KiB), returned on memories,
-  // filterable by top-level string equality.
+  // Free-form JSON object stored verbatim (≤ 16 KiB), returned on memories, filterable by top-level string equality.
   google.protobuf.Struct metadata = 6;
   // Optional entity hints for resolution.
   repeated EntityHint entity_hints = 7;
-  // How this document version relates to the previous one. All items of a
-  // document_id in one request must agree, otherwise INVALID_ARGUMENT.
-  // APPEND chains (decision N56): the base of an append is the highest
-  // existing version, even one still ingesting, so two concurrent appends
-  // yield `base ‖ A` and `base ‖ A ‖ B`, never a lost append.
+  // How this document version relates to the previous one. All items of a document_id in one request must agree,
+  // otherwise INVALID_ARGUMENT. APPEND chains (decision N56): the base of an append is the highest existing version,
+  // even one still ingesting, so two concurrent appends yield `base ‖ A` and `base ‖ A ‖ B`, never a lost append.
   UpdateMode update_mode = 8;
-  // MIME-ish content type: "text/plain" (default) or "text/markdown" (enables
-  // heading-anchored chunking).
+  // MIME-ish content type: "text/plain" (default) or "text/markdown" (enables heading-anchored chunking).
   string content_type = 10;
 
-  // Removed in v1.0.0-rc5 (review F-2, decision D9): `google.protobuf.Timestamp
-  // mentioned_at = 9`, a per-item override of the `as_of` key. A backdated key
-  // made "leak-free" depend on the client and the extractor. `mentioned_at` is
-  // now server-set = `timestamp`; a quoted older date lands in Memory.said_at.
+  // Removed in v1.0.0-rc5 (review F-2, decision D9): `google.protobuf.Timestamp mentioned_at = 9`, a per-item override
+  // of the `as_of` key. A backdated key made "leak-free" depend on the client and the extractor. `mentioned_at` is now
+  // server-set = `timestamp`; a quoted older date lands in Memory.said_at.
   reserved 9;
   reserved "mentioned_at";
 }
@@ -182,31 +142,27 @@ message RetainRequest {
   // request_id is the idempotency key of the whole call (24 h).
   RequestMeta meta = 2;
   repeated RetainItem items = 3;
-  // Optional client-chosen UUID (any RFC 4122 version is accepted, UUIDv7
-  // recommended; decision N72). With exactly one document in the request it
-  // is the Operation id verbatim; with several documents the per-document ids
-  // are derived as UUIDv5(operation_id, document_id). Resubmitting the same
-  // operation_id with the same request hash (SHA-256 over the normalised
-  // protojson of the request, N72) returns the existing operations; with a
-  // different hash fails with ALREADY_EXISTS.
+  // Optional client-chosen UUID (any RFC 4122 version is accepted, UUIDv7 recommended; decision N72). With exactly one
+  // document in the request it is the Operation id verbatim; with several documents the per-document ids are derived as
+  // UUIDv5(operation_id, document_id). Resubmitting the same operation_id with the same request hash (SHA-256 over the
+  // normalised protojson of the request, N72) returns the existing operations; with a different hash fails with
+  // ALREADY_EXISTS.
   string operation_id = 4;
 
-  // Removed in v1.0.0-rc2: `bool wait_for_visibility = 5` (synchronous
-  // retain). Replaced by OperationService.WaitOperation so that the API
-  // never holds a request open for the duration of an LLM pipeline.
+  // Removed in v1.0.0-rc2: `bool wait_for_visibility = 5` (synchronous retain). Replaced by
+  // OperationService.WaitOperation so that the API never holds a request open for the duration of an LLM pipeline.
   reserved 5;
   reserved "wait_for_visibility";
 
   reserved 100 to 199;
 }
 
-// RetainResponse acknowledges durable acceptance: one Operation per distinct
-// document_id, in order of first appearance in `items`.
+// RetainResponse acknowledges durable acceptance: one Operation per distinct document_id, in order of first appearance
+// in `items`.
 message RetainResponse {
   repeated Operation operations = 1;
-  // Ids of documents that were minted because the item had no document_id,
-  // aligned with `operations` (deterministic when operation_id was given,
-  // decision N127).
+  // Ids of documents that were minted because the item had no document_id, aligned with `operations` (deterministic
+  // when operation_id was given, decision N127).
   repeated string document_ids = 2;
 
   reserved 100 to 199;
@@ -216,90 +172,72 @@ message RetainResponse {
 message RecallRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
-  // Natural-language query, 1-8 KiB. Embedded once with the
-  // `search_query: ` prefix; also tokenised for BM25 and date extraction.
+  // Natural-language query, 1-8 KiB. Embedded once with the `search_query: ` prefix; also tokenised for BM25 and date
+  // extraction.
   string query = 3;
   // Effort level; UNSPECIFIED = namespace default (MID).
   Budget budget = 4;
-  // Overrides the budget's token budget for packing (cl100k_base tokens),
-  // 256-65536. 0 = budget default (4k/8k/16k). Items that do not fit are
-  // skipped (never truncated) and counted in RecallStats.skipped_count, with
-  // one exception (decision N129): rank 1 is always emitted whole, and its
-  // overflow is counted in tokens_used.
+  // Overrides the budget's token budget for packing (cl100k_base tokens), 256-65536. 0 = budget default (4k/8k/16k).
+  // Items that do not fit are skipped (never truncated) and counted in RecallStats.skipped_count, with one exception
+  // (decision N129): rank 1 is always emitted whole, and its overflow is counted in tokens_used.
   int32 max_tokens = 5;
   // Restrict facts to these types; empty = both. Does not affect chunks.
   repeated FactType fact_types = 6;
   // Tag filter; unset = no tag filtering (see TagMatchMode).
   TagFilter tag_filter = 7;
-  // Anchor for temporal reasoning: relative expressions in the query
-  // ("last week") are resolved against it and the temporal arm orders by
-  // distance to it. Default: server now. Does NOT hide anything.
+  // Anchor for temporal reasoning: relative expressions in the query ("last week") are resolved against it and the
+  // temporal arm orders by distance to it. Default: server now. Does NOT hide anything.
   google.protobuf.Timestamp query_timestamp = 8;
-  // Knowledge cut-off (decision D9). When set to T, every arm filters facts
-  // and chunks by `mentioned_at <= T` before ranking, and each observation
-  // (and page) is returned in the latest version whose `effective_at <= T`
-  // (none if the first version is later). Guarantee: nothing derived from
-  // content mentioned after T is returned. Unset = no cut-off. Independent
-  // of query_timestamp: as_of hides, query_timestamp anchors.
-  // Under as_of = T (decision N85, review-2 G-7):
+  // Knowledge cut-off (decision D9). When set to T, every arm filters facts and chunks by `mentioned_at <= T` before
+  // ranking, and each observation (and page) is returned in the latest version whose `effective_at <= T` (none if the
+  // first version is later). Guarantee: nothing derived from content mentioned after T is returned. Unset = no cut-off.
+  // Independent of query_timestamp: as_of hides, query_timestamp anchors. Under as_of = T (decision N85, review-2 G-7):
   //   * an observation version's evidence (`source_fact_ids`, `quotes`,
-  //     `proof_count`) is that version's own observation_version_sources rows
-  //     joined to facts that are visible AND mentioned_at <= T, never the
-  //     current working set;
+  //     `proof_count`) is that version's own observation_version_sources rows joined to facts that are visible AND
+  //     mentioned_at <= T, never the current working set;
   //   * entity names, aliases and entity hops are as_of-safe (decision N118):
-  //     EntityRef carries only `mention` and graph hops use
-  //     entity_mentions.mentioned_at <= T;
+  //     EntityRef carries only `mention` and graph hops use entity_mentions.mentioned_at <= T;
   //   * the chunk arm requires `embedding_effective_at <= T AND
-  //     mentioned_at <= T`, where embedding_effective_at is the newest
-  //     mentioned_at covered by the summary embedded into the chunk header
-  //     (accepted cost: after a summary grows, older chunks are invisible to
-  //     as_of queries earlier than the summary's coverage; the fact arm
-  //     embeds without header and is unaffected);
+  //     mentioned_at <= T`, where embedding_effective_at is the newest mentioned_at covered by the summary embedded
+  //     into the chunk header (accepted cost: after a summary grows, older chunks are invisible to as_of queries
+  //     earlier than the summary's coverage; the fact arm embeds without header and is unaffected);
   //   * `ChunkInfo.header` is returned empty.
   google.protobuf.Timestamp as_of = 9;
   // Include raw chunks (fifth arm) in the results.
   bool include_chunks = 10;
   // Include consolidated observations in the results.
   bool include_observations = 11;
-  // Hard cap on returned items after packing, 1-500; 0 = budget default
-  // (20/50/100). Packing may return fewer.
+  // Hard cap on returned items after packing, 1-500; 0 = budget default (20/50/100). Packing may return fewer.
   int32 max_results = 12;
-  // Run the cross-encoder rerank. Unset = true. The depths 0/50/150 are gated
-  // by the B.1 ablation `--rerank-top {0,50,150,300}` (decision N129). When
-  // false, when the budget's rerank depth is 0 (LOW, decision N53), or when the remaining deadline is
-  // < 106 ms at rerank time (rerank p95 + pack + stream + 8 ms, decision
-  // N106), results carry Scores.stage = FUSED. The SLO assumes a client
-  // deadline of at least 300 ms; a skip at a shorter deadline is by design
-  // and not an SLO breach. At 300 ms or more a deadline skip is counted
-  // against the rerank-skip SLO (N53, N106), not treated as a benign
-  // degradation.
+  // Run the cross-encoder rerank. Unset = true. The depths 0/50/150 are gated by the B.1 ablation `--rerank-top
+  // {0,50,150,300}` (decision N129). When false, when the budget's rerank depth is 0 (LOW, decision N53), or when the
+  // remaining deadline is < 106 ms at rerank time (rerank p95 + pack + stream + 8 ms, decision N106), results carry
+  // Scores.stage = FUSED. The SLO assumes a client deadline of at least 300 ms; a skip at a shorter deadline is by
+  // design and not an SLO breach. At 300 ms or more a deadline skip is counted against the rerank-skip SLO (N53, N106),
+  // not treated as a benign degradation.
   optional bool rerank = 13;
   // Populate Scores.arm_ranks and per-stage candidate counts in RecallStats.
   bool explain = 14;
-  // Explicit occurrence window for the temporal arm. Unset = derived from
-  // the query text by rule-based date extraction (may be empty, in which
-  // case the temporal arm is skipped).
+  // Explicit occurrence window for the temporal arm. Unset = derived from the query text by rule-based date extraction
+  // (may be empty, in which case the temporal arm is skipped).
   TemporalWindow temporal_window = 15;
   // Restrict to items whose metadata matches all of these (AND).
   repeated MetadataFilter metadata_filters = 16;
-  // With include_observations: rank an observation ahead of the facts it
-  // cites and suppress those facts from the packed result when the
-  // observation fits (Hindsight `prefer_observations`). Page refresh
-  // (section 5.3) sets it; default false.
+  // With include_observations: rank an observation ahead of the facts it cites and suppress those facts from the packed
+  // result when the observation fits (Hindsight `prefer_observations`). Page refresh (section 5.3) sets it; default
+  // false.
   bool prefer_observations = 18;
 
-  // Removed in v1.0.0-rc3: `float min_score = 17`. A raw score threshold is
-  // not comparable across arms and rerankers; budgets and max_results are the
-  // supported knobs.
+  // Removed in v1.0.0-rc3: `float min_score = 17`. A raw score threshold is not comparable across arms and rerankers;
+  // budgets and max_results are the supported knobs.
   reserved 17;
   reserved "min_score";
 
   reserved 100 to 199;
 }
 
-// RecallResponse is one stream message: either a ranked result or the single
-// trailing stats message. Clients must tolerate results after stats never
-// occurring and stats being absent if the stream errors.
+// RecallResponse is one stream message: either a ranked result or the single trailing stats message. Clients must
+// tolerate results after stats never occurring and stats being absent if the stream errors.
 message RecallResponse {
   oneof payload {
     RecallResult result = 1;
@@ -313,8 +251,7 @@ message RecallResponse {
 message RecallResult {
   // 1-based final rank across the whole response.
   int32 rank = 1;
-  // The memory with `scores` and `provenance` populated. Text fields are
-  // complete (packing skips, never truncates).
+  // The memory with `scores` and `provenance` populated. Text fields are complete (packing skips, never truncates).
   Memory memory = 2;
   // cl100k_base tokens this item consumed from the budget.
   int32 tokens = 3;
@@ -326,8 +263,7 @@ message RecallStats {
   int32 total_candidates = 1;
   // Items streamed.
   int32 returned_count = 2;
-  // Items that were ranked but did not fit the token budget (never
-  // truncated; packing continues past a skip).
+  // Items that were ranked but did not fit the token budget (never truncated; packing continues past a skip).
   int32 skipped_count = 3;
   // Tokens consumed by returned items.
   int32 tokens_used = 4;
@@ -337,9 +273,8 @@ message RecallStats {
   RecallStage last_stage = 6;
   // Why rerank was skipped ("deadline", "disabled", ""), if it was.
   string rerank_skip_reason = 7;
-  // Wall time per stage, in pipeline order: "authz", "embed", "arm:semantic",
-  // "arm:lexical", "arm:graph", "arm:temporal", "arm:chunk", "fuse",
-  // "rerank", "boost", "pack".
+  // Wall time per stage, in pipeline order: "authz", "embed", "arm:semantic", "arm:lexical", "arm:graph",
+  // "arm:temporal", "arm:chunk", "fuse", "rerank", "boost", "pack".
   repeated StageTiming stage_timings = 8;
   // The cut-off actually applied (echo of as_of).
   google.protobuf.Timestamp as_of_applied = 9;
@@ -349,12 +284,10 @@ message RecallStats {
   google.protobuf.Timestamp query_timestamp_applied = 11;
   // Total server time from admission to last flush.
   google.protobuf.Duration total = 12;
-  // True when any vector arm ran at E >= theta eligible rows (theta = 10 k):
-  // the recall is counted in the filtered class, p95 <= 1 s, and its arm
-  // transactions passed the second semaphore (decision N164).
+  // True when any vector arm ran at E >= theta eligible rows (theta = 10 k): the recall is counted in the filtered
+  // class, p95 <= 1 s, and its arm transactions passed the second semaphore (decision N164).
   bool filtered = 13;
-  // True when a filtered arm exhausted its scan bound (4 theta) and returned
-  // what it had (decision N151).
+  // True when a filtered arm exhausted its scan bound (4 theta) and returned what it had (decision N151).
   bool partial = 14;
 }
 
@@ -373,44 +306,35 @@ message StageTiming {
 message ObservationInfo {
   // Number of distinct source facts supporting the observation.
   int32 proof_count = 1;
-  // Ids of the supporting facts (hidden ones are excluded from Recall views
-  // but kept in GetMemory with `include_hidden_sources`).
+  // Ids of the supporting facts (hidden ones are excluded from Recall views but kept in GetMemory with
+  // `include_hidden_sources`).
   repeated string source_fact_ids = 2;
-  // Version returned: the version current at as_of (effective_at <= as_of <
-  // superseded_at) or, without as_of, the current version; when that version
-  // is hidden (decision N117) nothing is returned for the observation. A
-  // version with no visible source (proof_count = 0) is not returned.
+  // Version returned: the version current at as_of (effective_at <= as_of < superseded_at) or, without as_of, the
+  // current version; when that version is hidden (decision N117) nothing is returned for the observation. A version
+  // with no visible source (proof_count = 0) is not returned.
   int64 version = 3;
-  // The as_of visibility key (decision D9): max(mentioned_at) over every
-  // fact shown to the consolidation prompt that wrote this version (its
-  // inputs, a superset of source_fact_ids), clamped to be >= the effective_at
-  // of the observations shown and of the previous version.
+  // The as_of visibility key (decision D9): max(mentioned_at) over every fact shown to the consolidation prompt that
+  // wrote this version (its inputs, a superset of source_fact_ids), clamped to be >= the effective_at of the
+  // observations shown and of the previous version.
   google.protobuf.Timestamp effective_at = 4;
-  // True when a rewrite is pending for this observation: evidence changed
-  // since this version was written (a document replace or a re-extraction
-  // retired a source, an Invalidate hid one, a Restore brought one back). It
-  // says "a rebuild is pending", never "hidden": a stale version that is
-  // visible is still served (decision N135). A version whose evidence
-  // segment names a deleted document or an invalidated fact is not served at
-  // all, whatever this flag says: the read-time predicate hides it (decision
-  // N117), permanently for document causes at every as_of, and nothing is
-  // returned for the observation at an `as_of` whose current version is
-  // hidden until the rebuild lands.
+  // True when a rewrite is pending for this observation: evidence changed since this version was written (a document
+  // replace or a re-extraction retired a source, an Invalidate hid one, a Restore brought one back). It says "a rebuild
+  // is pending", never "hidden": a stale version that is visible is still served (decision N135). A version whose
+  // evidence segment names a deleted document or an invalidated fact is not served at all, whatever this flag says: the
+  // read-time predicate hides it (decision N117), permanently for document causes at every as_of, and nothing is
+  // returned for the observation at an `as_of` whose current version is hidden until the rebuild lands.
   bool stale = 5;
-  // Verbatim quotes from source facts, aligned with source_fact_ids where
-  // available. Evidence is versioned (decision N85): for any returned
-  // version, current or as_of, `source_fact_ids`, `quotes` and `proof_count`
-  // are that version's rows, filtered to visible facts with mentioned_at <=
-  // as_of when as_of is set.
+  // Verbatim quotes from source facts, aligned with source_fact_ids where available. Evidence is versioned (decision
+  // N85): for any returned version, current or as_of, `source_fact_ids`, `quotes` and `proof_count` are that version's
+  // rows, filtered to visible facts with mentioned_at <= as_of when as_of is set.
   repeated string quotes = 6;
 }
 
 // ChunkInfo is present on MEMORY_KIND_CHUNK memories.
 message ChunkInfo {
   // Contextual header prepended for embedding/extraction:
-  // "[doc summary ≤ 200 chars] > [heading path]". Not part of `text`.
-  // Empty whenever the request carried `as_of` (decision N85): the summary
-  // may name content mentioned after T.
+  // "[doc summary ≤ 200 chars] > [heading path]". Not part of `text`. Empty whenever the request carried `as_of`
+  // (decision N85): the summary may name content mentioned after T.
   string header = 1;
   // SHA-256 (hex) of the chunk text: its identity within the document.
   string content_hash = 2;
@@ -418,14 +342,13 @@ message ChunkInfo {
   int32 fact_count = 3;
 }
 
-// Memory is a fact, an observation or a chunk. Which sub-fields are set
-// depends on `kind`; the who/what/when/where/why fields are facts only.
+// Memory is a fact, an observation or a chunk. Which sub-fields are set depends on `kind`; the who/what/when/where/why
+// fields are facts only.
 message Memory {
   // UUIDv7 (memory_id, observation_id or chunk_id).
   string id = 1;
   MemoryKind kind = 2;
-  // Fact text / observation text / chunk text (≤ 16 KiB for chunks, the
-  // stored chunk limit of decision D8).
+  // Fact text / observation text / chunk text (≤ 16 KiB for chunks, the stored chunk limit of decision D8).
   string text = 3;
   // Facts only.
   FactType fact_type = 4;
@@ -437,20 +360,17 @@ message Memory {
   string why = 9;
   // When the fact happened (facts; empty window for chunks/observations).
   TemporalWindow occurred = 10;
-  // When the system learned it: the RetainItem `timestamp`, set by the
-  // server; the as_of visibility key for facts and chunks (decision D9).
-  // For a chunk it is the maximum timestamp of every item whose bytes the
-  // chunk covers (for an APPEND re-chunk also the mentioned_at of every base
-  // chunk the new text overlaps); facts inherit the chunk value (decision
-  // N86). A hard chunk boundary is forced between consecutive items whose
-  // timestamps differ by more than 24 h.
+  // When the system learned it: the RetainItem `timestamp`, set by the server; the as_of visibility key for facts and
+  // chunks (decision D9). For a chunk it is the maximum timestamp of every item whose bytes the chunk covers (for an
+  // APPEND re-chunk also the mentioned_at of every base chunk the new text overlaps); facts inherit the chunk value
+  // (decision N86). A hard chunk boundary is forced between consecutive items whose timestamps differ by more than 24
+  // h.
   google.protobuf.Timestamp mentioned_at = 11;
   // Resolved entities (facts) or entities mentioned (chunks).
   repeated EntityRef entities = 12;
   repeated string tags = 13;
   google.protobuf.Struct metadata = 14;
-  // Where it came from; for observations the provenance of the most recent
-  // cited source.
+  // Where it came from; for observations the provenance of the most recent cited source.
   Provenance provenance = 15;
   // Per-stage scores; only on Recall results (unset on Get/List).
   Scores scores = 16;
@@ -458,17 +378,15 @@ message Memory {
   ObservationInfo observation = 17;
   // Chunks only.
   ChunkInfo chunk = 18;
-  // Set when a `fact_hidden` row with cause `invalidate` exists for the fact
-  // (Invalidate; decision N115): hidden from Recall and Reflect but readable
-  // by GetMemory. `reextract` rows (a prompt or model bump hid a stale
-  // extraction) are NOT reported here and cannot be restored (decision N135).
+  // Set when a `fact_hidden` row with cause `invalidate` exists for the fact (Invalidate; decision N115): hidden from
+  // Recall and Reflect but readable by GetMemory. `reextract` rows (a prompt or model bump hid a stale extraction) are
+  // NOT reported here and cannot be restored (decision N135).
   google.protobuf.Timestamp invalidated_at = 19;
   Timestamps timestamps = 20;
   NamespaceRef namespace = 21;
-  // Facts only: when the source SAID it, as judged by the extractor (may
-  // precede mentioned_at when the chunk quotes or forwards older material).
-  // Display and ranking only — never an as_of key (decision D9, review F-2).
-  // Unset when the extractor gave no explicit date.
+  // Facts only: when the source SAID it, as judged by the extractor (may precede mentioned_at when the chunk quotes or
+  // forwards older material). Display and ranking only — never an as_of key (decision D9, review F-2). Unset when the
+  // extractor gave no explicit date.
   google.protobuf.Timestamp said_at = 22;
 
   reserved 100 to 199;
@@ -480,8 +398,7 @@ message GetMemoryRequest {
   string memory_id = 2;
   // Projection over Memory paths, e.g. ["text", "observation.source_fact_ids"].
   google.protobuf.FieldMask read_mask = 3;
-  // Observations: also list source facts that are invalidated (never
-  // tombstoned or purged ones; those are gone).
+  // Observations: also list source facts that are invalidated (never tombstoned or purged ones; those are gone).
   bool include_hidden_sources = 4;
 
   reserved 100 to 199;
@@ -519,9 +436,8 @@ message ListMemoriesRequest {
   // mentioned_at bounds (inclusive).
   google.protobuf.Timestamp mentioned_after = 8;
   google.protobuf.Timestamp mentioned_before = 9;
-  // Include soft-invalidated facts (`fact_hidden(invalidate)` markers;
-  // default excluded). Facts of a tombstoned document, and stale extractions
-  // hidden by `reextract`, are never returned.
+  // Include soft-invalidated facts (`fact_hidden(invalidate)` markers; default excluded). Facts of a tombstoned
+  // document, and stale extractions hidden by `reextract`, are never returned.
   bool include_invalidated = 10;
   // Restrict to items mentioning this entity id.
   string entity_id = 11;
@@ -549,8 +465,7 @@ message BatchGetMemoriesRequest {
   reserved 100 to 199;
 }
 
-// BatchGetMemoriesResponse returns found memories in request order and the
-// ids that were not found (no error).
+// BatchGetMemoriesResponse returns found memories in request order and the ids that were not found (no error).
 message BatchGetMemoriesResponse {
   repeated Memory memories = 1;
   repeated string missing_ids = 2;
@@ -562,11 +477,9 @@ message BatchGetMemoriesResponse {
 message InvalidateRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
-  // Must be a MEMORY_KIND_FACT id, else FAILED_PRECONDITION
-  // {MEMORY_NOT_A_FACT}; a fact whose row was purged after the retire grace is
-  // NOT_FOUND (the subject is resolved from the fact row, decision N162).
-  // Already-invalidated facts succeed without changing visibility and still
-  // write their own deletion-log row and intent (decisions N139, N143).
+  // Must be a MEMORY_KIND_FACT id, else FAILED_PRECONDITION {MEMORY_NOT_A_FACT}; a fact whose row was purged after the
+  // retire grace is NOT_FOUND (the subject is resolved from the fact row, decision N162). Already-invalidated facts
+  // succeed without changing visibility and still write their own deletion-log row and intent (decisions N139, N143).
   string memory_id = 3;
   // Free-text audit reason, ≤ 1 KiB.
   string reason = 4;
@@ -606,22 +519,18 @@ message ReflectRequest {
   // Budget used by every internal search tool call.
   Budget budget = 4;
   TagFilter tag_filter = 5;
-  // Same semantics as RecallRequest.as_of (including the versioned-evidence
-  // and empty-chunk-header rules of decision N85), applied to every tool call
-  // of the session (forced and free), so the answer is leak-free at T.
+  // Same semantics as RecallRequest.as_of (including the versioned-evidence and empty-chunk-header rules of decision
+  // N85), applied to every tool call of the session (forced and free), so the answer is leak-free at T.
   google.protobuf.Timestamp as_of = 6;
   google.protobuf.Timestamp query_timestamp = 7;
-  // Optional JSON Schema (draft 2020-12) the final answer must satisfy; the
-  // server validates and, on failure, retries once then reports
-  // ReflectAnswer.schema_valid = false.
+  // Optional JSON Schema (draft 2020-12) the final answer must satisfy; the server validates and, on failure, retries
+  // once then reports ReflectAnswer.schema_valid = false.
   google.protobuf.Struct output_schema = 8;
   // Cap on free iterations, 1-10; 0 = namespace default (10).
   int32 max_iterations = 9;
-  // Stream TokenDelta events (default true). When false only tool events,
-  // citations, the answer and stats are streamed.
+  // Stream TokenDelta events (default true). When false only tool events, citations, the answer and stats are streamed.
   optional bool stream_tokens = 10;
-  // Extra context the caller wants considered (e.g. the current conversation
-  // turn), ≤ 32 KiB; never retained.
+  // Extra context the caller wants considered (e.g. the current conversation turn), ≤ 32 KiB; never retained.
   string context = 11;
   // Overrides the namespace mission for this call only, ≤ 4 KiB.
   string mission_override = 12;
@@ -631,8 +540,7 @@ message ReflectRequest {
 
 // ReflectResponse is one event of the Reflect stream. Order: zero or more
 // {delta | tool_call | tool_result | citation} events, exactly one `answer`,
-// exactly one `stats` (last). On error the stream terminates with a gRPC
-// status and no `answer`.
+// exactly one `stats` (last). On error the stream terminates with a gRPC status and no `answer`.
 message ReflectResponse {
   oneof event {
     TokenDelta delta = 1;
@@ -656,8 +564,8 @@ message TokenDelta {
 // ToolCall is an internal tool invocation by the reflect agent.
 message ToolCall {
   string call_id = 1;
-  // "search_memories", "search_observations", "search_pages" (decision N73,
-  // full-text + semantic over page versions), "get_page", "expand_fact".
+  // "search_memories", "search_observations", "search_pages" (decision N73, full-text + semantic over page versions),
+  // "get_page", "expand_fact".
   string tool = 2;
   google.protobuf.Struct arguments = 3;
   int32 iteration = 4;
@@ -665,8 +573,7 @@ message ToolCall {
   bool forced = 5;
 }
 
-// ToolResult summarises what a tool returned (ids only; the agent's context
-// is not streamed).
+// ToolResult summarises what a tool returned (ids only; the agent's context is not streamed).
 message ToolResult {
   string call_id = 1;
   int32 result_count = 2;
@@ -677,9 +584,8 @@ message ToolResult {
   string error = 5;
 }
 
-// Citation links a span of the answer to a memory that was actually
-// retrieved during the session. Citations to ids never returned by a tool
-// are dropped server-side.
+// Citation links a span of the answer to a memory that was actually retrieved during the session. Citations to ids
+// never returned by a tool are dropped server-side.
 message Citation {
   string memory_id = 1;
   MemoryKind kind = 2;
@@ -692,8 +598,7 @@ message Citation {
 
 // ReflectAnswer is the final answer.
 message ReflectAnswer {
-  // Prose answer (also the concatenation of all TokenDelta.text with
-  // iteration 0).
+  // Prose answer (also the concatenation of all TokenDelta.text with iteration 0).
   string text = 1;
   // Present when output_schema was given; null when validation failed.
   google.protobuf.Struct structured = 2;

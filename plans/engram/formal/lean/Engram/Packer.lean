@@ -1,8 +1,7 @@
 /-
   Engram — token-budget packing (register D10, "Packing" row).
 
-  Status: NOT type-checked (Lean 4 is not installed in the planning
-  environment).  Lean 4 core only.
+  Status: NOT type-checked (Lean 4 is not installed in the planning environment). Lean 4 core only.
 
   Semantics being pinned:
     * items are visited in rank order;
@@ -10,13 +9,12 @@
     * an item that does not fit is skipped (never truncated) and counted;
     * packing never stops early: later, smaller items may still be taken.
 
-  `keep` and `skipped` are two structural recursions over the same decision
-  so that every theorem is a plain induction; `pack` pairs them (the Go code
-  computes both in one pass, which is observationally the same).
+  `keep` and `skipped` are two structural recursions over the same decision so that every theorem is a plain
+  induction; `pack` pairs them (the Go code computes both in one pass, which is observationally the same).
 
   Go counterpart: internal/recall/pack.go `Pack(items []Item, budget int) (kept []Item, skipped int)`;
-  internal/recall/pack_test.go (pgregory.net/rapid) checks the same theorems on
-  random item lists with token counts in [0, 2·budget].
+  internal/recall/pack_test.go (pgregory.net/rapid) checks the same theorems on random item lists with token counts
+  in [0, 2·budget].
 -/
 namespace Engram.Packer
 
@@ -103,9 +101,8 @@ theorem keep_skip_oversize (big : Item) (rest : List Item) (rem : Nat) (h : rem 
   have h' : ¬ big.tokens ≤ rem := Nat.not_le.mpr h
   simp [keep, skipped, h']
 
-/-- Prefix-closure: packing `l₁ ++ l₂` starts with exactly the result of
-    packing `l₁` with the same budget, i.e. later items never change earlier
-    decisions (the scan is a left fold). -/
+/-- Prefix-closure: packing `l₁ ++ l₂` starts with exactly the result of packing `l₁` with the same budget, i.e.
+    later items never change earlier decisions (the scan is a left fold). -/
 theorem keep_append : ∀ (l₁ l₂ : List Item) (rem : Nat),
     keep (l₁ ++ l₂) rem = keep l₁ rem ++ keep l₂ (rem - total (keep l₁ rem)) := by
   intro l₁
@@ -117,11 +114,11 @@ theorem keep_append : ∀ (l₁ l₂ : List Item) (rem : Nat),
     · simp only [List.cons_append, keep, h, if_true, ih, total_cons, Nat.sub_sub]
     · simp only [List.cons_append, keep, h, if_false, ih]
 
-/-- A kept item fits the budget that remained when it was reached: for the
-    item at position `i`, `tokens ≤ rem - total (keep (take i) rem)` whenever it
-    is kept.  Stated for the head after a prefix; proof deferred. -/
+/-- A kept item fits the budget that remained when it was reached: for the item at position `i`, `tokens ≤ rem -
+    total (keep (take i) rem)` whenever it is kept. Stated for the head after a prefix; proof deferred. -/
 theorem kept_fits (l₁ : List Item) (x : Item) (l₂ : List Item) (rem : Nat)
-    (hx : x ∈ keep (l₁ ++ x :: l₂) rem) (hnotin : x ∉ keep l₁ rem) (hnot₂ : x ∉ keep l₂ (rem - total (keep l₁ rem) - x.tokens)) :
+    (hx : x ∈ keep (l₁ ++ x :: l₂) rem) (hnotin : x ∉ keep l₁ rem)
+    (hnot₂ : x ∉ keep l₂ (rem - total (keep l₁ rem) - x.tokens)) :
     x.tokens ≤ rem - total (keep l₁ rem) := by
   sorry -- TODO(formal): rewrite with keep_append, then case on the head decision;
         -- the two exclusion hypotheses rule out an equal item elsewhere.
@@ -129,9 +126,11 @@ theorem kept_fits (l₁ : List Item) (x : Item) (l₂ : List Item) (rem : Nat)
 /-! ### Evaluation checks (same cases as the Go table test) -/
 
 example : pack [⟨3⟩, ⟨5⟩, ⟨2⟩] 6 = ([⟨3⟩, ⟨2⟩], 1) := by decide
-example : pack [⟨7⟩, ⟨1⟩] 6 = ([⟨1⟩], 1) := by decide          -- oversize first item skipped, scan continues
+-- oversize first item skipped, scan continues
+example : pack [⟨7⟩, ⟨1⟩] 6 = ([⟨1⟩], 1) := by decide
 example : pack [] 6 = ([], 0) := by decide
 example : pack [⟨0⟩, ⟨0⟩] 0 = ([⟨0⟩, ⟨0⟩], 0) := by decide    -- zero-token items always fit
-example : pack [⟨4⟩, ⟨4⟩, ⟨4⟩] 8 = ([⟨4⟩, ⟨4⟩], 1) := by decide  -- never stops early, never truncates
+-- never stops early, never truncates
+example : pack [⟨4⟩, ⟨4⟩, ⟨4⟩] 8 = ([⟨4⟩, ⟨4⟩], 1) := by decide
 
 end Engram.Packer

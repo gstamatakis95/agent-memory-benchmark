@@ -1,10 +1,9 @@
 /-
   Engram — tag-match semantics (register D10, Hindsight-compatible).
 
-  Status: NOT type-checked (Lean 4 is not installed in the planning
-  environment).  Written against Lean 4 core only (no Mathlib, no Batteries):
-  tags are `List String`, "sets" are lists compared by membership, which is
-  exactly what the Go implementation does after sorting + dedup.
+  Status: NOT type-checked (Lean 4 is not installed in the planning environment). Written against Lean 4 core only
+  (no Mathlib, no Batteries): tags are `List String`, "sets" are lists compared by membership, which is exactly what
+  the Go implementation does after sorting + dedup.
 
   Q = query tags (the filter), I = item tags.
 
@@ -15,11 +14,9 @@
     EXACT      : I = Q                       (as sets: Q ⊆ I ∧ I ⊆ Q)
     unset      : everything matches          (modelled as `Mode.unfiltered`)
 
-  The Go function `tags.Match(mode, q, i []string) bool` in
-  internal/recall/tags.go must agree with `TagMatch.matches` on every input;
-  `internal/recall/tags_test.go` exhaustively compares the two on all
-  tag lists drawn from a 4-symbol alphabet of length ≤ 3 (the same universe
-  used by `decide` below).
+  The Go function `tags.Match(mode, q, i []string) bool` in internal/recall/tags.go must agree with
+  `TagMatch.matches` on every input; `internal/recall/tags_test.go` exhaustively compares the two on all tag lists
+  drawn from a 4-symbol alphabet of length ≤ 3 (the same universe used by `decide` below).
 -/
 namespace Engram.TagMatch
 
@@ -119,8 +116,8 @@ theorem allStrict_mono (Q I I' : List Tag) (hI : subset I I') (h : Matches .allS
     rw [hI'] at this
     exact absurd this (List.not_mem_nil t)
 
-/-- ANY and ALL are *not* monotone in I: an untagged item passes, a tagged
-    one may not.  Witness: Q = ["a"], I = [], I' = ["b"]. -/
+/-- ANY and ALL are *not* monotone in I: an untagged item passes, a tagged one may not. Witness: Q = ["a"], I = [],
+    I' = ["b"]. -/
 example : Matches .any ["a"] [] ∧ ¬ Matches .any ["a"] ["b"] := by decide
 
 example : Matches .all ["a"] [] ∧ ¬ Matches .all ["a"] ["b"] := by decide

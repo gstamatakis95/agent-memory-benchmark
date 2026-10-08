@@ -1,25 +1,18 @@
 // memory/v1/page.proto
 //
-// PageService (phase 3): mental models / knowledge pages — living markdown
-// documents defined by a source query and a tag filter, refreshed after
-// consolidation or on a schedule by an LLM delta-edit (decision D12).
-// Staleness is tracked separately for writes (new evidence arrived) and
-// deletes (cited evidence was removed), because a delete-stale page may be
-// citing content that must not be shown, while a write-stale page is merely
-// incomplete.
+// PageService (phase 3): mental models / knowledge pages — living markdown documents defined by a source query and a
+// tag filter, refreshed after consolidation or on a schedule by an LLM delta-edit (decision D12). Staleness is tracked
+// separately for writes (new evidence arrived) and deletes (cited evidence was removed), because a delete-stale page
+// may be citing content that must not be shown, while a write-stale page is merely incomplete.
 //
-// Pages are versioned like observations: GetPage with as_of returns the
-// version current at T (effective_at ≤ T < superseded_at, decision D9);
-// NOT_FOUND when none exists. A page version is
-// visible iff no fact input in its evidence segment is tombstoned or hidden
-// and no observation-version input in its segment is hidden (decision N117);
-// depth is fixed at two (fact, observation, page) and pages never feed
-// observations. A page whose CURRENT version is hidden answers GetPage with
-// FAILED_PRECONDITION + PreconditionFailed{PAGE_HIDDEN} until the refresh
-// that the expunge always schedules lands.
+// Pages are versioned like observations: GetPage with as_of returns the version current at T (effective_at ≤ T <
+// superseded_at, decision D9); NOT_FOUND when none exists. A page version is visible iff no fact input in its evidence
+// segment is tombstoned or hidden and no observation-version input in its segment is hidden (decision N117); depth is
+// fixed at two (fact, observation, page) and pages never feed observations. A page whose CURRENT version is hidden
+// answers GetPage with FAILED_PRECONDITION + PreconditionFailed{PAGE_HIDDEN} until the refresh that the expunge always
+// schedules lands.
 //
-// Before phase 3 the service is registered and every method returns
-// UNIMPLEMENTED.
+// Before phase 3 the service is registered and every method returns UNIMPLEMENTED.
 syntax = "proto3";
 
 package memory.v1;
@@ -32,15 +25,13 @@ import "memory/v1/operation.proto";
 
 option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
 
-// PageService manages knowledge pages. Create/Update/Delete/Refresh require
-// memory.write; Get/List require memory.read.
+// PageService manages knowledge pages. Create/Update/Delete/Refresh require memory.write; Get/List require memory.read.
 service PageService {
-  // CreatePage defines a page and, unless `defer_refresh`, starts its first
-  // refresh. `name` is unique per namespace (ALREADY_EXISTS otherwise).
+  // CreatePage defines a page and, unless `defer_refresh`, starts its first refresh. `name` is unique per namespace
+  // (ALREADY_EXISTS otherwise).
   rpc CreatePage(CreatePageRequest) returns (CreatePageResponse);
-  // GetPage returns a page and (optionally) its markdown at a version or as
-  // of a time. FAILED_PRECONDITION + PreconditionFailed{PAGE_HIDDEN} when the
-  // requested content version is hidden by a delete or invalidation.
+  // GetPage returns a page and (optionally) its markdown at a version or as of a time. FAILED_PRECONDITION +
+  // PreconditionFailed{PAGE_HIDDEN} when the requested content version is hidden by a delete or invalidation.
   rpc GetPage(GetPageRequest) returns (GetPageResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -48,29 +39,23 @@ service PageService {
   rpc ListPages(ListPagesRequest) returns (ListPagesResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // SearchPages ranks pages by relevance of their current (or as_of) version
-  // to `query`: BM25 over `page_versions.text` ∪ HNSW over
-  // `page_version_vectors` (same per-namespace index rules as the other
-  // vector tables, decisions N111, N112), fused with RRF, no LLM; pages share
-  // the observation visibility and purge path (decision N139). It is
-  // the Reflect agent's `search_pages` tool and the equivalent of Hindsight's
-  // `search_mental_models` (decision N73). Unary, page tokens. Scope
-  // memory.read.
+  // SearchPages ranks pages by relevance of their current (or as_of) version to `query`: BM25 over `page_versions.text`
+  // ∪ HNSW over `page_version_vectors` (same per-namespace index rules as the other vector tables, decisions N111,
+  // N112), fused with RRF, no LLM; pages share the observation visibility and purge path (decision N139). It is the
+  // Reflect agent's `search_pages` tool and the equivalent of Hindsight's `search_mental_models` (decision N73). Unary,
+  // page tokens. Scope memory.read.
   rpc SearchPages(SearchPagesRequest) returns (SearchPagesResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // UpdatePage patches the definition (source_query, tag_filter,
-  // refresh_policy, display fields). Changing the query or filter marks the
-  // page stale_write.
+  // UpdatePage patches the definition (source_query, tag_filter, refresh_policy, display fields). Changing the query or
+  // filter marks the page stale_write.
   rpc UpdatePage(UpdatePageRequest) returns (UpdatePageResponse);
-  // DeletePage removes the definition and all versions synchronously (pages
-  // are small; no purge operation).
+  // DeletePage removes the definition and all versions synchronously (pages are small; no purge operation).
   rpc DeletePage(DeletePageRequest) returns (DeletePageResponse);
-  // RefreshPage starts a refresh (kind REFRESH_PAGE) and returns the
-  // Operation; a running refresh is returned instead of a new one. The refresh
-  // runs in the per-page singleton workflow (SignalWithStart of
-  // `ns/{namespace_id}/page/{page_id}` with the operation_id in the nudge);
-  // WaitOperation polls the page row (decision N157, review A-5).
+  // RefreshPage starts a refresh (kind REFRESH_PAGE) and returns the Operation; a running refresh is returned instead
+  // of a new one. The refresh runs in the per-page singleton workflow (SignalWithStart of
+  // `ns/{namespace_id}/page/{page_id}` with the operation_id in the nudge); WaitOperation polls the page row (decision
+  // N157, review A-5).
   rpc RefreshPage(RefreshPageRequest) returns (RefreshPageResponse);
 }
 
@@ -86,11 +71,9 @@ enum RefreshTrigger {
   REFRESH_TRIGGER_MANUAL = 3;
 }
 
-// RefreshPolicy controls automatic refreshes. It is the only refresh policy
-// in the system (decision N128): the plan's pipelines and the generated Go
-// `Page` follow this message. There is no `on_delete` knob: the expunge
-// always refreshes the pages that a delete or invalidation touched, whatever
-// the trigger says.
+// RefreshPolicy controls automatic refreshes. It is the only refresh policy in the system (decision N128): the plan's
+// pipelines and the generated Go `Page` follow this message. There is no `on_delete` knob: the expunge always refreshes
+// the pages that a delete or invalidation touched, whatever the trigger says.
 message RefreshPolicy {
   RefreshTrigger trigger = 1;
   // For SCHEDULED: 1 h .. 30 d.
@@ -104,9 +87,8 @@ message PageContent {
   int64 version = 1;
   // Markdown, ≤ 256 KiB.
   string markdown = 2;
-  // The as_of visibility key (decision D9): max(mentioned_at / effective_at)
-  // over every evidence item shown to the refresh prompt that wrote this
-  // version (not only the cited ones), clamped >= the previous version.
+  // The as_of visibility key (decision D9): max(mentioned_at / effective_at) over every evidence item shown to the
+  // refresh prompt that wrote this version (not only the cited ones), clamped >= the previous version.
   google.protobuf.Timestamp effective_at = 3;
   // Facts + observations cited.
   int32 source_count = 4;
@@ -120,12 +102,10 @@ message Page {
   // UUIDv7.
   string page_id = 1;
   NamespaceRef namespace = 2;
-  // Unique per namespace, `[a-z0-9][a-z0-9._-]{0,127}`; also the export file
-  // name.
+  // Unique per namespace, `[a-z0-9][a-z0-9._-]{0,127}`; also the export file name.
   string name = 3;
   string display_name = 4;
-  // Natural-language query that selects the evidence (run through Recall at
-  // HIGH budget on refresh).
+  // Natural-language query that selects the evidence (run through Recall at HIGH budget on refresh).
   string source_query = 5;
   TagFilter tag_filter = 6;
   RefreshPolicy refresh_policy = 7;
@@ -133,9 +113,8 @@ message Page {
   int64 current_version = 8;
   // New evidence matching source_query arrived since current_version.
   bool stale_write = 9;
-  // Evidence cited by current_version was deleted or invalidated since (the
-  // current version may be hidden by the read predicate, decision N117, until
-  // the refresh lands).
+  // Evidence cited by current_version was deleted or invalidated since (the current version may be hidden by the read
+  // predicate, decision N117, until the refresh lands).
   bool stale_delete = 10;
   google.protobuf.Timestamp stale_since = 11;
   google.protobuf.Timestamp last_refreshed_at = 12;
@@ -154,8 +133,7 @@ message Page {
 message CreatePageRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
-  // name, display_name, source_query, tag_filter, refresh_policy and
-  // instructions are read.
+  // name, display_name, source_query, tag_filter, refresh_policy and instructions are read.
   Page page = 3;
   // Do not start the first refresh now.
   bool defer_refresh = 4;
@@ -164,8 +142,7 @@ message CreatePageRequest {
   reserved 100 to 199;
 }
 
-// CreatePageResponse returns the page and, if started, the refresh
-// operation.
+// CreatePageResponse returns the page and, if started, the refresh operation.
 message CreatePageResponse {
   Page page = 1;
   Operation refresh_operation = 2;
@@ -184,8 +161,8 @@ message GetPageRequest {
   bool include_content = 4;
   // Content version to return; 0 = current (or the as_of rule below).
   int64 version = 5;
-  // When set, `content` is the latest version with effective_at ≤ as_of;
-  // NOT_FOUND {PAGE version} if none. Ignored when `version` > 0.
+  // When set, `content` is the latest version with effective_at ≤ as_of; NOT_FOUND {PAGE version} if none. Ignored when
+  // `version` > 0.
   google.protobuf.Timestamp as_of = 6;
   google.protobuf.FieldMask read_mask = 7;
 
@@ -223,14 +200,13 @@ message ListPagesResponse {
 message SearchPagesRequest {
   NamespaceRef namespace = 1;
   PagingRequest paging = 2;
-  // Natural-language query, 1-8 KiB; embedded once with the `search_query: `
-  // prefix and tokenised for BM25.
+  // Natural-language query, 1-8 KiB; embedded once with the `search_query: ` prefix and tokenised for BM25.
   string query = 3;
-  // Restricts to pages whose own tag_filter.tags satisfy the mode (pages are
-  // matched by their definition tags). Unset = every page.
+  // Restricts to pages whose own tag_filter.tags satisfy the mode (pages are matched by their definition tags). Unset =
+  // every page.
   TagFilter tag_filter = 4;
-  // Rank each page by the latest version with effective_at ≤ as_of and hide
-  // pages with no such version (decision D9). Unset = current versions.
+  // Rank each page by the latest version with effective_at ≤ as_of and hide pages with no such version (decision D9).
+  // Unset = current versions.
   google.protobuf.Timestamp as_of = 5;
   // Candidate caps per arm (LOW/MID/HIGH = 50/150/400); UNSPECIFIED = MID.
   Budget budget = 6;
@@ -270,8 +246,7 @@ message UpdatePageRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   Page patch = 3;
-  // Allowed paths: display_name, source_query, tag_filter, refresh_policy,
-  // refresh_policy.*, instructions.
+  // Allowed paths: display_name, source_query, tag_filter, refresh_policy, refresh_policy.*, instructions.
   google.protobuf.FieldMask update_mask = 4;
   string etag = 5;
 
@@ -308,8 +283,7 @@ message RefreshPageRequest {
   RequestMeta meta = 2;
   string page_id = 3;
   string operation_id = 4;
-  // Refresh even when the page is not stale (full rewrite instead of a
-  // delta edit).
+  // Refresh even when the page is not stale (full rewrite instead of a delta edit).
   bool force = 5;
 
   reserved 100 to 199;

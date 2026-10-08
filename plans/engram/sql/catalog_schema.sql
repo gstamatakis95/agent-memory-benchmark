@@ -1,21 +1,22 @@
 -- =============================================================================
 -- Engram catalog (control plane) schema
 -- Database: engram_catalog (one small PostgreSQL 16 instance + ONE ASYNCHRONOUS HOT STANDBY, D4, N163)
---   synchronous_standby_names = '', synchronous_commit = on (local). Everything the catalog holds is also derivable from
---   the shards: `engramctl catalog reconcile --from-shards` runs first in every promotion and restore (source moved_out =>
---   move >= committed; target active without a frozen/move or moved_out source => done; no target row and no moved_out
---   source => rolled_back; shard frozen/delete => deleting; epoch rule: see namespaces, N172). An outcome a shard or a client acts on is acted on only
---   after catalog_replicated(commit LSN) (N171). A catalog restore from backup (RPO 60 s) is the only lossy path.
--- Plain SQL, PostgreSQL 16, schema public (section 9 wraps it as migrations/catalog/0001_init.sql).
--- No extensions required (gen_random_uuid() is core). Apply as the owner role catalog_migrate.
+--   synchronous_standby_names = '', synchronous_commit = on (local). Everything the catalog holds is also derivable
+--   from the shards: `engramctl catalog reconcile --from-shards` runs first in every promotion and restore (source
+--   moved_out => move >= committed; target active without a frozen/move or moved_out source => done; no target row and
+--   no moved_out source => rolled_back; shard frozen/delete => deleting; epoch rule: see namespaces, N172). An outcome
+--   a shard or a client acts on is acted on only after catalog_replicated(commit LSN) (N171). A catalog restore from
+--   backup (RPO 60 s) is the only lossy path.
+-- Plain SQL, PostgreSQL 16, schema public (section 9 wraps it as migrations/catalog/0001_init.sql). No extensions
+-- required (gen_random_uuid() is core). Apply as the owner role catalog_migrate.
 --
 -- Roles
 --   catalog_migrate  owner of every object; runs this file and later migrations
 --   catalog_app      engram-api (Resolver, NamespaceService, TenantService reads, usage rollups)
 --   catalog_admin    engramctl, MoveService, ShardService (full DML)
--- The catalog has no RLS: it holds routing metadata only, is reached only by service roles,
--- and never by tenant credentials. It holds no delete log: delete intents (N122) are objects in blob
--- storage, and the shard's deletion_log records what was applied.
+-- The catalog has no RLS: it holds routing metadata only, is reached only by service roles, and never by tenant
+-- credentials. It holds no delete log: delete intents (N122) are objects in blob storage, and the shard's deletion_log
+-- records what was applied.
 -- =============================================================================
 
 SET search_path = public;
@@ -42,12 +43,12 @@ CREATE TYPE isolation_mode  AS ENUM ('shared', 'dedicated');
 CREATE TYPE shard_state     AS ENUM ('provisioning', 'active', 'full', 'draining', 'readonly', 'retired');
 CREATE TYPE namespace_state AS ENUM ('creating', 'active', 'moving', 'frozen', 'restoring', 'deleting', 'deleted');
 -- 'restoring' (N64): the shard is being restored; its ownership rows are frozen/restore and surface as NamespaceFrozen.
--- move_state (D5, N125, N160): planned -> frozen (source write-fenced; reads continue) -> copied (copy, verify, indexes, move
--- seal, consumer wait done) -> cutover ((b') target ready) -> committed ((a'') the CAS, the point of no return; then (c),
--- (b''), (d)) -> cleaning -> done. rolled_back is reachable up to and including cutover, and from no later state; restore
--- and failover CAS cutover -> rolled_back and exactly one of the two CASes wins (N123, N161(4)). 'lost' (N183) is
--- terminal, admin-only, from committed or cleaning: a restore left the move-in below its floor. The trigger
--- catalog_check_move_transition enforces the edges.
+-- move_state (D5, N125, N160): planned -> frozen (source write-fenced; reads continue) -> copied (copy, verify,
+-- indexes, move seal, consumer wait done) -> cutover ((b') target ready) -> committed ((a'') the CAS, the point of no
+-- return; then (c), (b''), (d)) -> cleaning -> done. rolled_back is reachable up to and including cutover, and from no
+-- later state; restore and failover CAS cutover -> rolled_back and exactly one of the two CASes wins (N123, N161(4)).
+-- 'lost' (N183) is terminal, admin-only, from committed or cleaning: a restore left the move-in below its floor. The
+-- trigger catalog_check_move_transition enforces the edges.
 CREATE TYPE move_state      AS ENUM ('planned', 'frozen', 'copied', 'cutover', 'committed',
                                      'cleaning', 'done', 'rolled_back', 'lost');
 
@@ -73,12 +74,11 @@ CREATE TABLE cells (
 );
 
 -- -----------------------------------------------------------------------------
--- tenants. config: the tenant layer of system < tenant < namespace inheritance (D12).
--- DELETE_TENANT (N127, N133d) has no operation row: the catalog derives the operation from this
--- row, as DELETE_NAMESPACE is derived from namespaces.state. delete_operation_id and
--- delete_requested_at are written in the same statement that sets state = 'deleting' (the
--- DeleteTenant ack); deleted_at is written by the last step of the TenantDelete workflow together
--- with state = 'deleted'. See the view tenant_delete_operations.
+-- tenants. config: the tenant layer of system < tenant < namespace inheritance (D12). DELETE_TENANT (N127, N133d) has
+-- no operation row: the catalog derives the operation from this row, as DELETE_NAMESPACE is derived from
+-- namespaces.state. delete_operation_id and delete_requested_at are written in the same statement that sets state =
+-- 'deleting' (the DeleteTenant ack); deleted_at is written by the last step of the TenantDelete workflow together with
+-- state = 'deleted'. See the view tenant_delete_operations.
 -- -----------------------------------------------------------------------------
 CREATE TABLE tenants (
   tenant_id     text PRIMARY KEY CHECK (tenant_id ~ '^[a-z0-9-]{1,64}$'),
@@ -88,9 +88,11 @@ CREATE TABLE tenants (
   config        jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(config) = 'object'),
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now(),
-  delete_operation_id  uuid,                        -- the DELETE_TENANT operation id (UUIDv7 minted by engram-api at the ack)
+  -- the DELETE_TENANT operation id (UUIDv7 minted by engram-api at the ack)
+  delete_operation_id  uuid,
   delete_requested_at  timestamptz,                 -- the ack time = the operation's create_time
-  delete_acknowledged_at timestamptz,               -- N182: stamped by TenantDelete once every namespace is frozen/delete
+  -- N182: stamped by TenantDelete once every namespace is frozen/delete
+  delete_acknowledged_at timestamptz,
   deleted_at    timestamptz,                        -- the operation's finish_time
   CHECK ((state = 'deleted') = (deleted_at IS NOT NULL)),
   CHECK ((state IN ('deleting', 'deleted')) = (delete_operation_id IS NOT NULL)),
@@ -98,8 +100,8 @@ CREATE TABLE tenants (
   CHECK (delete_acknowledged_at IS NULL OR state IN ('deleting', 'deleted'))
 );
 
--- DELETE_TENANT operations, derived (N133d): 'deleting' -> RUNNING, 'deleted' -> SUCCEEDED. No other
--- state is derivable: TenantDelete is retried until it completes, so a stuck delete stays RUNNING.
+-- DELETE_TENANT operations, derived (N133d): 'deleting' -> RUNNING, 'deleted' -> SUCCEEDED. No other state is
+-- derivable: TenantDelete is retried until it completes, so a stuck delete stays RUNNING.
 -- TenantService.GetTenantOperation reads this view (admin, tenant-scoped).
 CREATE VIEW tenant_delete_operations AS
 SELECT t.tenant_id,
@@ -115,8 +117,8 @@ CREATE TRIGGER tenants_touch BEFORE UPDATE ON tenants
   FOR EACH ROW EXECUTE FUNCTION catalog_touch_updated_at();
 
 -- -----------------------------------------------------------------------------
--- shards: one dedicated PostgreSQL 16 instance each (D2). Dense int32 ids.
--- Placement policy columns: dedicated_tenant_id + capacity counters.
+-- shards: one dedicated PostgreSQL 16 instance each (D2). Dense int32 ids. Placement policy columns:
+-- dedicated_tenant_id + capacity counters.
 -- -----------------------------------------------------------------------------
 CREATE TABLE shards (
   shard_id              integer PRIMARY KEY CHECK (shard_id >= 0),
@@ -129,17 +131,28 @@ CREATE TABLE shards (
   blob_cred_secret_ref  text NOT NULL,             -- secret holding the credential scoped to blob_prefix/*
   task_queue            text NOT NULL,             -- 'shard-{shard_id}' (Temporal)
   kafka_topic           text NOT NULL,             -- 'engram.events.shard-{shard_id}' (used only if Kafka is on)
-  replay_floor          timestamptz,               -- N134, N163(4): lower bound for delete-intent replay; lowered with min() by every restore/failover and NEVER raised while intents are retained (35 d). A catalog restore can lose it, so replay computes min(this, the restore targets listed under _control/restores/{shard}/ in blob storage): the blob listing is the only mirror
-  system_identifier     bigint,                    -- N123: pg_control_system().system_identifier of the current primary; written on PROMOTION before the virtual endpoint flips
-  timeline_id           integer,                   -- N123: pg_control_checkpoint().timeline_id; the mover compares its session's value at Freeze and (c), the relay every 10 s
+  -- N134, N163(4): lower bound for delete-intent replay; lowered with min() by every restore/failover and NEVER raised
+  -- while intents are retained (35 d). A catalog restore can lose it, so replay computes min(this, the restore targets
+  -- listed under _control/restores/{shard}/ in blob storage): the blob listing is the only mirror
+  replay_floor          timestamptz,
+  -- N123: pg_control_system().system_identifier of the current primary; written on PROMOTION before the virtual
+  -- endpoint flips
+  system_identifier     bigint,
+  -- N123: pg_control_checkpoint().timeline_id; the mover compares its session's value at Freeze and (c), the relay
+  -- every 10 s
+  timeline_id           integer,
   dedicated_tenant_id   text REFERENCES tenants (tenant_id),   -- NULL = shared pool
   max_namespaces        integer NOT NULL DEFAULT 120 CHECK (max_namespaces > 0),
-  soft_cap_facts        bigint  NOT NULL DEFAULT 5500000,     -- N114/N165/D3: 5.5 M live facts target (hot set about 74 GB, footprint about 138 GB; 250 GB per 10 M; 6.5 M only if M0.6 measures <= 80 GB)
+  -- N114/N165/D3: 5.5 M live facts target (hot set about 74 GB, footprint about 138 GB; 250 GB per 10 M; 6.5 M only if
+  -- M0.6 measures <= 80 GB)
+  soft_cap_facts        bigint  NOT NULL DEFAULT 5500000,
   hard_cap_facts        bigint  NOT NULL DEFAULT 10000000,    -- 10 M hard cap (about 250 GB)
-  volume_bytes          bigint  NOT NULL DEFAULT 600000000000 CHECK (volume_bytes > 0),   -- 600 GB local NVMe; ShardNearCapacity pages at 70 % of it (relation bytes, N114)
+  -- 600 GB local NVMe; ShardNearCapacity pages at 70 % of it (relation bytes, N114)
+  volume_bytes          bigint  NOT NULL DEFAULT 600000000000 CHECK (volume_bytes > 0),
   namespaces_count      integer NOT NULL DEFAULT 0 CHECK (namespaces_count >= 0),
   facts_estimate        bigint  NOT NULL DEFAULT 0 CHECK (facts_estimate >= 0),
-  bytes_estimate        bigint  NOT NULL DEFAULT 0 CHECK (bytes_estimate >= 0),   -- relation bytes of the shard's namespaces, hidden and unpurged rows included (N114)
+  -- relation bytes of the shard's namespaces, hidden and unpurged rows included (N114)
+  bytes_estimate        bigint  NOT NULL DEFAULT 0 CHECK (bytes_estimate >= 0),
   stats_updated_at      timestamptz,
   schema_version        integer NOT NULL DEFAULT 0,  -- last migration applied on the shard (mirror of shard_meta)
   created_at            timestamptz NOT NULL DEFAULT now(),
@@ -160,12 +173,11 @@ CREATE TRIGGER shards_touch BEFORE UPDATE ON shards
 -- -----------------------------------------------------------------------------
 -- namespaces: the routing table. shard_id + epoch + state are what the resolver caches.
 -- profile: reflect mission/directives/disposition (namespace identity, NOT inherited).
--- embedding_model / embedding_dims (N111): fixed at namespace creation and mirrored by the shard's
--- namespace_models row; a change is the ReembedNamespace workflow (new vectors, new index, flip,
--- expunge of the old), never a config flip.
--- large: mirror of the shard's namespace_stats.large (N112) — the namespace has crossed 2,000
--- vectors and owns per-namespace partial HNSW indexes on its shard; a stats-only column, no cache
--- invalidation.
+-- embedding_model / embedding_dims (N111): fixed at namespace creation and mirrored by the shard's namespace_models
+-- row; a change is the ReembedNamespace workflow (new vectors, new index, flip, expunge of the old), never a config
+-- flip.
+-- large: mirror of the shard's namespace_stats.large (N112) — the namespace has crossed 2,000 vectors and owns
+-- per-namespace partial HNSW indexes on its shard; a stats-only column, no cache invalidation.
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespaces (
   namespace_id      uuid PRIMARY KEY,               -- UUIDv7 minted by engram-api
@@ -173,8 +185,10 @@ CREATE TABLE namespaces (
   name              text NOT NULL CHECK (name ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'),
   shard_id          integer NOT NULL REFERENCES shards (shard_id),
   epoch             bigint NOT NULL DEFAULT 1 CHECK (epoch >= 1),
-  state             namespace_state NOT NULL DEFAULT 'creating',   -- creating|active|moving|frozen|restoring|deleting|deleted
-  embedding_model   text NOT NULL DEFAULT 'nomic-embed-text-v1.5' CHECK (octet_length(embedding_model) BETWEEN 1 AND 128),
+  -- creating|active|moving|frozen|restoring|deleting|deleted
+  state             namespace_state NOT NULL DEFAULT 'creating',
+  embedding_model   text NOT NULL DEFAULT 'nomic-embed-text-v1.5'
+      CHECK (octet_length(embedding_model) BETWEEN 1 AND 128),
   embedding_dims    integer NOT NULL DEFAULT 768 CHECK (embedding_dims BETWEEN 8 AND 4000),
   config            jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(config) = 'object'),
   profile           jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(profile) = 'object'),
@@ -189,38 +203,39 @@ CREATE TABLE namespaces (
 );
 
 -- Reconcile epoch rule (N172): epoch = max over a namespace's active and frozen/* shard rows and a moved_out row's
--- target_epoch; incoming and ready rows never contribute (they carry e + 1 for the whole freeze window).
--- tenant-unique name, reusable after delete
+-- target_epoch; incoming and ready rows never contribute (they carry e + 1 for the whole freeze window). tenant-unique
+-- name, reusable after delete
 CREATE UNIQUE INDEX namespaces_tenant_name_uq ON namespaces (tenant_id, name) WHERE state <> 'deleted';
 CREATE INDEX namespaces_shard_idx  ON namespaces (shard_id, state);
 CREATE INDEX namespaces_tenant_idx ON namespaces (tenant_id, state);
--- 'creating' rows older than 2 min are completed or deleted by the per-shard op-sweeper (N72,
--- review F-45): CreateNamespace is two-phase across the catalog and the shard.
+-- 'creating' rows older than 2 min are completed or deleted by the per-shard op-sweeper (N72, review F-45):
+-- CreateNamespace is two-phase across the catalog and the shard.
 CREATE INDEX namespaces_creating_idx ON namespaces (created_at) WHERE state = 'creating';
 
 CREATE TRIGGER namespaces_touch BEFORE UPDATE ON namespaces
   FOR EACH ROW EXECUTE FUNCTION catalog_touch_updated_at();
 
 -- -----------------------------------------------------------------------------
--- namespace_moves: one row per move attempt (D5, N125, N160). At most one live move per namespace.
--- It is also the ARBITER of restore and failover (N123): the catalog CAS
+-- namespace_moves: one row per move attempt (D5, N125, N160). At most one live move per namespace. It is also the
+-- ARBITER of restore and failover (N123): the catalog CAS
 --   UPDATE ... SET state = 'committed' WHERE move_id = $1 AND state = 'cutover'
 -- is the point of no return (a''). A restored or promoted shard CASes cutover -> rolled_back only after reading both
--- ownership rows and finding neither moved_out on the source nor active at the move's epoch on the target (N161(4));
--- if it reads 'committed' it completes (c), (b'') and (d) (reconcile_out). Exactly one CAS wins. Every shard action on
--- an arbiter outcome (thaw, unready_target, rollback_target, reconcile_out, (c)) waits catalog_replicated (10 s per
+-- ownership rows and finding neither moved_out on the source nor active at the move's epoch on the target (N161(4)); if
+-- it reads 'committed' it completes (c), (b'') and (d) (reconcile_out). Exactly one CAS wins. Every shard action on an
+-- arbiter outcome (thaw, unready_target, rollback_target, reconcile_out, (c)) waits catalog_replicated (10 s per
 -- attempt) and re-reads the row (N171(2)). Order: (b') target incoming -> ready; (a'') the CAS; (c) source frozen/move
 -- -> moved_out, fenced on the source row and the replicated 'committed' only; (b'') target ready -> active (clears
--- move_id); (d) catalog flip WHERE epoch = e AND state = 'frozen', "already (target, e + 1)" its only idempotent success.
--- Window (N173): read-only from frozen_at; freeze_deadline <= frozen_at + window_seconds, window_seconds >=
--- max(1.5 * w_est, w_est + 10 min), cap 8 h; before (a'') the deadline rolls back (MoveWindowExceeded), after it the
--- page MoveFrozenPastDeadline (N171(4)), never a rollback.
+-- move_id); (d) catalog flip WHERE epoch = e AND state = 'frozen', "already (target, e + 1)" its only idempotent
+-- success.
+-- Window (N173): read-only from frozen_at; freeze_deadline <= frozen_at + window_seconds, window_seconds >= max(1.5 *
+-- w_est, w_est + 10 min), cap 8 h; before (a'') the deadline rolls back (MoveWindowExceeded), after it the page
+-- MoveFrozenPastDeadline (N171(4)), never a rollback.
 -- Cleanup gate (N170): committed -> cleaning needs now() >= activated_at + 24 h, enforced once, in
 -- catalog_check_move_transition. activated_at is stamped by a separate same-state UPDATE ((b'') by the mover, or
--- `engramctl restore` for a target the restore path activated, N180(1)) before the committed -> cleaning statement;
--- the trigger reads OLD.activated_at; backdating by catalog_admin is within the admin trust. CleanupMove takes
--- committed -> cleaning only; the cleanup activity records 'done' after one extra engram_cleanup_namespace returning 0
--- (N184(2)). The seal (N179) precedes 'cutover': CHECKs below.
+-- `engramctl restore` for a target the restore path activated, N180(1)) before the committed -> cleaning statement; the
+-- trigger reads OLD.activated_at; backdating by catalog_admin is within the admin trust. CleanupMove takes committed ->
+-- cleaning only; the cleanup activity records 'done' after one extra engram_cleanup_namespace returning 0 (N184(2)).
+-- The seal (N179) precedes 'cutover': CHECKs below.
 -- Reconcile (N163, N180(4), N184(5), N185): the owner of a namespace is its highest-epoch active/frozen/* shard row
 -- (frozen/restore counts), re-read once on a torn snapshot; a re-derived 'committed' writes routing only and never
 -- activates a shard row; its copy_end_lsn comes from the target row's floor_lsn; a shard unreadable within 5 s is
@@ -237,45 +252,65 @@ CREATE TABLE namespace_moves (
   state                  move_state NOT NULL DEFAULT 'planned',
   source_system_id       bigint,                    -- N123: a mismatch fails MoveFenced
   source_timeline_id     integer,
-  w_est_seconds          integer NOT NULL CHECK (w_est_seconds >= 0),   -- N173(1): rows/R_copy + build(vectors) + max(wal_build/R_archive, wal_build/R_redo) + verify; about 27 min per 1 M facts
-  window_seconds         integer NOT NULL CHECK (window_seconds > 0 AND window_seconds <= 28800),   -- N173(3): the operator window (cap 8 h, default 4 h)
-  w_final                bigint,                    -- N147: the source's nextval under the freeze; the target is advanced past it once at the start of FrozenCopy ((b') checks last_value > w_final)
-  terminated_workflows   text[] NOT NULL DEFAULT '{}',  -- workflow ids terminated at drain, restarted on the target (N97)
+  -- N173(1): rows/R_copy + build(vectors) + max(wal_build/R_archive, wal_build/R_redo) + verify; about 27 min per 1 M
+  -- facts
+  w_est_seconds          integer NOT NULL CHECK (w_est_seconds >= 0),
+  -- N173(3): the operator window (cap 8 h, default 4 h)
+  window_seconds         integer NOT NULL CHECK (window_seconds > 0 AND window_seconds <= 28800),
+  -- N147: the source's nextval under the freeze; the target is advanced past it once at the start of FrozenCopy ((b')
+  -- checks last_value > w_final)
+  w_final                bigint,
+  -- workflow ids terminated at drain, restarted on the target (N97)
+  terminated_workflows   text[] NOT NULL DEFAULT '{}',
   error                  text,
   created_by             text NOT NULL,             -- operator principal (engramctl) or 'rebalancer'
   created_at             timestamptz NOT NULL DEFAULT now(),
   updated_at             timestamptz NOT NULL DEFAULT now(),
   frozen_at              timestamptz,
   freeze_deadline        timestamptz,               -- N173(3): at most frozen_at + window_seconds
-  ready_at               timestamptz,               -- (b') target incoming -> ready; rollback still possible (unready_target)
-  committed_at           timestamptz,               -- (a'') the catalog CAS cutover -> committed: the point of no return
-  committed_replicated_at timestamptz,              -- N171(2): the standby replayed the 'committed' CAS; (c) waits for it
-  rolled_back_replicated_at timestamptz,            -- N171(2): the standby replayed the 'rolled_back' CAS; thaw / unready_target / rollback_target wait for it
+  -- (b') target incoming -> ready; rollback still possible (unready_target)
+  ready_at               timestamptz,
+  -- (a'') the catalog CAS cutover -> committed: the point of no return
+  committed_at           timestamptz,
+  -- N171(2): the standby replayed the 'committed' CAS; (c) waits for it
+  committed_replicated_at timestamptz,
+  -- N171(2): the standby replayed the 'rolled_back' CAS; thaw / unready_target / rollback_target wait for it
+  rolled_back_replicated_at timestamptz,
   moved_out_at           timestamptz,               -- (c) on the source; informational (the arbiter is committed_at)
   activated_at           timestamptz,               -- (b'') target ready -> active
-  copy_end_lsn           pg_lsn,                    -- N179(1): pg_switch_wal() on the target after the last index commit (the floor of every target restore and failover)
+  -- N179(1): pg_switch_wal() on the target after the last index commit (the floor of every target restore and failover)
+  copy_end_lsn           pg_lsn,
   copy_end_timeline      int4,
-  copy_sealed_at         timestamptz,               -- N179(1): segment archived (pgbackrest check) and standby replayed (engram_standby_replayed), before (b')
-  reconciled_at          timestamptz,               -- N184(5): re-derived from shard truth; the reconcile stamped copy_sealed_at and committed_replicated_at with it
+  -- N179(1): segment archived (pgbackrest check) and standby replayed (engram_standby_replayed), before (b')
+  copy_sealed_at         timestamptz,
+  -- N184(5): re-derived from shard truth; the reconcile stamped copy_sealed_at and committed_replicated_at with it
+  reconciled_at          timestamptz,
   lost_at                timestamptz,               -- N183
   lost_restore_id        text,                      -- N183: the _control/restores/ marker that caused it
-  recovered_from_move_id uuid REFERENCES namespace_moves (move_id),   -- N183: set on the recovery move of a lost move-in
+  -- N183: set on the recovery move of a lost move-in
+  recovered_from_move_id uuid REFERENCES namespace_moves (move_id),
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
   CHECK (to_epoch = from_epoch + 1),
   CHECK ((source_system_id IS NULL) = (source_timeline_id IS NULL)),
-  CHECK (state NOT IN ('frozen', 'copied', 'cutover', 'committed', 'cleaning', 'done', 'lost') OR frozen_at IS NOT NULL),
+  CHECK (state NOT IN ('frozen', 'copied', 'cutover', 'committed', 'cleaning', 'done', 'lost') OR frozen_at IS
+         NOT NULL),
   CHECK ((frozen_at IS NULL) = (freeze_deadline IS NULL)),
   CHECK (state NOT IN ('committed', 'cleaning', 'done', 'lost') OR committed_at IS NOT NULL),
   CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL),
-  CHECK (ready_at IS NULL OR w_final IS NOT NULL),                                     -- N147: no 'ready' before the target's sequence passed W_final
-  CHECK (window_seconds >= greatest(1.5 * w_est_seconds, w_est_seconds + 600)),        -- N173(3): StartMove refuses a shorter window
+  -- N147: no 'ready' before the target's sequence passed W_final
+  CHECK (ready_at IS NULL OR w_final IS NOT NULL),
+  -- N173(3): StartMove refuses a shorter window
+  CHECK (window_seconds >= greatest(1.5 * w_est_seconds, w_est_seconds + 600)),
   CHECK (freeze_deadline IS NULL OR freeze_deadline <= frozen_at + window_seconds * interval '1 second'),
-  CHECK (created_by <> 'rebalancer' OR w_est_seconds <= 600),                          -- N173: unattended only when W_est <= 10 min
-  CHECK (state NOT IN ('cutover', 'committed', 'cleaning', 'done', 'lost') OR copy_sealed_at IS NOT NULL),   -- N179(1): the seal precedes the commit point
+  -- N173: unattended only when W_est <= 10 min
+  CHECK (created_by <> 'rebalancer' OR w_est_seconds <= 600),
+  -- N179(1): the seal precedes the commit point
+  CHECK (state NOT IN ('cutover', 'committed', 'cleaning', 'done', 'lost') OR copy_sealed_at IS NOT NULL),
   CHECK (copy_sealed_at IS NULL OR copy_sealed_at > frozen_at),
   CHECK (state <> 'lost' OR (lost_at IS NOT NULL AND lost_restore_id IS NOT NULL)),    -- N183
-  CHECK (moved_out_at IS NULL OR committed_replicated_at IS NOT NULL),                 -- N171(2); the reconcile satisfies it with committed_replicated_at = reconciled_at
+  -- N171(2); the reconcile satisfies it with committed_replicated_at = reconciled_at
+  CHECK (moved_out_at IS NULL OR committed_replicated_at IS NOT NULL),
   CHECK (state <> 'done' OR finished_at IS NOT NULL)
 );
 
@@ -286,8 +321,8 @@ CREATE INDEX namespace_moves_state_idx ON namespace_moves (state, updated_at);
 CREATE TRIGGER namespace_moves_touch BEFORE UPDATE ON namespace_moves
   FOR EACH ROW EXECUTE FUNCTION catalog_touch_updated_at();
 
--- The move state machine as a trigger (N125): the only way out of 'committed' is forward, so after
--- the CAS neither a rollback nor a restore reconcile can win. A same-state update is allowed (timestamps).
+-- The move state machine as a trigger (N125): the only way out of 'committed' is forward, so after the CAS neither a
+-- rollback nor a restore reconcile can win. A same-state update is allowed (timestamps).
 CREATE FUNCTION catalog_check_move_transition() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -313,8 +348,8 @@ CREATE TRIGGER namespace_moves_transition BEFORE UPDATE OF state ON namespace_mo
   FOR EACH ROW EXECUTE FUNCTION catalog_check_move_transition();
 
 -- -----------------------------------------------------------------------------
--- idempotency_keys: request_id for catalog-level writes (CreateNamespace, tenant/admin
--- methods), scoped to (tenant, method); 24 h (D1). Shard-level writes keep theirs on the shard.
+-- idempotency_keys: request_id for catalog-level writes (CreateNamespace, tenant/admin methods), scoped to (tenant,
+-- method); 24 h (D1). Shard-level writes keep theirs on the shard.
 -- -----------------------------------------------------------------------------
 CREATE TABLE idempotency_keys (
   tenant_id      text NOT NULL REFERENCES tenants (tenant_id),
@@ -330,9 +365,9 @@ CREATE TABLE idempotency_keys (
 CREATE INDEX idempotency_keys_expiry_idx ON idempotency_keys (expires_at);
 
 -- -----------------------------------------------------------------------------
--- tenant_usage_daily: cross-shard rollup for TENANT-level quotas (llm_tokens_per_day).
--- Shards hold per-namespace counters; a tenant may span shards and no query may span
--- shards, so engram-api folds per-minute deltas reported by workers into this table.
+-- tenant_usage_daily: cross-shard rollup for TENANT-level quotas (llm_tokens_per_day). Shards hold per-namespace
+-- counters; a tenant may span shards and no query may span shards, so engram-api folds per-minute deltas reported by
+-- workers into this table.
 -- -----------------------------------------------------------------------------
 CREATE TABLE tenant_usage_daily (
   tenant_id   text NOT NULL REFERENCES tenants (tenant_id),
@@ -383,8 +418,8 @@ END $$;
 CREATE TRIGGER catalog_events_notify AFTER INSERT ON catalog_events
   FOR EACH ROW EXECUTE FUNCTION catalog_notify_event();
 
--- Every routing-relevant namespace change is logged (and thereby notified). Stats-only
--- updates (facts_estimate, bytes_estimate, stats_updated_at) do not invalidate caches.
+-- Every routing-relevant namespace change is logged (and thereby notified). Stats-only updates (facts_estimate,
+-- bytes_estimate, stats_updated_at) do not invalidate caches.
 CREATE FUNCTION catalog_log_namespace_change() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -435,10 +470,9 @@ CREATE TRIGGER namespace_moves_log AFTER INSERT OR UPDATE ON namespace_moves
   FOR EACH ROW EXECUTE FUNCTION catalog_log_move_change();
 
 -- -----------------------------------------------------------------------------
--- Placement policy: pick_shard(tenant) chooses and reserves a shard slot.
--- Dedicated tenants land only on shards flagged for them; shared tenants only on unflagged
--- active shards below both caps. Least loaded first (facts ratio, then namespace count).
--- Called inside the CreateNamespace transaction; the row lock serialises placement.
+-- Placement policy: pick_shard(tenant) chooses and reserves a shard slot. Dedicated tenants land only on shards flagged
+-- for them; shared tenants only on unflagged active shards below both caps. Least loaded first (facts ratio, then
+-- namespace count). Called inside the CreateNamespace transaction; the row lock serialises placement.
 -- -----------------------------------------------------------------------------
 CREATE FUNCTION pick_shard(p_tenant_id text) RETURNS integer
 LANGUAGE plpgsql AS $$
@@ -453,8 +487,8 @@ BEGIN
     RAISE EXCEPTION 'tenant % is not active', p_tenant_id USING ERRCODE = 'P0002';
   END IF;
 
-  -- N131 (P-16): namespaces_count is DERIVED here from the namespaces table (a counter that is only
-  -- incremented drifts after deletes and moves); the stored column is refreshed from the same count.
+  -- N131 (P-16): namespaces_count is DERIVED here from the namespaces table (a counter that is only incremented drifts
+  -- after deletes and moves); the stored column is refreshed from the same count.
   SELECT s.shard_id INTO v_shard
     FROM shards s
    CROSS JOIN LATERAL (SELECT count(*)::integer AS n FROM namespaces x
@@ -487,9 +521,9 @@ END $$;
 --   INSERT namespace_ownership (ns, tenant, shard, 1, 'active') + namespace_stats + namespace_models
 --   (the shard's ownership trigger admits nothing but this active/epoch-1 insert from engram_app);
 -- then: UPDATE namespaces SET state = 'active' (which logs + NOTIFYs).
--- A crash between the phases leaves a 'creating' row: the per-shard op-sweeper (N72) completes
--- it when the shard row exists, otherwise deletes both (namespaces_creating_idx); a client
--- retry replays through idempotency_keys exactly like Retain.
+-- A crash between the phases leaves a 'creating' row: the per-shard op-sweeper (N72) completes it when the shard row
+-- exists, otherwise deletes both (namespaces_creating_idx); a client retry replays through idempotency_keys exactly
+-- like Retain.
 
 -- -----------------------------------------------------------------------------
 -- Grants
@@ -502,7 +536,8 @@ GRANT INSERT ON catalog_events TO catalog_app;                 -- via triggers
 GRANT INSERT, UPDATE, DELETE ON idempotency_keys TO catalog_app;
 GRANT INSERT, UPDATE ON tenant_usage_daily TO catalog_app;
 GRANT UPDATE (namespaces_count, facts_estimate, bytes_estimate, stats_updated_at, updated_at)
-  ON shards TO catalog_app;                                    -- pick_shard + stats reporter (namespaces.large is set by the same reporter)
+  -- pick_shard + stats reporter (namespaces.large is set by the same reporter)
+  ON shards TO catalog_app;
 GRANT EXECUTE ON FUNCTION pick_shard(text) TO catalog_app;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO catalog_admin;

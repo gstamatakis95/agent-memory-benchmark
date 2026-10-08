@@ -55,7 +55,8 @@ else
   echo "buf breaking: no baseline on the merge target (lint and build only)" >> "${GITHUB_STEP_SUMMARY:-/dev/stderr}"
 fi
 # plan pull requests (the plan lives on its own branch) compare with its merge base instead
-buf breaking plans/engram/proto --against ".git#ref=$(git merge-base origin/claude/engram-implementation-plan HEAD),subdir=plans/engram/proto"
+buf breaking plans/engram/proto \
+  --against ".git#ref=$(git merge-base origin/claude/engram-implementation-plan HEAD),subdir=plans/engram/proto"
 # the push-to-main job only: the previous commit, until v1.0.0 (N139)
 buf breaking plans/engram/proto --against '.git#branch=main,ref=HEAD~1,subdir=plans/engram/proto'
 ```

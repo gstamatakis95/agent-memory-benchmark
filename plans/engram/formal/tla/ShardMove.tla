@@ -1,81 +1,67 @@
----------------------------- MODULE ShardMove ----------------------------
-(***************************************************************************)
-(* Engram D27 (N160 to N163, N168 to N188): moving one namespace from Src  *)
-(* to Tgt by freeze, copy, verify, index, SEAL, cut over.                  *)
-(*                                                                         *)
-(* The catalog row of the move, cm, is the arbiter:                        *)
-(*   open --(a'') CAS--> committed --> done                                *)
-(*   open --AbortCAS--> rolled_back   (mover, window, restore reconcile)   *)
-(* Mover (mp): Plan (planned) -> Freeze (the source is static from here to *)
-(* thaw or cleanup) -> CopyStep* (frozen) -> VerifyFrozen (copied) ->      *)
-(* BuildIndex (built) -> SealCopy (sealed: the target's WAL is archived    *)
-(* through copy_end_lsn and its standby has replayed the copy; flr) ->     *)
-(* (b') Tgt incoming->ready -> (a'') CAS -> Replicated (the standby has the*)
-(* commit) -> (c) Src frozen->moved_out (source row and replicated         *)
-(* `committed` only) -> (b'') Tgt ready->active -> (d) catalog flip ->     *)
-(* Cleanup (the gate is the seal).  An abort is AbortCAS (mp = aborting),  *)
-(* AbortReplicated, then Thaw (needs the replicated `rolled_back`).        *)
-(*                                                                         *)
-(* No dirty copy, no catch-up, no merge, no re-run: the source does not    *)
-(* change while it is copied.  Three table classes (N137) are copied alike:*)
-(* an insert-only row r (ledger), a mutable key r (idempotency key; the    *)
-(* source may sweep it before the freeze) and a counter of the expiring    *)
-(* class (copied once, verified `<=`).  TgtDelete is a legitimate delete on*)
-(* the active target; `gone` is the set of such rows, which are durable:   *)
-(* the intent replay (Durability.tla) re-applies them after every restore. *)
-(*                                                                         *)
-(* Restore / failover of either shard (N123): the shard reverts to its last*)
-(* backup (Restore), to its standby's replayed snapshot sb (Failover), or, *)
-(* lossless, keeps its state; it comes up `restoring` (= frozen/restore),  *)
-(* reconciles the move against the catalog (open: AbortCAS, then the thaw  *)
-(* once `rolled_back` is replicated; committed: complete (c), (b''), (d)   *)
-(* itself).  A target restored after the commit point is an ordinary       *)
-(* restore: it completes (c)/(d), then RestoreDone activates it at a new   *)
-(* epoch and closes the move bit mv (N180).  Once the copy is sealed, flr  *)
-(* is the LSN floor of the target: a restore or failover that would land   *)
-(* below it is refused (N179(3)); a restore at or past it carries the copy,*)
-(* which the model states as "the snapshot covers the frozen rows".        *)
-(*                                                                         *)
-(* Catalog (N163, N171, N172, N185): CatalogLoss is a promotion of the     *)
-(* standby that loses an arbiter outcome not replicated yet; CatalogPromote*)
-(* is a lossless promotion; CatalogRestore is a restore from backup (RPO   *)
-(* 60 s, T7-3: rep is reset); every one sets cdirty and the reconcile (no  *)
-(* catalog access by anyone else while cdirty) re-derives cat/cm from the  *)
-(* ownership rows: ReadShard(s) snapshots one row, ApplyReconcile derives  *)
-(* from the snapshots (owner = highest-epoch active/frozen/restoring row), *)
-(* so mover steps and shard restores interleave with the reads.            *)
-(*                                                                         *)
-(* Knobs (design: all TRUE except StampAfterCut, CopyBeforeFreeze,         *)
-(* ReadyBeforeIndex, UnionRepair, AllowAbort, EpochFromAnyRow):            *)
-(*   UseReady=FALSE           Tgt goes active before (c); catalog may flip *)
-(*   ReconcileOnRestore=FALSE restore trusts its backup row, bumps epoch   *)
-(*   ReconcileVerify=FALSE    VerifyFrozen compares nothing (CopyFault ok) *)
-(*   FencedSteps=FALSE        mover steps do not check the rows they saw   *)
-(*   SweepPause=FALSE         the expiring-class sweep runs under a freeze *)
-(*   StampAfterCut=TRUE       (c) first, the catalog stamp afterwards      *)
-(*   SeqAdvance=FALSE         Freeze does not raise sq[Tgt] (N147)         *)
-(*   ShardTruth=FALSE         no catalog reconcile; shards trust the cm    *)
-(*   CopyBeforeFreeze=TRUE    copy from the unfrozen source, no catch-up   *)
-(*   ReadyBeforeIndex=TRUE    Tgt may become ready without its index       *)
-(*   CutNeedsReplicated=FALSE (c) and the shard reconcile act on an        *)
-(*                            unreplicated commit                          *)
-(*   UnionRepair=TRUE         a restored, serving target is repaired by    *)
-(*                            store[Tgt] u store[Src]                      *)
-(*   FloorBeforeCut=FALSE     (b') without the seal: no floor, no wait for *)
-(*                            the standby (N179)                           *)
-(*   FailoverChecksFloor=FALSE a failover of the target may land below the *)
-(*                            floor (N179(3))                              *)
-(*   RestoreCloses=FALSE      restore_done leaves the move bit set (N180)  *)
-(*   EndFromTargetRow=FALSE   the mover ends `done` when the catalog routes*)
-(*                            to the target, whatever its row says (N180(3))*)
-(*   ThawNeedsReplicated=FALSE thaw before `rolled_back` is replicated     *)
-(*   EpochFromAnyRow=TRUE     the reconcile's epoch counts incoming/ready  *)
-(*                            rows (N172)                                  *)
-(*   AllowAbort               the mover may abort at any pre-commit step   *)
-(*   MaxCat, MaxMoves, MaxFault, SqSkew, Window: catalog losses, promotions*)
-(*   and restores, moves of the namespace, copy faults, initial sq[s1], the*)
-(*   freeze window in ticks                                                *)
-(***************************************************************************)
+--------------------------------------------------- MODULE ShardMove ---------------------------------------------------
+(**********************************************************************************************************************)
+(* Engram D27 (N160 to N163, N168 to N188): moving one namespace from Src to Tgt by freeze, copy, verify, index,      *)
+(* SEAL, cut over.                                                                                                    *)
+(*                                                                                                                    *)
+(* The catalog row of the move, cm, is the arbiter:                                                                   *)
+(*   open --(a'') CAS--> committed --> done                                                                           *)
+(*   open --AbortCAS--> rolled_back   (mover, window, restore reconcile)                                              *)
+(* Mover (mp): Plan (planned) -> Freeze (the source is static from here to thaw or cleanup) -> CopyStep* (frozen) ->  *)
+(* VerifyFrozen (copied) -> BuildIndex (built) -> SealCopy (sealed: the target's WAL is archived through copy_end_lsn *)
+(* and its standby has replayed the copy; flr) ->                                                                     *)
+(* (b') Tgt incoming->ready -> (a'') CAS -> Replicated (the standby has the commit) -> (c) Src frozen->moved_out      *)
+(* (source row and replicated `committed` only) -> (b'') Tgt ready->active -> (d) catalog flip -> Cleanup (the gate   *)
+(* is the seal). An abort is AbortCAS (mp = aborting), AbortReplicated, then Thaw (needs the replicated               *)
+(* `rolled_back`).                                                                                                    *)
+(*                                                                                                                    *)
+(* No dirty copy, no catch-up, no merge, no re-run: the source does not change while it is copied. Three table        *)
+(* classes (N137) are copied alike: an insert-only row r (ledger), a mutable key r (idempotency key; the source may   *)
+(* sweep it before the freeze) and a counter of the expiring class (copied once, verified `<=`). TgtDelete is a       *)
+(* legitimate delete on the active target; `gone` is the set of such rows, which are durable: the intent replay       *)
+(* (Durability.tla) re-applies them after every restore.                                                              *)
+(*                                                                                                                    *)
+(* Restore / failover of either shard (N123): the shard reverts to its last backup (Restore), to its standby's        *)
+(* replayed snapshot sb (Failover), or, lossless, keeps its state; it comes up `restoring` (= frozen/restore),        *)
+(* reconciles the move against the catalog (open: AbortCAS, then the thaw once `rolled_back` is replicated;           *)
+(* committed: complete (c), (b''), (d) itself). A target restored after the commit point is an ordinary restore: it   *)
+(* completes (c)/(d), then RestoreDone activates it at a new epoch and closes the move bit mv (N180). Once the copy   *)
+(* is sealed, flr is the LSN floor of the target: a restore or failover that would land below it is refused           *)
+(* (N179(3)); a restore at or past it carries the copy, which the model states as "the snapshot covers the frozen     *)
+(* rows".                                                                                                             *)
+(*                                                                                                                    *)
+(* Catalog (N163, N171, N172, N185): CatalogLoss is a promotion of the standby that loses an arbiter outcome not      *)
+(* replicated yet; CatalogPromote is a lossless promotion; CatalogRestore is a restore from backup (RPO 60 s, T7-3:   *)
+(* rep is reset); every one sets cdirty and the reconcile (no catalog access by anyone else while cdirty) re-derives  *)
+(* cat/cm from the ownership rows: ReadShard(s) snapshots one row, ApplyReconcile derives from the snapshots (owner = *)
+(* highest-epoch active/frozen/restoring row), so mover steps and shard restores interleave with the reads.           *)
+(*                                                                                                                    *)
+(* Knobs (design: all TRUE except StampAfterCut, CopyBeforeFreeze, ReadyBeforeIndex, UnionRepair, AllowAbort,         *)
+(* EpochFromAnyRow):                                                                                                  *)
+(*   UseReady=FALSE           Tgt goes active before (c); catalog may flip                                            *)
+(*   ReconcileOnRestore=FALSE restore trusts its backup row, bumps epoch                                              *)
+(*   ReconcileVerify=FALSE    VerifyFrozen compares nothing (CopyFault ok)                                            *)
+(*   FencedSteps=FALSE        mover steps do not check the rows they saw                                              *)
+(*   SweepPause=FALSE         the expiring-class sweep runs under a freeze                                            *)
+(*   StampAfterCut=TRUE       (c) first, the catalog stamp afterwards                                                 *)
+(*   SeqAdvance=FALSE         Freeze does not raise sq[Tgt] (N147)                                                    *)
+(*   ShardTruth=FALSE         no catalog reconcile; shards trust the cm                                               *)
+(*   CopyBeforeFreeze=TRUE    copy from the unfrozen source, no catch-up                                              *)
+(*   ReadyBeforeIndex=TRUE    Tgt may become ready without its index                                                  *)
+(*   CutNeedsReplicated=FALSE (c) and the shard reconcile act on an                                                   *)
+(*                            unreplicated commit                                                                     *)
+(*   UnionRepair=TRUE         a restored, serving target is repaired by store[Tgt] u store[Src]                       *)
+(*   FloorBeforeCut=FALSE     (b') without the seal: no floor, no wait for the standby (N179)                         *)
+(*   FailoverChecksFloor=FALSE a failover of the target may land below the                                            *)
+(*                            floor (N179(3))                                                                         *)
+(*   RestoreCloses=FALSE      restore_done leaves the move bit set (N180)                                             *)
+(*   EndFromTargetRow=FALSE   the mover ends `done` when the catalog routes to the target, whatever its row says      *)
+(*                            (N180(3))                                                                               *)
+(*   ThawNeedsReplicated=FALSE thaw before `rolled_back` is replicated                                                *)
+(*   EpochFromAnyRow=TRUE     the reconcile's epoch counts incoming/ready rows (N172)                                 *)
+(*   AllowAbort               the mover may abort at any pre-commit step                                              *)
+(*   MaxCat, MaxMoves, MaxFault, SqSkew, Window: catalog losses, promotions and restores, moves of the namespace,     *)
+(*   copy faults, initial sq[s1], the freeze window in ticks                                                          *)
+(**********************************************************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS NRows, Clients, Life, MaxT, Window, MaxEp, MaxRestore, MaxBak, AllowAbort,
@@ -108,7 +94,8 @@ RolV  == <<src, tgt, nMoves, me>>             \* roles of the current move (a se
 SqV   == <<sq>>
 IdxV  == <<idx>>
 FlagV == <<rep, cdirty, rview, abt, abp>>
-FlrV  == <<sb, flr, mv>>                    \* sb: the target's standby image; flr[s]: the shard's WAL floor (floor_lsn) and what it covers; mv: the move bit
+\* sb: the target's standby image; flr[s]: the shard's WAL floor (floor_lsn) and what it covers; mv: the move bit
+FlrV  == <<sb, flr, mv>>
 NoFloor == [on |-> FALSE, rows |-> {}, keys |-> {}]
 CpV   == <<cdn, cex, rc, nFault, fzt>>
 TlV   == <<tlc, nCat>>
@@ -117,7 +104,8 @@ vars == <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV
 Row(st, ep) == [st |-> st, ep |-> ep]
 NoRow == Row("unread", 0)
 IdleW == [ph |-> "idle", r |-> 0, sh |-> "s1", age |-> 0]
-\* The standby's replayed image: the rows, the keys and the index bit (the shard's row, counter and sequence are not tracked).
+\* The standby's replayed image: the rows, the keys and the index bit (the shard's row, counter and sequence are not
+\* tracked).
 SbOf(s) == [store |-> store[s], mk |-> mk[s], idx |-> idx[s]]
 Holders(s) == {c \in Clients : wr[c].ph = "hold" /\ wr[c].sh = s}
 \* Every mover step is a compare-and-set on the rows it observed (source, target, catalog move).
@@ -127,11 +115,11 @@ SessionOk == mtl = tl
 Settled == \A s \in Shards : own[s].st \notin {"restoring", "replaying"}
 Max2(a, b) == IF a >= b THEN a ELSE b
 
-\* A snapshot (a backup, a standby's replay) at or past a floor carries the whole copy the floor was set for (every sealed row
-\* it did not delete itself) and its index: copy_end_lsn is read after the last index build has committed.
+\* A snapshot (a backup, a standby's replay) at or past a floor carries the whole copy the floor was set for (every
+\* sealed row it did not delete itself) and its index: copy_end_lsn is read after the last index build has committed.
 CoversRows(rows, keys, B) == (rows \ gone) \subseteq B.store /\ (keys \ gone) \subseteq B.mk /\ B.idx
-\* N179(3): a restore or failover to B lands below the shard's floor if B lacks what the floor covers.  The floor stays on
-\* the row after the move (it is cleared only by return_move).
+\* N179(3): a restore or failover to B lands below the shard's floor if B lacks what the floor covers. The floor stays
+\* on the row after the move (it is cleared only by return_move).
 BelowFloor(s, B) == flr[s].on /\ ~CoversRows(flr[s].rows, flr[s].keys, B)
 
 \* The copy of the current move is complete: every row of the (static) source has been copied once, and the counter.
@@ -140,9 +128,9 @@ CopyDone == (store[src] \cup mk[src]) \subseteq cdn /\ cex
 Verified == ~ReconcileVerify \/ (store[src] = store[tgt] /\ mk[src] = mk[tgt] /\ ex[tgt] <= ex[src])
 CopyPhase == IF CopyBeforeFreeze THEN mp = "planned" ELSE (mp = "frozen" /\ SrcFrozen)
 
-\* Rows that the move preserves although the shard that held them loses its tail (not an RPO loss): the target's copy
-\* of the source rows is repairable from the intact source; the source's frozen rows live on the target copy once the
-\* commit is durable (replicated, or acted on by (c)).  A commit that is neither is not a promise (N163(3)).
+\* Rows that the move preserves although the shard that held them loses its tail (not an RPO loss): the target's copy of
+\* the source rows is repairable from the intact source; the source's frozen rows live on the target copy once the
+\* commit is durable (replicated, or acted on by (c)). A commit that is neither is not a promise (N163(3)).
 Recoverable(s) ==
   IF cleaned THEN {}
   ELSE IF s = tgt /\ flr[tgt].on /\ mp \in {"sealed", "ready", "committed", "cut", "tactive", "done"}
@@ -168,7 +156,8 @@ Init ==
   /\ sq = [s \in Shards |-> IF s = "s1" THEN SqSkew ELSE 0]
   /\ idx = [s \in Shards |-> s = "s1"]
   /\ bak = [s \in Shards |-> [own |-> own[s], store |-> {}, mk |-> {}, ex |-> 0, sq |-> sq[s], idx |-> idx[s]]]
-  /\ sb = [s \in Shards |-> [store |-> {}, mk |-> {}, idx |-> idx[s]]] /\ flr = [s \in Shards |-> NoFloor] /\ mv = [s \in Shards |-> FALSE]
+  /\ sb = [s \in Shards |-> [store |-> {}, mk |-> {}, idx |-> idx[s]]] /\ flr = [s \in Shards |-> NoFloor]
+       /\ mv = [s \in Shards |-> FALSE]
   /\ used = {} /\ sqt = [r \in Rows |-> 0]
   /\ committed = {} /\ lost = {} /\ gone = {}
   /\ wr = [c \in Clients |-> IdleW] /\ cc = [c \in Clients |-> cat]
@@ -186,8 +175,8 @@ Refresh(c) == /\ ~cdirty
               /\ cc' = [cc EXCEPT ![c] = cat]
               /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, wr, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
 
-\* A write transaction takes the shared fence and checks `active` at its epoch.  Its insert-only
-\* row has ins_seq = nextval of the shard's sequence.
+\* A write transaction takes the shared fence and checks `active` at its epoch. Its insert-only row has ins_seq =
+\* nextval of the shard's sequence.
 Begin(c, r) ==
   /\ wr[c].ph = "idle" /\ r \notin used
   /\ LET s == cc[c].sh IN own[s] = Row("active", cc[c].ep)
@@ -208,24 +197,25 @@ Commit(c) ==
   /\ wr' = [wr EXCEPT ![c] = IdleW]
   /\ UNCHANGED <<CatV, MovV, OwnV, used, sqt, lost, gone, cc, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
 
-\* Source-side deletes of the mutable class (the 24 h sweep of idempotency keys).  An active source only: under
-\* the freeze nothing is deleted (N160).
+\* Source-side deletes of the mutable class (the 24 h sweep of idempotency keys). An active source only: under the
+\* freeze nothing is deleted (N160).
 SrcDelete(r) ==
   /\ own[src].st = "active" /\ r \in mk[src]
   /\ mk' = [mk EXCEPT ![src] = @ \ {r}]
   /\ UNCHANGED <<CatV, MovV, OwnV, store, ex, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
 
-\* A legitimate delete on the active target (document expunge, retire purge, key sweep, compaction; C-1).  The
-\* row stays on the source until its cleanup; the delete is durable (intent), see the header.
+\* A legitimate delete on the active target (document expunge, retire purge, key sweep, compaction; C-1). The row stays
+\* on the source until its cleanup; the delete is durable (intent), see the header.
 TgtDelete(r) ==
   /\ own[tgt].st = "active" /\ mp \in {"tactive", "done"} /\ r \in store[tgt]
   /\ store' = [store EXCEPT ![tgt] = @ \ {r}]
   /\ mk' = [mk EXCEPT ![tgt] = @ \ {r}]
   /\ gone' = gone \cup {r}
-  /\ UNCHANGED <<CatV, MovV, OwnV, ex, used, sqt, committed, lost, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, ex, used, sqt, committed, lost, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV,
+                 FlrV>>
 
-\* The retention sweep of the expiring class.  It joins purgeable_namespaces and so pauses during a move; with
-\* SweepPause = FALSE it also runs under the freeze (a source that is not static).
+\* The retention sweep of the expiring class. It joins purgeable_namespaces and so pauses during a move; with SweepPause
+\* = FALSE it also runs under the freeze (a source that is not static).
 SweepEx ==
   /\ ex[src] > 0
   /\ \/ own[src].st = "active" /\ (~SweepPause \/ cm \notin {"open", "committed"})
@@ -237,7 +227,8 @@ Tick ==
   /\ now < MaxT /\ \A c \in Clients : wr[c].ph = "idle" \/ wr[c].age < Life
   /\ now' = now + 1
   /\ wr' = [c \in Clients |-> IF wr[c].ph = "hold" THEN [wr[c] EXCEPT !.age = @ + 1] ELSE wr[c]]
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, cc, tl, nRestore, nBak, bak, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, cc, tl, nRestore, nBak, bak, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV,
+                 FlrV>>
 
 -----------------------------------------------------------------------------
 (* The mover *)
@@ -261,8 +252,8 @@ Plan ==
   /\ cdn' = {} /\ cex' = FALSE /\ rc' = 0 /\ fzt' = 0
   /\ UNCHANGED <<cat, fin, DatV, HistV, CliV, EnvV, zcut, SqV, cdirty, rview, abt, abp, nFault, TlV, sb>>
 
-\* Freeze (exclusive fence, one attempt, no holder).  The source is static from here.  The one engram_seq_advance
-\* call of the move follows directly (no source write exists in between, N147).
+\* Freeze (exclusive fence, one attempt, no holder). The source is static from here. The one engram_seq_advance call of
+\* the move follows directly (no source write exists in between, N147).
 Freeze ==
   /\ mp = "planned" /\ Fenced /\ own[src].st = "active" /\ Holders(src) = {} /\ SessionOk
   /\ own' = [own EXCEPT ![src].st = "frozen"]
@@ -271,10 +262,11 @@ Freeze ==
   /\ sq' = IF SeqAdvance THEN [sq EXCEPT ![tgt] = Max2(sq[tgt], sq[src])] ELSE sq
   /\ fzt' = now
   /\ mv' = [mv EXCEPT ![src] = TRUE]
-  /\ UNCHANGED <<CatV, mtl, fin, DatV, HistV, CliV, EnvV, actSet, actMk, zcut, cleaned, RolV, IdxV, FlagV, cdn, cex, rc, nFault, TlV, sb, flr>>
+  /\ UNCHANGED <<CatV, mtl, fin, DatV, HistV, CliV, EnvV, actSet, actMk, zcut, cleaned, RolV, IdxV, FlagV, cdn, cex, rc,
+                 nFault, TlV, sb, flr>>
 
-\* Copy one row of the static source (COPY into a temp table, upsert under the incoming fence).  CopyBeforeFreeze
-\* is the rejected variant: the same copy from an active source.
+\* Copy one row of the static source (COPY into a temp table, upsert under the incoming fence). CopyBeforeFreeze is the
+\* rejected variant: the same copy from an active source.
 CopyStep(r) ==
   /\ Fenced /\ CopyPhase
   /\ r \in (store[src] \cup mk[src]) \ cdn
@@ -287,10 +279,11 @@ CopyEx ==
   /\ Fenced /\ CopyPhase /\ ~cex
   /\ ex' = [ex EXCEPT ![tgt] = ex[src]]
   /\ cex' = TRUE
-  /\ UNCHANGED <<CatV, MovV, OwnV, store, mk, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, cdn, rc, nFault, fzt, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, store, mk, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, cdn, rc, nFault, fzt, TlV,
+                 FlrV>>
 
-\* A fault of the copy, to give VerifyFrozen something to catch: a dropped row (the target holds no row before the
-\* copy, so a stale row cannot exist, N175).
+\* A fault of the copy, to give VerifyFrozen something to catch: a dropped row (the target holds no row before the copy,
+\* so a stale row cannot exist, N175).
 CopyFault(r) ==
   /\ Fenced /\ CopyPhase /\ nFault < MaxFault
   /\ r \in store[tgt] \cup mk[tgt]
@@ -317,7 +310,8 @@ BuildIndex ==
   /\ UNCHANGED <<CatV, mtl, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, FlagV, CpV, TlV, FlrV>>
 
 \* SealCopy (N179(1)): after the last index build, the target's WAL is archived through copy_end_lsn and its standby has
-\* replayed it (sb equals the target's image); the floor flr then covers what the target holds.  A restore or failover of the target lands at or past it.
+\* replayed it (sb equals the target's image); the floor flr then covers what the target holds. A restore or failover of
+\* the target lands at or past it.
 SealCopy ==
   /\ mp = "built" /\ Fenced /\ SrcFrozen
   /\ FloorBeforeCut => sb[tgt] = SbOf(tgt)                  \* the standby has replayed the target through copy_end_lsn
@@ -333,7 +327,8 @@ MakeReady ==                                                 \* (b')
             /\ UNCHANGED <<actSet, actMk>>
        ELSE /\ own' = [own EXCEPT ![tgt].st = "active"] /\ mp' = "early"      \* old order: no ready state
             /\ actSet' = store[tgt] /\ actMk' = mk[tgt]
-  /\ UNCHANGED <<CatV, mtl, fin, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, mtl, fin, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, IdxV,
+                 FlagV, CpV, TlV, FlrV>>
 
 \* (a''): the catalog CAS, the point of no return.  Retried when a catalog loss reverted it.
 CommitCAS ==
@@ -341,13 +336,15 @@ CommitCAS ==
   /\ (~FencedSteps \/ (own[src].st = "frozen" /\ own[tgt].st = "ready"))   \* the rows the mover verified
   /\ cm' = "committed" /\ mp' = "committed" /\ rep' = FALSE
   /\ zcut' = (zcut \/ mtl # tl)
-  /\ UNCHANGED <<cat, mtl, OwnV, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, actSet, actMk, cleaned, RolV, SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<cat, mtl, OwnV, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, actSet, actMk, cleaned, RolV,
+                 SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV, FlrV>>
 
 \* The asynchronous standby has replayed the commit (N163(3)).
 Replicated ==
   /\ cm = "committed" /\ ~rep
   /\ rep' = TRUE
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV,
+                 FlrV>>
 
 \* (c) (N169(4), N171): Src frozen -> moved_out, fenced on the source row and the replicated `committed` only; the
 \* target row is not a conjunct (after the commit point it is the restore path's business).
@@ -360,7 +357,8 @@ Cut ==
   /\ mp' = CASE mp = "committed" -> "cut" [] mp = "ready" -> "cut" [] mp = "early" -> "tactive" [] OTHER -> "done"
   /\ cm' = IF mp = "early" THEN "committed" ELSE IF mp = "early_flipped" THEN "done" ELSE cm
   /\ zcut' = (zcut \/ mtl # tl)
-  /\ UNCHANGED <<cat, mtl, fin, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, actSet, actMk, cleaned, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<cat, mtl, fin, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, actSet, actMk, cleaned, RolV,
+                 SqV, IdxV, FlagV, CpV, TlV, FlrV>>
 
 \* Old-order bookkeeping: the stamp that records (c) in the catalog after the fact.
 Stamp ==
@@ -374,17 +372,19 @@ Activate ==
   /\ own' = [own EXCEPT ![tgt].st = "active"] /\ mp' = "tactive"
   /\ actSet' = store[tgt] /\ actMk' = mk[tgt]
   /\ mv' = [s \in Shards |-> FALSE]
-  /\ UNCHANGED <<CatV, mtl, fin, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, IdxV, FlagV, CpV, TlV, sb, flr>>
+  /\ UNCHANGED <<CatV, mtl, fin, DatV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, IdxV,
+                 FlagV, CpV, TlV, sb, flr>>
 
-\* The rejected end test (EndFromTargetRow = FALSE, C8-2): after (c) the mover ends `done` as soon as the routing row names
-\* the target, without reading the target's row; a reconcile after (c) writes that routing row while the target is `ready`.
+\* The rejected end test (EndFromTargetRow = FALSE, C8-2): after (c) the mover ends `done` as soon as the routing row
+\* names the target, without reading the target's row; a reconcile after (c) writes that routing row while the target is
+\* `ready`.
 EndOnRouting ==
   /\ ~EndFromTargetRow /\ mp = "cut" /\ ~cdirty /\ cat.sh = tgt /\ cat.ep >= me
   /\ mp' = "done" /\ cm' = "done"
   /\ UNCHANGED <<cat, mtl, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
 
-\* (d): catalog flip WHERE epoch = e AND state = frozen; early order flips before (c).  After a catalog
-\* reconcile the flip has already been derived from the shards.
+\* (d): catalog flip WHERE epoch = e AND state = frozen; early order flips before (c). After a catalog reconcile the
+\* flip has already been derived from the shards.
 CatFlip ==
   /\ ~cdirty
   /\ \/ mp = "tactive" /\ cat = [sh |-> src, ep |-> me - 1]
@@ -403,17 +403,18 @@ UnionRepairStep ==
   /\ mk' = [mk EXCEPT ![tgt] = @ \cup mk[src]]
   /\ UNCHANGED <<CatV, MovV, OwnV, ex, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
 
-\* Cleanup (N161(1), N170): the source's data rows go; the moved_out ownership row stays.  The gate is the seal (already
+\* Cleanup (N161(1), N170): the source's data rows go; the moved_out ownership row stays. The gate is the seal (already
 \* taken, N179): the target's restore point is never below the floor, so never earlier than a complete copy.
 Cleanup ==
   /\ mp = "done" /\ ~cleaned /\ own[tgt].st = "active" /\ own[src].st = "moved_out"
   /\ store' = [store EXCEPT ![src] = {}] /\ mk' = [mk EXCEPT ![src] = {}] /\ ex' = [ex EXCEPT ![src] = 0]
   /\ idx' = [idx EXCEPT ![src] = FALSE]
   /\ cleaned' = TRUE
-  /\ UNCHANGED <<CatV, MovV, OwnV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, actSet, actMk, zcut, RolV, SqV, FlagV, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, actSet, actMk, zcut, RolV, SqV,
+                 FlagV, CpV, TlV, FlrV>>
 
-\* Abort before the point of no return (N171(2)): the abort CAS open -> rolled_back; the shard actions follow only
-\* once it is replicated.  A catalog loss may revert it, then the mover (or a restore reconcile) takes it again.
+\* Abort before the point of no return (N171(2)): the abort CAS open -> rolled_back; the shard actions follow only once
+\* it is replicated. A catalog loss may revert it, then the mover (or a restore reconcile) takes it again.
 AbortCAS ==
   /\ mp \in PreC /\ cm = "open" /\ Holders(tgt) = {} /\ ~cdirty
   /\ cm' = "rolled_back" /\ mp' = "aborting" /\ rep' = FALSE /\ abt' = TRUE /\ abp' = mp
@@ -422,13 +423,15 @@ AbortCAS ==
 AbortReplicated ==
   /\ cm = "rolled_back" /\ ~rep
   /\ rep' = TRUE
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, cdirty, rview, abt, abp, CpV, TlV,
+                 FlrV>>
 
-\* Thaw the source, drop the target rows and indexes, undo a premature flip.  It re-reads `rolled_back` and (design)
+\* Thaw the source, drop the target rows and indexes, undo a premature flip. It re-reads `rolled_back` and (design)
 \* waits for its replication.
 Thaw ==
   /\ abt /\ Settled /\ ~cdirty
-  /\ IF ThawNeedsReplicated THEN cm = "rolled_back" /\ rep ELSE TRUE   \* without it the actor acts on the outcome it read
+  \* without it the actor acts on the outcome it read
+  /\ IF ThawNeedsReplicated THEN cm = "rolled_back" /\ rep ELSE TRUE
   /\ mp' = IF mp = "aborting" THEN "rolled_back" ELSE mp
   /\ abt' = FALSE
   /\ own' = [own EXCEPT ![src] = IF @.st = "frozen" THEN Row("active", @.ep) ELSE @,
@@ -436,37 +439,44 @@ Thaw ==
   /\ store' = [store EXCEPT ![tgt] = {}] /\ mk' = [mk EXCEPT ![tgt] = {}] /\ ex' = [ex EXCEPT ![tgt] = 0]
   /\ idx' = [idx EXCEPT ![tgt] = FALSE]
   /\ cat' = IF cat.sh = tgt THEN [sh |-> src, ep |-> own[src].ep] ELSE cat
-  /\ mv' = [s \in Shards |-> FALSE] /\ flr' = [flr EXCEPT ![tgt] = NoFloor]        \* return_move clears the floor and the move bit
+  \* return_move clears the floor and the move bit
+  /\ mv' = [s \in Shards |-> FALSE] /\ flr' = [flr EXCEPT ![tgt] = NoFloor]
   /\ UNCHANGED <<cm, mtl, fin, HistV, CliV, EnvV, FzV, RolV, SqV, rep, cdirty, rview, abp, CpV, TlV, sb>>
 AbortAny == AllowAbort /\ AbortCAS
 AbortRetry == mp = "aborting" /\ AbortCAS
 VerifyAbort == VerifyFails /\ rc = 1 /\ AbortCAS                         \* the second mismatch: MoveVerifyFailed
-WindowTimeout == mp \in {"frozen", "copied", "built", "sealed"} /\ now >= fzt + Window /\ AbortCAS   \* MoveWindowExceeded
+\* MoveWindowExceeded
+WindowTimeout == mp \in {"frozen", "copied", "built", "sealed"} /\ now >= fzt + Window /\ AbortCAS
 Rollback == AbortAny \/ AbortRetry \/ VerifyAbort \/ WindowTimeout
 
 \* The mover restarts (Temporal) and re-reads the shard's timeline.
 Reconnect ==
   /\ mp \in PreC /\ mtl # tl /\ mtl' = tl
-  /\ UNCHANGED <<CatV, mp, OwnV, DatV, HistV, CliV, now, tl, nRestore, nBak, bak, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, mp, OwnV, DatV, HistV, CliV, now, tl, nRestore, nBak, bak, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV,
+                 FlrV>>
 
 -----------------------------------------------------------------------------
 (* Backups, restore and failover (N123, N161) *)
 
 Backup(s) ==
   /\ nBak < MaxBak /\ own[s].st \notin {"restoring", "replaying"}
-  /\ bak' = [bak EXCEPT ![s] = [own |-> own[s], store |-> store[s], mk |-> mk[s], ex |-> ex[s], sq |-> sq[s], idx |-> idx[s]]]
+  /\ bak' = [bak EXCEPT ![s] = [own |-> own[s], store |-> store[s], mk |-> mk[s], ex |-> ex[s], sq |-> sq[s],
+                                idx |-> idx[s]]]
   /\ nBak' = nBak + 1
   /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, now, tl, nRestore, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, FlrV>>
 
-\* Restore to the last backup, or failover to a replica that keeps everything: the shard rejects everything
-\* until Reconcile and RestoreDone.  A lossy restore re-applies the acknowledged deletes (intent replay).  Faults are
-\* not combined with a dirty catalog: the catalog reconcile runs first (N163(1)).
-\* B is the image the shard comes back to: its last backup (Restore), its standby's replayed snapshot (Failover); lossy = FALSE
-\* keeps the state (a failover to a replica that has everything).  The shard's standby is rebuilt from the result.
+\* Restore to the last backup, or failover to a replica that keeps everything: the shard rejects everything until
+\* Reconcile and RestoreDone. A lossy restore re-applies the acknowledged deletes (intent replay). Faults are not
+\* combined with a dirty catalog: the catalog reconcile runs first (N163(1)).
+\* B is the image the shard comes back to: its last backup (Restore), its standby's replayed snapshot (Failover); lossy
+\* = FALSE keeps the state (a failover to a replica that has everything). The shard's standby is rebuilt from the
+\* result.
 RestoreCore(s, B, lossy) ==
   /\ nRestore < MaxRestore /\ own[s].st \notin {"restoring", "replaying"} /\ cat.ep < MaxEp
-  /\ \A o \in Shards : tlc[o] = 0 \/ o = s            \* repeated faults hit one shard (a fault of both copies is outside the model)
-  /\ (lossy => ~cdirty)          \* a restore to an older point needs the catalog-first epoch write, which waits for the reconcile (7.2.2)
+  \* repeated faults hit one shard (a fault of both copies is outside the model)
+  /\ \A o \in Shards : tlc[o] = 0 \/ o = s
+  \* a restore to an older point needs the catalog-first epoch write, which waits for the reconcile (7.2.2)
+  /\ (lossy => ~cdirty)
   /\ IF ~lossy
        THEN /\ UNCHANGED <<DatV, lost, sq, idx>> /\ fin' = [fin EXCEPT ![s] = own[s]]
             /\ sb' = [sb EXCEPT ![s] = SbOf(s)]
@@ -486,28 +496,33 @@ RestoreCore(s, B, lossy) ==
   /\ UNCHANGED <<CatV, MovV, used, sqt, committed, gone, cc, now, nBak, bak, FzV, RolV, FlagV, CpV, nCat, flr, mv>>
 
 TgtPhase == cm \in {"committed", "done"}
-\* A restore to B, refused below the floor (N179(3)); the shard's own catalog reconcile follows.  A shard restore that began
-\* before a catalog promotion is read by it (N185); a lossless failover may also start while the reconcile runs.
+\* A restore to B, refused below the floor (N179(3)); the shard's own catalog reconcile follows. A shard restore that
+\* began before a catalog promotion is read by it (N185); a lossless failover may also start while the reconcile runs.
 RestoreTo(s, B) == RestoreCore(s, B, FALSE) \/ (~BelowFloor(s, B) /\ RestoreCore(s, B, TRUE))
 Restore(s) == ~(s = tgt /\ TgtPhase) /\ RestoreTo(s, bak[s])
 \* The target restored or promoted after the commit point, to bak[tgt]: an ordinary restore at a new epoch (N169).
 TgtRestore == TgtPhase /\ me < MaxEp /\ RestoreTo(tgt, bak[tgt])
 \* The target's standby is promoted with what it has replayed (rows, keys, index; the row, counter and sequence are the
-\* primary's); refused when that is below the floor (N179(3)).  The source's lagging promotion is Restore to an older backup.
+\* primary's); refused when that is below the floor (N179(3)). The source's lagging promotion is Restore to an older
+\* backup.
 Failover(s) ==
   /\ s = tgt /\ (TgtPhase => me < MaxEp)
   /\ FailoverChecksFloor => ~BelowFloor(s, sb[s])
-  /\ RestoreCore(s, [own |-> own[s], store |-> sb[s].store, mk |-> sb[s].mk, ex |-> ex[s], sq |-> sq[s], idx |-> sb[s].idx], TRUE)
+  /\ RestoreCore(s, [own |-> own[s], store |-> sb[s].store, mk |-> sb[s].mk, ex |-> ex[s], sq |-> sq[s],
+                     idx |-> sb[s].idx], TRUE)
 
-\* The standby replays the primary up to now, or is rebuilt from the base backup and starts again from there (N179(3)).  Enabled
-\* while a failover can still happen, and for the seal's wait.
+\* The standby replays the primary up to now, or is rebuilt from the base backup and starts again from there (N179(3)).
+\* Enabled while a failover can still happen, and for the seal's wait.
 StandbyReplay(s) ==
   /\ s = tgt /\ own[s].st \notin {"restoring", "replaying"}
   /\ \/ /\ sb[s] # SbOf(s) /\ (nRestore < MaxRestore \/ mp = "built")
         /\ sb' = [sb EXCEPT ![s] = SbOf(s)] /\ nBak' = nBak
-     \/ /\ nRestore < MaxRestore /\ nBak < MaxBak /\ sb[s] # [store |-> bak[s].store, mk |-> bak[s].mk, idx |-> bak[s].idx]
-        /\ sb' = [sb EXCEPT ![s] = [store |-> bak[s].store, mk |-> bak[s].mk, idx |-> bak[s].idx]] /\ nBak' = nBak + 1   \* rebuilt from a base backup (PG8-8); it uses the extra-backup budget
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, now, tl, nRestore, bak, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, flr, mv>>
+     \/ /\ nRestore < MaxRestore /\ nBak < MaxBak /\ sb[s] # [store |-> bak[s].store, mk |-> bak[s].mk,
+                                                              idx |-> bak[s].idx]
+        \* rebuilt from a base backup (PG8-8); it uses the extra-backup budget
+        /\ sb' = [sb EXCEPT ![s] = [store |-> bak[s].store, mk |-> bak[s].mk, idx |-> bak[s].idx]] /\ nBak' = nBak + 1
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, now, tl, nRestore, bak, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV,
+                 flr, mv>>
 
 \* N171(2), N163(3): the catalog promotion loses an arbiter outcome that the standby has not replayed; the promotion
 \* runs the reconcile (cdirty).
@@ -526,34 +541,38 @@ CatalogRestore ==
   /\ nCat < MaxCat /\ cm \in {"committed", "done"} /\ Settled
   /\ cm' = "open"
   /\ cat' = IF cat.sh = tgt THEN [sh |-> src, ep |-> me - 1] ELSE cat
-  /\ cdirty' = ShardTruth /\ rep' = FALSE /\ rview' = [s \in Shards |-> NoRow]   \* the commit is gone from the catalog, so it is no promise any more
+  \* the commit is gone from the catalog, so it is no promise any more
+  /\ cdirty' = ShardTruth /\ rep' = FALSE /\ rview' = [s \in Shards |-> NoRow]
   /\ nCat' = nCat + 1
   /\ UNCHANGED <<MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, abt, abp, CpV, tlc, FlrV>>
 
-\* N188, N172: a lossless promotion of the catalog standby: nothing is reverted, but the promotion runs the reconcile, which
-\* re-derives the routing row from the ownership rows (so it runs after (c), C8-2).
+\* N188, N172: a lossless promotion of the catalog standby: nothing is reverted, but the promotion runs the reconcile,
+\* which re-derives the routing row from the ownership rows (so it runs after (c), C8-2).
 CatalogPromote ==
   /\ nCat < MaxCat /\ ShardTruth /\ ~cdirty
   /\ cdirty' = TRUE /\ rview' = [s \in Shards |-> NoRow] /\ nCat' = nCat + 1
   /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, abt, abp, CpV, tlc, FlrV>>
 
-\* engramctl catalog reconcile --from-shards (N163(2), N172, C7-5): ReadShard snapshots one ownership row, ApplyReconcile
-\* derives the routing row from the unique owner (its epoch from owner rows only; EpochFromAnyRow counts every row) and the
-\* move row from the source's moved_out or the target's active row.
+\* engramctl catalog reconcile --from-shards (N163(2), N172, C7-5): ReadShard snapshots one ownership row,
+\* ApplyReconcile derives the routing row from the unique owner (its epoch from owner rows only; EpochFromAnyRow counts
+\* every row) and the move row from the source's moved_out or the target's active row.
 ReadShard(s) ==
   /\ ShardTruth /\ cdirty /\ rview[s] = NoRow            \* a restoring shard reads as no owner
   /\ rview' = [rview EXCEPT ![s] = own[s]]
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, cdirty, abt, abp, CpV, TlV, FlrV>>
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, rep, cdirty, abt, abp, CpV, TlV,
+                 FlrV>>
 
-\* The owner is the highest-epoch active/frozen/restoring row (frozen/restore counts, N180(4)); at one epoch an active or
-\* frozen row outranks a restoring one.  A restoring row of the move's target is an owner only once the source row reads
-\* moved_out: before that the target holds no namespace (a move-in that was never activated), and with the literal rule the
-\* higher epoch of its incoming row would route the catalog to it before the commit (found by TLC, section 7.2.2).  A re-derived `committed` (the source row moved_out) writes the routing row and
-\* nothing else: it never activates a shard row (N172).
+\* The owner is the highest-epoch active/frozen/restoring row (frozen/restore counts, N180(4)); at one epoch an active
+\* or frozen row outranks a restoring one. A restoring row of the move's target is an owner only once the source row
+\* reads moved_out: before that the target holds no namespace (a move-in that was never activated), and with the literal
+\* rule the higher epoch of its incoming row would route the catalog to it before the commit (found by TLC, section
+\* 7.2.2). A re-derived `committed` (the source row moved_out) writes the routing row and nothing else: it never
+\* activates a shard row (N172).
 ApplyReconcile ==
   /\ ShardTruth /\ cdirty /\ \A s \in Shards : rview[s] # NoRow
   /\ LET owners == {s \in Shards : rview[s].st \in {"active", "frozen"}
-                                    \/ (rview[s].st \in {"restoring", "replaying"} /\ ~(s = tgt /\ rview[src].st # "moved_out"))} IN
+                                    \/ (rview[s].st \in {"restoring", "replaying"}
+                                        /\ ~(s = tgt /\ rview[src].st # "moved_out"))} IN
      LET rank(s) == 2 * rview[s].ep + (IF rview[s].st \in {"active", "frozen"} THEN 1 ELSE 0) IN
      LET anyEp == Max2(rview["s1"].ep, rview["s2"].ep) IN
        cat' = IF owners # {}
@@ -572,13 +591,14 @@ DerivedCommitted(s) ==
   IF s = tgt THEN own[src].st = "moved_out" \/ (fin[tgt].st = "active" /\ fin[tgt].ep >= me)
   ELSE own[tgt].st = "active" \/ fin[src] = Row("moved_out", me)
 
-\* Settle the move against the catalog, then take the final row.  With ShardTruth the catalog row is first re-derived
-\* from the ownership rows.  Every act on an arbiter outcome waits for its replication (N171(2)): the abort CAS
-\* of the reconcile is its own step, the thaw follows once `rolled_back` is replicated.
+\* Settle the move against the catalog, then take the final row. With ShardTruth the catalog row is first re-derived
+\* from the ownership rows. Every act on an arbiter outcome waits for its replication (N171(2)): the abort CAS of the
+\* reconcile is its own step, the thaw follows once `rolled_back` is replicated.
 ReconcileDesign(s) ==
   /\ own[s].st = "restoring" /\ ~cdirty
   /\ LET cmE == IF ShardTruth /\ cm = "open" /\ DerivedCommitted(s) THEN "committed" ELSE cm IN
-     LET seen == cm # "committed" \/ rep \/ ~CutNeedsReplicated IN            \* a read `committed` is acted on once replicated
+     \* a read `committed` is acted on once replicated
+     LET seen == cm # "committed" \/ rep \/ ~CutNeedsReplicated IN
      IF cmE = "open"                                       \* the rows show no commit (N161(4)): abort CAS
        THEN /\ cm' = "rolled_back" /\ mp' = "aborting" /\ rep' = FALSE /\ abp' = mp /\ abt' = FALSE
             /\ UNCHANGED <<own, cat, fin, DatV, idx, actSet, actMk, flr, mv>>
@@ -603,7 +623,8 @@ ReconcileDesign(s) ==
                /\ cat' = [sh |-> tgt, ep |-> ne] /\ cm' = "done" /\ mp' = mp          \* RestoreDone ends the move
                /\ fin' = [fin EXCEPT ![tgt] = Row("active", ne)]
             /\ own' = [own EXCEPT ![tgt].st = "replaying", ![src] = Row("moved_out", me)]
-            /\ actSet' = store[tgt] \cap frozenSet /\ actMk' = mk[tgt] \cap frozenMk   \* the moved rows it holds (post-activation writes are not moved rows)
+            \* the moved rows it holds (post-activation writes are not moved rows)
+            /\ actSet' = store[tgt] \cap frozenSet /\ actMk' = mk[tgt] \cap frozenMk
             /\ UNCHANGED <<rep, DatV, idx, abt, abp, flr, mv>>
      ELSE IF cmE = "committed"                             \* the source: complete (c) here; no epoch bump
        THEN /\ seen
@@ -630,7 +651,8 @@ ReconcileDesign(s) ==
                THEN store' = [store EXCEPT ![src] = {}] /\ mk' = [mk EXCEPT ![src] = {}] /\ ex' = [ex EXCEPT ![src] = 0]
                ELSE UNCHANGED DatV
           /\ UNCHANGED <<rep, idx, actSet, actMk, abt, abp, flr, mv>>
-  /\ UNCHANGED <<mtl, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, cdirty, rview, CpV, TlV, sb>>
+  /\ UNCHANGED <<mtl, HistV, CliV, EnvV, frozenSet, frozenMk, frozenEx, zcut, cleaned, RolV, SqV, cdirty, rview, CpV,
+                 TlV, sb>>
 
 \* Bug variant: trust the backup row, bump the epoch if it says active, ignore the open move.
 ReconcileNaive(s) ==
@@ -644,8 +666,8 @@ ReconcileNaive(s) ==
 
 Reconcile_(s) == IF ReconcileOnRestore THEN ReconcileDesign(s) ELSE ReconcileNaive(s)
 
-\* restore_done (frozen/restore -> active): ends the move of a restored target (conditional `close`, N180(1)) and re-asserts the
-\* catalog epoch, max(catalog, shard), once the catalog accepts writes (N185).
+\* restore_done (frozen/restore -> active): ends the move of a restored target (conditional `close`, N180(1)) and
+\* re-asserts the catalog epoch, max(catalog, shard), once the catalog accepts writes (N185).
 RestoreDone(s) ==
   /\ own[s].st = "replaying" /\ ~cdirty
   /\ LET ends == s = tgt /\ cm = "done" /\ mp \in {"committed", "cut", "tactive"} IN
@@ -679,20 +701,21 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Forward) /\ WF_vars(Recovery) /\ WF_var
 -----------------------------------------------------------------------------
 (* Invariants *)
 
-\* Never two writable owners; a writer only holds the fence at an active shard
-\* (so `ready`, `incoming`, `frozen`, `moved_out`, `restoring` accept nothing).
+\* Never two writable owners; a writer only holds the fence at an active shard (so `ready`, `incoming`, `frozen`,
+\* `moved_out`, `restoring` accept nothing).
 SingleWriter ==
   /\ Cardinality({s \in Shards : own[s].st = "active"}) <= 1
   /\ \A c \in Clients : wr[c].ph = "hold" => own[wr[c].sh].st = "active"
 
-\* The active stores.  NoLossNoDup: the target is activated with exactly the rows that were frozen at the source (no
-\* loss, no duplicate); once the source is cleaned an active target holds every frozen row that it did not delete
-\* itself (also after a restore behind it); and once the namespace is settled every acknowledged row that was not an
-\* accepted RPO loss and not deleted on the target is on an active owner (N146).
+\* The active stores. NoLossNoDup: the target is activated with exactly the rows that were frozen at the source (no
+\* loss, no duplicate); once the source is cleaned an active target holds every frozen row that it did not delete itself
+\* (also after a restore behind it); and once the namespace is settled every acknowledged row that was not an accepted
+\* RPO loss and not deleted on the target is on an active owner (N146).
 ActiveStores == UNION {store[s] : s \in {s2 \in Shards : own[s2].st = "active"}}
 NoLossNoDup ==
   /\ mp \in {"tactive", "done", "early", "early_flipped"} =>
-       ((frozenSet \ gone) \subseteq actSet /\ actSet \subseteq frozenSet /\ (frozenMk \ gone) \subseteq actMk /\ actMk \subseteq frozenMk)
+       ((frozenSet \ gone) \subseteq actSet /\ actSet \subseteq frozenSet /\ (frozenMk \ gone) \subseteq actMk
+        /\ actMk \subseteq frozenMk)
   \* a committed move whose source no longer holds the namespace frozen has a ready or active target with the rows
   /\ (Settled /\ ~cleaned /\ cm \in {"committed", "done"} /\ own[src].st \in {"active", "moved_out"}) =>
        (own[tgt].st \in {"ready", "active"} /\ ((frozenSet \ gone) \ lost) \subseteq store[tgt])
@@ -710,8 +733,8 @@ SourceStaticUnderFreeze ==
   (own[src].st = "frozen" /\ mp \in {"frozen", "copied", "built", "sealed", "ready", "committed"}) =>
     (store[src] = frozenSet /\ mk[src] = frozenMk /\ ex[src] = frozenEx)
 
-\* Before the point of no return the source is still the owner and holds every committed row (bar restore
-\* RPO loss and rows deleted on the active target of an earlier move), so Rollback loses nothing.
+\* Before the point of no return the source is still the owner and holds every committed row (bar restore RPO loss and
+\* rows deleted on the active target of an earlier move), so Rollback loses nothing.
 RollbackPossibleBeforeC ==
   mp \in PreC =>
     /\ own[src].st \in {"active", "frozen", "restoring", "replaying"}
@@ -746,8 +769,8 @@ CatalogNamesOwnerAfterDone ==
 \* Cleanup never removes the only copy: once the source rows are gone, an active target holds what was frozen.
 CleanupSafe == (cleaned /\ own[tgt].st = "active") => (frozenSet \ gone) \subseteq store[tgt]
 
-\* N147: every row a ready or active shard holds has an ins_seq below the shard's sequence, so floors computed on
-\* the shard (exports, the consolidation watermark, a second move) see the moved rows as old.
+\* N147: every row a ready or active shard holds has an ins_seq below the shard's sequence, so floors computed on the
+\* shard (exports, the consolidation watermark, a second move) see the moved rows as old.
 CopiedBelowTargetSeq ==
   \A s \in Shards : own[s].st \in {"ready", "active"} => \A r \in store[s] : sqt[r] < sq[s]
 
@@ -765,4 +788,4 @@ MoveTerminates == (mp # "none") ~> (mp \in {"done", "rolled_back"})
 \* A frozen move reaches the commit point or rolls back (the window deadline, N160(2)).
 FrozenBounded == (mp = "frozen") ~> (mp \in PostC \cup {"rolled_back"})
 
-=============================================================================
+========================================================================================================================

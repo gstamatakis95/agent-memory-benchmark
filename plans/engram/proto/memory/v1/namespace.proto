@@ -2,15 +2,11 @@
 //
 // NamespaceService: the tenant-facing control surface for namespaces.
 //
-// What is hidden and why: a Namespace never exposes its `shard_id` or its
-// ownership `epoch`. Clients address (tenant_id, namespace_id) only
-// (decision D1); a shard id in the public resource would invite clients to
-// cache it and reason about placement, and the epoch changes on every move
-// and restore without any client-visible meaning. Both are visible to
-// operators through memory.admin.v1 (ShardService.ResolveNamespace,
-// MoveService) and the ops CLI. The public `state` is exposed so a client can
-// understand why a write is being retried (MOVING/FROZEN) or rejected
-// (DELETING).
+// What is hidden and why: a Namespace never exposes its `shard_id` or its ownership `epoch`. Clients address
+// (tenant_id, namespace_id) only (decision D1); a shard id in the public resource would invite clients to cache it and
+// reason about placement, and the epoch changes on every move and restore without any client-visible meaning. Both are
+// visible to operators through memory.admin.v1 (ShardService.ResolveNamespace, MoveService) and the ops CLI. The public
+// `state` is exposed so a client can understand why a write is being retried (MOVING/FROZEN) or rejected (DELETING).
 syntax = "proto3";
 
 package memory.v1;
@@ -25,54 +21,44 @@ import "memory/v1/operation.proto";
 
 option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
 
-// NamespaceService creates, reads, updates and deletes namespaces. Create,
-// Update and Delete require scope memory.admin (namespace administration
-// inside a tenant); Get/List require memory.read. A JWT whose `ns` allowlist
-// is not `["*"]` cannot create namespaces.
+// NamespaceService creates, reads, updates and deletes namespaces. Create, Update and Delete require scope memory.admin
+// (namespace administration inside a tenant); Get/List require memory.read. A JWT whose `ns` allowlist is not `["*"]`
+// cannot create namespaces.
 service NamespaceService {
-  // CreateNamespace assigns a UUIDv7 id and a shard (catalog bin-packing,
-  // honouring tenant isolation) and returns the namespace in state
-  // PROVISIONING or ACTIVE. `name` must be unique within the tenant
-  // (ALREADY_EXISTS otherwise). Idempotent by RequestMeta.request_id.
+  // CreateNamespace assigns a UUIDv7 id and a shard (catalog bin-packing, honouring tenant isolation) and returns the
+  // namespace in state PROVISIONING or ACTIVE. `name` must be unique within the tenant (ALREADY_EXISTS otherwise).
+  // Idempotent by RequestMeta.request_id.
   rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse);
   // GetNamespace returns one namespace with optional stats.
   rpc GetNamespace(GetNamespaceRequest) returns (GetNamespaceResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // ListNamespaces lists the caller's tenant's namespaces (restricted to the
-  // JWT allowlist unless it is `["*"]`).
+  // ListNamespaces lists the caller's tenant's namespaces (restricted to the JWT allowlist unless it is `["*"]`).
   rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // UpdateNamespace applies a field-mask patch to mutable fields
-  // (display_name, mission, reflect_directives, disposition,
-  // config_overrides).
+  // UpdateNamespace applies a field-mask patch to mutable fields (display_name, mission, reflect_directives,
+  // disposition, config_overrides).
   // Optimistic concurrency through `etag`.
   rpc UpdateNamespace(UpdateNamespaceRequest) returns (UpdateNamespaceResponse);
-  // GetEffectiveConfig returns the resolved configuration of a namespace
-  // (system, tenant and namespace layers merged) and the namespace's own
-  // overrides, so a tenant can see which model a namespace will use
-  // (decision N129).
+  // GetEffectiveConfig returns the resolved configuration of a namespace (system, tenant and namespace layers merged)
+  // and the namespace's own overrides, so a tenant can see which model a namespace will use (decision N129).
   rpc GetEffectiveConfig(GetEffectiveConfigRequest) returns (GetEffectiveConfigResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // DeleteNamespace freezes the namespace on its shard (`freeze_delete`) and
-  // sets the catalog state `deleting` (the marker: reads and writes are
-  // rejected from then on, as PreconditionFailed{NAMESPACE_DELETING}), then
-  // writes the delete intent object (decision N122, put after the marker
-  // commits) and acknowledges: the delete is effective at the ack and an
-  // acknowledged one survives restore and failover. The returned Operation
-  // (kind DELETE_NAMESPACE, not cancellable) tracks the purge (DROP INDEX by
-  // deterministic names, batched DELETE, blob prefix; no graph repair).
-  // Running operations of the namespace are cancelled
-  // (CANCEL_REASON_NAMESPACE_DELETING). A duplicate call keeps the client's
-  // operation_id, returns the existing operation and makes sure the intent
-  // object exists. Deadline cap 40 s (decision N139).
+  // DeleteNamespace freezes the namespace on its shard (`freeze_delete`) and sets the catalog state `deleting` (the
+  // marker: reads and writes are rejected from then on, as PreconditionFailed{NAMESPACE_DELETING}), then writes the
+  // delete intent object (decision N122, put after the marker commits) and acknowledges: the delete is effective at the
+  // ack and an acknowledged one survives restore and failover. The returned Operation (kind DELETE_NAMESPACE, not
+  // cancellable) tracks the purge (DROP INDEX by deterministic names, batched DELETE, blob prefix; no graph repair).
+  // Running operations of the namespace are cancelled (CANCEL_REASON_NAMESPACE_DELETING). A duplicate call keeps the
+  // client's operation_id, returns the existing operation and makes sure the intent object exists. Deadline cap 40 s
+  // (decision N139).
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
 }
 
-// Disposition tunes the reflect agent's persona per namespace (decision
-// D12). Each value is 1..5; 0 means "inherit" (system default 3).
+// Disposition tunes the reflect agent's persona per namespace (decision D12). Each value is 1..5; 0 means "inherit"
+// (system default 3).
 message Disposition {
   // 1 = accepts claims at face value … 5 = demands multiple sources.
   int32 skepticism = 1;
@@ -82,9 +68,8 @@ message Disposition {
   int32 empathy = 3;
 }
 
-// Directive is one standing instruction for Reflect (decision N129). A
-// directive with tags applies only when the Reflect request carries matching
-// tags (Hindsight-compatible).
+// Directive is one standing instruction for Reflect (decision N129). A directive with tags applies only when the
+// Reflect request carries matching tags (Hindsight-compatible).
 message Directive {
   // The instruction, 1 byte to 1 KiB.
   string text = 1;
@@ -92,8 +77,7 @@ message Directive {
   int32 priority = 2;
   // Unset = true.
   optional bool active = 3;
-  // Applies only to Reflect calls whose tag_filter intersects these tags;
-  // empty = always.
+  // Applies only to Reflect calls whose tag_filter intersects these tags; empty = always.
   repeated string tags = 4;
 }
 
@@ -115,8 +99,7 @@ message NamespaceStats {
   int64 unconsolidated_facts = 11;
 }
 
-// Namespace is the public resource. Output-only fields: namespace_id,
-// tenant_id, state, stats, timestamps, etag.
+// Namespace is the public resource. Output-only fields: namespace_id, tenant_id, state, stats, timestamps, etag.
 message Namespace {
   // Server-assigned UUIDv7.
   string namespace_id = 1;
@@ -125,24 +108,20 @@ message Namespace {
   string name = 3;
   // Human-readable label, ≤ 256 bytes.
   string display_name = 4;
-  // What the agent using this namespace is for; injected into Reflect
-  // prompts. ≤ 4 KiB.
+  // What the agent using this namespace is for; injected into Reflect prompts. ≤ 4 KiB.
   string mission = 5;
-  // Removed in v1.0.0-rc6 (decision N129): `repeated string directives = 6`,
-  // replaced by the typed `reflect_directives = 13`.
+  // Removed in v1.0.0-rc6 (decision N129): `repeated string directives = 6`, replaced by the typed `reflect_directives
+  // = 13`.
   reserved 6;
   reserved "directives";
   Disposition disposition = 7;
   // Config overrides layered over tenant and system config (decision D12).
-  // Keys: `models.{extract,consolidate,reflect,rerank}`, `chunk.target_chars`,
-  // `recall.default_budget`, `quota.*`, `prompts.*`, `retain.mission`,
-  // `consolidate.{mission,observation_scope,max_observations_per_scope,
-  // max_rebuilds_per_round}`, `reflect.keep_transcripts` (decision N66; this
-  // list and the server's allow-list are generated from one Go table and
-  // checked in CI). `models.embed` and the embedding dimension are fixed at
-  // namespace creation (decision N111): they may be set in CreateNamespace
-  // only; a later change is the ReembedNamespace workflow, never an override.
-  // Unknown keys are rejected with INVALID_ARGUMENT.
+  // Keys: `models.{extract,consolidate,reflect,rerank}`, `chunk.target_chars`, `recall.default_budget`, `quota.*`,
+  // `prompts.*`, `retain.mission`, `consolidate.{mission,observation_scope,max_observations_per_scope,
+  // max_rebuilds_per_round}`, `reflect.keep_transcripts` (decision N66; this list and the server's allow-list are
+  // generated from one Go table and checked in CI). `models.embed` and the embedding dimension are fixed at namespace
+  // creation (decision N111): they may be set in CreateNamespace only; a later change is the ReembedNamespace workflow,
+  // never an override. Unknown keys are rejected with INVALID_ARGUMENT.
   google.protobuf.Struct config_overrides = 8;
   // Catalog state (see errors.proto NamespaceState).
   NamespaceState state = 9;
@@ -162,8 +141,8 @@ message CreateNamespaceRequest {
   // Must equal the JWT tenant_id claim.
   string tenant_id = 1;
   RequestMeta meta = 2;
-  // Only name, display_name, mission, reflect_directives, disposition and
-  // config_overrides are read; other fields must be unset.
+  // Only name, display_name, mission, reflect_directives, disposition and config_overrides are read; other fields must
+  // be unset.
   Namespace namespace = 3;
 
   reserved 100 to 199;
@@ -185,8 +164,7 @@ message GetEffectiveConfigRequest {
 
 // GetEffectiveConfigResponse returns the merged and the raw configuration.
 message GetEffectiveConfigResponse {
-  // System, tenant and namespace layers merged; every allow-listed key is
-  // present.
+  // System, tenant and namespace layers merged; every allow-listed key is present.
   google.protobuf.Struct effective = 1;
   // Only the namespace's own overrides (Namespace.config_overrides).
   google.protobuf.Struct namespace_overrides = 2;
@@ -238,12 +216,11 @@ message UpdateNamespaceRequest {
   RequestMeta meta = 2;
   // Carries the new values for the paths in update_mask.
   Namespace patch = 3;
-  // Required, non-empty. Allowed paths: display_name, mission,
-  // reflect_directives, disposition, disposition.*, config_overrides. Any other path fails with
-  // INVALID_ARGUMENT (OUTPUT_ONLY / UNKNOWN_FIELD_MASK_PATH).
+  // Required, non-empty. Allowed paths: display_name, mission, reflect_directives, disposition, disposition.*,
+  // config_overrides. Any other path fails with INVALID_ARGUMENT (OUTPUT_ONLY / UNKNOWN_FIELD_MASK_PATH).
   google.protobuf.FieldMask update_mask = 4;
-  // When set, the update only applies if it equals the current etag
-  // (FAILED_PRECONDITION + PreconditionFailed{ETAG_MISMATCH} otherwise).
+  // When set, the update only applies if it equals the current etag (FAILED_PRECONDITION +
+  // PreconditionFailed{ETAG_MISMATCH} otherwise).
   string etag = 5;
 
   reserved 100 to 199;
@@ -261,8 +238,7 @@ message DeleteNamespaceRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   string operation_id = 3;
-  // Must equal the namespace `name`; a typed confirmation that guards
-  // against deleting the wrong id.
+  // Must equal the namespace `name`; a typed confirmation that guards against deleting the wrong id.
   string confirm_name = 4;
 
   reserved 100 to 199;
@@ -271,8 +247,8 @@ message DeleteNamespaceRequest {
 // DeleteNamespaceResponse returns the purge operation.
 message DeleteNamespaceResponse {
   Operation operation = 1;
-  // Commit time of the delete marker (shard freeze and catalog `deleting`):
-  // from here nothing of the namespace is readable.
+  // Commit time of the delete marker (shard freeze and catalog `deleting`): from here nothing of the namespace is
+  // readable.
   google.protobuf.Timestamp deleted_at = 2;
   // Stated bounds of the asynchronous purge.
   ExpungeSla expunge_sla = 3;

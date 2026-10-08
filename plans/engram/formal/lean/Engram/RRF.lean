@@ -1,29 +1,24 @@
 /-
   Engram — Reciprocal Rank Fusion (register D10: RRF, k = 60, over all arms).
 
-  Status: NOT type-checked (Lean 4 is not installed in the planning
-  environment).
+  Status: NOT type-checked (Lean 4 is not installed in the planning environment).
 
   Design of the formalisation.  The fused score is
       score(d) = Σ_{arms a} contrib(k, rank_a(d))      with contrib(k, r) = 1 / (k + r)
-  and `rank_a(d) = none` when `d` is absent from arm `a` (contributes 0).
-  The theorems of interest are structural:
+  and `rank_a(d) = none` when `d` is absent from arm `a` (contributes 0). The theorems of interest are structural:
     * permutation invariance: reordering the arms does not change any score,
       hence not the fused order;
     * monotonicity: improving a document's rank in one arm never lowers its
       fused score;
     * boundedness for k > 0: 0 ≤ score(d) ≤ |arms| / (k + 1).
-  To stay Mathlib-free we abstract the contribution values into a type with a
-  commutative, associative addition (`CommAdd`), prove the structural facts
-  there, and instantiate with `Nat` (exact: contributions scaled by a common
-  denominator) and with `Float` (what Go computes; no proofs about Float
-  arithmetic are attempted).  `Rat` (core Lean ≥ 4.19, else Batteries) can be
-  substituted for `Float` for an exact instance; the `Rat` ordering lemmas are
-  the only `sorry` left and are marked.
+  To stay Mathlib-free we abstract the contribution values into a type with a commutative, associative addition
+  (`CommAdd`), prove the structural facts there, and instantiate with `Nat` (exact: contributions scaled by a common
+  denominator) and with `Float` (what Go computes; no proofs about Float arithmetic are attempted). `Rat` (core Lean
+  ≥ 4.19, else Batteries) can be substituted for `Float` for an exact instance; the `Rat` ordering lemmas are the
+  only `sorry` left and are marked.
 
-  Go counterpart: internal/recall/fuse.go `RRF(arms [][]ID, k int) []Scored`;
-  internal/recall/fuse_test.go checks the same three properties with
-  pgregory.net/rapid on random arm lists (k = 60, ≤ 5 arms, ≤ 400 ids).
+  Go counterpart: internal/recall/fuse.go `RRF(arms [][]ID, k int) []Scored`; internal/recall/fuse_test.go checks
+  the same three properties with pgregory.net/rapid on random arm lists (k = 60, ≤ 5 arms, ≤ 400 ids).
 -/
 namespace Engram.RRF
 
@@ -49,8 +44,8 @@ def sumList : List α → α
 theorem sumList_nil : sumList ([] : List α) = 0 := rfl
 theorem sumList_cons (x : α) (xs : List α) : sumList (x :: xs) = x + sumList xs := rfl
 
-/-- The sum of a list is invariant under permutation.  Proof by induction on
-    the permutation (nil / cons / swap / trans). -/
+/-- The sum of a list is invariant under permutation. Proof by induction on the permutation (nil / cons / swap /
+    trans). -/
 theorem sumList_perm {l₁ l₂ : List α} (h : l₁.Perm l₂) : sumList l₁ = sumList l₂ := by
   induction h with
   | nil => rfl
@@ -62,15 +57,13 @@ theorem sumList_perm {l₁ l₂ : List α} (h : l₁.Perm l₂) : sumList l₁ =
 
 end Sum
 
-/-- An arm is a ranking: a document either has a rank or is absent.
-    Ranks are **1-based** (rank 1 = top), matching Go's `fuse` and Hindsight's
-    `1/(k + rank)` with `rank ≥ 1`; the worked check below uses `some 1` for a
-    top-ranked document.  The theorems in this file are stated for every `r : Nat`,
-    so they hold a fortiori for `r ≥ 1`; nothing here depends on the base. -/
+/-- An arm is a ranking: a document either has a rank or is absent. Ranks are **1-based** (rank 1 = top), matching
+    Go's `fuse` and Hindsight's `1/(k + rank)` with `rank ≥ 1`; the worked check below uses `some 1` for a top-ranked
+    document. The theorems in this file are stated for every `r : Nat`, so they hold a fortiori for `r ≥ 1`; nothing
+    here depends on the base. -/
 abbrev Arm (Doc : Type) := Doc → Option Nat
 
-/-- Contribution of one arm to a document, given a contribution function of
-    the rank.  Absent documents contribute 0. -/
+/-- Contribution of one arm to a document, given a contribution function of the rank. Absent documents contribute 0. -/
 def contribOf {α Doc : Type} [CommAdd α] (contrib : Nat → α) (a : Arm Doc) (d : Doc) : α :=
   match a d with
   | some r => contrib r
@@ -97,8 +90,8 @@ theorem order_perm {α Doc : Type} [CommAdd α] [LT α] (contrib : Nat → α)
 
 /-! ### Monotonicity: improving a rank in one arm never lowers the fused score.
 
-    We need an order compatible with addition; we state the minimal axioms as
-    a class so the theorem is Mathlib-free.  `Nat` satisfies them. -/
+    We need an order compatible with addition; we state the minimal axioms as a class so the theorem is Mathlib-free.
+    `Nat` satisfies them. -/
 
 class OrderedCommAdd (α : Type) extends CommAdd α, LE α where
   le_refl : ∀ a : α, a ≤ a
@@ -112,8 +105,8 @@ instance : OrderedCommAdd Nat where
   add_le_add_left := fun _ _ c h => Nat.add_le_add_left h c
   add_le_add_right := fun _ _ c h => Nat.add_le_add_right h c
 
-/-- A contribution function is *antitone* when a better (smaller) rank gives
-    at least as much.  1/(k+r) is antitone for every k. -/
+/-- A contribution function is *antitone* when a better (smaller) rank gives at least as much. 1/(k+r) is antitone
+    for every k. -/
 def Antitone {α : Type} [LE α] (contrib : Nat → α) : Prop :=
   ∀ r r', r ≤ r' → contrib r' ≤ contrib r
 
@@ -140,9 +133,8 @@ theorem contribOf_le_of_improves {α Doc : Type} [OrderedCommAdd α] (contrib : 
   · exact hz _
   · exact hc _ _ h
 
-/-- Main monotonicity theorem: improving `d` in arm `i` does not lower `score d`.
-    The induction over `arms.set` is routine; left as `sorry` pending a
-    type-check (the per-arm lemma above carries the content). -/
+/-- Main monotonicity theorem: improving `d` in arm `i` does not lower `score d`. The induction over `arms.set` is
+    routine; left as `sorry` pending a type-check (the per-arm lemma above carries the content). -/
 theorem score_mono {α Doc : Type} [OrderedCommAdd α] (contrib : Nat → α)
     (hc : Antitone contrib) (hz : ∀ r, (0 : α) ≤ contrib r)
     (arms : List (Arm Doc)) (i : Nat) (a' : Arm Doc) (d : Doc)
@@ -155,9 +147,8 @@ theorem score_mono {α Doc : Type} [OrderedCommAdd α] (contrib : Nat → α)
 
     Over the rationals, with contrib(k, r) = 1/(k+r):
         0 ≤ score(d) ≤ |arms| · 1/(k+1)   and   score(d) = 0 ↔ d absent from every arm.
-    We state the Nat-scaled version: multiply every contribution by
-    D = lcm(k+1 .. k+R) where R bounds the ranks; then contribNat r = D/(k+r)
-    is an exact natural number and 1 ≤ contribNat r ≤ D/(k+1).  -/
+    We state the Nat-scaled version: multiply every contribution by D = lcm(k+1 .. k+R) where R bounds the ranks;
+    then contribNat r = D/(k+r) is an exact natural number and 1 ≤ contribNat r ≤ D/(k+1). -/
 
 def contribNat (D k r : Nat) : Nat := D / (k + r)
 
@@ -175,13 +166,12 @@ theorem contribNat_le (D k r : Nat) (hk : 0 < k) : contribNat D k r ≤ D / (k +
 theorem score_le_bound (D k : Nat) (hk : 0 < k) {Doc : Type} (arms : List (Arm Doc)) (d : Doc) :
     score (contribNat D k) arms d ≤ arms.length * (D / (k + 1)) := by
   sorry -- TODO(formal): induction on arms; contribNat r ≤ D/(k+1) because k+1 ≤ k+r for r ≥ 1.
-        -- Ranks are 1-based throughout this file (see `Arm`), so the bound D/(k+1) is the
-        -- top-rank contribution; `contribNat_le` above is the weaker r ≥ 0 form and is
-        -- not needed here.  (Review F-31 flagged the earlier "0-based" comment on `Arm` as
-        -- contradicting this one; the definitions were always rank-base-agnostic.)
+        -- Ranks are 1-based throughout this file (see `Arm`), so the bound D/(k+1) is the top-rank contribution;
+        -- `contribNat_le` above is the weaker r ≥ 0 form and is not needed here. (Review F-31 flagged the earlier
+        -- "0-based" comment on `Arm` as contradicting this one; the definitions were always rank-base-agnostic.)
 
-/-- k > 0 guarantees every contribution is finite and positive in ℚ; the Nat
-    model expresses "positive" as `0 < D / (k + r)` whenever `k + r ∣ D`. -/
+/-- k > 0 guarantees every contribution is finite and positive in ℚ; the Nat model expresses "positive" as `0 < D /
+    (k + r)` whenever `k + r ∣ D`. -/
 theorem contribNat_pos (D k r : Nat) (hD : 0 < D) (hdvd : (k + r) ∣ D) (hk : 0 < k) :
     0 < contribNat D k r := by
   unfold contribNat
@@ -197,9 +187,8 @@ def armA : Arm Nat := fun d => if d = 0 then some 1 else if d = 1 then some 2 el
 def armB : Arm Nat := fun d => if d = 0 then some 1 else if d = 1 then some 1 else none
 def armC : Arm Nat := fun d => if d = 1 then some 3 else none
 
--- Exact values: D60/61 = 234360, D60/62 = 230580, D60/63 = 226920, so
--- score 0 = 468720 and score 1 = 691860: a document present in three arms
--- outranks one present in two, even though the latter is top-ranked in both.
+-- Exact values: D60/61 = 234360, D60/62 = 230580, D60/63 = 226920, so score 0 = 468720 and score 1 = 691860: a document
+-- present in three arms outranks one present in two, even though the latter is top-ranked in both.
 example : score (contribNat D60 k60) [armA, armB, armC] 0 <
           score (contribNat D60 k60) [armA, armB, armC] 1 := by
   decide

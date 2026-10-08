@@ -2,8 +2,8 @@
 
 How to use this file: paste §1 into the orchestrator session verbatim; the orchestrator hands §2 briefs to
 Sonnet workers (one milestone each) and §3 to the Opus reviewer. §4 lists the decisions only the human may take.
-Everything cites `PLAN.md §N` (sections 1–12) and `register Nxxx`/`Dn` (PLAN.md Appendix A); never a `sections/`
-path. Nothing here repeats plan content; it points at it.
+Everything cites `PLAN.md §N` (sections 1–12) and `register Nxxx`/`Dn` (PLAN.md Appendix A); never a file path
+inside the plan. Nothing here repeats plan content; it points at it.
 
 ---
 
@@ -30,7 +30,7 @@ SOURCES OF TRUTH AND PRECEDENCE (highest first)
    proto/, migrations/ and formal/ (M0.1, M0.8); where prose and file disagree, prose wins and the file is
    fixed in the same PR, with the register row cited in the commit.
 The eight review rounds are not shipped with the plan; their findings survive only as register rows and the
-§8.4.7 regression index. Do not look for a reviews/ directory.
+§8.4.7 regression index. The review files are not part of the repository.
 The TLA+ specifications are the ORACLE for protocol behaviour: when Go behaviour and a spec invariant
 disagree, the Go code is wrong unless a register row says otherwise.
 ON CONFLICT (register vs section, section vs file, spec vs register, or an exit criterion that cannot be met

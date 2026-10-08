@@ -1,20 +1,17 @@
 /-
-  Engram — temporal-window arithmetic (register D10, temporal arm:
-  "facts whose occurrence window overlaps the query window, ordered by
-  distance to query_timestamp").
+  Engram — temporal-window arithmetic (register D10, temporal arm: "facts whose occurrence window overlaps the query
+  window, ordered by distance to query_timestamp").
 
-  Status: NOT type-checked (Lean 4 is not installed in the planning
-  environment).  Lean 4 core only; all arithmetic is over `Int`
-  (Unix seconds) and the proofs are `omega`-shaped.
+  Status: NOT type-checked (Lean 4 is not installed in the planning environment). Lean 4 core only; all arithmetic
+  is over `Int` (Unix seconds) and the proofs are `omega`-shaped.
 
-  Go counterpart: internal/recall/temporal.go (`Window`, `Overlaps`,
-  `Contains`, `DistanceTo`); internal/recall/temporal_test.go
-  (pgregory.net/rapid) checks the same theorems on random windows.
+  Go counterpart: internal/recall/temporal.go (`Window`, `Overlaps`, `Contains`, `DistanceTo`);
+  internal/recall/temporal_test.go (pgregory.net/rapid) checks the same theorems on random windows.
 -/
 namespace Engram.TemporalWindow
 
-/-- A closed window [lo, hi] with lo ≤ hi.  Open-ended windows are encoded by
-    the caller with Int.min/Int.max sentinels, outside this module. -/
+/-- A closed window [lo, hi] with lo ≤ hi. Open-ended windows are encoded by the caller with Int.min/Int.max
+    sentinels, outside this module. -/
 structure Window where
   lo : Int
   hi : Int
@@ -43,8 +40,8 @@ theorem overlaps_symm (a b : Window) (h : overlaps a b) : overlaps b a :=
 theorem overlaps_refl (a : Window) : overlaps a a :=
   ⟨a.ok, a.ok⟩
 
-/-- Overlap is *not* transitive (a=[0,1], b=[1,2], c=[2,3]); stated as a
-    counterexample so nobody "fixes" the Go code to assume it. -/
+/-- Overlap is *not* transitive (a=[0,1], b=[1,2], c=[2,3]); stated as a counterexample so nobody "fixes" the Go code
+    to assume it. -/
 example : overlaps ⟨0, 1, by decide⟩ ⟨1, 2, by decide⟩ ∧
           overlaps ⟨1, 2, by decide⟩ ⟨2, 3, by decide⟩ ∧
           ¬ overlaps ⟨0, 1, by decide⟩ ⟨2, 3, by decide⟩ := by decide
@@ -120,8 +117,8 @@ theorem distanceTo_lipschitz (w : Window) (t t' : Int) :
   have := w.ok
   split <;> split <;> (try split) <;> (try split) <;> (try split) <;> omega
 
-/-- Ordering by distance is a total preorder: the Go sort is well-defined and
-    ties are broken by fact id (deterministic streaming order). -/
+/-- Ordering by distance is a total preorder: the Go sort is well-defined and ties are broken by fact id
+    (deterministic streaming order). -/
 theorem distance_total (w₁ w₂ : Window) (t : Int) :
     distanceTo w₁ t ≤ distanceTo w₂ t ∨ distanceTo w₂ t ≤ distanceTo w₁ t :=
   Int.le_total _ _

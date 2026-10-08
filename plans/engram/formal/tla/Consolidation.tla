@@ -1,36 +1,28 @@
-------------------------- MODULE Consolidation -------------------------
-(***************************************************************************)
-(* Engram D12/N121 (D22): consolidation round with at-least-once activity  *)
-(* execution.                                                              *)
-(*                                                                         *)
-(* A round takes a set of facts and processes a batch (8 facts in          *)
-(* production, 4 here).  Two-stage consolidation (N121): stage 1 routes    *)
-(* the batch and persists the decisions write-once under batch_key (the    *)
-(* `Op` list below: create / update(attach) / delete(merge, drop_source)); *)
-(* stage 2 writes one observation version per touched observation as the   *)
-(* effect of an op, citing the batch facts that are still visible when the *)
-(* version commits.  A failed routing call bisects the batch (8 -> 4 -> 2  *)
-(* -> 1); a failed singleton is skipped.  The text-writing LLM call is not *)
-(* modelled: only the idempotence of the persisted decision and of its     *)
-(* effect.  Visibility of the written versions under concurrent deletes    *)
-(* (markers, segments, the derivation lock) is Derivation.tla; here a     *)
-(* delete only removes the fact from the set of visible sources.           *)
-(*                                                                         *)
-(* Idempotency: batch_key = sha256(sorted fact ids || prompt || model) is  *)
-(* modelled as the fact set itself; op_key = (batch_key, op_index).        *)
-(* `consolidation_applied(op_key)` is inserted in the same transaction as  *)
-(* the op's effect.  The worker may crash anywhere and Temporal re-runs    *)
-(* the activity (at-least-once).                                           *)
-(*                                                                         *)
-(* Two design knobs expose the two ways this goes wrong:                   *)
-(*   DurableProposal = FALSE : the apply step uses the LLM output of the   *)
-(*       current attempt instead of a proposal persisted under batch_key.  *)
-(*       After a crash the LLM returns a different op list and op_index-   *)
-(*       based keys silently skip ops that were never applied             *)
-(*       (ExactlyOnceEffect violated).                                     *)
-(*   AtomicKeyRecord = FALSE : effect and op_key insert are separate       *)
-(*       transactions; a crash between them double-applies the op.         *)
-(***************************************************************************)
+------------------------------------------------- MODULE Consolidation -------------------------------------------------
+(**********************************************************************************************************************)
+(* Engram D12/N121 (D22): consolidation round with at-least-once activity execution.                                  *)
+(*                                                                                                                    *)
+(* A round takes a set of facts and processes a batch (8 facts in production, 4 here). Two-stage consolidation        *)
+(* (N121): stage 1 routes the batch and persists the decisions write-once under batch_key (the `Op` list below:       *)
+(* create / update(attach) / delete(merge, drop_source)); stage 2 writes one observation version per touched          *)
+(* observation as the effect of an op, citing the batch facts that are still visible when the version commits. A      *)
+(* failed routing call bisects the batch (8 -> 4 -> 2 -> 1); a failed singleton is skipped. The text-writing LLM call *)
+(* is not modelled: only the idempotence of the persisted decision and of its effect. Visibility of the written       *)
+(* versions under concurrent deletes (markers, segments, the derivation lock) is Derivation.tla; here a delete only   *)
+(* removes the fact from the set of visible sources.                                                                  *)
+(*                                                                                                                    *)
+(* Idempotency: batch_key = sha256(sorted fact ids || prompt || model) is                                             *)
+(* modelled as the fact set itself; op_key = (batch_key, op_index). `consolidation_applied(op_key)` is inserted in    *)
+(* the same transaction as the op's effect. The worker may crash anywhere and Temporal re-runs the activity           *)
+(* (at-least-once).                                                                                                   *)
+(*                                                                                                                    *)
+(* Two design knobs expose the two ways this goes wrong:                                                              *)
+(*   DurableProposal = FALSE : the apply step uses the LLM output of the                                              *)
+(*       current attempt instead of a proposal persisted under batch_key. After a crash the LLM returns a different   *)
+(*       op list and op_index- based keys silently skip ops that were never applied (ExactlyOnceEffect violated).     *)
+(*   AtomicKeyRecord = FALSE : effect and op_key insert are separate                                                  *)
+(*       transactions; a crash between them double-applies the op.                                                    *)
+(**********************************************************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS NFacts,           \* facts of the round are 1..NFacts (4 here, 8 in production)
@@ -73,7 +65,8 @@ VARIABLES
   crashes,
   deletes
 
-vars == <<live, queue, stored, mem, applied, applyCount, effectOf, pending, done, finalProp, failed, obs, crashes, deletes>>
+vars == <<live, queue, stored, mem, applied, applyCount, effectOf, pending, done, finalProp, failed, obs, crashes,
+          deletes>>
 
 PropStore == IF DurableProposal THEN stored ELSE mem
 HasProp(B) == B \in DOMAIN PropStore
@@ -111,8 +104,8 @@ Init ==
 -----------------------------------------------------------------------------
 (* Propose activity: one LLM call per batch.                                *)
 
-\* Success: the proposal is recorded (durably, keyed by batch_key, or only in
-\* the attempt's memory).  A durable record is write-once (ON CONFLICT DO NOTHING).
+\* Success: the proposal is recorded (durably, keyed by batch_key, or only in the attempt's memory). A durable record is
+\* write-once (ON CONFLICT DO NOTHING).
 ProposeOk(B, P) ==
   /\ B \in queue /\ B \notin done /\ ~HasProp(B)
   /\ IF DurableProposal THEN stored' = stored @@ (B :> P) /\ UNCHANGED mem
@@ -131,17 +124,17 @@ ProposeFail(B) ==
 (* Apply activity: ops of the proposal in index order, each guarded by its  *)
 (* op_key.  Re-execution after a crash skips recorded keys.                 *)
 
-\* Effect of an op on the observation table.  Sources are the batch facts
-\* that are still live (re-verified under the shared derivation lock, N120); an op
-\* whose sources vanished, or that does not apply (update of a retired
-\* observation, create of an existing one), is dropped but its key is still
-\* recorded so it is never retried.
+\* Effect of an op on the observation table. Sources are the batch facts that are still live (re-verified under the
+\* shared derivation lock, N120); an op whose sources vanished, or that does not apply (update of a retired observation,
+\* create of an existing one), is dropped but its key is still recorded so it is never retried.
 Effect(op, B) ==
   LET S == B \cap live IN
   IF S = {} THEN obs
-  ELSE CASE op.kind = "create" -> IF obs[op.o].st = "absent" THEN [obs EXCEPT ![op.o] = [st |-> "live", src |-> S]] ELSE obs
+  ELSE CASE op.kind = "create" -> IF obs[op.o].st = "absent" THEN [obs EXCEPT ![op.o] = [st |-> "live", src |-> S]]
+       ELSE obs
          [] op.kind = "update" -> IF obs[op.o].st = "live"   THEN [obs EXCEPT ![op.o].src = S] ELSE obs
-         [] op.kind = "delete" -> IF obs[op.o].st = "live"   THEN [obs EXCEPT ![op.o] = [st |-> "retired", src |-> {}]] ELSE obs
+         [] op.kind = "delete" -> IF obs[op.o].st = "live"   THEN [obs EXCEPT ![op.o] = [st |-> "retired", src |-> {}]]
+              ELSE obs
 
 NextIndex(B) == LET P == PropStore[B] IN
   CHOOSE i \in 1..Len(P) : <<B, i>> \notin applied /\ \A j \in 1..(i - 1) : <<B, j>> \in applied
@@ -188,9 +181,8 @@ MarkDone(B) ==
 -----------------------------------------------------------------------------
 (* Faults and concurrency *)
 
-\* Worker crash: everything volatile is lost; durable state survives.
-\* Temporal re-runs the activity, which is modelled by the actions above
-\* simply remaining enabled.
+\* Worker crash: everything volatile is lost; durable state survives. Temporal re-runs the activity, which is modelled
+\* by the actions above simply remaining enabled.
 Crash ==
   /\ crashes < MaxCrashes
   /\ crashes' = crashes + 1
@@ -198,8 +190,8 @@ Crash ==
   /\ pending' = {}
   /\ UNCHANGED <<live, queue, stored, applied, applyCount, effectOf, done, finalProp, failed, obs, deletes>>
 
-\* Concurrent document delete (N115): a marker; the fact stops being a visible source.  Written
-\* versions are never touched (insert-only, N113); their visibility is a read-time predicate.
+\* Concurrent document delete (N115): a marker; the fact stops being a visible source. Written versions are never
+\* touched (insert-only, N113); their visibility is a read-time predicate.
 DeleteFact(f) ==
   /\ f \in live /\ deletes < MaxDeletes
   /\ deletes' = deletes + 1
@@ -225,8 +217,8 @@ Symm == Permutations(Obs)
 -----------------------------------------------------------------------------
 (* Properties *)
 
-\* Each op's effect is applied at most once, and every op of a completed
-\* batch was applied exactly as the batch's (final) proposal states it.
+\* Each op's effect is applied at most once, and every op of a completed batch was applied exactly as the batch's
+\* (final) proposal states it.
 ExactlyOnceEffect ==
   /\ \A k \in Keys : applyCount[k] <= 1
   /\ \A B \in done : \A i \in 1..Len(finalProp[B]) :
@@ -234,12 +226,12 @@ ExactlyOnceEffect ==
        /\ applyCount[<<B, i>>] = 1
        /\ effectOf[<<B, i>>] = finalProp[B][i]
 
-\* Every written observation version cites at least one fact of the round (an op whose visible
-\* sources vanished before commit is dropped, never written with an empty segment).
+\* Every written observation version cites at least one fact of the round (an op whose visible sources vanished before
+\* commit is dropped, never written with an empty segment).
 ObservationHasSources ==
   \A o \in Obs : obs[o].st = "live" => obs[o].src /= {} /\ obs[o].src \subseteq Facts
 
 \* Every batch of the round is eventually done, bisected into done/failed children.
 RoundTerminates == <>(queue = {})
 
-=============================================================================
+========================================================================================================================

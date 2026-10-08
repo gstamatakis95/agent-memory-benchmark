@@ -123,7 +123,7 @@ Every call must carry a deadline. A call without one is rejected with `INVALID_A
 `ValidationError{violations:[{field:"grpc-timeout", reason:"MISSING_DEADLINE"}]}` before any work
 is done. Rationale: (1) Recall's rerank stage decides on the *remaining* deadline (skip rerank if
 < 106 ms = rerank p95 + pack + stream + 8 ms, N106; the SLO assumes a client deadline ≥ 300 ms) and cannot do that without one; (2) an unbounded call is an unbounded shard
-connection through pgbouncer, and the per-instance pool is only 32 (D3); (3) Envoy route timeouts
+connection through pgbouncer, and the per-process pool is only 16 connections per shard behind a 24-connection pgbouncer pool (D3, N114); (3) Envoy route timeouts
 would otherwise silently become the deadline, with a different error code. Rejected alternative:
 a server-side default deadline — it hides misconfigured clients until the day the default is
 wrong.

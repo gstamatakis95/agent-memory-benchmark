@@ -618,7 +618,7 @@ message WriteObservationInput {
 
 // ObservationWrite is one persisted stage-2 result, idempotent by op_key.
 message ObservationWrite {
-  // sha256(batch_key ‖ op_index); recorded in consolidation_applied.
+  // sha256(batch_key ‖ attempt ‖ op_index); recorded in consolidation_applied.
   string op_key = 1;
   ObservationWriteKind kind = 2;
   // Empty for CREATE.

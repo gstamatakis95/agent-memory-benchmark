@@ -96,7 +96,7 @@ in one *derivation transaction*:
    root rebuild for observations, `page_full/v1` for pages); the writer never "repairs" a result by
    adjusting its inputs.
 
-The lock is never held across an LLM call (a refresh would block `Materialize` for a minute): the
+The SQL helpers are `engram_facts_all_visible` (step 2, fact inputs), `engram_obs_version_hidden` / `engram_page_version_hidden` (one `p_doc_tomb` jsonb of all open tombstones; invalidation is an anti-join on `fact_hidden` with `cause = 'invalidate'`) and `engram_derivation_base_ok` (step 3). The lock is never held across an LLM call (a refresh would block `Materialize` for a minute): the
 re-verification, not the lock, covers the call's duration. `Materialize` and `Restore` take the
 lock exclusively, and `Materialize` re-reads `fact_hidden` and the open tombstones in every batch
 (§5.4.2); markers take no lock. A configuration without the lock, without the page re-verify,
@@ -579,8 +579,7 @@ online takes **≈ 100 days at 4 cells**. Embedding (≤ 64 texts per call, ≈ 
 the RPM cap and onto the gateway batch API (~50 % cheaper). It does **not** re-implement retain:
 it pre-warms the two caches and then runs ordinary `RetainDocument` children that hit them.
 
-0. The parent registers an `operations` row (internal kind `retain_backfill`, mapped to
-   `RETAIN_DOCUMENT` by the API, N38) so that a move's `Drain` sees it (C-20).
+0. The parent registers an `operations` row (kind `retain_document`, `target_id` = the backfill id) so that a move's `Drain` sees it (C-20).
 1. For each operation in the batch (≤ 10 000): `LoadItem` + `Chunk` (≤ 32 parallel) → manifests.
 2. `PlanCacheMisses` (blob `Head` on every xcache key, 1 000 per activity) → the list of
    `(xcache_key, prompt input)` pairs.
@@ -629,7 +628,7 @@ admin-tx activity that joins `namespace_ownership` and acts **only on rows with 
 `UNION` the namespaces with stale (`stale_write OR stale_delete`) observations — and signals each
 namespace's singleton with `Nudge{reason = sweep}`. The same sweep **advances the watermark**: it
 moves `watermark_memory_id` up to just below the smallest unconsolidated fact id, visible or
-marker-hidden, and never past the last `seq` the relay has seen: the guard is commit-based, because
+marker-hidden, and never past `ins_seq < engram_seq_floor(now())`: the guard is commit-based, because
 an id timestamp cannot bound a transaction (a `CommitChunk` that minted a lower id may commit
 later, C-19), and ids are minted per attempt inside the transaction (§5.0). Facts purged as
 re-extracted twins get their `done` stamp from the purge itself (§5.4.2), so they never pin it. Rejected: one Temporal
@@ -680,7 +679,7 @@ with no facts never starts one.
       pushed to the front of the group's queue (8 → 4 → 2 → 1); `len = 1` and still failing →
       **`StampFailed`** (write tx: `INSERT fact_consolidation(…, note = 'failed')`; stamps are
       inserts, never updates, N95). A fact whose latest stamp is `failed` and older than 7 days is
-      pending again by the anti-join; a batch is re-queued at most 3 times before `failed`.
+      pending again by the anti-join; a batch is re-queued at most 3 times (attempts are capped at 4) before `failed`.
    4. **`WriteObservation`** (stage 2) **and `Dedup`.** *Write* (gateway, `consolidate_write/v1`,
       `models.consolidate`, `quota.Reserve` first): one call per touched observation, ≤ 4 in
       parallel per group, with `mode ∈ {update, create, rebuild}`. `update`: the previous text, the
@@ -714,7 +713,7 @@ with no facts never starts one.
       `update` and `merge` op, the **`base_version`** it was written against (the version of the
       target whose text the writer was shown). Then `consolidation_batches.state = 'stored'`. Zero
       rows → an earlier call of the same attempt already stored a list; **the stored list wins** and
-      this call's writes are discarded. `op_key = sha256(batch_key ‖ op_index)` is computed over
+      this call's writes are discarded. `op_key = sha256(batch_key ‖ attempt ‖ op_index)` is computed over
       the stored list, never over a live LLM answer (TLC `Consolidation_VolatileProposal`). A
       proposal is never updated or deleted (`engram_app` holds `SELECT, INSERT` on the table): a
       discard or a capacity retry writes a **new `attempt`** and the old list is dead by key.
@@ -827,7 +826,7 @@ per touched observation, ≈ 3.5 calls per chunk overall (D3); ≤ 4 groups in p
 | `WriteObservation` (stage 2, `consolidate_write/v1`) | activity | `batch_key` + observation | `P-llm` after `quota.Reserve` | none | none | — |
 | `Dedup` (`dedup_adjudicate/v1`, decision only; `merge` → root rebuild of the older observation) | activity | `batch_key` + write index | `P-embed`/`P-llm`; failure → `keep` | read fence | read tx | — |
 | `StoreProposal` (N43, N121) | activity | `(batch_key, attempt)` via `consolidation_proposals` (write-once; the stored list wins; each `update`/`merge` op records `base_version`) | `P-frozen` | shared try-lock, `active` @ epoch | write tx | — |
-| `ApplyBatch` | activity | `op_key = sha256(batch_key ‖ op_index)` over the **stored** list, via `consolidation_applied`; `consolidation_batches.state = 'applied'` in the same tx as the stamps | `P-frozen`; `discarded` → re-queue | shared try-lock, `active` @ epoch + shared derivation lock (N120); inputs re-verified by the visibility predicate; `current_version = base_version` checked; `observation_sources` rewritten only here | derivation tx (+ a separate tx for the discard) | `ObservationUpserted`, `ObservationRetired`, `PagesMarkedStale` |
+| `ApplyBatch` | activity | `op_key = sha256(batch_key ‖ attempt ‖ op_index)` over the **stored** list, via `consolidation_applied`; `consolidation_batches.state = 'applied'` in the same tx as the stamps | `P-frozen`; `discarded` → re-queue | shared try-lock, `active` @ epoch + shared derivation lock (N120); inputs re-verified by the visibility predicate; `current_version = base_version` checked; `observation_sources` rewritten only here | derivation tx (+ a separate tx for the discard) | `ObservationUpserted`, `ObservationRetired`, `PagesMarkedStale` |
 | `MarkRound` | activity | `(ns, round_no)` | `P-db` | shared try-lock, `active` @ epoch | write tx | — |
 | Page nudges | workflow | signal debounced by the page workflow | Temporal | — | none | — |
 
@@ -1137,7 +1136,7 @@ Derived versions add the evidence-segment check of N117 (§5.4.2), which tests `
 predicate, whose SQL form is `engram_visible_facts`, `engram_visible_chunks`,
 `engram_visible_observation_versions` and `engram_visible_page_versions` (with
 `engram_obs_version_hidden` and `engram_page_version_hidden` for a single version; §3.4).
-`DocumentService` is a reader too: for a `DELETING` document, `GetDocument` and
+`DocumentService` is a reader too (SQL view `document_tombstone_view`): for a `DELETING` document, `GetDocument` and
 `ListDocuments(include_deleting)` return `{document_id, state, deleted_at, up_to_version,
 operation_id}` only, and `GetDocumentVersion` of a covered version is `NOT_FOUND{DOCUMENT_DELETED}`
 (N136; the marker cleared the content-bearing columns, so nothing leaks even by a bug). `as_of`
@@ -1183,7 +1182,7 @@ role. **A run is per tombstone `(document_id, up_to_version)`:** every predicate
    resurface at any `as_of`.
 2. **Purge** (`write tx`, batches of 1,000, heartbeat, `ContinueAsNew` every 200 batches), only
    **after every registered index and Kafka consumer cursor has passed the tombstone's
-   `event_seq`** (`engram_consumers_passed`; `ids_elided` victims are deleted by the indexed
+   `event_seq`** (`engram_consumers_passed(event_seq)`; `ids_elided` victims are deleted by the indexed
    `(namespace_id, document_id)` query restricted to `document_version <= up_to_version`).
    **Paced by WAL, not by a fixed pause:** each batch's `pg_current_wal_insert_lsn` delta is
    measured and the next batch waits so that the shard stays at **≤ 25 MB/s** (`wal_compression =

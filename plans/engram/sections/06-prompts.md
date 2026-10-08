@@ -989,14 +989,14 @@ derivation set.
 | One LME-M run (≈ 13× the ingestion) | | **≈ $1 540** (≈ $1 210 with the batch API); the harness budget guard stays `--max-cost-usd 2000` | ≈ $900 |
 | One LoCoMo run (10 conversations, ≈ 92 k tokens) | ≈ 120 chunks, 1 200 facts, 150 batches | ≈ **$0.19** | ≈ $0.12 |
 | Per 1 k facts (the §8.8 unit; 25 documents) | A-F = 10: 100 chunks, 125 batches. A-F = 4: 250 chunks, 125 batches | extraction $0.066 + consolidation $0.079 + summaries $0.010 + embeddings $0.002 → **≈ $0.157 per 1 k facts** | extraction $0.120 + $0.079 + $0.010 + $0.006 → **≈ $0.21** |
-| Initial fill of 1 B facts online (D3) | A-F = 10: 100 M chunks, 125 M batches, 25 M documents; throughput `min(N_workers × 32 / L_extract, RPM_cap / (60 × calls_per_chunk))` = `600 / (60 × 3.5)` ≈ **2.9 chunks/s per cell**, 14.5 chunks/s at 5 cells | **≈ $157 k ≈ $160 k** at list prices (≈ $124 k with the batch API); **≈ 80 days** at 5 cells (154 shards at the 6.5 M target; ≈ 400 days for one cell) | $211 k; 250 M chunks at ≈ 4.9 chunks/s per cell: **≈ 120 days** |
-| One shard at the 6.5 M-fact target (N154) | 650 k chunks, 812 k batches, 163 k documents (the 1 B-fact figures ÷ 154) | ≈ **$1 020** (≈ $810 with the batch API); 154 such shards = the $157 k above | ≈ $1 370 |
+| Initial fill of 1 B facts online (D3) | A-F = 10: 100 M chunks, 125 M batches, 25 M documents; throughput `min(N_workers × 32 / L_extract, RPM_cap / (60 × calls_per_chunk))` = `600 / (60 × 3.5)` ≈ **2.9 chunks/s per cell**, 17.4 chunks/s at 6 cells | **≈ $157 k ≈ $160 k** at list prices (≈ $124 k with the batch API); **≈ 67 days** at 6 cells (182 shards at the 5.5 M target; ≈ 400 days for one cell) | $211 k; 250 M chunks at ≈ 4.9 chunks/s per cell: **≈ 100 days** at 6 cells |
+| One shard at the 5.5 M-fact target (N165) | 550 k chunks, 687 k batches, 137 k documents (the 1 B-fact figures ÷ 182) | ≈ **$860** (≈ $685 with the batch API); 182 such shards = the $157 k above | ≈ $1 160 |
 | `RetainBackfill` fill (batch API, no RPM cap; a launch prerequisite, N130) | the same counts | ≈ $124 k; bounded by batch-API turnaround and quota, not by the RPM cap; the planning figure is weeks, measured in M2.5 | ≈ $151 k |
 
 Reading the table: consolidation is **≈ 50 %** of all-in ingest cost at A-F = 10, so the
 Phase 2 cost gate in §10 is set from the measured A-F with a 25 % margin (**≤ $0.30 per LME-S
 haystack at A-F = 10**, 1.25 × $0.24); "$70–120 per LME-S run" is exactly the span between
-A-F = 4 and A-F = 10. A fill of 1 B facts at ≈ 80 days online is why `RetainBackfill` is in
+A-F = 4 and A-F = 10. A fill of 1 B facts at ≈ 67 days online is why `RetainBackfill` is in
 the committed scope. The §6.1 summary refresh rule (N60) keeps the summary and re-embedding
 lines small on append-heavy conversations.
 
@@ -1006,10 +1006,8 @@ class (extract, routing, write, page refresh, each Reflect iteration); workflows
 counts prompt + completion tokens of every call above through `token_usage` (PD-1 / N25); the
 per-call caps in the first table bound the worst case of one activity.
 
-### Round-5 changes
+### Round-6 changes
 
 | Item | Removed | Added |
 |---|---|---|
-| Page and observation commit (§6.3, §6.6) | CAS before the idempotency check, version-numbered markdown key, `stale_write = false` | `commit_key` lookup first, `$expected` CAS for every writer, attempt-unique blob key (N144) |
-| Stage 2 (§6.3) | a write to a retired target stamped `done` | the facts re-route as a new attempt (N157) |
-| Fill (§6.8, Table 6.8-B) | 125 shards, 4 cells, 11.4 chunks/s, ≈ 100 days (≈ 150 at A-F = 4) | 154 shards, 5 cells, 14.5 chunks/s, ≈ 80 days (≈ 120 at A-F = 4); a per-shard row at 6.5 M facts (N154) |
+| Fill (§6.8, Table 6.8-B) | 154 shards, 5 cells, 14.5 chunks/s, ≈ 80 days (≈ 120 at A-F = 4); a per-shard row at 6.5 M facts | 182 shards, 6 cells, 17.4 chunks/s, ≈ 67 days (≈ 100 at A-F = 4); a per-shard row at 5.5 M facts, ≈ $860 (N165) |

@@ -2,12 +2,13 @@
 
 A decision-oriented implementation plan for a Go + PostgreSQL long-term memory service for AI agents,
 modelled on Hindsight (MIT). The plan is standalone and unrelated to the benchmark project in this repository.
-It has been through five adversarial design reviews (`reviews/round-1.md` to `reviews/round-5.md`); the plan text is
-the post-fifth-review version. Round 3 produced a redesign of storage, deletion visibility, delete durability and
+It has been through six adversarial design reviews (`reviews/round-1.md` to `reviews/round-6.md`); the plan text is
+the post-sixth-review version. Round 3 produced a redesign of storage, deletion visibility, delete durability and
 shard moves (advice R1 to R5), applied through register block D22 (N111 to N134); round 4 kept its core and
 corrected the mechanisms that acted outside its assumptions (advice in `reviews/round-4.md`), applied through D23
 (N135 to N143) and in-place rewrites of earlier rows (marked "rev. D23"); round 5 found no blocker and was applied through D24
-(N144 to N157) and further in-place rewrites (marked "rev. D24"). **The six TLA+ specifications are written and
+(N144 to N159) and further in-place rewrites (marked "rev. D24"); round 6 replaced the shard-move protocol with
+freeze-then-copy and was applied through D25 (N160 to N168) and in-place rewrites (marked "rev. D25"). **The six TLA+ specifications are written and
 model-checked** (`Outbox`, `Consolidation`, `Storage`, `Derivation`, `Durability`, `ShardMove`) with their must-fail
 configurations and logs; section 7.1 states what each checks and what it omits. The Lean 4 developments are not
 type-checked here.
@@ -15,8 +16,8 @@ type-checked here.
 | Path | What it is |
 |---|---|
 | `PLAN.md` | The assembled plan (sections 1-12 plus the decision register as Appendix A). |
-| `00-decision-register.md` | The binding cross-cutting decisions every section follows; D20 holds the corrections adopted from round 1 (N50-N77), D21 those of round 2 (N79-N108), D22 the round-3 redesign (N111-N134), D23 the round-4 decisions (N135-N143), D24 the round-5 decisions (N144-N157). Rows a redesign or a review superseded were rewritten in place ("rev. D23", "rev. D24") and keep their ids. |
-| `reviews/` | The five adversarial reviews, one file per round: `round-1.md` (45 findings F-1...F-45), `round-2.md` (G-1...G-30), `round-3.md` (the correctness, Postgres and API/numbers reviews H-*, P-*, A-*, and the redesign advice R1 to R5), `round-4.md` (C-1...C-23, P-1...P-15, A-1...A-25 and the closing advice), `round-5.md` (C-1...C-14, P-1...P-15, A-1...A-18; ids restart each round). Each ends with a Disposition table that maps every finding to a register row and the section where it was applied. Read them to understand *why* D2, D5, D8, D9, D22, D23 and D24 read the way they do. |
+| `00-decision-register.md` | The binding cross-cutting decisions every section follows; D20 holds the corrections adopted from round 1 (N50-N77), D21 those of round 2 (N79-N108), D22 the round-3 redesign (N111-N134), D23 the round-4 decisions (N135-N143), D24 the round-5 decisions (N144-N159), D25 the round-6 decisions (N160-N168). Rows a redesign or a review superseded were rewritten in place ("rev. D23", "rev. D24", "rev. D25") and keep their ids. |
+| `reviews/` | The six adversarial reviews, one file per round: `round-1.md` (45 findings F-1...F-45), `round-2.md` (G-1...G-30), `round-3.md` (the correctness, Postgres and API/numbers reviews H-*, P-*, A-*, and the redesign advice R1 to R5), `round-4.md` (C-1...C-23, P-1...P-15, A-1...A-25 and the closing advice), `round-5.md` (C-1...C-14, P-1...P-15, A-1...A-18), `round-6.md` (C-1...C-16, P-1...P-12, A-1...A-11; ids restart each round). Each ends with a Disposition table that maps every finding to a register row and the section where it was applied. Read them to understand *why* D2, D5, D8, D9, D22, D23, D24 and D25 read the way they do. |
 | `sections/` | The individual sections that `PLAN.md` is assembled from. |
 | `proto/` | The protobuf contracts (`memory.v1`, `memory.admin.v1`, internal workflow and event schemas) with `buf.yaml`. |
 | `sql/` | DDL for the control-plane catalog and for one shard. |

@@ -1,6 +1,6 @@
 # Engram: implementation plan for a Go + Postgres agent-memory service
 
-**Status:** design plan, v1.5 (2026-10-08, after five adversarial reviews: `reviews/round-1.md` / register D20, `reviews/round-2.md` / D21, `reviews/round-3.md` / D22 (N111 to N134), `reviews/round-4.md` / D23 (N135 to N143), `reviews/round-5.md` / D24 (N144 to N157)). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
+**Status:** design plan, v1.5 (2026-10-08, after six adversarial reviews: `reviews/round-1.md` to `reviews/round-6.md`; register D20 (round 1), D21, D22 (N111 to N134), D23 (N135 to N143), D24 (N144 to N159), D25 (round 6, N160 to N168)). **Reference system:** Hindsight (github.com/vectorize-io/hindsight, MIT).
 **Scope:** everything needed to build, verify and operate a Hindsight-class long-term memory service in Go,
 exposed as gRPC (`memory.v1`), with PostgreSQL 16 as the per-shard system of record, Temporal for
 asynchronous work, an AI gateway for every model call and blob storage for large or immutable data.
@@ -18,16 +18,17 @@ changed only the mechanisms that acted outside the predicate's assumptions (D23)
 the facts it names and re-extraction is a write; one commit rule for every writer of a derived
 version; hard delete reaches derived artefacts; intents are put after the marker commits and the
 replay floor lives in the catalog; moves re-copy by an insertion sequence and are arbitrated by a
-catalog CAS; and the shard was sized from a measured hot set. Round 5 found no blocker (D24): every major
-was a round-4 mechanism that regressed a neighbour (idempotency before the base check, an invalidation
-independent of the fact row, `ins_seq` monotone across a move, recorded epochs on replay), a spec that was
-kinder than the prose or the SQL (a lossless catalog, copy before verify, re-copy onto a restored target),
-or a derived number that was not re-derived. Its decisions: the catalog gets a **synchronous standby** and its
-facts are also derivable from the shards and a blob-side floor mirror; the hot set is restated with both
-covering link indexes, so the shard is **6.5 M facts target / 10 M cap, 600 GB, NVMe ≥ 50 k IOPS** (154
-shards, 5 cells for 1 B facts); the filtered semantic plan is cost-based with an exact fallback; the
-connection budget is re-derived for N transactions per recall; Phase 0 exits on spec-side work and the
-twins live with their subjects (N156). The six TLA+ specifications (`Outbox`, `Consolidation`, `Storage`, `Derivation`,
+catalog CAS; and the shard was sized from a measured hot set. Round 5 found no blocker (D24) and its fixes were mostly sound, but the shard-move protocol (dirty copy, reconcile,
+`PreVerify`, `ReconcileIn`, cleanup gate) had now produced a blocker or major in rounds 4, 5 and 6, each fix adding a floor
+or a repair the next review broke. Round 6 (D25, N160 to N168) therefore does not patch it: **the move is
+freeze-then-copy**. The namespace is read-only for a bounded, size-proportional window (unattended only when the
+estimate is ≤ 10 min, operator-scheduled windows up to 4 h), every row is copied from a static source, verification is
+equality on a static set, and nothing is ever merged into a target that has served writes (a target restored to before
+its activation is re-copied, not repaired). The rest of D25: the curation subject is `(document_id, content_hash)`, so
+twins are one chain; the catalog has **one asynchronous hot standby** and reconciles from the shards on every promotion
+and restore; filtered recalls are their own class (θ = 10 k, p95 ≤ 1 s, own semaphore); the hot set is restated with
+measured B-tree fill, so the shard is **5.5 M facts target / 10 M cap** on the same 128 GB instance (182 shards, 6 cells
+for 1 B facts); WAL is budgeted as full-page-image dominated; connections get TCP keepalives. The six TLA+ specifications (`Outbox`, `Consolidation`, `Storage`, `Derivation`,
 `Durability`, `ShardMove`) are **written and model-checked** with their must-fail configurations;
 §7.1 states what each omits, and the Phase 0 spec work is the written must-fail manifest, invariant code and trace converter (M0.7), with each Go twin built in
 the milestone of its subject.
@@ -92,20 +93,19 @@ Phase 2 exit in week 29, stated in §10).
   indexes (≤ 48 h); while markers are pending the namespace runs in a documented degraded mode.
   `Invalidate`/`Restore` insert and delete one marker, so `Restore` is exact.
 - **Durability without synchronous replication of the shards.** Every shard role commits with
-  `synchronous_commit = local`, so a commit cannot hang on a standby; the small, off-hot-path catalog is the
-  one exception and has a synchronous standby (N146), and a catalog restore is repaired from the shards. **Acknowledged** deletes and invalidations have RPO 0: the
+  `synchronous_commit = local`, so a commit cannot hang on a standby; the small, off-hot-path catalog has one
+  asynchronous hot standby, and every promotion or restore first reconciles it from the shards (N163). **Acknowledged** deletes and invalidations have RPO 0: the
   intent object is put after the marker commits and before the ack, and a restore or failover replays
   the intents verbatim with their recorded epochs, per subject in chain order, from a floor kept in the
-  catalog and mirrored in blob storage (`frozen/restore` until the replay finishes); a committed-but-unacknowledged delete may be lost
+  catalog and the blob-side `_control/restores/` objects (`frozen/restore` until the replay finishes); a committed-but-unacknowledged delete may be lost
   and the client's retry re-applies it. Retains have RPO ≤ 60 s.
-- **Shard moves copy dirty, freeze, and reconcile by insertion sequence.** Tables belong to three
-  classes (insert-only with `ins_seq`, mutable, excluded) and the expunge is paused for the move, so
-  whole-namespace verification runs before the freeze and the freeze re-copies only the rows
-  inserted since the copy began plus the small mutable tables. There is no replay, no copy barrier
-  and no catch-up loop. `ins_seq` is advanced past the source's on the target, and cutover waits for the
-  target's indexes. Cutover goes through a `ready` state with a single point of no return, the
-  **catalog CAS `cutover → committed`**, which a restore or failover arbitrates against; rollback
-  exists at every step before it.
+- **Shard moves are freeze-then-copy.** The namespace is frozen (reads continue, writes get a retryable
+  `NamespaceFrozen` with an estimate) for a window sized from its bytes and vectors; every table is copied
+  from the static source, verified by count and key-hash equality, the target's indexes are built, and
+  cutover goes through a `ready` state with a single point of no return, the **catalog CAS
+  `cutover → committed`** (checked as replicated before the source is fenced). Rollback exists at every
+  step before it and at the window deadline; cleanup waits 24 h plus a post-activation backup; a target
+  restored to before its activation is re-copied from the retained source, never merged.
 - **Time travel is exact for facts, observations and their evidence, and for chunks subject to a stated rule (N85).**
   Every fact and chunk carries `mentioned_at` = the item timestamp, set by the server; observations are
   versioned with `effective_at = max(mentioned_at over every fact rendered to the writer, effective_at of
@@ -122,8 +122,8 @@ Phase 2 exit in week 29, stated in §10).
   Phases 0 to 2, **≈ 84.25 ew** against 78 ew of capacity (conformance and measurements, the MVP with
   moves behind an admin flag, the expunge and delete-intent log, consolidation, Reflect and
   `RetainBackfill`), so the MVP lands in week 24 and the Phase 2 exit in week 29; pages, export,
-  multi-cell and most of the formal tooling are a separate 39.25-ew track. One shard holds **6.5 M facts**
+  multi-cell and most of the formal tooling are a separate 39.25-ew track. One shard holds **5.5 M facts**
   (10 M hard cap, 600 GB, NVMe ≥ 50 k IOPS), one API + worker stack serves up to 32 shards, and 1 B
-  facts is 154 shards in 5 cells: **≈ 80 days to fill online** at 3.5 gateway calls per chunk and
+  facts is 182 shards in 6 cells: **≈ 67 days to fill online** at 3.5 gateway calls per chunk and
   600 RPM per cell, ≈ $160 k at list prices (Table 6.8-B); `RetainBackfill` through the batch API is a
   launch prerequisite.

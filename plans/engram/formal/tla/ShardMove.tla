@@ -498,10 +498,10 @@ Failover(s) ==
 StandbyReplay(s) ==
   /\ own[s].st \notin {"restoring", "replaying"}
   /\ \/ /\ sb[s] # Snap(s) /\ (nRestore < MaxRestore \/ (s = tgt /\ mp = "built"))
-        /\ sb' = [sb EXCEPT ![s] = Snap(s)]
-     \/ /\ nRestore < MaxRestore /\ sb[s] # bak[s]                     \* the standby is rebuilt from the base backup (PG8-8)
-        /\ sb' = [sb EXCEPT ![s] = bak[s]]
-  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, EnvV, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, flr, mv>>
+        /\ sb' = [sb EXCEPT ![s] = Snap(s)] /\ nBak' = nBak
+     \/ /\ nRestore < MaxRestore /\ nBak < MaxBak /\ sb[s] # bak[s]      \* rebuilt from a base backup (PG8-8); it uses the extra-backup budget
+        /\ sb' = [sb EXCEPT ![s] = bak[s]] /\ nBak' = nBak + 1
+  /\ UNCHANGED <<CatV, MovV, OwnV, DatV, HistV, CliV, now, tl, nRestore, bak, FzV, RolV, SqV, IdxV, FlagV, CpV, TlV, flr, mv>>
 
 \* N171(2), N163(3): the catalog promotion loses an arbiter outcome that the standby has not replayed; the promotion
 \* runs the reconcile (cdirty).
@@ -649,6 +649,7 @@ RestoreDone(s) ==
 -----------------------------------------------------------------------------
 Copying == (\E r \in Rows : CopyStep(r)) \/ CopyEx
 Forward == Freeze \/ Copying \/ VerifyFrozen \/ Recopy \/ BuildIndex \/ SealCopy \/ MakeReady \/ CommitCAS
+           \/ (\E s \in Shards : StandbyReplay(s))
            \/ Replicated \/ AbortReplicated \/ Thaw \/ Cut \/ Stamp \/ Activate \/ EndOnRouting \/ CatFlip
            \/ (\E s \in Shards : ReadShard(s)) \/ ApplyReconcile
 Recovery == \E s \in Shards : Reconcile_(s) \/ RestoreDone(s)
@@ -659,7 +660,7 @@ Faults == \E r \in Rows : CopyFault(r)
 Next == Plan \/ Forward \/ Rollback \/ Reconnect \/ Tick \/ Cleanup \/ SweepEx \/ Faults
         \/ (\E c \in Clients : Refresh(c) \/ Commit(c) \/ (\E r \in Rows : Begin(c, r)))
         \/ (\E r \in Rows : SrcDelete(r) \/ TgtDelete(r))
-        \/ (\E s \in Shards : Backup(s) \/ Restore(s) \/ Failover(s) \/ StandbyReplay(s)) \/ TgtRestore
+        \/ (\E s \in Shards : Backup(s) \/ Restore(s) \/ Failover(s)) \/ TgtRestore
         \/ CatalogRestore \/ CatalogLoss \/ CatalogPromote
         \/ Recovery \/ UnionRepairStep
 

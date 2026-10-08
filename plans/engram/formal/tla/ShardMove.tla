@@ -517,7 +517,7 @@ ReconcileDesign(s) ==
                /\ cat' = [sh |-> tgt, ep |-> ne] /\ cm' = "done" /\ mp' = "done"
                /\ fin' = [fin EXCEPT ![tgt] = Row("active", ne)]
             /\ own' = [own EXCEPT ![tgt].st = "replaying", ![src] = Row("moved_out", me)]
-            /\ actSet' = store[tgt] /\ actMk' = mk[tgt]            \* the restored data, `gone` replayed
+            /\ actSet' = store[tgt] \cap frozenSet /\ actMk' = mk[tgt] \cap frozenMk   \* the moved rows it holds (post-activation writes are not moved rows)
             /\ UNCHANGED <<rep, DatV, idx>>
      ELSE IF cmE = "committed"                             \* the source: complete (c) here; no epoch bump
        THEN /\ seen

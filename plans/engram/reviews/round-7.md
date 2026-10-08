@@ -115,7 +115,7 @@ Every round-7 finding and TLC gap maps to a register row. "Fixed by" names the D
 | A7-2 stale results tables | minor | **Accepted.** §7.7 and `RESULTS.md` regenerated from the logs; M0.7 exit names the D26 set. | N178 | CI |
 | A7-3 stale connection figures | minor | **Accepted.** N54, N114, N155 restated with N176. | N176 | — |
 | A7-4 window arithmetic | minor | **Accepted** with PG7-6. ≈ 350 k facts unattended; cap 8 h; refusal below the margin. | N173 | — |
-| A7-5 fields without a column | minor | **Accepted.** `rerun_count`/`rerun_attempt` reserved (no re-run); `source_blobs_gc_after` is derived (`finished_at + 28 d`); `CleanupGrace`/`CleanupOptions` deleted, `Cleanup(ctx, id.MoveID)`. | N169, N175; N167 rev. | `TestDeps_EveryRPCHasPath` |
+| A7-5 fields without a column | minor | **Accepted.** `rerun_count`/`rerun_attempt` reserved (no re-run); `source_blobs_gc_after` is derived (`finished_at + 28 d`); `CleanupGrace`/`CleanupOptions` deleted, `Cleanup(ctx, id.MoveID)`. | N169, N170; N167 rev. | `TestDeps_EveryRPCHasPath` |
 | A7-6 `cutover_c` note | minor | **Accepted.** "(c), after the point of no return (a″) was read and replicated". | N175 | generated table |
 | A7-7 reserved names | minor | **Accepted.** Names reserved; WIRE_JSON check in CI. | N177 | CI |
 | A7-8 `COPIED` definition | minor | **Accepted.** `copied` = verify, indexes, move backup and consumer wait all done; `MoveResult` comment reworded. | N175 | — |

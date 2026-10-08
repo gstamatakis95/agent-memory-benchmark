@@ -1,19 +1,31 @@
 // memory/v1/operation.proto
 //
-// Long-running operations. Every asynchronous unit of work (a document
-// retain, a document/namespace delete, a page refresh, a snapshot, a
-// consolidation round) is an Operation backed by exactly one Temporal
-// workflow (id `ns/{namespace_id}/op/{operation_id}` on task queue
-// `shard-{shard_id}`, decision D11). OperationService is the read barrier of
-// the consistency model (decision D16): after WaitOperation returns SUCCEEDED
-// for a retain, Recall on the same namespace observes every fact of that
-// document version unless `result.superseded_by` is set (decision N127).
+// Long-running operations. Every asynchronous unit of work is an Operation,
+// and the workflow behind it depends on its kind (decision N136):
+//   * RETAIN_DOCUMENT, CREATE_SNAPSHOT and REFRESH_PAGE run as their own
+//     Temporal workflow, id `ns/{namespace_id}/op/{operation_id}` on task
+//     queue `shard-{shard_id}` (decision D11);
+//   * DELETE_DOCUMENT is the per-namespace Expunge singleton
+//     (`ns/{namespace_id}/expunge`) plus the tombstone's `operation_id`, with
+//     progress read from the expunge's own bookkeeping; DELETE_NAMESPACE runs
+//     the namespace Expunge at `ns/{namespace_id}/op/{operation_id}`;
+//     DELETE_TENANT is derived from the catalog's tenant row;
+//   * CONSOLIDATE is the per-namespace Consolidate singleton.
+// OperationService is the read barrier of the consistency model (decision
+// D16): after WaitOperation returns SUCCEEDED for a retain, Recall on the
+// same namespace observes every fact of that document version unless
+// `result.superseded_by` is set (decision N127).
 //
 // Deletes are different: a delete is effective when its RPC is acknowledged
-// (soft-delete marker, decision N115); the Operation only tracks the
-// asynchronous expunge (N119), so SUCCEEDED means "physically gone", not
-// "hidden". A namespace move is not an Operation: it lives on the catalog
-// `namespace_moves` row and is visible only in memory.admin.v1 (N127).
+// (committed marker plus durable intent object, decisions N115, N122); the
+// Operation only tracks the asynchronous expunge (N119), so SUCCEEDED means
+// "physically gone", not "hidden". A DELETE_* operation cannot be cancelled
+// (FAILED_PRECONDITION + PreconditionFailed{OPERATION_NOT_CANCELLABLE}), and
+// WaitOperation on it polls the tombstone (or the catalog row), not a
+// workflow. A FAILED operation is never restarted under its id: a retry uses
+// a new operation_id (decision N139). A namespace move is not an Operation:
+// it lives on the catalog `namespace_moves` row and is visible only in
+// memory.admin.v1 (N127).
 syntax = "proto3";
 
 package memory.v1;
@@ -42,8 +54,11 @@ service OperationService {
   }
   // CancelOperation requests cancellation. Cancellation is cooperative: the
   // workflow stops at the next activity boundary; chunks already committed
-  // stay visible (retain) or stay deleted (purge). Terminal operations fail
-  // with FAILED_PRECONDITION + PreconditionFailed{OPERATION_TERMINAL}.
+  // stay visible (retain). Terminal operations fail with FAILED_PRECONDITION
+  // + PreconditionFailed{OPERATION_TERMINAL}; DELETE_DOCUMENT,
+  // DELETE_NAMESPACE and DELETE_TENANT fail with PreconditionFailed
+  // {OPERATION_NOT_CANCELLABLE} because the delete is already effective and
+  // the expunge must finish (decision N136).
   rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
   // WaitOperation blocks until the operation is terminal or `timeout`
   // elapses, whichever is first, and returns the operation either way (check
@@ -55,7 +70,9 @@ service OperationService {
   // workflow-result long-poll (GetWorkflow(...).Get with the remaining
   // timeout), capped per API process; beyond the cap, or when the workflow
   // is gone (purged namespace), it falls back to a jittered database poll of
-  // the operations row. Exempt from the DELETING rejection like GetOperation.
+  // the operations row. For DELETE_* kinds it polls the tombstone (document)
+  // or the catalog row (namespace, tenant) instead of a workflow (decision
+  // N136). Exempt from the DELETING rejection like GetOperation.
   rpc WaitOperation(WaitOperationRequest) returns (WaitOperationResponse);
 }
 
@@ -66,10 +83,12 @@ enum OperationKind {
   OPERATION_KIND_RETAIN_DOCUMENT = 1;
   // DocumentService.DeleteDocument: the asynchronous Expunge (decision N119)
   // that follows the acknowledged soft-delete marker. The delete is already
-  // effective for every read path when this operation is returned.
+  // effective for every read path when this operation is returned. Backed by
+  // the expunge singleton; not cancellable (decision N136).
   OPERATION_KIND_DELETE_DOCUMENT = 2;
   // NamespaceService.DeleteNamespace: per-shard purge after the delete
-  // freeze and the intent object (N122).
+  // freeze, the catalog `deleting` state and the intent object (N122). Not
+  // cancellable (decision N136).
   OPERATION_KIND_DELETE_NAMESPACE = 3;
   // Background consolidation round (never client-created; listed for
   // observability of consolidation_lag).
@@ -83,9 +102,11 @@ enum OperationKind {
   reserved 7;
   reserved "OPERATION_KIND_MOVE_NAMESPACE";
   // TenantService.DeleteTenant: the tenant-level umbrella over one
-  // DELETE_NAMESPACE operation per namespace (decision N127). It is stored in
-  // the catalog database, not on a shard, and is read through the
-  // tenant-scoped memory.admin.v1.TenantService.GetOperation.
+  // DELETE_NAMESPACE operation per namespace (decision N127). It is derived
+  // from the catalog's tenant row, not stored on a shard, and is read through
+  // the tenant-scoped memory.admin.v1.TenantService.GetTenantOperation. The
+  // per-namespace operations are created as the TenantDelete workflow fences
+  // each namespace, after the ack (decision N122); not cancellable.
   OPERATION_KIND_DELETE_TENANT = 8;
 }
 
@@ -161,7 +182,9 @@ message ExpungeSla {
   // Derived versions that name the victim are materialised hidden and
   // rebuilds are nudged: 15 minutes.
   google.protobuf.Duration materialize_within = 1;
-  // Rows, vectors, links, evidence and blobs are physically deleted: 24 hours.
+  // Rows, vectors, links, blobs, the text of derived versions (reduced to
+  // content-free stubs), page markdown and Reflect transcripts are physically
+  // deleted: 24 hours (decisions N119, N136).
   google.protobuf.Duration purge_within = 2;
   // Touched vector indexes are rebuilt: 48 hours.
   google.protobuf.Duration index_rebuilt_within = 3;
@@ -176,7 +199,8 @@ message OperationProgress {
   int32 units_failed = 3;
   // Current phase label, e.g. "chunk", "extract", "embed", "commit",
   // "finalize"; for DELETE_* the Expunge phases "materialize", "purge",
-  // "index", "finish" (decision N119).
+  // "derived" (stubs and transcripts), "index", "finish" (decisions N119,
+  // N136).
   string phase = 4;
   // Retain only: chunks skipped by the content-hash delta (unchanged).
   int32 units_skipped = 5;
@@ -189,8 +213,9 @@ message OperationError {
   string message = 2;
   // Typed details, same set as memory/v1/errors.proto.
   repeated google.protobuf.Any details = 3;
-  // True when resubmitting the same request with a new operation_id is
-  // expected to succeed (gateway outage, transient shard error).
+  // True when resubmitting the same request with a NEW operation_id is
+  // expected to succeed (gateway outage, transient shard error). A FAILED
+  // operation is never restarted under its own id (decision N139).
   bool retryable = 4;
 }
 
@@ -232,7 +257,9 @@ message OperationResult {
   // RETAIN_DOCUMENT: set when a newer version of the document finalised first;
   // this operation still ends SUCCEEDED but its version never became active
   // and the facts of `document_version` are not guaranteed visible (decision
-  // N49, N127). The value is the newer version number.
+  // N49, N127). The value is the NEWER VERSION NUMBER of the document, not an
+  // operation id (the shard column `operations.superseded_by` is a bigint
+  // version too, decision N139).
   int64 superseded_by = 10;
   // DELETE_NAMESPACE / DELETE_TENANT: namespaces whose expunge finished.
   int32 namespaces_done = 11;

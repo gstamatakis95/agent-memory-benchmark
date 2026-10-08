@@ -12,17 +12,22 @@
 // re-interpreting a field requires a `workflow.GetVersion` patch in the
 // workflow code and a drain window for running histories (section 4.5).
 //
-// Pre-1.0 breaking-change exception (decision N128, review A-11). This
-// package has not shipped v1.0.0, so the round-3 redesign (D22) changed it
-// incompatibly and `buf breaking` is baselined against the `proto/v1.0.0`
-// tag, not `main`. The breaks, all intended: N86 `ChunkWork.item_index = 9`
+// Pre-1.0 breaking-change exception (decisions N128, N139, review A-9, A-11).
+// This package has not shipped v1.0.0, so the round-3 redesign (D22) and the
+// round-4 changes (D23) changed it incompatibly. Until v1.0.0, `buf breaking`
+// is baselined on `main@HEAD~1` and every intended break carries a labelled
+// exception and a changelog entry (plan section 4.5). The breaks, all
+// intended: N86 `ChunkWork.item_index = 9`
 // became `item_indexes = 17` (old number reserved); the lineage-based
 // consolidation messages (`ObservationVersionRef`, `candidate_versions`,
 // `flagged_candidate_versions`, N79) were replaced by the two-stage shapes of
 // N121; `PurgeTarget`/`PurgeInput`/`PurgeResult` were replaced by the
 // Expunge messages of N119; `ExportInput` lost its outbox cut (N126); and the
 // move messages lost the replay floor, `applied_seq` and the verify watermark
-// (N124). Every top-level input written by the D22 build carries
+// (N124). Round 4 (N119, N121, N135 to N137) reserved `ExpungeInput.batch_pause`
+// (the purge is paced by WAL, not by a fixed pause), moved the proposal key to
+// `(batch_key, attempt)` and added `base_version` to the stored writes.
+// Every top-level input written by the D22 build carries
 // `schema_version = 2`; the worker branches on it for in-flight histories
 // started at 1 and keeps that branch until they have drained (30 days).
 //
@@ -441,8 +446,11 @@ message CommitChunkResult {
 // `content_hash NOT IN (SELECT content_hash FROM document_version_chunks
 // WHERE namespace_id = $1 AND document_id = $2 AND version = $3)`; it inserts
 // `chunk_tombstones(reason = 'replace')` and, for kept chunks whose
-// extraction_key differs from the current key, `fact_hidden(reason =
-// 'reextract')` (decisions N58, N115). Both are inserts.
+// extraction_key differs from the current key, `fact_hidden(cause =
+// 'reextract')` (decisions N58, N115). Both are inserts, and neither hides
+// anything derived: observations that name those facts are only flagged
+// `stale_write` and evidence rows are kept (a replace and a re-extraction are
+// writes, decision N135).
 message FinalizeVersionInput {
   WorkflowScope scope = 1;
   string operation_id = 2;
@@ -457,15 +465,17 @@ message FinalizeVersionInput {
 message FinalizeVersionResult {
   // Chunk tombstones inserted by this finalize.
   int32 chunks_retired = 1;
-  // Facts hidden through those chunk tombstones (counted, not written).
+  // Facts hidden from the fact and chunk arms through those chunk tombstones
+  // (counted, not written).
   int32 facts_retired = 2;
   // Chunk tombstones deleted again because the chunk is back in the version.
   int32 chunks_unretired = 3;
   int64 outbox_seq = 4;
   // Visible facts of kept chunks whose extraction_key differed from the
-  // chunk's current key, hidden by `fact_hidden(reason = 'reextract')`
-  // (decision N58: a prompt or model bump never leaves two visible fact sets
-  // on a chunk).
+  // chunk's current key, hidden from the fact and chunk arms by
+  // `fact_hidden(cause = 'reextract')` (decision N58: a prompt or model bump
+  // never leaves two visible fact sets on a chunk). Derived versions stay
+  // visible (decision N135).
   int32 stale_extraction_facts_retired = 5;
   // Content hashes whose header_hash changed and need chunk re-embedding
   // (N60: chunk vectors only).
@@ -474,6 +484,10 @@ message FinalizeVersionResult {
   // marked superseded and tombstoned nothing. The operation ends SUCCEEDED
   // with OperationResult.superseded_by set (decisions N49, N127).
   int64 superseded_by = 7;
+  // Observations flagged `stale_write` in the same transaction because their
+  // current segment names a fact of a tombstoned chunk or an old-key fact
+  // (one indexed statement, decision N135).
+  int32 observations_flagged_stale = 8;
 }
 
 // ConsolidateTrigger is the SignalWithStart payload of the per-namespace
@@ -616,6 +630,12 @@ message ObservationWrite {
   // (decision N117), all of them O's own sources (only visible sources are
   // rendered). A strict superset of source_fact_ids.
   repeated string input_fact_ids = 7;
+  // UPDATE and MERGE-survivor writes: the version of the target observation
+  // whose text the writer was shown. ApplyBatch applies the write only if
+  // `observations.current_version = base_version` and the base is visible
+  // (the derivation commit rule, decisions N120, N121); 0 for CREATE and
+  // ROOT_REBUILD.
+  int64 base_version = 8;
 }
 
 // WriteObservationResult returns the validated write.
@@ -625,7 +645,9 @@ message WriteObservationResult {
 }
 
 // StoreProposalInput persists the validated stage-2 writes of a batch
-// write-once (decision N43), before apply.
+// write-once (decision N43), before apply, under `(batch_key, attempt)`. A
+// proposal is never updated or deleted: a discard or a capacity retry writes
+// a new attempt and the old list is dead by key (decision N121).
 message StoreProposalInput {
   WorkflowScope scope = 1;
   // Hex sha256(sorted fact ids ‖ prompt_version ‖ model).
@@ -633,6 +655,11 @@ message StoreProposalInput {
   string prompt_version = 6;
   string model = 7;
   repeated ObservationWrite writes = 8;
+  // 1-based attempt of the batch (`consolidation_batches.attempt`).
+  int32 attempt = 9;
+  // "" or "capacity": the capacity re-run is its own attempt with the note
+  // "do not use create; attach or merge instead".
+  string prompt_variant = 10;
 
   // Removed in the D22 redesign (decisions N117, N121, N128): lineage and the
   // stage-1 candidate text are no longer recorded. `repeated ObservationOp ops
@@ -644,8 +671,9 @@ message StoreProposalInput {
 
 // StoreProposalResult returns the list that won (the stored one).
 message StoreProposalResult {
-  // False when an earlier attempt had already stored a proposal: `writes` is
-  // then that attempt's list and this attempt's writes were discarded.
+  // False when an earlier call of the SAME attempt had already stored a
+  // proposal: `writes` is then that list and this call's writes were
+  // discarded.
   bool stored_new = 1;
   repeated ObservationWrite writes = 3;
 
@@ -658,18 +686,23 @@ message StoreProposalResult {
 message ApplyBatchInput {
   WorkflowScope scope = 1;
   string batch_key = 2;
+  // The attempt whose stored list is applied.
+  int32 attempt = 3;
 }
 
 // ApplyOutcome is how ApplyBatch ended.
 enum ApplyOutcome {
   APPLY_OUTCOME_UNSPECIFIED = 0;
   APPLY_OUTCOME_APPLIED = 1;
-  // Every op_key already existed: an earlier attempt committed.
+  // Every op_key already existed, or the batch is `applied`: an earlier call
+  // committed.
   APPLY_OUTCOME_ALREADY = 2;
-  // Re-verification failed (decision N116): an input fact is no longer
-  // visible under the read predicate, evaluated in a fresh statement (facts
-  // are immutable, no FOR SHARE). The proposal was deleted in its separate
-  // transaction.
+  // The derivation commit rule refused the proposal (decision N120): an
+  // input fact or the base version's text is no longer visible under the
+  // read predicate, or `current_version` moved past a write's base_version.
+  // The WHOLE proposal is discarded: `consolidation_batches.state =
+  // 'discarded'` with the next attempt in a separate transaction. Nothing is
+  // deleted.
   APPLY_OUTCOME_DISCARDED = 3;
   // The scope is at max_observations_per_scope.
   APPLY_OUTCOME_CAPACITY_EXCEEDED = 4;
@@ -683,6 +716,10 @@ message ApplyBatchResult {
   // them from the batch and re-queues it with a new batch_key; a batch is
   // re-queued at most 3 times before `failed`).
   repeated string missing_fact_ids = 3;
+  // DISCARDED: a write's base observation moved on or became hidden; the
+  // batch is re-routed under `next_attempt` with the same batch_key.
+  bool base_moved = 5;
+  int32 next_attempt = 6;
 
   // Removed in the D22 redesign (decision N79 is withdrawn): `repeated
   // ObservationVersionRef flagged_candidate_versions = 4`.
@@ -737,30 +774,41 @@ enum ExpungeTarget {
   // batched DELETE, blob prefix; no graph repair (decision N112).
   EXPUNGE_TARGET_NAMESPACE = 2;
   // Chunk tombstones (`replace`, `reextract`) older than the grace of 1 h:
-  // rows are purged and the tombstone deleted.
+  // rows are purged and the tombstone deleted. Evidence rows stay (decision
+  // N135).
   EXPUNGE_TARGET_CHUNK_TOMBSTONES = 3;
   // Vectors of the previous embedding model after a ReembedNamespace flip.
   EXPUNGE_TARGET_OLD_EMBEDDING_MODEL = 4;
+  // Facts carrying a `fact_hidden(reextract)` row older than the same 1 h
+  // grace: rows, vectors, links, mentions and the marker; the purge writes
+  // their `done` stamps (decisions N119, N135).
+  EXPUNGE_TARGET_REEXTRACTED_FACTS = 5;
 }
 
-// ExpungePhase is the four-phase shape of the workflow (decision N119).
+// ExpungePhase is the phase shape of the workflow (decisions N119, N136).
 enum ExpungePhase {
   EXPUNGE_PHASE_UNSPECIFIED = 0;
   // Under the exclusive derivation lock: insert `derived_hidden`, mark
   // observations and pages `stale_delete`, nudge root rebuilds and refreshes,
   // set `expunge_state = 'materialized'`. SLA ≤ 15 min.
   EXPUNGE_PHASE_MATERIALIZE = 1;
-  // Batches of 1,000 with 50 ms pauses: facts, vectors, links, mentions,
-  // evidence, chunks, versions, explicit-delete ledger rows, then blob
-  // tombstones. Starts only after every registered index/Kafka cursor passed
-  // the delete's `seq`. SLA ≤ 24 h.
+  // Batches of 1,000 paced to ≤ 25 MB/s of WAL: facts, vectors, links,
+  // mentions, chunks, versions, explicit-delete ledger rows, then blobs.
+  // Evidence rows are not purged here (decision N135). Starts only after every
+  // registered index/Kafka cursor passed the tombstone's `event_seq`. SLA ≤
+  // 24 h.
   EXPUNGE_PHASE_PURGE = 2;
-  // REINDEX INDEX CONCURRENTLY on touched partition indexes above 5 % dead
-  // fraction. SLA ≤ 48 h.
+  // Index hygiene: a touched HNSW whose purged count reached 1 % of its
+  // `rows_at_build` or 2 k elements is rebuilt by the index runner, then
+  // `VACUUM (INDEX_CLEANUP ON)` (decision N138). SLA ≤ 48 h.
   EXPUNGE_PHASE_INDEX = 3;
   // `expunge_state = 'purged'`, tombstone dropped 24 h later, operation
   // SUCCEEDED.
   EXPUNGE_PHASE_FINISH = 4;
+  // DerivedPurge (decision N136), after Materialize and paced like the purge:
+  // covered observation and page versions become content-free stubs, page
+  // markdown blobs and Reflect transcripts are deleted.
+  EXPUNGE_PHASE_DERIVED_PURGE = 5;
 }
 
 // ExpungeInput starts or signals the per-namespace Expunge workflow (id
@@ -778,17 +826,25 @@ message ExpungeInput {
   repeated string document_ids = 5;
   // Rows per delete batch (default 1,000).
   int32 batch_size = 6;
-  // Pause between batches (default 50 ms).
-  google.protobuf.Duration batch_pause = 7;
+  // Removed in round 4 (decision N119): `Duration batch_pause = 7`. The purge
+  // is paced by the WAL it writes (`wal_mb_per_s`), not by a fixed pause.
+  reserved 7;
+  reserved "batch_pause";
   // xcache/ecache/staging blobs are deleted only when no visible chunk
   // references the hash AND the blob is older than this (default 24 h, longer
   // than the maximum in-flight activity age; decision N100).
   google.protobuf.Duration xcache_grace = 8;
   // OLD_EMBEDDING_MODEL only.
   string old_embedding_model = 9;
+  // WAL budget of the purge in MB/s (default 25): each batch's
+  // `pg_current_wal_insert_lsn` delta is measured and the next batch waits so
+  // that the shard stays under it (decision N119).
+  int32 wal_mb_per_s = 10;
 }
 
-// MaterializeInput is the Materialize activity input.
+// MaterializeInput is the Materialize activity input. Every batch re-reads
+// `fact_hidden` and the open tombstones under the exclusive derivation lock;
+// a set computed once fails RestoreExact (decision N120).
 message MaterializeInput {
   WorkflowScope scope = 1;
   // Pending tombstones to materialize (empty = all pending).
@@ -818,7 +874,7 @@ message PurgeBatchInput {
   bytes last_key = 4;
   int32 batch_size = 5;
   // Lowest outbox cursor among the registered index/Kafka consumers; the
-  // purge refuses to start while it is below the delete's `seq`.
+  // purge refuses to start while it is below the tombstone's `event_seq`.
   int64 min_consumer_cursor = 6;
   // MARKERS only: the tombstone's up_to_version. Every delete carries
   // `document_version <= up_to_version`, so rows of a document id that was
@@ -832,6 +888,36 @@ message PurgeBatchResult {
   bytes last_key = 2;
   bool table_done = 3;
   int64 blobs_tombstoned = 4;
+  // WAL bytes the batch wrote, for the pacing loop (decision N119).
+  int64 wal_bytes = 5;
+}
+
+// DerivedPurgeInput is one DerivedPurge activity batch (decision N136): reduce
+// observation and page versions covered by a document-cause `derived_hidden`
+// row to content-free stubs.
+message DerivedPurgeInput {
+  WorkflowScope scope = 1;
+  // Victim document whose cause rows select the versions.
+  string document_id = 2;
+  // Resume key of the previous batch (empty before the first).
+  bytes last_key = 3;
+  int32 batch_size = 4;
+  int32 wal_mb_per_s = 5;
+}
+
+// DerivedPurgeResult reports one batch.
+message DerivedPurgeResult {
+  // Versions replaced by a stub (version row deleted, stub inserted; inputs,
+  // sources, vector row and BM25 entry cascade with the deleted row).
+  int64 versions_stubbed = 1;
+  // pages/{page_id}/v{n}.md blobs deleted.
+  int64 page_blobs_deleted = 2;
+  // reflect/{op}.jsonl transcripts of the namespace written before the
+  // delete.
+  int64 transcripts_deleted = 3;
+  bytes last_key = 4;
+  bool done = 5;
+  int64 wal_bytes = 6;
 }
 
 // ExpungeResult reports the whole run.
@@ -842,6 +928,9 @@ message ExpungeResult {
   int32 observations_hidden = 4;
   int32 pages_hidden = 5;
   int32 indexes_rebuilt = 6;
+  // Derived versions reduced to stubs and transcripts deleted (decision N136).
+  int64 derived_versions_stubbed = 10;
+  int64 transcripts_deleted = 11;
   // Time from the tombstone to the end of Materialize / Purge / Index, for the
   // SLA metrics.
   google.protobuf.Duration materialized_after = 7;
@@ -850,15 +939,20 @@ message ExpungeResult {
 }
 
 // TenantDeleteInput starts the TenantDelete workflow on the cell-wide
-// `control` task queue (register N36). The intent object was written and
-// every namespace frozen (`freeze_delete`) before the ack.
+// `control` task queue (register N36). Before the ack the catalog tenant row
+// was set to `deleting` and the tenant-level intent object was written
+// (decision N122); the workflow then fences each namespace
+// (`freeze_delete`), writes that namespace's own intent object and runs its
+// expunge, at most 8 in parallel.
 message TenantDeleteInput {
   uint32 schema_version = 1;
   string tenant_id = 2;
   string operation_id = 3;
   // `_control/deletes/{tenant}/…` key of the intent object (decision N122).
   string intent_object_key = 4;
-  // Namespaces to expunge, with their shard and epoch at freeze time.
+  // Namespaces to expunge, with their shard and epoch. May be empty for a
+  // large tenant: the workflow then pages through the tenant's namespaces
+  // with the admin RPC (workers never read the catalog directly, D4).
   repeated NamespaceTarget namespaces = 5;
 }
 
@@ -958,8 +1052,9 @@ message ExportResult {
 // on the TARGET shard's task queue (`shard-{target_shard_id}`, register N2).
 // The executing worker opens a second, move-scoped pool to the source shard
 // (role `engram_move`); it is the only code path that holds two shard handles.
-// Protocol: plan, dirty copy, freeze, reconcile by set difference, drain,
-// cutover with a `ready` state, restart, cleanup (decisions N124, N125).
+// Protocol: plan, dirty copy, pre-freeze verification, freeze, reconcile by
+// insertion sequence, drain, cutover with a `ready` state and a catalog CAS
+// as the point of no return, restart, cleanup (decisions N124, N125, N137).
 message MoveInput {
   // 2 for inputs written by the D22 build.
   uint32 schema_version = 1;
@@ -974,8 +1069,8 @@ message MoveInput {
   string target_blob_prefix = 10;
   bool pause_before_freeze = 11;
   // Freeze watchdog: max(120 s, 60 s + 1 s per 10,000 live facts), capped at
-  // 15 min, computed by Plan from the stats row. Armed until cutover
-  // sub-step (c) commits.
+  // 15 min, computed by Plan from the stats row. Armed until the catalog CAS
+  // (a″) commits.
   google.protobuf.Duration freeze_watchdog = 12;
 }
 
@@ -1000,18 +1095,39 @@ enum CutoverStep {
   CUTOVER_STEP_UNSPECIFIED = 0;
   // (b′) target `incoming → ready`; rollback still possible.
   CUTOVER_STEP_READY_TARGET = 1;
-  // (c) source `frozen/move → moved_out`: the point of no return.
+  // (c) source `frozen/move → moved_out`, executed only after (a″) was read.
   CUTOVER_STEP_MOVED_OUT_SOURCE = 2;
   // (b″) target `ready → active`.
   CUTOVER_STEP_ACTIVE_TARGET = 3;
   // (d) catalog flip.
   CUTOVER_STEP_CATALOG_FLIP = 4;
+  // (a″) catalog CAS `cutover → committed`: the point of no return.
+  CUTOVER_STEP_CATALOG_COMMIT = 5;
 }
 
-// ReconcileReport is the Reconcile activity's result (decision N124). Any
-// residual mismatch ends in Rollback.
+// PreVerifyReport is the PreVerify activity's result (decisions N124, N137).
+// It runs while the namespace is still active, so the whole-namespace checks
+// stay out of the freeze. Any mismatch fails the activity and rolls the move
+// back before it freezes.
+message PreVerifyReport {
+  // `nextval('engram_ins_seq')` and `now()` on the source when PreVerify
+  // started (W_pre, T_pre).
+  int64 w_pre = 1;
+  google.protobuf.Timestamp t_pre = 2;
+  // Insert-only rows copied by the catch-up copy of ins_seq at or above
+  // engram_seq_floor(T_copy).
+  int64 catchup_rows_copied = 3;
+  // Tables whose count(*) or bit_xor(hashtextextended(pk::text, 0)) differ
+  // for ins_seq below engram_seq_floor(now()) (empty = match).
+  repeated string mismatched_tables = 4;
+  bool verify_fk_ok = 5;
+  int64 blobs_missing = 6;
+}
+
+// ReconcileReport is the Reconcile activity's result (decisions N124, N137).
+// Any residual mismatch ends in Rollback.
 message ReconcileReport {
-  // Immutable rows re-copied: `created_at ≥ T_copy − 10 min`.
+  // Insert-only rows re-copied: `ins_seq ≥ engram_seq_floor(T_pre)`.
   int64 rows_recopied = 1;
   // Mutable-table rows upserted, and target rows absent on the source deleted.
   int64 mutable_rows_upserted = 2;
@@ -1021,11 +1137,13 @@ message ReconcileReport {
   int64 blobs_copied = 4;
   int64 blobs_still_missing = 5;
   // Tables whose count(*) or bit_xor(hashtextextended(pk::text, 0)) differ
-  // after the re-copy (empty = match).
+  // over the re-copied range, or whose excluded-class count(*) on the target
+  // exceeds the source's (empty = match).
   repeated string mismatched_tables = 6;
   // True once every source consumer cursor passed the namespace's final
-  // max(seq) (≤ 60 s, else rollback).
+  // max(seq) (≤ 120 s, twice the gap horizon, else rollback).
   bool consumers_drained = 7;
+  // VerifyFK on the target restricted to the re-copied range.
   bool verify_fk_ok = 8;
 }
 
@@ -1052,6 +1170,7 @@ message MoveCheckpoint {
   int32 source_timeline_id = 12;
   CutoverStep cutover_step = 13;
   ReconcileReport reconcile = 14;
+  PreVerifyReport pre_verify = 15;
 
   // Removed in the D22 redesign (decision N124): the replay floor
   // `int64 copy_start_seq = 2` (p0), `int64 applied_seq = 3`, the pre-freeze

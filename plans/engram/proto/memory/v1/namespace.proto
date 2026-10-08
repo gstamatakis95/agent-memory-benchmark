@@ -45,7 +45,8 @@ service NamespaceService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
   // UpdateNamespace applies a field-mask patch to mutable fields
-  // (display_name, mission, directives, disposition, config_overrides).
+  // (display_name, mission, reflect_directives, disposition,
+  // config_overrides).
   // Optimistic concurrency through `etag`.
   rpc UpdateNamespace(UpdateNamespaceRequest) returns (UpdateNamespaceResponse);
   // GetEffectiveConfig returns the resolved configuration of a namespace
@@ -55,12 +56,18 @@ service NamespaceService {
   rpc GetEffectiveConfig(GetEffectiveConfigRequest) returns (GetEffectiveConfigResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // DeleteNamespace writes the delete intent object (decision N122), freezes
-  // the namespace on its shard (`freeze_delete`, reads and writes are
-  // rejected from then on) and acknowledges: the delete is effective at the
-  // ack. The returned Operation (kind DELETE_NAMESPACE) tracks the purge
-  // (DROP INDEX, batched DELETE, blob prefix; no graph repair). Running
-  // operations of the namespace are cancelled (CANCEL_REASON_NAMESPACE_DELETING).
+  // DeleteNamespace freezes the namespace on its shard (`freeze_delete`) and
+  // sets the catalog state `deleting` (the marker: reads and writes are
+  // rejected from then on, as PreconditionFailed{NAMESPACE_DELETING}), then
+  // writes the delete intent object (decision N122, put after the marker
+  // commits) and acknowledges: the delete is effective at the ack and an
+  // acknowledged one survives restore and failover. The returned Operation
+  // (kind DELETE_NAMESPACE, not cancellable) tracks the purge (DROP INDEX by
+  // deterministic names, batched DELETE, blob prefix; no graph repair).
+  // Running operations of the namespace are cancelled
+  // (CANCEL_REASON_NAMESPACE_DELETING). A duplicate call keeps the client's
+  // operation_id, returns the existing operation and makes sure the intent
+  // object exists. Deadline cap 40 s (decision N139).
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
 }
 
@@ -264,8 +271,8 @@ message DeleteNamespaceRequest {
 // DeleteNamespaceResponse returns the purge operation.
 message DeleteNamespaceResponse {
   Operation operation = 1;
-  // Commit time of the delete freeze: from here nothing of the namespace is
-  // readable.
+  // Commit time of the delete marker (shard freeze and catalog `deleting`):
+  // from here nothing of the namespace is readable.
   google.protobuf.Timestamp deleted_at = 2;
   // Stated bounds of the asynchronous purge.
   ExpungeSla expunge_sla = 3;

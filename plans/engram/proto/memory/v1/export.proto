@@ -16,6 +16,18 @@
 // refused by the sync client until it has applied the next delta (the delta
 // carries the delete records).
 //
+// Curation (decision N126). The files are built through the read-time
+// visibility predicate at write time and are static afterwards (a compressed
+// byte stream cannot be filtered on read). A delete therefore EXPIRES the
+// snapshots that could contain the document; Invalidate and Restore never
+// expire a snapshot. Instead GetSnapshotManifest returns a live
+// `hidden_overlay` (the currently invalidated facts and the hidden derived
+// versions) that the sync client applies before serving, so curation reaches a
+// synced agent within one manifest poll and the next snapshot honours it.
+// After a delete expired the latest ready snapshot, the expunge starts a
+// system-initiated snapshot (debounced 10 min per namespace), so read-only
+// sync clients regain a servable copy.
+//
 // StreamSnapshot is SERVER-STREAMING: parts of ≤ 1 MiB, resumable by
 // (path, offset). Unary "download a file" was rejected because gRPC messages
 // should stay ≤ 4 MiB and files reach gigabytes.
@@ -34,13 +46,18 @@ option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
 // memory.read.
 service ExportService {
   // CreateSnapshot starts a snapshot (kind CREATE_SNAPSHOT) and returns the
-  // Operation. BeginSnapshot inserts the snapshot as `building`; the files
-  // are written from one REPEATABLE READ snapshot; RecordSnapshot refuses to
-  // promote a row that a delete expired in between (decision N126). At most
-  // one snapshot per namespace runs at a time (ABORTED + OperationConflict
-  // otherwise).
+  // Operation. BeginSnapshot inserts the snapshot as `building` and records
+  // an insertion-sequence watermark; the files are written in short
+  // READ COMMITTED key ranges bounded by that watermark, with the marker sets
+  // read once (no long snapshot is held); RecordSnapshot refuses to promote a
+  // row that a delete expired in between (decision N126). At most one
+  // snapshot per namespace runs at a time (ABORTED + OperationConflict
+  // otherwise). The same workflow is started by the expunge after a delete
+  // expired the latest ready snapshot (system-initiated, no caller scope).
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
-  // GetSnapshotManifest returns the manifest of one version (0 = latest).
+  // GetSnapshotManifest returns the manifest of one version (0 = latest) and
+  // the live curation overlay (decision N126). The overlay is computed at
+  // read time and is never part of the stored manifest.json.
   rpc GetSnapshotManifest(GetSnapshotManifestRequest) returns (GetSnapshotManifestResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -53,8 +70,9 @@ service ExportService {
   // `expired` (a document in it, or in it while it was `building`, was
   // deleted since, decision N126) is refused with FAILED_PRECONDITION +
   // PreconditionFailed{SNAPSHOT_EXPIRED}: the client takes the next
-  // snapshot's delta or a new full snapshot. Every part applies the read-time
-  // visibility predicate (decision N116).
+  // snapshot's delta or a new full snapshot. The parts are the stored bytes
+  // and are NOT filtered on read: deletes are handled by expiry, curation by
+  // the manifest's hidden_overlay (decision N126).
   rpc StreamSnapshot(StreamSnapshotRequest) returns (stream StreamSnapshotResponse);
 }
 
@@ -63,8 +81,9 @@ enum SnapshotFileKind {
   SNAPSHOT_FILE_KIND_UNSPECIFIED = 0;
   // manifest.json (also returned inline as SnapshotManifest).
   SNAPSHOT_FILE_KIND_MANIFEST = 1;
-  // facts.jsonl.zst: one Memory (kind FACT) per line, invisible facts
-  // (tombstoned documents, fact_hidden) excluded.
+  // facts.jsonl.zst: one Memory (kind FACT) per line; facts invisible when
+  // the file was written (tombstoned documents, fact_hidden) are excluded.
+  // Curation after that instant is the manifest's hidden_overlay.
   SNAPSHOT_FILE_KIND_FACTS = 2;
   // observations.jsonl.zst: latest visible version of each observation.
   SNAPSHOT_FILE_KIND_OBSERVATIONS = 3;
@@ -101,9 +120,9 @@ message SnapshotManifest {
   // True for every version above 1: the delta is always emitted (decision
   // N126).
   bool delta_available = 4;
-  // Consistent point of the snapshot: the start of the REPEATABLE READ
-  // transaction that wrote the files; everything committed before it and
-  // visible then is included.
+  // Consistent point of the snapshot: the start of the build. Insert-only rows
+  // are bounded by the insertion-sequence watermark taken then; everything
+  // committed before it and visible then is included.
   google.protobuf.Timestamp as_of = 5;
   repeated SnapshotFile files = 6;
   int64 total_bytes = 7;
@@ -129,6 +148,45 @@ message SnapshotManifest {
   // sync client applies them before serving. Long lists are paged into the
   // delta file's delete records; this field holds at most the first 10,000.
   repeated string deleted_ids = 17;
+
+  reserved 100 to 199;
+}
+
+// HiddenVersion names a derived version that the read predicate hides now.
+message HiddenVersion {
+  // Which kind of derived version.
+  HiddenKind kind = 1;
+  // Observation id or page id.
+  string id = 2;
+  // The hidden range: every version of the observation or page whose
+  // root_version equals `root_version` and whose version is at least
+  // `from_version` is hidden (decision N117).
+  int64 root_version = 3;
+  int64 from_version = 4;
+}
+
+// HiddenKind says what a HiddenVersion names.
+enum HiddenKind {
+  HIDDEN_KIND_UNSPECIFIED = 0;
+  HIDDEN_KIND_OBSERVATION = 1;
+  HIDDEN_KIND_PAGE = 2;
+}
+
+// HiddenOverlay is the live curation state that the sync client applies to a
+// snapshot before serving it (decision N126): the facts currently invalidated
+// (`fact_hidden` with cause `invalidate`) and the derived versions currently
+// hidden (`derived_hidden` rows). It is computed when the manifest is read,
+// is paged (the first page comes with the manifest) and reflects Restore as
+// well: a restored fact is simply absent.
+message HiddenOverlay {
+  // Ids of invalidated facts.
+  repeated string hidden_memory_ids = 1;
+  repeated HiddenVersion hidden_versions = 2;
+  // When the overlay was computed.
+  google.protobuf.Timestamp computed_at = 3;
+  // Non-empty while more overlay rows exist; pass it as
+  // GetSnapshotManifestRequest.overlay_page_token.
+  string next_page_token = 4;
 
   reserved 100 to 199;
 }
@@ -159,13 +217,18 @@ message GetSnapshotManifestRequest {
   NamespaceRef namespace = 1;
   // 0 = latest completed version.
   int64 version = 2;
+  // Continuation of the overlay (HiddenOverlay.next_page_token); empty on the
+  // first call.
+  string overlay_page_token = 3;
 
   reserved 100 to 199;
 }
 
-// GetSnapshotManifestResponse wraps the manifest.
+// GetSnapshotManifestResponse wraps the manifest and the live overlay.
 message GetSnapshotManifestResponse {
   SnapshotManifest manifest = 1;
+  // Live curation overlay, applied by engram-sync before serving.
+  HiddenOverlay hidden_overlay = 2;
 
   reserved 100 to 199;
 }

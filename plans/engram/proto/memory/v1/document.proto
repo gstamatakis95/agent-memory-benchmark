@@ -2,23 +2,35 @@
 //
 // DocumentService: read and delete documents (the client-addressed unit of
 // retain and delete). Documents are created only through
-// MemoryService.Retain; this service never writes content.
+// MemoryService.Retain; this service never writes content. The one mutation
+// it offers, UpdateDocumentTags, changes the filter tags of a document row.
 //
 // DeleteDocument is UNARY and returns an Operation because the delete has two
 // halves (decisions D8, N115, N119). The synchronous half is an O(1)
-// soft-delete marker: the delete intent object is written to blob storage
-// (N122), then one shard transaction inserts a document tombstone, flips the
-// document to DELETING and writes the outbox event, and the call returns. From
-// that ack on, every read path (Recall, Reflect, GetMemory, ListMemories,
-// GetPage, SearchPages, StreamSnapshot) hides everything derived from the
+// soft-delete marker: one shard transaction, under the document lock, flips
+// the document to DELETING and clears its summary, context, metadata and tags,
+// inserts a document tombstone and a deletion-log row and writes the outbox
+// event; after it COMMITS the delete intent object is written to blob storage
+// (N122) and only then does the call return. From that ack on, every read
+// path (Recall, Reflect, GetMemory, ListMemories, GetPage, SearchPages,
+// StreamSnapshot, and this service) hides everything derived from the
 // document, evaluated at read time against the tombstone set (N116, N117);
 // nothing is walked or stamped at delete time. The asynchronous half is the
 // throttled per-namespace Expunge workflow (N119) that the returned
 // Operation tracks: materialize (<= 15 min), purge rows and blobs (<= 24 h),
-// index rebuild (<= 48 h). Recall SLOs may degrade for the namespace while
-// the tombstone is pending. A client that needs "no longer returned" needs
-// nothing beyond the ack; one that needs "storage reclaimed" waits on the
-// Operation.
+// derived versions reduced to content-free stubs, index rebuild (<= 48 h).
+// Recall SLOs may degrade for the namespace while the tombstone is pending. A
+// client that needs "no longer returned" needs nothing beyond the ack; one
+// that needs "storage reclaimed" waits on the Operation.
+//
+// Tombstone view (decision N136). A document in state DELETING is returned
+// by GetDocument and ListDocuments(include_deleting) as its tombstone only:
+// document_id, state, deleted_at, up_to_version and delete_operation_id; every
+// content-derived field (summary, context, metadata, tags, content hash,
+// counts, versions) is empty. GetDocumentVersion and GetDocumentBody of a
+// version the tombstone covers answer NOT_FOUND with reason DOCUMENT_DELETED.
+// A Retain into the same document_id starts a new life above up_to_version
+// and is served normally.
 syntax = "proto3";
 
 package memory.v1;
@@ -32,7 +44,8 @@ import "memory/v1/operation.proto";
 option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
 
 // DocumentService reads and deletes documents. Scope memory.read for
-// Get/List, memory.write for Delete.
+// Get/List/GetDocumentBody/ListTags, memory.write for Delete and
+// UpdateDocumentTags.
 service DocumentService {
   // GetDocument returns document metadata and, optionally, its version list.
   rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse) {
@@ -44,20 +57,46 @@ service DocumentService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
   // DeleteDocument soft-deletes a document and everything derived from it.
-  // The ack means: the intent object is durable (N122) and the tombstone
-  // marker is committed (N115), so the delete is effective for every read
-  // path and survives restore and failover (acknowledged deletes have RPO 0).
-  // Cost: one blob put (10-50 ms) plus one small transaction, independent of
+  // The ack means: the tombstone marker is committed (N115) and its intent
+  // object is durable (put after the commit, N122), so the delete is
+  // effective for every read path and survives restore and failover
+  // (acknowledged deletes have RPO 0; a delete that was committed but not
+  // acknowledged may be lost by a restore, and the client's retry re-applies
+  // it).
+  // Cost: one small transaction plus one blob put (10-50 ms), independent of
   // document size. The returned Operation (kind DELETE_DOCUMENT) tracks the
   // asynchronous Expunge. Deleting an unknown document returns NOT_FOUND;
   // deleting a document that is already DELETING returns the existing
-  // operation (idempotent).
+  // operation (idempotent) and, before acking, makes sure the intent object of
+  // the marker it found exists, so an ack always implies an intent (decision
+  // N122). Deadline cap 40 s: the marker waits for the exclusive document lock
+  // in one 35 s attempt (decision N139).
   rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
   // GetDocumentVersion returns one version's metadata (chunk/fact counts,
-  // status, the operation that produced it).
+  // status, the operation that produced it). A version covered by a delete
+  // tombstone is NOT_FOUND with reason DOCUMENT_DELETED (decision N136).
   rpc GetDocumentVersion(GetDocumentVersionRequest) returns (GetDocumentVersionResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
+  // GetDocumentBody returns the reconstructed body of one version, in byte
+  // ranges (an APPEND chain's body can exceed one gRPC message). The body is
+  // the single owner-keyed object of the version (decision N104). Same
+  // NOT_FOUND{DOCUMENT_DELETED} rule as GetDocumentVersion (decision N139).
+  rpc GetDocumentBody(GetDocumentBodyRequest) returns (GetDocumentBodyResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListTags lists the distinct filter tags of the namespace's documents with
+  // their document counts, optionally by prefix (decision N139). Tags of
+  // DELETING documents are not counted.
+  rpc ListTags(ListTagsRequest) returns (ListTagsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // UpdateDocumentTags adds and removes filter tags on one document (set
+  // semantics; tags are normalised as at retain, decision N32). Tags live on
+  // the document row only (decision N116), so tag filters see the change at
+  // once; existing observations keep their scope and nothing is re-extracted.
+  // A DELETING document is NOT_FOUND{DOCUMENT_DELETED}. Scope memory.write.
+  rpc UpdateDocumentTags(UpdateDocumentTagsRequest) returns (UpdateDocumentTagsResponse);
 }
 
 // DocumentState is the lifecycle of a document.
@@ -68,7 +107,8 @@ enum DocumentState {
   // First version still ingesting; nothing visible yet.
   DOCUMENT_STATE_INGESTING = 2;
   // Tombstone committed (the delete is effective); expunge in progress. Not
-  // returned by List unless `include_deleting`.
+  // returned by List unless `include_deleting`, and then as the content-free
+  // tombstone view only (decision N136).
   DOCUMENT_STATE_DELETING = 3;
 }
 
@@ -83,7 +123,11 @@ enum DocumentVersionStatus {
   DOCUMENT_VERSION_STATUS_DELETED = 4;
 }
 
-// Document is the public view of a document.
+// Document is the public view of a document. For state == DELETING only
+// namespace, document_id, state, deleted_at, up_to_version and
+// delete_operation_id are set: the marker transaction clears the
+// content-bearing columns, so nothing derived from the deleted content is
+// returned (decision N136).
 message Document {
   NamespaceRef namespace = 1;
   string document_id = 2;
@@ -109,6 +153,13 @@ message Document {
   repeated DocumentVersion versions = 13;
   // Free-text context of the current version.
   string context = 14;
+  // DELETING only: commit time of the delete marker.
+  google.protobuf.Timestamp deleted_at = 15;
+  // DELETING only: the tombstone covers every version up to and including
+  // this one; a Retain into the same document_id starts above it.
+  int64 up_to_version = 16;
+  // DELETING only: the DELETE_DOCUMENT operation that tracks the expunge.
+  string delete_operation_id = 17;
 
   reserved 100 to 199;
 }
@@ -156,7 +207,8 @@ message ListDocumentsRequest {
   string document_id_prefix = 4;
   // Only documents updated at or after this time.
   google.protobuf.Timestamp updated_after = 5;
-  // Also return documents in state DELETING.
+  // Also return documents in state DELETING, as content-free tombstone views
+  // (decision N136).
   bool include_deleting = 6;
   google.protobuf.FieldMask read_mask = 7;
   repeated MetadataFilter metadata_filters = 8;
@@ -180,7 +232,10 @@ message DeleteDocumentRequest {
   // Optional client-chosen operation id (UUIDv7).
   string operation_id = 4;
   // When > 0, the delete only proceeds if current_version equals this value
-  // (FAILED_PRECONDITION + PreconditionFailed{ETAG_MISMATCH} otherwise).
+  // (FAILED_PRECONDITION + PreconditionFailed{ETAG_MISMATCH} otherwise). The
+  // comparison happens inside the marker transaction, under the document
+  // lock, so a concurrent retain cannot slip a version in between (decision
+  // N139).
   int64 expected_version = 5;
 
   reserved 100 to 199;
@@ -217,6 +272,82 @@ message GetDocumentVersionRequest {
 // GetDocumentVersionResponse wraps the version.
 message GetDocumentVersionResponse {
   DocumentVersion document_version = 1;
+
+  reserved 100 to 199;
+}
+
+// GetDocumentBodyRequest reads a byte range of one version's body.
+message GetDocumentBodyRequest {
+  NamespaceRef namespace = 1;
+  string document_id = 2;
+  // 0 = current version.
+  int64 version = 3;
+  // Byte offset to start from (0 = start); must be below total_bytes.
+  int64 offset = 4;
+  // Maximum bytes to return; 0 = 4 MiB, clamped to 4 MiB.
+  int32 limit_bytes = 5;
+
+  reserved 100 to 199;
+}
+
+// GetDocumentBodyResponse is one range of the body.
+message GetDocumentBodyResponse {
+  string document_id = 1;
+  int64 version = 2;
+  // Hex SHA-256 of the whole body (the version's content_hash).
+  string content_hash = 3;
+  // UTF-8 bytes. A range may end inside a multi-byte sequence: concatenate
+  // the ranges before decoding.
+  bytes content = 4;
+  int64 total_bytes = 5;
+  // Offset of the next range; equal to total_bytes on the last one.
+  int64 next_offset = 6;
+
+  reserved 100 to 199;
+}
+
+// ListTagsRequest lists the namespace's filter tags.
+message ListTagsRequest {
+  NamespaceRef namespace = 1;
+  PagingRequest paging = 2;
+  // Only tags starting with this prefix.
+  string prefix = 3;
+
+  reserved 100 to 199;
+}
+
+// TagCount is one tag with the number of documents carrying it.
+message TagCount {
+  string tag = 1;
+  int64 document_count = 2;
+}
+
+// ListTagsResponse is a page of tags, ordered by tag.
+message ListTagsResponse {
+  repeated TagCount tags = 1;
+  PagingResponse paging = 2;
+
+  reserved 100 to 199;
+}
+
+// UpdateDocumentTagsRequest adds and removes tags on one document.
+message UpdateDocumentTagsRequest {
+  NamespaceRef namespace = 1;
+  RequestMeta meta = 2;
+  string document_id = 3;
+  // Tags to add (≤ 32 tags in the result, each 1-64 bytes).
+  repeated string add_tags = 4;
+  // Tags to remove; absent tags are ignored.
+  repeated string remove_tags = 5;
+  // When > 0, only proceeds if current_version equals this value.
+  int64 expected_version = 6;
+
+  reserved 100 to 199;
+}
+
+// UpdateDocumentTagsResponse returns the document with its new tags.
+message UpdateDocumentTagsResponse {
+  Document document = 1;
 
   reserved 100 to 199;
 }

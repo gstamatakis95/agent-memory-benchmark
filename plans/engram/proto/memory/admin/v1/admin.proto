@@ -1,13 +1,19 @@
 // memory/admin/v1/admin.proto
 //
-// Admin-only control-plane API (scope tenant.admin, served on the same port
-// as memory.v1 but behind the admin interceptor and a separate Envoy route
-// that is not exposed to tenants). Three services fixed by decision D1:
+// Admin-only control-plane API (served on the same port as memory.v1 but
+// behind the admin interceptor and a separate Envoy route that is not
+// exposed to tenants). Scopes (decision D13, N139): `tenant.admin` is
+// tenant-bound, the interceptor enforcing token.tenant_id ==
+// request.tenant_id on every tenant-level method; `engram.operator` is
+// fleet-wide with its own audience and covers ShardService, MoveService and
+// ListTenants. Three services fixed by decision D1:
 //   TenantService — tenants, quotas, config, isolation;
 //   ShardService  — shard registry and namespace → shard resolution;
 //   MoveService   — the per-namespace move protocol of decision D5 (dirty
-//                   copy, freeze, reconcile by set difference, cutover with a
-//                   `ready` state; decisions N124, N125).
+//                   copy, pre-freeze verification, freeze, reconcile by
+//                   insertion sequence, cutover with a `ready` state and a
+//                   catalog CAS as the point of no return; decisions N124,
+//                   N125, N137).
 // The tenant-scoped GetTenantOperation also lives here (decision N127).
 // This is the ONLY place where shard ids and epochs appear in an API.
 syntax = "proto3";
@@ -41,11 +47,15 @@ service TenantService {
   // Changing isolation to DEDICATED does not move namespaces; it only
   // constrains future placement (use MoveService to relocate).
   rpc UpdateTenant(UpdateTenantRequest) returns (UpdateTenantResponse);
-  // DeleteTenant writes the delete intent object (decision N122), marks the
-  // tenant DELETING, freezes every namespace (`freeze_delete`) and
-  // acknowledges: the delete is effective at the ack. It returns one
-  // DELETE_TENANT operation (stored in the catalog database) and one
-  // DELETE_NAMESPACE operation per namespace for the asynchronous expunge.
+  // DeleteTenant marks the tenant DELETING in the catalog, writes the
+  // tenant-level delete intent object (decision N122, put after the catalog
+  // commit) and acknowledges: from the ack every request for the tenant fails
+  // with PreconditionFailed{TENANT_DELETING}, the read barrier. The ack has
+  // bounded fan-out: the TenantDelete workflow then fences the namespaces
+  // asynchronously (`freeze_delete`), writing one intent object per
+  // namespace as it fences each, and runs one DELETE_NAMESPACE expunge per
+  // namespace. It returns the DELETE_TENANT operation (derived from the
+  // catalog's tenant row). Deadline cap 40 s (decision N139).
   rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
   // GetTenantOperation reads a tenant-scoped operation (kind DELETE_TENANT),
   // which no namespace-scoped OperationService.GetOperation can address
@@ -101,17 +111,23 @@ service MoveService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
   // RollbackMove aborts a move that has not passed its point of no return
-  // (cutover sub-step (c), decision N125): before Freeze the source is
-  // `abort_move`d; after Freeze it is thawed first; after the target reached
-  // `ready` it goes back to `incoming` first; then the target's copied rows
-  // and ownership row are deleted. Onto a shard that had a `moved_out` row the
-  // permanent fence value is restored. After (c) a rollback is a new move
-  // back (FAILED_PRECONDITION).
+  // (the catalog CAS (a″) `cutover → committed`, decision N125): before
+  // Freeze the source is `abort_move`d; after Freeze it is thawed first (also
+  // while the target is unreachable: a `ready` target accepts nothing and is
+  // un-readied at its next contact); after the target reached `ready` the
+  // rollback first wins the `cutover → rolled_back` CAS and the target goes
+  // back to `incoming`; then the target's copied rows, indexes and ownership
+  // row are deleted. Onto a shard that had a `moved_out` row the permanent
+  // fence value is restored. After (a″) a rollback is a new move back
+  // (FAILED_PRECONDITION).
   rpc RollbackMove(RollbackMoveRequest) returns (RollbackMoveResponse);
   // CleanupMove runs decision D5 step 7 after the 24 h grace: drops the
-  // namespace's partial indexes on the source shard, deletes its rows
-  // (`engram_cleanup_namespace`, batched) and blob prefix, and sets the move
-  // DONE. The `moved_out` ownership row stays forever. Called by the Move
+  // namespace's partial indexes on the source shard by their deterministic
+  // names, deletes its rows (`engram_cleanup_namespace`, batched) and sets the
+  // move DONE. The source blob prefix is kept until the 28-day backup window
+  // has passed (`Move.source_blobs_gc_after`, decision N123) so that a PITR to
+  // a point before the move-in can still recover it. The `moved_out`
+  // ownership row stays forever. Called by the Move
   // workflow (the worker never writes the catalog outside Plan/Freeze/
   // Cutover) or earlier by `engramctl move cleanup`. Idempotent.
   rpc CleanupMove(CleanupMoveRequest) returns (CleanupMoveResponse);
@@ -248,15 +264,19 @@ message DeleteTenantRequest {
   reserved 100 to 199;
 }
 
-// DeleteTenantResponse returns the tenant (DELETING), the tenant-level
-// operation and the per-namespace expunge operations.
+// DeleteTenantResponse returns the tenant (DELETING) and the tenant-level
+// operation.
 message DeleteTenantResponse {
   Tenant tenant = 1;
+  // Per-namespace DELETE_NAMESPACE operations that exist at the ack. The
+  // namespaces are fenced after the ack, so this is normally empty; the
+  // operations appear in GetTenantOperationResponse.namespace_operations as
+  // the workflow creates them (decision N122).
   repeated memory.v1.Operation namespace_operations = 2;
   // Kind DELETE_TENANT; read it with TenantService.GetTenantOperation.
   memory.v1.Operation operation = 3;
-  // Commit time of the last delete freeze: from here nothing of the tenant is
-  // readable.
+  // Commit time of the catalog `deleting` state: from here every request for
+  // the tenant is rejected with TENANT_DELETING.
   google.protobuf.Timestamp deleted_at = 4;
 
   reserved 100 to 199;
@@ -270,9 +290,12 @@ message GetTenantOperationRequest {
   reserved 100 to 199;
 }
 
-// GetTenantOperationResponse wraps the operation.
+// GetTenantOperationResponse wraps the operation and the per-namespace
+// expunge operations created so far.
 message GetTenantOperationResponse {
   memory.v1.Operation operation = 1;
+  // DELETE_NAMESPACE operations the TenantDelete workflow has created.
+  repeated memory.v1.Operation namespace_operations = 2;
 
   reserved 100 to 199;
 }
@@ -460,7 +483,9 @@ message ReleaseNamespaceResponse {
 }
 
 // MoveState follows decision D5: planned → copying → frozen → reconciling →
-// cutover → cleaning → done, or rolled_back before the point of no return.
+// cutover → committed → cleaning → done, or rolled_back before the point of
+// no return (the catalog CAS `cutover → committed`, decision N125). The
+// pre-freeze verification runs inside COPYING.
 enum MoveState {
   MOVE_STATE_UNSPECIFIED = 0;
   MOVE_STATE_PLANNED = 1;
@@ -472,14 +497,20 @@ enum MoveState {
   reserved "MOVE_STATE_CATCHING_UP";
   // Source frozen (`frozen/move`, reads continue).
   MOVE_STATE_FROZEN = 4;
-  // Cutover sub-steps (b′), (c), (b″), (d); see Move.cutover_step.
+  // Cutover sub-steps (a), (b′); see Move.cutover_step. Rollback still
+  // possible.
   MOVE_STATE_CUTOVER = 5;
   MOVE_STATE_CLEANING = 6;
   MOVE_STATE_DONE = 7;
   MOVE_STATE_ROLLED_BACK = 8;
-  // Under freeze: re-copy of rows newer than T_copy − 10 min, mutable-table
-  // diff, blob check, relay drain, VerifyFK (decision N124).
+  // Under freeze: re-copy of insert-only rows at or above
+  // engram_seq_floor(T_pre) by insertion sequence, mutable-table merge-diff,
+  // excluded-class count check, blob check, relay drain, VerifyFK on the
+  // re-copied range (decisions N124, N137).
   MOVE_STATE_RECONCILING = 9;
+  // The catalog CAS (a″) was taken: the point of no return. Sub-steps (c),
+  // (b″) and (d) run; the move can only complete (decision N125).
+  MOVE_STATE_COMMITTED = 10;
 }
 
 // CutoverStep names the sub-step of MOVE_STATE_CUTOVER (decision N125).
@@ -487,12 +518,15 @@ enum CutoverStep {
   CUTOVER_STEP_UNSPECIFIED = 0;
   // (b′) target `incoming → ready`; rollback is still possible.
   CUTOVER_STEP_READY_TARGET = 1;
-  // (c) source `frozen/move → moved_out`: the point of no return.
+  // (c) source `frozen/move → moved_out`, executed only after (a″) was read.
   CUTOVER_STEP_MOVED_OUT_SOURCE = 2;
   // (b″) target `ready → active`, retried indefinitely.
   CUTOVER_STEP_ACTIVE_TARGET = 3;
   // (d) catalog flip, retried forever.
   CUTOVER_STEP_CATALOG_FLIP = 4;
+  // (a″) catalog CAS `namespace_moves.state: cutover → committed`: the point
+  // of no return (decision N125).
+  CUTOVER_STEP_CATALOG_COMMIT = 5;
 }
 
 // MoveProgress reports copy and reconcile progress.
@@ -509,10 +543,11 @@ message MoveProgress {
   repeated string restarted_operation_ids = 8;
   // Tables fully copied so far.
   repeated string tables_done = 9;
-  // When the dirty copy began (T_copy): the reconcile re-copies immutable
-  // rows created at or after T_copy − 10 min.
+  // When the dirty copy began (T_copy): the pre-freeze catch-up copies the
+  // insert-only rows at or above engram_seq_floor(T_copy).
   google.protobuf.Timestamp copy_started_at = 10;
-  // Immutable rows re-copied under freeze.
+  // Insert-only rows re-copied under freeze (ins_seq at or above
+  // engram_seq_floor(T_pre), decision N137).
   int64 rows_recopied = 11;
   // Mutable-table rows upserted or deleted by the merge-diff.
   int64 mutable_rows_reconciled = 12;
@@ -520,6 +555,9 @@ message MoveProgress {
   int64 blobs_reconciled = 13;
   // Freeze watchdog: max(120 s, 60 s + 1 s per 10 k facts), at most 15 min.
   google.protobuf.Duration freeze_watchdog = 14;
+  // Insert-only rows copied by the pre-freeze catch-up (namespace still
+  // active, decision N124).
+  int64 rows_catchup_copied = 15;
 }
 
 // Move is one namespace relocation.
@@ -545,9 +583,12 @@ message Move {
   reserved "operation_id";
   // Set while state is CUTOVER.
   CutoverStep cutover_step = 14;
-  // True once cutover sub-step (c) committed; RollbackMove is refused from
-  // then on.
+  // True once the catalog CAS (a″) committed (state COMMITTED or later);
+  // RollbackMove is refused from then on.
   bool past_point_of_no_return = 15;
+  // Earliest time at which the source blob prefix may be deleted: 28 days
+  // after cleanup, the backup window (decision N123).
+  google.protobuf.Timestamp source_blobs_gc_after = 16;
 
   reserved 100 to 199;
 }
@@ -607,7 +648,8 @@ message ListMovesResponse {
   reserved 100 to 199;
 }
 
-// RollbackMoveRequest aborts a move before its point of no return.
+// RollbackMoveRequest aborts a move before its point of no return (the
+// catalog CAS (a″)).
 message RollbackMoveRequest {
   memory.v1.RequestMeta meta = 1;
   string move_id = 2;
@@ -623,8 +665,9 @@ message RollbackMoveResponse {
   reserved 100 to 199;
 }
 
-// CleanupMoveRequest purges the source side of a move in state CLEANING.
-// The source's `moved_out` ownership row is never deleted (decision N93).
+// CleanupMoveRequest purges the source side of a move in state CLEANING: the
+// rows now, the blob prefix only after the backup window. The source's
+// `moved_out` ownership row is never deleted (decision N93).
 message CleanupMoveRequest {
   memory.v1.RequestMeta meta = 1;
   string move_id = 2;

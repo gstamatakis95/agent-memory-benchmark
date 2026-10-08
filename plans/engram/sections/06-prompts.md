@@ -44,12 +44,19 @@ submits a new document version from the ledger for each document; `PlanChunks` c
 unchanged chunks as `stale_extraction` because their `extraction_key` differs, the chunks go
 through `ExtractChunk` under the new cache key (a cache miss by construction), and
 `FinalizeVersion` hides **every live fact of the document whose `extraction_key` differs from
-its chunk's current key** by inserting `fact_hidden(reason = 'reextract')` rows (N58, N115: a kept chunk keeps its `chunk_id`, so the hide set is keyed on `extraction_key`, not on chunk membership; facts are immutable and never updated) and activates the v2 ones
-(§5.1.2). Consolidation then
-sees the v2 facts as unconsolidated and evolves observations through ordinary rounds. The
-same mechanism serves a model change. Rejected: rewriting facts in place (loses the audit
-trail and the ability to A/B by namespace; breaks `as_of` reasoning about what was known
-when).
+its chunk's current key** from the fact and chunk arms by inserting `fact_hidden(cause =
+'reextract')` rows (N58, N115: a kept chunk keeps its `chunk_id`, so the hide set is keyed on
+`extraction_key`, not on chunk membership; facts are immutable and never updated) and activates
+the v2 ones (§5.1.2). **Re-extraction is a write, not a hide of derived content (N135):** the
+cause is read by the fact and chunk arms only, so observations and pages built from the old facts
+stay visible at every `as_of`; the same transaction flags `observations.stale_write` for each
+observation whose current segment names an old-key fact, the v2 facts are unconsolidated, and
+consolidation rebuilds the flagged observations from visible sources (a `reextract`-hidden fact is
+never rendered into a prompt; its v2 twin is) through ordinary rounds. The old-key facts are
+purged after 1 h, which keeps the marker sets bounded by expunge lag. The same mechanism serves a
+model change. Rejected: rewriting facts in place (loses the audit trail and the ability to A/B
+by namespace; breaks `as_of` reasoning about what was known when); hiding derived content with
+the facts (a prompt bump would blank every observation until the rebuild lands).
 
 **Config keys the prompts read (N66).** Every per-namespace input a prompt below names is a
 key of the inheritable config (system ⊂ tenant ⊂ namespace, D12) and is in the generated
@@ -384,7 +391,14 @@ Consolidation is two prompts so that text never flows from one observation into 
 per touched observation and sees only that observation's own previous text, its own live
 sources and the facts newly attached to it. Hence `inputs(O, v)` is a set of O's own sources
 and the evidence segment of §3 (N117) stays small. Idempotency, proposals and bisection are in
-§5.2.2; this section is the prompts.
+§5.2.2; this section is the prompts. **Proposal attempts (N121):** the routing result is stored
+write-once under `(batch_key, attempt)` and nothing is ever deleted; every `update` or `merge` op
+in it carries the `base_version` the stage-2 prompt will show (set by the system, never by the
+model). If the base is no longer current at apply (N120) the whole proposal is discarded and the
+batch is re-routed as a new attempt with the same prompt on fresh candidates; an overflow of
+`consolidate.max_observations_per_scope` re-runs as a new attempt with `prompt_variant =
+'capacity'`, i.e. the same prompt with `{capacity_note}` filled, so the stored overflowing list
+can never be replayed. A prompt change is a new `prompt_version` and therefore a new `batch_key`.
 
 #### 6.3.1 `consolidate_route/v1` — place a batch of facts
 
@@ -395,7 +409,7 @@ and the evidence segment of §3 (N117) stays small. Idempotency, proposals and b
 | Temperature | 0.0 |
 | Inputs | `observations_mission` (`consolidate.mission`, optional), `facts[]` `{id, text, mentioned_at, said_at (only when ≠ mentioned_at), occurred, tags}`, `candidates[]` `{id, text, sources[{fact_id, quote}]}`: at most 10 candidates, **at most 5 quoted sources each** (the 5 most recent visible, ties by `memory_id`), `capacity_note` |
 | Rendered content | **visible content only** (N116): a source of a tombstoned document or a hidden fact is neither listed nor quoted, and a candidate whose current version is hidden is rendered by its live sources only; a batch is re-queued at most 3 times, then `failed` |
-| Persisted | decisions only; the candidates' texts and quotes are not stored anywhere |
+| Persisted | decisions only, write-once per `(batch_key, attempt)` with `base_version` per `update`/`merge` op; the candidates' texts and quotes are not stored anywhere |
 | Not cached | the result depends on the candidate set |
 | Max output tokens | 1 000 |
 
@@ -487,6 +501,7 @@ misplace a fact; it cannot put text into an observation.
 | Temperature | 0.0 |
 | Inputs | `mode ∈ {update, create, rebuild}`; `previous` (text; present only for `update`); `sources[]` `{fact_id, quote}`: the observation's own **visible** sources (≤ 10 most recent for `update`, ≤ 30 for `rebuild`); `attached[]` `{id, text, mentioned_at, said_at, occurred}`: the facts newly attached by stage 1 (≤ 8) |
 | Modes | `update`: previous text shown. `create`: no previous text. `rebuild` (a **root rebuild**: a `merge` survivor from the union of live sources, a `drop_source`, an observation whose segment holds a tombstoned or hidden input, or a capacity rewrite): **no previous text is shown**, live sources only |
+| Zero sources (N135) | a `rebuild` that finds **no visible source** retires the observation without calling the model (exempt from `quota.Reserve`); a version with no visible source is never served |
 | Inputs recorded (N117) | `observation_inputs(observation_id, version, fact_id)` = the `attached` facts ∪ the `sources` rendered; every one of them is a source of this observation. `observation_versions.root_version = version` for `create` and `rebuild`, else the previous value; `effective_at = max(mentioned_at of every fact rendered, effective_at of the previous version)` (D9) |
 | Not cached | the result depends on the observation's state |
 | Max output tokens | 800 |
@@ -721,8 +736,10 @@ answers as `<<<PARTIAL ANSWERS>>>` evidence and runs one final `reflect/v1` turn
 call only `done` (the *reduce* step). Citations are the union of the partial id lists,
 filtered as usual against the ids actually returned by tools in the session. Cost is
 bounded by the cap (≤ 5 extra strong-class calls, ≈ +$0.10 at A-P3); the §6.5.3 cost gate
-covers it. `search_pages` and the fallback are the two Hindsight capabilities review F-33
-found dropped; §1.9's "improved" rows are downgraded to "changed, to be measured" until the
+covers it. **Forced steps (N139):** once pages exist `search_pages` is the first forced
+search, then `search_observations`, then `search_memories`; before Phase 3 the first forced
+step is `search_observations`, and §1.9 says "different" for the page step. `search_pages` and
+the fallback are the two Hindsight capabilities review F-33 found dropped; §1.9's "improved" rows are downgraded to "changed, to be measured" until the
 §8.6 ablations exist.
 
 #### 6.5.2 `reflect_structured/v1` — second pass into a caller schema
@@ -780,7 +797,7 @@ answer is still returned).
 | Model class | `models.reflect` |
 | Temperature | 0.2 |
 | Inputs | `topic` (page name + `source_query`), `document` (sections with ids, blocks with ids and text), `added[]`, `changed[]` `{id, old_text, new_text}`, `retired[]` `{id, text}` (evidence consolidation retired because it was refuted or merged away; never a deleted or invalidated item), `kept_sources` count, `max_tokens`. Only visible evidence is rendered (N116) |
-| Inputs recorded (N117) | `page_version_inputs(page_id, version, kind, source_id, source_version, document_id)` = every id rendered in `added`, `changed` (new side) and `retired`; `page_versions.root_version` is inherited from the previous version, so the derivation set is the segment `root_version(v) ≤ w ≤ v`. The page depends on facts and observation versions only: pages never feed observations and Reflect output is never stored |
+| Inputs recorded (N117) | `page_version_inputs(page_id, version, kind, source_id, source_version, document_id)` = every id rendered in `added`, `changed` (new side) and `retired`; `page_versions.root_version` is inherited from the previous version, so the derivation set is the segment `root_version(v) ≤ w ≤ v`. The page depends on facts and observation versions only: pages never feed observations and Reflect output is never stored. **Commit rule (N120):** `CommitPageVersion` re-verifies every rendered input in a fresh statement under the shared derivation lock (fact inputs against all markers of both causes, observation-version inputs against all open tombstones) and checks that the base version is still current; a refresh whose model call spanned a delete or another refresh is refused, its output discarded, and the page is rebuilt by `page_full/v1` from current evidence. The lock is never held across the call |
 | Max output tokens | 4 000 |
 
 Output schema:
@@ -951,7 +968,7 @@ cite Table 6.8-B and do not restate its arithmetic.
 | `consolidate_write/v1`, one touched observation | 1 150 / 150 | 0.173 + 0.09 | $0.00026 |
 | + 0.1 `dedup_adjudicate/v1` per batch and ≈ 3 new-text embeddings | 400 / 10; 240 | 0.1 × 0.000066 + 0.000005 | $0.00001 |
 | **one consolidation batch, all-in** | 1 routing + 0.8 writes + dedup | 0.00041 + 0.8 × 0.00026 + 0.00001 | **$0.00063** → **$0.00008 per fact** (bisect overhead ≤ 2× on failures) |
-| one Reflect (`mid`, 6 iterations) | ≈ 133 k billed in (120 k cached) / 2 100 out | 13.3 k × 2.50 + 120 k × 0.25 + 2.1 k × 10 (per M) | **$0.085**; worst case (10 iterations, 10 k of tool results each, 562 k billed in, 7.5 k out): **≈ $0.34**, same cumulative method |
+| one Reflect (`mid`, 6 iterations) | ≈ 133 k billed in (120 k cached) / 5 100 out (1 500 + 6 × 600 tool-call tokens, the rule of the prompt table) | 13.3 k × 2.50 + 120 k × 0.25 + 5.1 k × 10 (per M) | **$0.114**; worst case (10 iterations, 10 k of tool results each, 562 k billed in, 7.5 k out): **≈ $0.34**, same cumulative method |
 | one page delta refresh / full rebuild | 4 600 / 800; 6 250 / 1 500 | 0.0115 + 0.008; 0.0156 + 0.015 | **$0.02** / **$0.03** |
 
 **Table 6.8-B — derived counts and costs (the only cost table; everything else cites it).**
@@ -971,8 +988,8 @@ derivation set.
 | Wall time of an LME-S run at the 600 RPM gateway cap | 273 k calls | **≈ 7.6 h** if every stage shares the cap concurrently, 10–11 h if consolidation trails each retain's debounce | ≈ 5 h |
 | One LME-M run (≈ 13× the ingestion) | | **≈ $1 540** (≈ $1 210 with the batch API); the harness budget guard stays `--max-cost-usd 2000` | ≈ $900 |
 | One LoCoMo run (10 conversations, ≈ 92 k tokens) | ≈ 120 chunks, 1 200 facts, 150 batches | ≈ **$0.19** | ≈ $0.12 |
-| Per 1 k facts (the §8.8 unit; 25 documents) | A-F = 10: 100 chunks, 125 batches. A-F = 4: 250 chunks, 125 batches | extraction $0.066 + consolidation $0.079 + summaries $0.010 + embeddings $0.002 → **≈ $0.157 per 1 k facts** | extraction $0.120 + $0.079 + $0.010 + $0.003 → **≈ $0.21** |
-| Initial fill of 1 B facts online (D3) | A-F = 10: 100 M chunks, 125 M batches, 25 M documents; throughput `min(32 / L, 600 RPM / (60 × 3.5))` ≈ **2.9 chunks/s per cell**, 11.4 chunks/s at 4 cells | **≈ $157 k ≈ $160 k** at list prices (≈ $124 k with the batch API); **≈ 100 days** (≈ 400 days for one cell) | $211 k; 250 M chunks at ≈ 4.9 chunks/s per cell: **≈ 150 days** |
+| Per 1 k facts (the §8.8 unit; 25 documents) | A-F = 10: 100 chunks, 125 batches. A-F = 4: 250 chunks, 125 batches | extraction $0.066 + consolidation $0.079 + summaries $0.010 + embeddings $0.002 → **≈ $0.157 per 1 k facts** | extraction $0.120 + $0.079 + $0.010 + $0.006 → **≈ $0.21** |
+| Initial fill of 1 B facts online (D3) | A-F = 10: 100 M chunks, 125 M batches, 25 M documents; throughput `min(N_workers × 32 / L_extract, RPM_cap / (60 × calls_per_chunk))` = `600 / (60 × 3.5)` ≈ **2.9 chunks/s per cell**, 11.4 chunks/s at 4 cells | **≈ $157 k ≈ $160 k** at list prices (≈ $124 k with the batch API); **≈ 100 days** (≈ 400 days for one cell) | $211 k; 250 M chunks at ≈ 4.9 chunks/s per cell: **≈ 150 days** |
 | `RetainBackfill` fill (batch API, no RPM cap; a launch prerequisite, N130) | the same counts | ≈ $124 k; bounded by batch-API turnaround and quota, not by the RPM cap; the planning figure is weeks, measured in M2.5 | ≈ $151 k |
 
 Reading the table: consolidation is **≈ 50 %** of all-in ingest cost at A-F = 10, so the
@@ -987,3 +1004,13 @@ class (extract, routing, write, page refresh, each Reflect iteration); workflows
 (`DEFERRED`), synchronous Reflect returns `RESOURCE_EXHAUSTED`. `llm_tokens_per_day` (D13)
 counts prompt + completion tokens of every call above through `token_usage` (PD-1 / N25); the
 per-call caps in the first table bound the worst case of one activity.
+
+### Round-4 changes
+
+| Item | Removed | Added |
+|---|---|---|
+| Re-extraction (§6.0) | `fact_hidden(reason = 'reextract')` hiding derived content | cause-tagged hide read by the fact and chunk arms only, `stale_write` on affected observations, old-key facts purged after 1 h (N135) |
+| Consolidation (§6.3) | proposal keyed by `batch_key` alone | attempts, `base_version` per op, capacity re-run as a new attempt, zero-source retirement without a call (N121, N135) |
+| Pages (§6.6) | refresh committed without re-verification | the N120 commit rule, `page_full/v1` after a refused commit |
+| Reflect (§6.5, §6.8) | typical cost $0.085 (2.1 k output) | $0.114 (5.1 k output); `search_pages` the first forced step once pages exist (N139) |
+| Throughput formula (§6.8) | `min(32 / L, …)` | `min(N_workers × 32 / L_extract, RPM_cap / (60 × calls_per_chunk))` |

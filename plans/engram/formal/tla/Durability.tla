@@ -1,157 +1,221 @@
 --------------------------- MODULE Durability ---------------------------
 (***************************************************************************)
-(* Engram D22 (N122, N123): acknowledged deletes survive restore/failover. *)
+(* Engram D23 (N122, N123, N134): acknowledged deletes survive restore and *)
+(* failover.                                                               *)
 (*                                                                         *)
-(* Write path: put the intent object in the blob store (strongly           *)
-(* consistent, shard independent), run the marker transaction (a local     *)
-(* commit that a restore or failover may lose), then ack.                  *)
+(* Write path (design): the marker transaction commits locally (a commit   *)
+(* that a restore or failover may lose); only then is the intent object    *)
+(* put into the blob store (strongly consistent, shard independent); then  *)
+(* the ack, after a re-read of the marker.  The intent records the         *)
+(* marker's exact effect (for a document delete: the versions it covers)   *)
+(* and the subject's previous deletion_log entry (prev_operation_id).      *)
+(* A duplicate attempt (concurrent, or a retry after a crash between       *)
+(* commit and put) finds the subject already deleting/hidden: it writes no *)
+(* marker and puts the committed marker's own intent (put-if-absent), so   *)
+(* an ack always implies an intent for the marker the client relies on.    *)
 (*                                                                         *)
 (* Restore / failover to point p: the shard keeps only commits with        *)
-(* commit time <= p and comes up `frozen/restore` (writes and reads        *)
-(* rejected).  Replay applies, in name order, every intent whose           *)
-(* deleted_at >= p - Margin and that is not yet applied; only then reads   *)
-(* reopen.  A second restore may hit before or after the first replay.     *)
+(* commit time <= p and comes up `restoring` (reads and writes rejected).  *)
+(* The replay floor `fl` lives in the catalog, OUTSIDE the restorable      *)
+(* state, and is lowered (min) by every restore, never raised (N134).      *)
+(* Replay applies, per subject in prev_operation_id chain order, every     *)
+(* intent with deleted_at + Margin >= fl that is not yet applied, with the *)
+(* recorded effect, verbatim; only then do reads reopen.  A second restore *)
+(* may hit before or after the first replay.                               *)
 (*                                                                         *)
-(* Ops: kind inv/res on subject "x" (fact_hidden: last state wins), del on *)
-(* subject "y" (document tombstone).  Ops on one subject are sequential:   *)
-(* the next starts after the previous was acked; a failed op (transport    *)
-(* error, intent maybe written) closes the subject.  An op that has not    *)
-(* committed within Lat ticks of its intent time is abandoned.             *)
+(* Ops come from a fixed Shape (op i has subject and kind Shape[i]):       *)
+(*   y: del (document delete), ret (retain; revives the document, no       *)
+(*      intent, RPO 60 s).  Version 0 exists from the start.               *)
+(*   x: inv / res (fact_hidden: last state wins).                          *)
+(* A failed op (API crash, transport error) may or may not have committed; *)
+(* the client's retry is a new op (a duplicate if the marker is there).    *)
+(* The recorded time `at` (deleted_at) of an op is its issue time minus a  *)
+(* host clock skew in 0..Skew.                                             *)
 (*                                                                         *)
-(* Knobs (design: all TRUE):                                               *)
-(*   IntentBeforeAck  FALSE: the ack may precede the intent put            *)
-(*   ReplayFirst      FALSE: reads reopen before replay finishes           *)
-(*   OrderedReplay    FALSE: replay applies intents in any order           *)
-(*   MonotoneFloor    FALSE: each restore recomputes the replay floor from its *)
-(*                    own target; a second restore (or failover) during or *)
-(*                    after a replay then skips intents the first restore  *)
-(*                    lost and the second loses again.  TRUE: the floor    *)
-(*                    never moves later (min over all restores, kept while *)
-(*                    intents are retained).                               *)
-(* A Margin below the longest intent-to-commit latency (Margin 0, Lat 2 in *)
-(* Durability_NarrowWindow.cfg) loses commits outside the replay window.   *)
+(* Knobs (design: all TRUE except Recompute/ClockOrder/AnyOrder variants): *)
+(*   IntentAfterCommit FALSE  the intent is put before the marker and has  *)
+(*                     no recorded effect: replay recomputes it (old N122; *)
+(*                     orphan intents, C-5)                                *)
+(*   AckNeedsIntent    FALSE  the ack may precede the intent               *)
+(*   AckRecheck        FALSE  no re-read of the marker before the ack      *)
+(*   DupReput          FALSE  a duplicate that found the marker puts nothing *)
+(*   ReplayFirst       FALSE  reads reopen before replay finishes          *)
+(*   FloorMode         "min" lower only (N134); "raise" Reopen resets the  *)
+(*                     floor (C-4); "target" each restore sets its target  *)
+(*   OrderMode         "chain" prev_operation_id; "clock" (deleted_at,id); *)
+(*                     "any"                                               *)
+(* A Margin below Lat + Skew loses commits outside the replay window.      *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences
 
-CONSTANTS MaxOps, MaxT, Lat, Margin, MaxRestores,
-          IntentBeforeAck, ReplayFirst, OrderedReplay, MonotoneFloor
+CONSTANTS Shape, MaxT, Lat, Skew, Margin, MaxRestores,
+          IntentAfterCommit, AckNeedsIntent, AckRecheck, DupReput, ReplayFirst,
+          FloorMode, OrderMode
 
-Subjects == {"x", "y"}
-Allowed(s, k) == (s = "x" /\ k \in {"inv", "res"}) \/ (s = "y" /\ k = "del")
-OpIds == 1..MaxOps
+ShapeDoc  == <<[s |-> "y", k |-> "del"], [s |-> "y", k |-> "del"], [s |-> "y", k |-> "ret"]>>
+ShapeFact == <<[s |-> "x", k |-> "inv"], [s |-> "x", k |-> "res"], [s |-> "x", k |-> "inv"]>>
 
-VARIABLES t, ops, intents, dbq, sst, rp, nIssued, nRestore
-vars == <<t, ops, intents, dbq, sst, rp, nIssued, nRestore>>
+N == Len(Shape)
+OpIds == 1..N
+S(i) == Shape[i].s
+K(i) == Shape[i].k
 
-\* dbq: the marker transactions the shard has applied, in application order.
-db == {dbq[i] : i \in DOMAIN dbq}
+VARIABLES t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn
+vars == <<t, ops, intents, dbq, sst, fl, nIssued, nRestore, cn>>
 
-NoOp == [subj |-> "x", kind |-> "inv", at |-> 0, ph |-> "none", ct |-> 0]
+\* dbq: the marker rows the shard has applied, in application order: [op, eff].
+\* eff: for a document delete, the versions it covers (the tombstone's up_to_version).
+db == {dbq[i].op : i \in DOMAIN dbq}
+Entries == {dbq[i] : i \in DOMAIN dbq}
+
+NoOp == [ph |-> "none", it |-> 0, at |-> 0, ct |-> 0, cn0 |-> 0, eff |-> {}, prev |-> 0, obs |-> 0]
 Phases == {"none", "new", "committed", "acked", "failed"}
 
 TypeOK ==
-  /\ t \in 0..MaxT /\ intents \subseteq OpIds /\ db \subseteq OpIds /\ Len(dbq) <= MaxOps
-  /\ sst \in {"active", "restoring"} /\ rp \in 0..MaxT
+  /\ t \in 0..MaxT /\ intents \subseteq OpIds /\ db \subseteq OpIds /\ Len(dbq) <= 2 * N
+  /\ sst \in {"active", "restoring"} /\ fl \in 0..(MaxT + 1)
   /\ \A i \in OpIds : ops[i].ph \in Phases
 
 Init ==
   /\ t = 0 /\ ops = [i \in OpIds |-> NoOp] /\ intents = {} /\ dbq = << >>
-  /\ sst = "active" /\ rp = 0 /\ nIssued = 0 /\ nRestore = 0
+  /\ sst = "active" /\ fl = MaxT + 1 /\ nIssued = 0 /\ nRestore = 0 /\ cn = 0
+
+-----------------------------------------------------------------------------
+(* What the marker tables show *)
+
+RetOps == {e.op : e \in {e \in Entries : K(e.op) = "ret"}}
+AllRet == {0} \cup RetOps                                 \* document versions that exist
+DelCov == UNION {e.eff : e \in {e \in Entries : K(e.op) = "del"}}
+Vis == AllRet \ DelCov                                    \* versions of the document that are served
+
+IdxOn(s) == {i \in DOMAIN dbq : S(dbq[i].op) = s /\ K(dbq[i].op) # "ret"}
+LastOn(s) == IF IdxOn(s) = {} THEN 0 ELSE dbq[CHOOSE m \in IdxOn(s) : \A j \in IdxOn(s) : j <= m].op
+HiddenX == LastOn("x") # 0 /\ K(LastOn("x")) = "inv"
 
 Issued == {i \in OpIds : ops[i].ph # "none"}
-OnSubj(s) == {i \in Issued : ops[i].subj = s}
+Live(i) == ops[i].ph \in {"new", "committed"}
 
-Issue(s, k) ==
-  /\ nIssued < MaxOps /\ Allowed(s, k) /\ sst = "active"
-  /\ \A i \in OnSubj(s) : ops[i].ph = "acked"          \* sequential; a failed op closes the subject
-  /\ (s = "y" => OnSubj(s) = {})
+-----------------------------------------------------------------------------
+Issue ==
+  /\ nIssued < N /\ sst = "active"
   /\ LET i == nIssued + 1 IN
-     ops' = [ops EXCEPT ![i] = [subj |-> s, kind |-> k, at |-> t, ph |-> "new", ct |-> 0]]
+     /\ (S(i) = "x" => \A j \in Issued : ~Live(j))          \* x: one request at a time
+     /\ \E sk \in 0..Skew :
+          /\ sk <= t
+          /\ ops' = [ops EXCEPT ![i] = [NoOp EXCEPT !.ph = "new", !.it = t, !.at = t - sk]]
   /\ nIssued' = nIssued + 1
-  /\ UNCHANGED <<t, intents, dbq, sst, rp, nRestore>>
-
-PutIntent(o) ==
-  /\ o \notin intents /\ ops[o].ph \in (IF IntentBeforeAck THEN {"new"} ELSE {"new", "committed", "acked"})
-  /\ intents' = intents \cup {o}
-  /\ UNCHANGED <<t, ops, dbq, sst, rp, nIssued, nRestore>>
+  /\ UNCHANGED <<t, intents, dbq, sst, fl, nRestore, cn>>
 
 \* The marker transaction: a local commit, refused by the namespace fence while restoring.
+\* A duplicate (subject already deleting / hidden) writes no marker and observes the existing one.
 Commit(o) ==
-  /\ ops[o].ph = "new" /\ o \notin db /\ sst = "active" /\ t - ops[o].at <= Lat
-  /\ (IntentBeforeAck => o \in intents)
-  /\ dbq' = Append(dbq, o)
-  /\ ops' = [ops EXCEPT ![o].ph = "committed", ![o].ct = t]
-  /\ UNCHANGED <<t, intents, sst, rp, nIssued, nRestore>>
+  /\ ops[o].ph = "new" /\ sst = "active" /\ t - ops[o].it <= Lat
+  /\ (IntentAfterCommit \/ o \in intents)                  \* old order: intent first
+  /\ LET k == K(o) IN LET s == S(o) IN
+     LET isDup == (k = "del" /\ Vis = {}) \/ (k = "inv" /\ HiddenX) IN
+     /\ (k = "res" => HiddenX)
+     /\ IF isDup
+          THEN /\ ops' = [ops EXCEPT ![o] = [@ EXCEPT !.ph = "committed", !.ct = t, !.obs = LastOn(s)]]
+               /\ UNCHANGED <<dbq, cn>>
+          ELSE LET eff == IF k = "del" THEN AllRet ELSE {} IN
+               /\ dbq' = Append(dbq, [op |-> o, eff |-> eff])
+               /\ cn' = cn + 1
+               /\ ops' = [ops EXCEPT ![o] = [@ EXCEPT !.ph = "committed", !.ct = t, !.cn0 = cn + 1,
+                            !.eff = eff, !.obs = o, !.prev = IF k = "ret" THEN 0 ELSE LastOn(s)]]
+  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore>>
+
+\* Design: after the commit, put the intent of the marker this attempt relies on (its own, or the
+\* one a duplicate observed).  Old order: before the commit, its own.
+PutIntent(o) ==
+  /\ K(o) # "ret"
+  /\ IF IntentAfterCommit
+       THEN /\ ops[o].ph = "committed" /\ ops[o].obs \notin intents
+            /\ (ops[o].obs = o \/ DupReput)
+            /\ intents' = intents \cup {ops[o].obs}
+       ELSE /\ ops[o].ph = "new" /\ o \notin intents
+            /\ intents' = intents \cup {o}
+  /\ UNCHANGED <<t, ops, dbq, sst, fl, nIssued, nRestore, cn>>
+
+IntentOK(o) == ops[o].obs \in intents \/ ~AckNeedsIntent \/ (ops[o].obs # o /\ ~DupReput)
 
 Ack(o) ==
-  /\ ops[o].ph = "committed" /\ o \in db
-  /\ (IntentBeforeAck => o \in intents)
+  /\ ops[o].ph = "committed"
+  /\ K(o) = "ret" \/ (IntentOK(o) /\ (AckRecheck => ops[o].obs \in db))
   /\ ops' = [ops EXCEPT ![o].ph = "acked"]
-  /\ UNCHANGED <<t, intents, dbq, sst, rp, nIssued, nRestore>>
+  /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn>>
 
-Fail(o) ==
-  /\ ops[o].ph \in {"new", "committed"}
-  /\ ops' = [ops EXCEPT ![o].ph = "failed"]
-  /\ UNCHANGED <<t, intents, dbq, sst, rp, nIssued, nRestore>>
+\* The client sees an error: before the commit (Abort), or after it with the intent not yet put
+\* (CrashBeforePut), or with the intent put (LostAck).
+Abort(o) == /\ ops[o].ph = "new" /\ K(o) # "ret"
+            /\ ops' = [ops EXCEPT ![o].ph = "failed"]
+            /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn>>
+CrashBeforePut(o) == /\ ops[o].ph = "committed" /\ K(o) # "ret" /\ ops[o].obs \notin intents
+                     /\ ops' = [ops EXCEPT ![o].ph = "failed"]
+                     /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn>>
+LostAck(o) == /\ ops[o].ph = "committed" /\ K(o) # "ret" /\ ops[o].obs \in intents
+              /\ ops' = [ops EXCEPT ![o].ph = "failed"]
+              /\ UNCHANGED <<t, intents, dbq, sst, fl, nIssued, nRestore, cn>>
 
 Tick ==
   /\ t < MaxT /\ t' = t + 1
-  /\ UNCHANGED <<ops, intents, dbq, sst, rp, nIssued, nRestore>>
+  /\ UNCHANGED <<ops, intents, dbq, sst, fl, nIssued, nRestore, cn>>
 
-\* Restore or failover to point p: commits after p are lost.
-Restore(p) ==
+\* Restore or failover to point p: commits after p are lost; the floor (catalog) is not.
+RestoreTo(p) ==
   /\ nRestore < MaxRestores /\ p <= t
-  /\ dbq' = SelectSeq(dbq, LAMBDA o : ops[o].ct <= p)
+  /\ dbq' = SelectSeq(dbq, LAMBDA e : ops[e.op].ct <= p)
   /\ sst' = "restoring" /\ nRestore' = nRestore + 1
-  /\ rp' = IF MonotoneFloor /\ nRestore > 0 /\ rp < p THEN rp ELSE p
-  /\ UNCHANGED <<t, ops, intents, nIssued>>
+  /\ fl' = IF FloorMode = "target" THEN p ELSE IF fl < p THEN fl ELSE p
+  /\ UNCHANGED <<t, ops, intents, nIssued, cn>>
 
-InWindow(o) == o \in intents /\ ops[o].at + Margin >= rp
+InWindow(o) == o \in intents /\ ops[o].at + Margin >= fl
 Pending == {o \in intents : InWindow(o) /\ o \notin db}
+
+Before(o, o2) == ops[o].at < ops[o2].at \/ (ops[o].at = ops[o2].at /\ o <= o2)
 
 \* Admin variant of the marker transaction: same effect, fence bypassed.
 Replay(o) ==
   /\ sst = "restoring" /\ o \in Pending
-  /\ (OrderedReplay => \A o2 \in Pending : o <= o2)           \* name order = (deleted_at, operation id)
-  /\ dbq' = Append(dbq, o)
+  /\ CASE OrderMode = "chain" -> ops[o].prev = 0 \/ ops[o].prev \notin Pending
+       [] OrderMode = "clock" -> \A o2 \in Pending : S(o2) = S(o) => Before(o, o2)
+       [] OTHER -> TRUE
+  /\ LET eff == IF K(o) = "del" /\ ~IntentAfterCommit THEN AllRet ELSE ops[o].eff IN
+     dbq' = Append(dbq, [op |-> o, eff |-> eff])
   /\ ops' = [ops EXCEPT ![o].ct = t]
-  /\ UNCHANGED <<t, intents, sst, rp, nIssued, nRestore>>
+  /\ UNCHANGED <<t, intents, sst, fl, nIssued, nRestore, cn>>
 
 Reopen ==
   /\ sst = "restoring" /\ (ReplayFirst => Pending = {})
   /\ sst' = "active"
-  /\ UNCHANGED <<t, ops, intents, dbq, rp, nIssued, nRestore>>
+  /\ fl' = IF FloorMode = "raise" THEN MaxT + 1 ELSE fl
+  /\ UNCHANGED <<t, ops, intents, dbq, nIssued, nRestore, cn>>
 
-Next == Tick \/ Reopen \/ (\E p \in 0..MaxT : Restore(p)) \/ (\E o \in OpIds : PutIntent(o) \/ Commit(o) \/ Ack(o) \/ Fail(o) \/ Replay(o))
-        \/ (\E s \in Subjects, k \in {"inv", "res", "del"} : Issue(s, k))
+Next == Tick \/ Reopen \/ Issue \/ (\E p \in 0..MaxT : RestoreTo(p))
+        \/ (\E o \in OpIds : PutIntent(o) \/ Commit(o) \/ Ack(o) \/ Abort(o) \/ CrashBeforePut(o)
+                             \/ LostAck(o) \/ Replay(o))
 
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
-\* State of a subject as the shard's marker tables show it: the last APPLIED op wins
-\* (Invalidate inserts fact_hidden, Restore deletes it, DeleteDocument inserts a tombstone).
-Hidden(s) ==
-  LET idx == {i \in DOMAIN dbq : ops[dbq[i]].subj = s} IN
-  idx # {} /\ ops[dbq[CHOOSE m \in idx : \A j \in idx : j <= m]].kind # "res"
+LastIssued(s) == LET L == {i \in Issued : S(i) = s} IN IF L = {} THEN 0 ELSE CHOOSE m \in L : \A j \in L : j <= m
 
-\* Every acknowledged op has a durable intent.
-AckImpliesIntent == \A o \in OpIds : ops[o].ph = "acked" => o \in intents
+\* Every acknowledged delete or invalidation has a durable intent.
+AckImpliesIntent == \A o \in OpIds : (ops[o].ph = "acked" /\ K(o) # "ret") => ops[o].obs \in intents
 
-\* A subject whose last op was acked shows exactly that op's result while the shard serves.
-LastAckedShown(s) ==
-  LET L == {i \in OnSubj(s) : \A j \in OnSubj(s) : j <= i} IN
-  (L # {} /\ ops[CHOOSE i \in L : TRUE].ph = "acked") =>
-    (Hidden(s) <=> ops[CHOOSE i \in L : TRUE].kind # "res")
+\* The marker an acknowledged delete relies on is in force whenever the shard serves.
+AckedDeleteSurvives == sst = "active" => \A o \in OpIds : (ops[o].ph = "acked" /\ K(o) = "del") => ops[o].obs \in db
 
-\* Acknowledged deletes survive restore and failover.
-AckedDeleteSurvives == sst = "active" => LastAckedShown("y")
+\* Invalidate/Restore: per-subject chain order makes the last state win, whatever the clocks say.
+IntentOrderLastWins ==
+  sst = "active" =>
+    LET l == LastIssued("x") IN
+    (l # 0 /\ ops[l].ph = "acked") => (HiddenX <=> K(l) = "inv")
 
-\* Invalidate/Restore pairs: replay in name order makes the last state win, so an acked Restore is
-\* not undone by an older Invalidate and an acked Invalidate is not undone by an older Restore.
-IntentOrderLastWins == sst = "active" => LastAckedShown("x")
-
-\* When reads reopen after a restore, every acked in-window intent is applied.
-RestoreReplaysIntents ==
-  (sst = "active" /\ nRestore > 0) => \A o \in OpIds : (ops[o].ph = "acked" /\ InWindow(o)) => o \in db
+\* An effect that reaches a later acknowledged write is not allowed: every applied marker was
+\* written by a committed operation, and covers only versions committed before it.
+NoUnackedEffectOnLaterAck ==
+  \A e \in Entries : K(e.op) # "ret" =>
+    /\ ops[e.op].cn0 > 0
+    /\ \A r \in e.eff \ {0} : ops[r].cn0 < ops[e.op].cn0
 
 =============================================================================

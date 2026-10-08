@@ -36,10 +36,12 @@ CREATE TYPE namespace_state AS ENUM ('creating', 'active', 'moving', 'frozen', '
 -- ownership rows are frozen with freeze_reason = 'restore' and surface as NamespaceFrozen.
 -- A client can therefore tell a restore from a move ('frozen').
 -- move_state (D5, N124, N125): planned -> copying (dirty bulk copy, no snapshot) -> frozen -> reconciling
--- (set difference under the freeze) -> cutover ((b') ready, (c) moved_out = point of no return,
--- (b'') active, (d) catalog flip) -> cleaning -> done; rolled_back is reachable from every state
--- before (c). There is no catch-up state: moves do not replay the outbox.
-CREATE TYPE move_state      AS ENUM ('planned', 'copying', 'frozen', 'reconciling', 'cutover',
+-- (reconcile by insertion sequence under the freeze) -> cutover ((b') target ready) -> committed (a'') the
+-- catalog CAS cutover -> committed, the POINT OF NO RETURN -> (c) source moved_out, (b'') target
+-- active, (d) catalog flip -> cleaning -> done. rolled_back is reachable from every state up to and
+-- including cutover, and from no later one: restore and failover CAS cutover -> rolled_back, and exactly
+-- one of the two CASes wins (N123). The trigger catalog_check_move_transition enforces the edges.
+CREATE TYPE move_state      AS ENUM ('planned', 'copying', 'frozen', 'reconciling', 'cutover', 'committed',
                                      'cleaning', 'done', 'rolled_back');
 
 -- -----------------------------------------------------------------------------
@@ -117,15 +119,17 @@ CREATE TABLE shards (
   blob_cred_secret_ref  text NOT NULL,             -- secret holding the credential scoped to blob_prefix/*
   task_queue            text NOT NULL,             -- 'shard-{shard_id}' (Temporal)
   kafka_topic           text NOT NULL,             -- 'engram.events.shard-{shard_id}' (used only if Kafka is on)
+  replay_floor          timestamptz,               -- N134: lower bound for delete-intent replay; lowered with min() by every restore/failover, NEVER raised while intents are retained (35 d); lives here so a PITR or a stale promotion cannot lose it
   system_identifier     bigint,                    -- N123: pg_control_system().system_identifier of the current primary; written on PROMOTION before the virtual endpoint flips
   timeline_id           integer,                   -- N123: pg_control_checkpoint().timeline_id; the mover compares its session's value at Freeze and (c), the relay every 10 s
   dedicated_tenant_id   text REFERENCES tenants (tenant_id),   -- NULL = shared pool
-  max_namespaces        integer NOT NULL DEFAULT 150 CHECK (max_namespaces > 0),
-  soft_cap_facts        bigint  NOT NULL DEFAULT 10000000,
-  hard_cap_facts        bigint  NOT NULL DEFAULT 20000000,
+  max_namespaces        integer NOT NULL DEFAULT 120 CHECK (max_namespaces > 0),
+  soft_cap_facts        bigint  NOT NULL DEFAULT 8000000,     -- N114/D3: 8 M live facts target
+  hard_cap_facts        bigint  NOT NULL DEFAULT 12000000,    -- 12 M hard cap
+  volume_bytes          bigint  NOT NULL DEFAULT 600000000000 CHECK (volume_bytes > 0),   -- 600 GB local NVMe; ShardNearCapacity pages at 70 % of it (relation bytes, N114)
   namespaces_count      integer NOT NULL DEFAULT 0 CHECK (namespaces_count >= 0),
   facts_estimate        bigint  NOT NULL DEFAULT 0 CHECK (facts_estimate >= 0),
-  bytes_estimate        bigint  NOT NULL DEFAULT 0 CHECK (bytes_estimate >= 0),
+  bytes_estimate        bigint  NOT NULL DEFAULT 0 CHECK (bytes_estimate >= 0),   -- relation bytes of the shard's namespaces, hidden and unpurged rows included (N114)
   stats_updated_at      timestamptz,
   schema_version        integer NOT NULL DEFAULT 0,  -- last migration applied on the shard (mirror of shard_meta)
   created_at            timestamptz NOT NULL DEFAULT now(),
@@ -187,12 +191,17 @@ CREATE TRIGGER namespaces_touch BEFORE UPDATE ON namespaces
 
 -- -----------------------------------------------------------------------------
 -- namespace_moves: one row per move attempt (D5, N124, N125). At most one live move per namespace.
--- It is also the ARBITER of restore and failover (N123): a restored or promoted shard completes or
--- aborts every open move that names it from this row. Cutover order: (b') the target row goes
--- incoming -> ready (ready_at); (c) the source row goes frozen/move -> moved_out carrying
--- target_shard_id / target_epoch (moved_out_at, the point of no return); (b'') the target row goes
--- ready -> active (activated_at); (d) the catalog flip, retried indefinitely and idempotently. The
--- API routes from the moved_out row's WrongShardOrEpoch detail, so (d) is on no read path.
+-- It is also the ARBITER of restore and failover (N123, N125): the catalog CAS
+--   UPDATE ... SET state = 'committed' WHERE move_id = $1 AND state = 'cutover'
+-- is the point of no return. A restored or promoted shard CASes cutover -> rolled_back; if it reads
+-- 'committed' it completes (c), (b'') and (d) itself (reconcile_out). Exactly one CAS wins and the loser
+-- stops. Cutover order: (b') the target row goes incoming -> ready (ready_at); (a'') the CAS above
+-- (committed_at), taken only after the mover re-checks its timeline; (c) the source row goes
+-- frozen/move -> moved_out carrying target_shard_id / target_epoch (moved_out_at, informational),
+-- executed only after the mover READ 'committed'; (b'') the target row goes ready -> active
+-- (activated_at); (d) the catalog flip WHERE epoch = e AND state = 'frozen', with "already
+-- (target, e + 1)" as the only idempotent success. The API routes from the moved_out row's
+-- WrongShardOrEpoch detail, so (d) is on no read path.
 -- There is no outbox position here: the move never reads or replays the outbox (N124).
 -- -----------------------------------------------------------------------------
 CREATE TABLE namespace_moves (
@@ -206,7 +215,9 @@ CREATE TABLE namespace_moves (
   state                  move_state NOT NULL DEFAULT 'planned',
   source_system_id       bigint,                    -- N123: recorded at Plan; every later source activity fails MoveFenced on mismatch
   source_timeline_id     integer,
-  t_copy                 timestamptz,               -- N124: source now() when the dirty copy began; reconcile re-copies rows with created_at >= t_copy - 10 min
+  t_copy                 timestamptz,               -- N124: source now() when the dirty copy began; the catch-up copy takes ins_seq >= engram_seq_floor(t_copy)
+  t_pre                  timestamptz,               -- N124: source now() at the pre-freeze verification; the freeze re-copies ins_seq >= engram_seq_floor(t_pre)
+  w_pre                  bigint,                    -- N124: nextval('engram_ins_seq') taken with t_pre
   terminated_workflows   text[] NOT NULL DEFAULT '{}',  -- workflow ids terminated at drain, restarted on the target (N97)
   error                  text,
   created_by             text NOT NULL,             -- operator principal (engramctl) or 'rebalancer'
@@ -214,13 +225,15 @@ CREATE TABLE namespace_moves (
   updated_at             timestamptz NOT NULL DEFAULT now(),
   frozen_at              timestamptz,
   ready_at               timestamptz,               -- (b') target incoming -> ready; rollback still possible (unready_target)
-  moved_out_at           timestamptz,               -- (c) committed on the source: the point of no return
+  committed_at           timestamptz,               -- (a'') the catalog CAS cutover -> committed: the point of no return
+  moved_out_at           timestamptz,               -- (c) on the source; informational (the arbiter is committed_at)
   activated_at           timestamptz,               -- (b'') target ready -> active
   finished_at            timestamptz,
   CHECK (source_shard_id <> target_shard_id),
   CHECK (to_epoch = from_epoch + 1),
   CHECK ((source_system_id IS NULL) = (source_timeline_id IS NULL)),
-  CHECK (state NOT IN ('reconciling', 'cutover', 'cleaning', 'done') OR frozen_at IS NOT NULL),
+  CHECK (state NOT IN ('reconciling', 'cutover', 'committed', 'cleaning', 'done') OR frozen_at IS NOT NULL),
+  CHECK (state NOT IN ('committed', 'cleaning', 'done') OR committed_at IS NOT NULL),
   CHECK (state NOT IN ('cleaning', 'done') OR moved_out_at IS NOT NULL)
 );
 
@@ -230,6 +243,28 @@ CREATE INDEX namespace_moves_state_idx ON namespace_moves (state, updated_at);
 
 CREATE TRIGGER namespace_moves_touch BEFORE UPDATE ON namespace_moves
   FOR EACH ROW EXECUTE FUNCTION catalog_touch_updated_at();
+
+-- The move state machine as a trigger (N125): the only way out of 'committed' is forward, so after
+-- the CAS neither a rollback nor a restore reconcile can win. A same-state update is allowed (timestamps).
+CREATE FUNCTION catalog_check_move_transition() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.state = OLD.state THEN
+    RETURN NEW;
+  END IF;
+  IF (OLD.state, NEW.state) IN (
+       ('planned', 'copying'), ('copying', 'frozen'), ('frozen', 'reconciling'), ('reconciling', 'cutover'),
+       ('cutover', 'committed'), ('committed', 'cleaning'), ('cleaning', 'done'),
+       ('planned', 'rolled_back'), ('copying', 'rolled_back'), ('frozen', 'rolled_back'),
+       ('reconciling', 'rolled_back'), ('cutover', 'rolled_back')) THEN
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'illegal move transition % -> % (move %)', OLD.state, NEW.state, OLD.move_id
+    USING ERRCODE = '23514';
+END $$;
+
+CREATE TRIGGER namespace_moves_transition BEFORE UPDATE OF state ON namespace_moves
+  FOR EACH ROW EXECUTE FUNCTION catalog_check_move_transition();
 
 -- -----------------------------------------------------------------------------
 -- idempotency_keys: request_id for catalog-level writes (CreateNamespace, tenant/admin

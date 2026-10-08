@@ -309,9 +309,14 @@ message EntityHint {
 }
 
 // Metadata attached by clients is a free-form JSON object (google.protobuf.Struct).
-// It is stored verbatim (≤ 16 KiB serialised), returned on Memory and
-// Document, indexed for equality filtering on top-level string values only,
-// and never interpreted by the pipeline.
+// It is stored verbatim (≤ 16 KiB serialised) on the document (the metadata of
+// the first item of its current version), returned on Memory and Document,
+// and never interpreted by the pipeline. Filters resolve at DOCUMENT level,
+// exactly like tags (decision N139): the recall layer evaluates them once
+// against `documents.metadata` (GIN `jsonb_path_ops`) into the allowed-document
+// set that every arm receives, so facts, chunks and observations are filtered
+// through their documents. Only equality on top-level string values is
+// supported.
 message MetadataFilter {
   // Top-level key whose value must equal `value` (string comparison).
   string key = 1;

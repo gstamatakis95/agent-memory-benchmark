@@ -9,7 +9,8 @@
 // incomplete.
 //
 // Pages are versioned like observations: GetPage with as_of returns the
-// latest version with effective_at ≤ T (decision D9). A page version is
+// version current at T (effective_at ≤ T < superseded_at, decision D9);
+// NOT_FOUND when none exists. A page version is
 // visible iff no fact input in its evidence segment is tombstoned or hidden
 // and no observation-version input in its segment is hidden (decision N117);
 // depth is fixed at two (fact, observation, page) and pages never feed
@@ -48,7 +49,10 @@ service PageService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
   // SearchPages ranks pages by relevance of their current (or as_of) version
-  // to `query`: BM25 ∪ HNSW over page_versions fused with RRF, no LLM. It is
+  // to `query`: BM25 over `page_versions.text` ∪ HNSW over
+  // `page_version_vectors` (same per-namespace index rules as the other
+  // vector tables, decisions N111, N112), fused with RRF, no LLM; pages share
+  // the observation visibility and purge path (decision N139). It is
   // the Reflect agent's `search_pages` tool and the equivalent of Hindsight's
   // `search_mental_models` (decision N73). Unary, page tokens. Scope
   // memory.read.

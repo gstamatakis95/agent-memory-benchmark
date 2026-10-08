@@ -21,7 +21,10 @@
 //   * every id INSIDE a payload (memory, chunk, entity, observation and page
 //     ids) is a 16-byte `bytes` value, ≈ 18 B encoded instead of ≈ 38 B as
 //     text. Client-chosen `document_id` and the envelope ids (namespace_id,
-//     tenant_id, event_id, operation_id) stay strings;
+//     tenant_id, event_id, operation_id) stay strings. Each retyped field got
+//     a NEW number AND a new name with the suffix `_bytes`; the old number and
+//     the old name are both reserved, so neither the number nor the protojson
+//     name can be recycled (decision N139, review A-9);
 //   * an event carries at most 256 ids in total across all its lists. A
 //     larger set is paged as consecutive events of the same type written in
 //     the SAME transaction, with `page` (0-based) and `page_count` plus the
@@ -33,8 +36,8 @@
 //   * a delete is an O(1) marker event (`DocumentDeleted`): no id list at all
 //     (decision N115). The async index consumer deletes by the indexed
 //     `(namespace_id, document_id)` query, and the expunge's row purge waits
-//     until every registered consumer cursor has passed the delete's `seq`
-//     (decision N119);
+//     until every registered consumer cursor has passed the tombstone's
+//     `event_seq`, the `seq` of this very event (decisions N119, N139);
 //   * every encoded event is ≤ 16 KiB by construction; the CHECK
 //     `octet_length(payload) <= 16384` on the outbox is only the backstop.
 //
@@ -43,12 +46,13 @@
 // build; consumers must skip unknown payload variants (proto3 keeps unknown
 // oneof members as unknown fields) and count them in
 // `events_unknown_payload_total`. This package has not shipped v1.0.0, so the
-// round-3 redesign changed it incompatibly, `buf breaking` is baselined
-// against the `proto/v1.0.0` tag instead of `main`, and the breaks are listed
-// here:
+// round-3 and round-4 redesigns changed it incompatibly. Until v1.0.0,
+// `buf breaking` is baselined on `main@HEAD~1` and every intended break
+// carries a labelled exception and a changelog entry (plan section 4.5,
+// decision N139); the breaks are listed here:
 //   * N80: every id field that changed from `string` to `bytes` got a NEW
-//     field number; the old number is `reserved` (the name is reused by the
-//     replacing field). A consumer built before the change therefore ignores
+//     field number and (round 4) a new `_bytes` name; the old number and name
+//     are `reserved`. A consumer built before the change therefore ignores
 //     the new field instead of decoding a 36-byte ASCII UUID as a 36-byte id;
 //   * the N81 payloads (oneof 40-47) and `RowsPurged` (36) are removed;
 //   * `ChunksRetired` (22) is replaced by `ChunksTombstoned` (49);
@@ -126,7 +130,7 @@ message DocumentVersionStarted {
 
 // ChunkCommitted: CommitChunk committed a chunk with its facts, vectors,
 // mentions and links.
-// Paging group key: (document_id, version, chunk_id).
+// Paging group key: (document_id, version, chunk_id_bytes).
 message ChunkCommitted {
   string document_id = 1;
   int64 version = 2;
@@ -140,18 +144,20 @@ message ChunkCommitted {
   bool ids_elided = 11;
   int32 fact_count = 12;
   int32 entity_count = 13;
-  bytes chunk_id = 14;
-  // ≤ 256 ids across fact_ids and entity_ids per event (N80).
-  repeated bytes fact_ids = 15;
-  repeated bytes entity_ids = 16;
+  bytes chunk_id_bytes = 14;
+  // ≤ 256 ids across fact_ids_bytes and entity_ids_bytes per event (N80).
+  repeated bytes fact_ids_bytes = 15;
+  repeated bytes entity_ids_bytes = 16;
 
-  // Replaced by 14-16 (string → bytes, decision N80).
+  // Replaced by 14-16 (string → bytes, decisions N80, N139).
   reserved 3, 5, 6;
+  reserved "chunk_id", "fact_ids", "entity_ids";
 }
 
 // ChunksTombstoned: FinalizeVersion inserted chunk_tombstones (decision
-// N115). The facts of those chunks are hidden by the read predicate; nothing
-// else changes.
+// N115). The facts of those chunks are hidden from the fact and chunk arms
+// by the read predicate; derived versions stay visible (a replace is a write,
+// decision N135), and the evidence rows are kept.
 // Paging group key: (document_id, version, tombstoned_at).
 message ChunksTombstoned {
   string document_id = 1;
@@ -190,7 +196,9 @@ enum ExpungeState {
 }
 
 // DocumentDeleted: the O(1) soft-delete marker (decision N115), emitted again
-// when the expunge materializes and when it purges. No id list: consumers
+// when the expunge materializes and when it purges. The `seq` of the first
+// (PENDING) event is stored on the tombstone as `event_seq`: the expunge's
+// purge waits until every registered consumer cursor has passed it. No id list: consumers
 // delete by the indexed `(namespace_id, document_id)` query restricted to
 // `document_version <= up_to_version`, because the same document_id may have
 // been retained again since (decision N133c).
@@ -207,27 +215,31 @@ message DocumentDeleted {
   reserved 2 to 6, 8 to 15;
 }
 
-// FactInvalidated: a `fact_hidden` marker was inserted (decision N115).
+// FactInvalidated: a `fact_hidden(invalidate)` marker was inserted (decision
+// N115). Re-extraction markers (`reextract`) are not events: they are inserted
+// by FinalizeVersion and covered by ChunksTombstoned / the version events.
 // Observation and page versions whose segment names the fact are hidden by the
 // read predicate; no per-version event exists.
 message FactInvalidated {
   google.protobuf.Timestamp invalidated_at = 2;
   string reason = 3;
-  bytes fact_id = 4;
+  bytes fact_id_bytes = 4;
 
   reserved 1;
+  reserved "fact_id";
 }
 
-// FactRestored: the `fact_hidden` marker was deleted.
+// FactRestored: the `fact_hidden(invalidate)` marker was deleted.
 message FactRestored {
-  bytes fact_id = 2;
+  bytes fact_id_bytes = 2;
 
   reserved 1;
+  reserved "fact_id";
 }
 
 // ObservationUpserted: a stage-2 consolidation write created a new
 // observation version (decision N121).
-// Paging group key: (observation_id, version).
+// Paging group key: (observation_id_bytes, version).
 message ObservationUpserted {
   int64 version = 2;
   google.protobuf.Timestamp effective_at = 4;
@@ -239,14 +251,15 @@ message ObservationUpserted {
   // observation_id.
   bool ids_elided = 9;
   int32 source_count = 10;
-  bytes observation_id = 11;
+  bytes observation_id_bytes = 11;
   // ≤ 256 ids per event (N80).
-  repeated bytes source_fact_ids = 12;
+  repeated bytes source_fact_ids_bytes = 12;
   // The version's root_version (decision N117): equal to `version` for a root
   // rebuild.
   int64 root_version = 13;
 
   reserved 1, 3;
+  reserved "observation_id", "source_fact_ids";
 }
 
 // ObservationRetired: a consolidation retire, or the last visible source
@@ -254,9 +267,10 @@ message ObservationUpserted {
 message ObservationRetired {
   string op_key = 2;
   bool zero_sources = 3;
-  bytes observation_id = 4;
+  bytes observation_id_bytes = 4;
 
   reserved 1;
+  reserved "observation_id";
 }
 
 // ObservationsMarkedStale: evidence changed under these observations
@@ -264,16 +278,17 @@ message ObservationRetired {
 // `stale_delete` from an expunge materialize or an invalidate: a rebuild is
 // nudged, and versions whose segment names the victim are already hidden by
 // the read predicate).
-// Paging group key: (cause_fact_id, document_id of the cause when known).
+// Paging group key: (cause_fact_id_bytes, document_id of the cause when known).
 message ObservationsMarkedStale {
   uint32 page = 3;
   uint32 page_count = 4;
   bool ids_elided = 5;
   int32 observation_count = 6;
-  repeated bytes observation_ids = 7;
-  bytes cause_fact_id = 8;
+  repeated bytes observation_ids_bytes = 7;
+  bytes cause_fact_id_bytes = 8;
 
   reserved 1, 2;
+  reserved "observation_ids", "cause_fact_id";
 }
 
 // EntityUpserted: entity created or canonical name changed (the expunge
@@ -282,22 +297,24 @@ message EntityUpserted {
   string canonical_name = 2;
   string type = 3;
   bool created = 4;
-  bytes entity_id = 5;
+  bytes entity_id_bytes = 5;
 
   reserved 1;
+  reserved "entity_id";
 }
 
-// EntitiesMerged: resolution merged duplicates into `survivor_id`.
-// Paging group key: survivor_id.
+// EntitiesMerged: resolution merged duplicates into `survivor_id_bytes`.
+// Paging group key: survivor_id_bytes.
 message EntitiesMerged {
   uint32 page = 3;
   uint32 page_count = 4;
   bool ids_elided = 5;
   int32 merged_count = 6;
-  bytes survivor_id = 7;
-  repeated bytes merged_ids = 8;
+  bytes survivor_id_bytes = 7;
+  repeated bytes merged_ids_bytes = 8;
 
   reserved 1, 2;
+  reserved "survivor_id", "merged_ids";
 }
 
 // PageVersionCreated: a refresh wrote a page version.
@@ -305,18 +322,20 @@ message PageVersionCreated {
   int64 version = 2;
   string markdown_blob_key = 3;
   google.protobuf.Timestamp effective_at = 4;
-  bytes page_id = 5;
+  bytes page_id_bytes = 5;
   // The version's root_version (decision N117).
   int64 root_version = 6;
 
   reserved 1;
+  reserved "page_id";
 }
 
 // PageDeleted: the page definition and versions were removed.
 message PageDeleted {
-  bytes page_id = 2;
+  bytes page_id_bytes = 2;
 
   reserved 1;
+  reserved "page_id";
 }
 
 // PagesMarkedStale: evidence changed under these pages.
@@ -328,9 +347,10 @@ message PagesMarkedStale {
   uint32 page_count = 5;
   bool ids_elided = 6;
   int32 page_id_count = 7;
-  repeated bytes page_ids = 8;
+  repeated bytes page_ids_bytes = 8;
 
   reserved 1;
+  reserved "page_ids";
 }
 
 // SnapshotCreated: an export finished.

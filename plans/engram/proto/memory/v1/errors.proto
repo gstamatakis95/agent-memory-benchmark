@@ -24,7 +24,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // ValidationError → INVALID_ARGUMENT. The request is malformed; fix it, do
 // not retry as-is. Also used when the call has no deadline (violation on the pseudo-field "grpc-timeout") and when a
@@ -141,8 +141,6 @@ enum NamespaceState {
 // part of this message: the routing hint a moved-out shard returns to the API is the internal MovedOutHint
 // (engram/internal/errors/v1). Client action: retry the whole call with backoff (new resolve), do not persist anything
 // from this detail.
-// Removed in v1.0.0-rc6 (decision N128): `int32 target_shard_id = 5` and `int64 next_epoch = 6` moved to the internal
-// MovedOutHint.
 message WrongShardOrEpoch {
   string namespace_id = 1;
   // Epoch the caller (API or worker) believed to be current.
@@ -151,9 +149,6 @@ message WrongShardOrEpoch {
   int64 actual_epoch = 3;
   // Ownership state on the shard that rejected the call.
   NamespaceState namespace_state = 4;
-
-  reserved 5, 6;
-  reserved "target_shard_id", "next_epoch";
 }
 
 // NamespaceFrozen → FAILED_PRECONDITION. The namespace is in the freeze
@@ -184,13 +179,8 @@ enum FreezeReason {
   FREEZE_REASON_MOVE = 1;
   FREEZE_REASON_RESTORE = 2;
   // Delete freeze (freeze_reason = 'delete' in namespace_ownership). Never emitted: a delete freeze is
-  // PreconditionFailed{NAMESPACE_DELETING} (decision N139). Kept only so that the number is not recycled.
+  // PreconditionFailed{NAMESPACE_DELETING} (decision N139).
   FREEZE_REASON_DELETE = 3 [deprecated = true];
-
-  // Removed in v1.0.0-rc6 (decision N128): `FREEZE_REASON_FENCE_BUSY = 4`. A refused shared try-lock is reported as
-  // NamespaceFrozen with reason UNSPECIFIED; the distinction is the internal FenceBusy detail.
-  reserved 4;
-  reserved "FREEZE_REASON_FENCE_BUSY";
 }
 
 // NamespaceNotReady → UNAVAILABLE (retryable). The namespace's target shard
@@ -202,9 +192,6 @@ message NamespaceNotReady {
   string namespace_id = 1;
   google.protobuf.Duration retry_after = 2;
 }
-
-// Removed in v1.0.0-rc6 (decision N128): DocumentBusy (N83) and InputBlobMissing (N100) are write-path details, now in
-// engram/internal/errors/v1/errors.proto.
 
 // OperationConflict → ABORTED (concurrent conflict) or ALREADY_EXISTS
 // (idempotency-key or operation_id reuse with a different payload). Client action for ABORTED: wait for
@@ -230,11 +217,6 @@ enum OperationConflictReason {
   OPERATION_CONFLICT_REASON_NAMESPACE_BUSY = 3;
   // A refresh of the same page is already running (ABORTED).
   OPERATION_CONFLICT_REASON_PAGE_REFRESHING = 4;
-
-  // DOCUMENT_PURGING (2) is removed (decision N133c): a deleted document_id can be retained again at once and its new
-  // versions start above the tombstone's up_to_version, so a retain never waits for an expunge.
-  reserved 2;
-  reserved "OPERATION_CONFLICT_REASON_DOCUMENT_PURGING";
 }
 
 // PreconditionFailed → FAILED_PRECONDITION. The request was well-formed but
@@ -258,8 +240,9 @@ message Precondition {
   // window estimate exceeds the 10 min an unattended move may take, without an operator `window`) and
   // "MOVE_WINDOW_TOO_SHORT" (the given `window` is below max(1.5 W_est, W_est + 10 min); cap 8 h; decision N173),
   // "MOVE_TARGET_ARCHIVE_UNHEALTHY" (StartMove: the target has no completed backup or its WAL archiver is failing or
-  // lagging; decision N179) and "MOVE_PAST_COMMIT" (RollbackMove after the catalog commit (a″); decision N184).
-  // "MOVE_TOO_LARGE" is reserved for a future per-namespace cap and unused.
+  // lagging; decision N179), "MOVE_TARGET_NOT_HA" (Plan: the target shard runs the `single` profile, with no standby,
+  // so it cannot be a move target; decision N190) and "MOVE_PAST_COMMIT" (RollbackMove after the catalog commit (a″);
+  // decision N184).
   string type = 1;
   // Resource the precondition applies to (id).
   string subject = 2;

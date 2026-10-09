@@ -36,7 +36,7 @@ import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 import "memory/v1/operation.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // DocumentService reads and deletes documents. Scope memory.read for Get/List/GetDocumentBody/ListTags, memory.write
 // for Delete and UpdateDocumentTags.
@@ -147,8 +147,6 @@ message Document {
   // Monotone counter bumped by every UpdateDocumentTags and every retain that recomputes the tags; the export delta
   // keys its `documents` part by (document_id, tag_generation) (decision N157).
   int64 tag_generation = 18;
-
-  reserved 100 to 199;
 }
 
 // DocumentVersion describes one retain of a document.
@@ -174,15 +172,11 @@ message GetDocumentRequest {
   // Also return `versions`. Versions a pending delete tombstone covers (version <= up_to_version) are never listed,
   // also after the document id was retained again (decision N157, review A-14).
   bool include_versions = 4;
-
-  reserved 100 to 199;
 }
 
 // GetDocumentResponse wraps the document.
 message GetDocumentResponse {
   Document document = 1;
-
-  reserved 100 to 199;
 }
 
 // ListDocumentsRequest lists documents, most recently updated first.
@@ -199,16 +193,12 @@ message ListDocumentsRequest {
   bool include_deleting = 6;
   google.protobuf.FieldMask read_mask = 7;
   repeated MetadataFilter metadata_filters = 8;
-
-  reserved 100 to 199;
 }
 
 // ListDocumentsResponse is a page of documents.
 message ListDocumentsResponse {
   repeated Document documents = 1;
   PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // DeleteDocumentRequest removes a document.
@@ -222,23 +212,15 @@ message DeleteDocumentRequest {
   // PreconditionFailed{ETAG_MISMATCH} otherwise). The comparison happens inside the marker transaction, under the
   // document lock, so a concurrent retain cannot slip a version in between (decision N139).
   int64 expected_version = 5;
-
-  reserved 100 to 199;
 }
 
 // DeleteDocumentResponse acknowledges the tombstone (decision N115) and returns the expunge operation.
 message DeleteDocumentResponse {
   Operation operation = 1;
-  // Removed in v1.0.0-rc6 (decisions N115, N117): `int32 facts_retired = 2`, `int32 observations_marked_stale = 3`,
-  // `int32 pages_marked_stale = 4`. Nothing is counted at delete time any more; the expunge reports progress.
-  reserved 2 to 4;
-  reserved "facts_retired", "observations_marked_stale", "pages_marked_stale";
   // Commit time of the tombstone: the instant from which no read path returns anything derived from the document.
   google.protobuf.Timestamp deleted_at = 5;
   // Stated bounds of the asynchronous expunge.
   ExpungeSla expunge_sla = 6;
-
-  reserved 100 to 199;
 }
 
 // GetDocumentVersionRequest fetches one version.
@@ -247,15 +229,11 @@ message GetDocumentVersionRequest {
   string document_id = 2;
   // 0 = current version.
   int64 version = 3;
-
-  reserved 100 to 199;
 }
 
 // GetDocumentVersionResponse wraps the version.
 message GetDocumentVersionResponse {
   DocumentVersion document_version = 1;
-
-  reserved 100 to 199;
 }
 
 // GetDocumentBodyRequest reads a byte range of one version's body.
@@ -268,8 +246,6 @@ message GetDocumentBodyRequest {
   int64 offset = 4;
   // Maximum bytes to return; 0 = 4 MiB, clamped to 4 MiB.
   int32 limit_bytes = 5;
-
-  reserved 100 to 199;
 }
 
 // GetDocumentBodyResponse is one range of the body.
@@ -283,8 +259,6 @@ message GetDocumentBodyResponse {
   int64 total_bytes = 5;
   // Offset of the next range; equal to total_bytes on the last one.
   int64 next_offset = 6;
-
-  reserved 100 to 199;
 }
 
 // ListTagsRequest lists the namespace's filter tags.
@@ -293,8 +267,6 @@ message ListTagsRequest {
   PagingRequest paging = 2;
   // Only tags starting with this prefix.
   string prefix = 3;
-
-  reserved 100 to 199;
 }
 
 // TagCount is one tag with the number of documents carrying it.
@@ -307,8 +279,6 @@ message TagCount {
 message ListTagsResponse {
   repeated TagCount tags = 1;
   PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // UpdateDocumentTagsRequest adds and removes tags on one document.
@@ -322,13 +292,9 @@ message UpdateDocumentTagsRequest {
   repeated string remove_tags = 5;
   // When > 0, only proceeds if current_version equals this value.
   int64 expected_version = 6;
-
-  reserved 100 to 199;
 }
 
 // UpdateDocumentTagsResponse returns the document with its new tags.
 message UpdateDocumentTagsResponse {
   Document document = 1;
-
-  reserved 100 to 199;
 }

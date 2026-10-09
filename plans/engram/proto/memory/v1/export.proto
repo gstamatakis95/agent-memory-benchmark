@@ -36,7 +36,7 @@ import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 import "memory/v1/operation.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // ExportService creates and serves snapshots. CreateSnapshot needs memory.write (it consumes worker capacity and
 // storage); the reads need memory.read.
@@ -126,8 +126,7 @@ message SnapshotManifest {
   // broken) but StreamSnapshot refuses them.
   bool expired = 15;
   // When the snapshot expired; the source is the `export_snapshots.expires_at` column, set together with `state =
-  // 'expired'` and an `expired_reason` (decision N157). Renamed from `expired_at` in round 5 (pre-1.0 exception, plan
-  // section 4.5); the old name is reserved.
+  // 'expired'` and an `expired_reason` (decision N157).
   google.protobuf.Timestamp expires_at = 16;
   // Ids (facts, chunks, observations) deleted between base_version and this version, also when the base snapshot has
   // expired (decision N126). The sync client applies them before serving. Long lists are paged into the delta file's
@@ -136,9 +135,6 @@ message SnapshotManifest {
   // Why the snapshot expired, set with `expired = true`: "ttl", "document_delete" or "namespace_delete" (the
   // `export_snapshots. expired_reason` column; empty while not expired; round 6, review A-11).
   string expired_reason = 18;
-
-  reserved "expired_at";
-  reserved 100 to 199;
 }
 
 // HiddenVersion names a derived version that the read predicate hides now.
@@ -175,8 +171,6 @@ message HiddenOverlay {
   google.protobuf.Timestamp computed_at = 3;
   // Non-empty while more overlay rows exist; pass it as GetSnapshotManifestRequest.overlay_page_token.
   string next_page_token = 4;
-
-  reserved 100 to 199;
 }
 
 // CreateSnapshotRequest starts a snapshot.
@@ -188,16 +182,12 @@ message CreateSnapshotRequest {
   bool include_chunks = 4;
   // Include pages/*.md (default true when unset).
   optional bool include_pages = 5;
-
-  reserved 100 to 199;
 }
 
 // CreateSnapshotResponse returns the snapshot operation; the version is in OperationResult.snapshot_version once
 // SUCCEEDED.
 message CreateSnapshotResponse {
   Operation operation = 1;
-
-  reserved 100 to 199;
 }
 
 // GetSnapshotManifestRequest fetches a manifest.
@@ -207,8 +197,6 @@ message GetSnapshotManifestRequest {
   int64 version = 2;
   // Continuation of the overlay (HiddenOverlay.next_page_token); empty on the first call.
   string overlay_page_token = 3;
-
-  reserved 100 to 199;
 }
 
 // GetSnapshotManifestResponse wraps the manifest and the live overlay.
@@ -216,24 +204,18 @@ message GetSnapshotManifestResponse {
   SnapshotManifest manifest = 1;
   // Live curation overlay, applied by engram-sync before serving.
   HiddenOverlay hidden_overlay = 2;
-
-  reserved 100 to 199;
 }
 
 // ListSnapshotsRequest lists manifests, newest first.
 message ListSnapshotsRequest {
   NamespaceRef namespace = 1;
   PagingRequest paging = 2;
-
-  reserved 100 to 199;
 }
 
 // ListSnapshotsResponse is a page of manifests.
 message ListSnapshotsResponse {
   repeated SnapshotManifest manifests = 1;
   PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // StreamSnapshotRequest selects one file and a resume offset.
@@ -244,8 +226,6 @@ message StreamSnapshotRequest {
   string path = 3;
   // Byte offset to resume from (0 = start). Must be < size_bytes.
   int64 offset = 4;
-
-  reserved 100 to 199;
 }
 
 // StreamSnapshotResponse is one part of the file.
@@ -259,6 +239,4 @@ message StreamSnapshotResponse {
   bool last = 4;
   // Hex SHA-256 of the whole file; set only when `last`.
   string sha256 = 5;
-
-  reserved 100 to 199;
 }

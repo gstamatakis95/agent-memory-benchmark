@@ -32,7 +32,7 @@ import "memory/v1/common.proto";
 import "memory/v1/errors.proto";
 import "memory/v1/operation.proto";
 
-option go_package = "example.com/engram/gen/go/memory/admin/v1;adminv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/admin/v1;adminv1";
 
 // TenantService manages tenants.
 service TenantService {
@@ -112,8 +112,9 @@ service MoveService {
   // refused (MOVE_WINDOW_TOO_SHORT) unless window >= max(1.5 W_est, W_est + 10 min); the window is capped at 8 h, the
   // default is 4 h (decision N173). `estimate_only` returns the estimate without planning. One move per namespace at a
   // time (ABORTED + OperationConflict). The target must have a completed backup and a healthy WAL archiver, else
-  // PreconditionFailed{MOVE_TARGET_ARCHIVE_UNHEALTHY} (decision N179). `meta.request_id` is required. Scope
-  // engram.operator.
+  // PreconditionFailed{MOVE_TARGET_ARCHIVE_UNHEALTHY} (decision N179), and must run an HA profile (a standby that
+  // replays the seal); a `single`-profile target is refused with PreconditionFailed{MOVE_TARGET_NOT_HA} (decision
+  // N190). `meta.request_id` is required. Scope engram.operator.
   rpc StartMove(StartMoveRequest) returns (StartMoveResponse);
   // GetMove returns the move with progress.
   rpc GetMove(GetMoveRequest) returns (GetMoveResponse) {
@@ -192,8 +193,6 @@ message Tenant {
   memory.v1.Timestamps timestamps = 7;
   string etag = 8;
   int32 namespace_count = 9;
-
-  reserved 100 to 199;
 }
 
 // CreateTenantRequest creates a tenant.
@@ -201,30 +200,22 @@ message CreateTenantRequest {
   memory.v1.RequestMeta meta = 1;
   // tenant_id, display_name, isolation, quotas and config are read.
   Tenant tenant = 2;
-
-  reserved 100 to 199;
 }
 
 // CreateTenantResponse returns the tenant.
 message CreateTenantResponse {
   Tenant tenant = 1;
-
-  reserved 100 to 199;
 }
 
 // GetTenantRequest fetches one tenant.
 message GetTenantRequest {
   string tenant_id = 1;
   google.protobuf.FieldMask read_mask = 2;
-
-  reserved 100 to 199;
 }
 
 // GetTenantResponse wraps the tenant.
 message GetTenantResponse {
   Tenant tenant = 1;
-
-  reserved 100 to 199;
 }
 
 // ListTenantsRequest lists tenants by id.
@@ -232,16 +223,12 @@ message ListTenantsRequest {
   memory.v1.PagingRequest paging = 1;
   repeated TenantState states = 2;
   string tenant_id_prefix = 3;
-
-  reserved 100 to 199;
 }
 
 // ListTenantsResponse is a page of tenants.
 message ListTenantsResponse {
   repeated Tenant tenants = 1;
   memory.v1.PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // UpdateTenantRequest patches a tenant.
@@ -252,15 +239,11 @@ message UpdateTenantRequest {
   // UpdateTenantLimits, decision N167).
   google.protobuf.FieldMask update_mask = 3;
   string etag = 4;
-
-  reserved 100 to 199;
 }
 
 // UpdateTenantResponse returns the updated tenant.
 message UpdateTenantResponse {
   Tenant tenant = 1;
-
-  reserved 100 to 199;
 }
 
 // UpdateTenantLimitsRequest patches the operator-owned fields of a tenant.
@@ -270,15 +253,11 @@ message UpdateTenantLimitsRequest {
   // Allowed paths: isolation, quotas, quotas.*, state (ACTIVE ↔ SUSPENDED only).
   google.protobuf.FieldMask update_mask = 3;
   string etag = 4;
-
-  reserved 100 to 199;
 }
 
 // UpdateTenantLimitsResponse returns the updated tenant.
 message UpdateTenantLimitsResponse {
   Tenant tenant = 1;
-
-  reserved 100 to 199;
 }
 
 // DeleteTenantRequest deletes a tenant and every namespace in it.
@@ -287,8 +266,6 @@ message DeleteTenantRequest {
   string tenant_id = 2;
   // Must equal tenant_id (typed confirmation).
   string confirm_tenant_id = 3;
-
-  reserved 100 to 199;
 }
 
 // DeleteTenantResponse returns the tenant (DELETING) and the tenant-level operation.
@@ -302,16 +279,12 @@ message DeleteTenantResponse {
   // Commit time of the catalog `deleting` state: from here every request for the tenant is rejected with
   // TENANT_DELETING.
   google.protobuf.Timestamp deleted_at = 4;
-
-  reserved 100 to 199;
 }
 
 // GetTenantOperationRequest fetches a tenant-scoped operation.
 message GetTenantOperationRequest {
   string tenant_id = 1;
   string operation_id = 2;
-
-  reserved 100 to 199;
 }
 
 // GetTenantOperationResponse wraps the operation and the per-namespace expunge operations created so far.
@@ -319,8 +292,6 @@ message GetTenantOperationResponse {
   memory.v1.Operation operation = 1;
   // DELETE_NAMESPACE operations the TenantDelete workflow has created.
   repeated memory.v1.Operation namespace_operations = 2;
-
-  reserved 100 to 199;
 }
 
 // ShardState is the lifecycle of a shard. The values mirror the catalog's `shard_state` enum one-to-one (provisioning,
@@ -341,11 +312,6 @@ enum ShardState {
   SHARD_STATE_READONLY = 7;
   // Hosts no namespaces; decommissioned, never reused.
   SHARD_STATE_RETIRED = 8;
-
-  // Removed in v1.0.0-rc5 (review F-27): `SHARD_STATE_EMPTY = 3` and `SHARD_STATE_DISABLED = 4` had no catalog
-  // counterpart; RETIRED and READONLY replace them.
-  reserved 3, 4;
-  reserved "SHARD_STATE_EMPTY", "SHARD_STATE_DISABLED";
 }
 
 // Shard is one dedicated PostgreSQL instance (decision D2).
@@ -360,7 +326,7 @@ message Shard {
   // Blob key prefix = the shard id as text, e.g. "7" (the catalog enforces `blob_prefix = shard_id::text`). Keys are
   // `{prefix}/{tenant}/{ns}/…`.
   string blob_prefix = 5;
-  // Set when the shard is reserved for one tenant (isolation DEDICATED).
+  // Set when the shard is dedicated to one tenant (isolation DEDICATED).
   string dedicated_tenant_id = 6;
   // Soft capacity used by the placer (default 10 M live facts).
   int64 capacity_facts = 7;
@@ -372,8 +338,6 @@ message Shard {
   // Last schema migration applied on the shard (mirror of the shard's `shard_meta.schema_version` and the catalog's
   // integer column).
   int32 schema_version = 13;
-
-  reserved 100 to 199;
 }
 
 // RegisterShardRequest adds a shard.
@@ -382,29 +346,21 @@ message RegisterShardRequest {
   // cell_id, dsn_secret_ref, blob_prefix, dedicated_tenant_id and capacity_facts are read; shard_id is assigned by the
   // catalog.
   Shard shard = 2;
-
-  reserved 100 to 199;
 }
 
 // RegisterShardResponse returns the shard with its id.
 message RegisterShardResponse {
   Shard shard = 1;
-
-  reserved 100 to 199;
 }
 
 // GetShardRequest fetches one shard.
 message GetShardRequest {
   int32 shard_id = 1;
-
-  reserved 100 to 199;
 }
 
 // GetShardResponse wraps the shard.
 message GetShardResponse {
   Shard shard = 1;
-
-  reserved 100 to 199;
 }
 
 // ListShardsRequest lists shards by id.
@@ -412,16 +368,12 @@ message ListShardsRequest {
   memory.v1.PagingRequest paging = 1;
   repeated ShardState states = 2;
   string cell_id = 3;
-
-  reserved 100 to 199;
 }
 
 // ListShardsResponse is a page of shards.
 message ListShardsResponse {
   repeated Shard shards = 1;
   memory.v1.PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // DrainShardRequest sets a shard to DRAINING.
@@ -429,16 +381,12 @@ message DrainShardRequest {
   memory.v1.RequestMeta meta = 1;
   int32 shard_id = 2;
   string reason = 3;
-
-  reserved 100 to 199;
 }
 
 // DrainShardResponse returns the shard and the namespaces still on it.
 message DrainShardResponse {
   Shard shard = 1;
   repeated memory.v1.NamespaceRef remaining_namespaces = 2;
-
-  reserved 100 to 199;
 }
 
 // UpdateShardRequest patches a shard.
@@ -448,22 +396,16 @@ message UpdateShardRequest {
   // Allowed paths: state, cell_id, capacity_facts, dedicated_tenant_id, dsn_secret_ref.
   google.protobuf.FieldMask update_mask = 3;
   string etag = 4;
-
-  reserved 100 to 199;
 }
 
 // UpdateShardResponse returns the updated shard.
 message UpdateShardResponse {
   Shard shard = 1;
-
-  reserved 100 to 199;
 }
 
 // ResolveNamespaceRequest looks up placement.
 message ResolveNamespaceRequest {
   memory.v1.NamespaceRef namespace = 1;
-
-  reserved 100 to 199;
 }
 
 // ResolveNamespaceResponse is the catalog's answer.
@@ -476,8 +418,6 @@ message ResolveNamespaceResponse {
   string move_id = 5;
   // Target shard of the in-progress move, if any.
   int32 target_shard_id = 6;
-
-  reserved 100 to 199;
 }
 
 // ReleaseNamespaceRequest finalises a namespace delete (ShardService).
@@ -488,16 +428,12 @@ message ReleaseNamespaceRequest {
   // Epoch the purge ran under; FAILED_PRECONDITION if the catalog disagrees.
   int64 epoch = 4;
   string operation_id = 5;
-
-  reserved 100 to 199;
 }
 
 // ReleaseNamespaceResponse echoes the catalog state (DELETED).
 message ReleaseNamespaceResponse {
   memory.v1.NamespaceRef namespace = 1;
   google.protobuf.Timestamp deleted_at = 2;
-
-  reserved 100 to 199;
 }
 
 // MoveState follows decision D5 (freeze-then-copy, decision N160): planned →
@@ -509,11 +445,6 @@ enum MoveState {
   MOVE_STATE_UNSPECIFIED = 0;
   // Plan done: catalog row, target `incoming`, source `start_move`, blob pre-warm. The source is still writable.
   MOVE_STATE_PLANNED = 1;
-  // Removed in v1.0.0-rc7 (decision N160): `MOVE_STATE_COPYING = 2` (the dirty copy with a writable source) and
-  // `MOVE_STATE_RECONCILING = 9` (the freeze reconcile). Removed in v1.0.0-rc6 (decision N124):
-  // `MOVE_STATE_CATCHING_UP = 3`.
-  reserved 2, 3, 9;
-  reserved "MOVE_STATE_COPYING", "MOVE_STATE_CATCHING_UP", "MOVE_STATE_RECONCILING";
   // Source frozen (`frozen/move`, reads continue): drain, copy of every table from the static source, VerifyFrozen,
   // BuildIndexes, SealCopy. Bounded by the freeze deadline.
   MOVE_STATE_FROZEN = 4;
@@ -555,20 +486,10 @@ message MoveProgress {
   int64 bytes_copied = 2;
   // Owner-keyed blobs copied (the pre-warm before the freeze plus the per-row copy-if-absent under it).
   int64 blobs_copied = 3;
-  // Removed in v1.0.0-rc6 (decision N124): the outbox replay machinery (`copy_start_seq = 4`, `applied_seq = 5`,
-  // `replay_lag_events = 6`, `replay_lag = 7`).
-  reserved 4 to 7;
-  reserved "copy_start_seq", "applied_seq", "replay_lag_events", "replay_lag";
   // Operation ids terminated during drain and restarted after cutover.
   repeated string restarted_operation_ids = 8;
   // Tables fully copied so far.
   repeated string tables_done = 9;
-  // Removed in v1.0.0-rc7 (decision N160): the dirty-copy and reconcile counters `copy_started_at = 10`, `rows_recopied
-  // = 11`, `mutable_rows_reconciled = 12`, `blobs_reconciled = 13`, the freeze watchdog `freeze_watchdog = 14`
-  // (replaced by Move.freeze_deadline) and `rows_catchup_copied = 15`.
-  reserved 10 to 15;
-  reserved "copy_started_at", "rows_recopied", "mutable_rows_reconciled", "blobs_reconciled", "freeze_watchdog";
-  reserved "rows_catchup_copied";
   // Partial indexes the mover requested on the target under the freeze and how many are valid; cutover waits until all
   // are (BuildIndexes).
   int32 indexes_requested = 16;
@@ -597,21 +518,10 @@ message Move {
   google.protobuf.Timestamp frozen_at = 10;
   // Set when state is ROLLED_BACK or the executor is retrying after an error.
   string error = 12;
-  // Removed in v1.0.0-rc6 (decision N127): `string operation_id = 13`. A move is not an Operation and is not visible to
-  // tenants.
-  reserved 13;
-  reserved "operation_id";
   // Set while state is CUTOVER, and while COMMITTED for (c), (b″) and (d).
   CutoverStep cutover_step = 14;
   // True once the catalog CAS (a″) committed (state COMMITTED or later); RollbackMove is refused from then on.
   bool past_point_of_no_return = 15;
-  // Removed in v1.0.0-rc8 (decision N170): `source_blobs_gc_after = 16` (derived: `finished_at + 28 d`).
-  reserved 16;
-  reserved "source_blobs_gc_after";
-  // Removed in v1.0.0-rc7 (decisions N160, N161): `reconciled_in_at = 18`, `cleanup_reconciled_at = 19` and
-  // `target_content_checked_at = 20` (the ReconcileIn repair and the cleanup-time content gate).
-  reserved 18 to 20;
-  reserved "reconciled_in_at", "cleanup_reconciled_at", "target_content_checked_at";
   // W_est: the window estimate computed by Plan, rows / R_copy + build(vectors)
   // + max(wal_build / R_archive, wal_build / R_redo) + verify (decisions N173, N179; about 27 min per 1 M live facts).
   google.protobuf.Duration window_estimate = 21;
@@ -623,12 +533,6 @@ message Move {
   google.protobuf.Timestamp freeze_deadline = 23;
   // Target `ready → active`; the 24 h cleanup gate counts from it (N170).
   google.protobuf.Timestamp activated_at = 24;
-  // Removed in v1.0.0-rc8 (decisions N169, N179): `move_backup_at = 17` and `move_backup_started_at = 25` (the move
-  // backup is replaced by the seal; second removal of these numbers, earlier names `target_backup_at`,
-  // `target_backup_started_at`), `cutover_at = 11` (no column) and `int32 rerun_count = 26` (the re-run is deleted).
-  reserved 11, 17, 25, 26;
-  reserved "cutover_at", "move_backup_at", "move_backup_started_at", "target_backup_at", "target_backup_started_at";
-  reserved "rerun_count";
   // The copy's WAL floor (decision N179): `pg_switch_wal()` on the target after the last index build; `copy_end_lsn` is
   // the `pg_lsn` text form. Restores and failovers of the target below it are refused.
   string copy_end_lsn = 27;
@@ -647,8 +551,6 @@ message Move {
   string lost_restore_id = 35;
   // On a recovery move: the LOST move it replaces.
   string recovered_from_move_id = 36;
-
-  reserved 100 to 199;
 }
 
 // StartMoveRequest plans a move.
@@ -671,8 +573,6 @@ message StartMoveRequest {
   google.protobuf.Timestamp freeze_not_before = 8;
   // Compute and return the window estimate without planning anything.
   bool estimate_only = 9;
-
-  reserved 100 to 199;
 }
 
 // StartMoveResponse returns the move.
@@ -680,22 +580,16 @@ message StartMoveResponse {
   Move move = 1;
   // W_est for the namespace and target (also when `estimate_only` is set, in which case `move` is unset).
   google.protobuf.Duration window_estimate = 2;
-
-  reserved 100 to 199;
 }
 
 // GetMoveRequest fetches a move.
 message GetMoveRequest {
   string move_id = 1;
-
-  reserved 100 to 199;
 }
 
 // GetMoveResponse wraps the move.
 message GetMoveResponse {
   Move move = 1;
-
-  reserved 100 to 199;
 }
 
 // ListMovesRequest lists moves, newest first.
@@ -704,16 +598,12 @@ message ListMovesRequest {
   repeated MoveState states = 2;
   memory.v1.NamespaceRef namespace = 3;
   int32 shard_id = 4;
-
-  reserved 100 to 199;
 }
 
 // ListMovesResponse is a page of moves.
 message ListMovesResponse {
   repeated Move moves = 1;
   memory.v1.PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // RollbackMoveRequest aborts a move before its point of no return (the catalog CAS (a″)).
@@ -721,15 +611,11 @@ message RollbackMoveRequest {
   memory.v1.RequestMeta meta = 1;
   string move_id = 2;
   string reason = 3;
-
-  reserved 100 to 199;
 }
 
 // RollbackMoveResponse returns the move (ROLLED_BACK or rolling back).
 message RollbackMoveResponse {
   Move move = 1;
-
-  reserved 100 to 199;
 }
 
 // CleanupMoveRequest takes a committed move to CLEANING under the 24 h gate (decision N170); the activity purges the
@@ -738,11 +624,6 @@ message RollbackMoveResponse {
 message CleanupMoveRequest {
   memory.v1.RequestMeta meta = 1;
   string move_id = 2;
-  // Removed in v1.0.0-rc7 (decision N161): `bool skip_grace = 3`; the 24 h gate cannot be shortened.
-  reserved 3;
-  reserved "skip_grace";
-
-  reserved 100 to 199;
 }
 
 // CleanupMoveResponse returns the move (DONE, or CLEANING while batches run).
@@ -750,6 +631,4 @@ message CleanupMoveResponse {
   Move move = 1;
   int64 rows_purged = 2;
   int64 blobs_purged = 3;
-
-  reserved 100 to 199;
 }

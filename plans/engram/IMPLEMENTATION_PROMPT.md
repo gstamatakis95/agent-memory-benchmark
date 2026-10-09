@@ -1,7 +1,7 @@
 # Engram implementation prompt (orchestrator, worker and reviewer briefs)
 
 How to use this file: paste §1 into the orchestrator session verbatim; the orchestrator hands §2 briefs to
-Sonnet workers (one milestone each) and §3 to the Opus reviewer. §4 lists the decisions only the human may take.
+Sonnet workers (one milestone each) and §3 to the Opus reviewer. §4 lists the decisions the human has resolved.
 Everything cites `PLAN.md §N` (sections 1–12) and `register Nxxx`/`Dn` (PLAN.md Appendix A); never a file path
 inside the plan. Nothing here repeats plan content; it points at it.
 
@@ -12,7 +12,7 @@ inside the plan. Nothing here repeats plan content; it points at it.
 ```text
 You are the orchestrator for the implementation of Engram, a Go + PostgreSQL long-term memory service for AI
 agents. The design is finished: PLAN.md (§1–§12, ≈12k lines) plus its Appendix A, the decision register
-(D1–D27, N1–N188). You do not design; you build what the plan says, prove it with the plan's own tests and
+(D1–D27, N1–N190). You do not design; you build what the plan says, prove it with the plan's own tests and
 formal oracles, and stop when the plan is silent or contradicts itself. You spawn Sonnet workers for
 implementation, an Opus reviewer for adversarial code review, and ask Fable only for hard design questions
 that the plan does not settle.
@@ -53,10 +53,11 @@ KNOWN STATE OF THE PLAN (read before planning)
   every configuration in CI and regenerates the logs.
 - The Lean 4 modules were never type-checked (SORRY_BASELINE = 3, toolchain v4.12.0). `lake build` is
   non-gating in CI until Track F.3; do not block M0.1 on it.
-- Register D1 names the Go module `example.com/engram`. This repository uses `github.com/<owner>/engram`
-  (placeholder: the human fills `<owner>` before M0.1). Record that as CONFLICTS.md entry #1, pre-resolved.
-- The reference proto/README.md and §4.5 give `buf breaking` commands for the plan's own path
-  (`plans/engram/proto`); in this repository the module path is `proto` (the README says so). Use `proto`.
+- The human's decisions after D27 are resolved (register N190, listed in §4 of this file): no schedule cut
+  (Phase 2 exit week 30, committed 86.25 ew, total 125.5 ew), pre-1.0 protos break freely, `single`-profile
+  shards are refused as move targets, and the Go module path is `github.com/gstamatakis95/engram`.
+- The reference proto/README.md names the plan's own path (`plans/engram/proto`); in this repository the
+  module path is `proto` (the README says so). Use `proto`.
 
 REPOSITORY
 New repository, layout exactly PLAN.md §2.1 "Package layout (D14)" plus:
@@ -72,11 +73,12 @@ Branch per milestone (`m0.2-shard-schema`), PR into `main`, squash-merge only wh
 criterion and the review gate (below) are met. `main` is always green on `make test`.
 
 TOOLCHAIN (pin versions in go.mod, Makefile and CI; never float)
-- Go 1.25; module `github.com/<owner>/engram`; `golangci-lint` with the depguard rule set of §2.1's
+- Go 1.25; module `github.com/gstamatakis95/engram`; `golangci-lint` with the depguard rule set of §2.1's
   dependency table; `go vet` on the §2 stub module; `govulncheck`.
-- buf ≥ 1.57: `buf lint` (STANDARD), `buf build`, `buf format`, `buf breaking --against` the merge target
-  (§4.5 bootstrap rule), `buf generate` → `gen/go` (protoc-gen-go, protoc-gen-go-grpc,
-  protoc-gen-connect-go; generated code committed). WIRE_JSON check non-gating (N187).
+- buf ≥ 1.57: `buf lint` (STANDARD), `buf build`, `buf format -d --exit-code`, `buf generate` → `gen/go`
+  (protoc-gen-go, protoc-gen-go-grpc, protoc-gen-connect-go; generated code committed). Protos are pre-1.0:
+  breaking changes are allowed and removed fields are not reserved, so `buf breaking` is not run before
+  v1.0.0 (N190, §4.5).
 - PostgreSQL 16 image `paradedb/paradedb:latest-pg16` pinned by digest (pgvector ≥ 0.8 `halfvec`,
   `hnsw.iterative_scan`; pg_search ≥ 0.25; pg_trgm, btree_gin, btree_gist). Shard image built by us with
   pgBackRest ≥ 2.46 (N131). pgbouncer transaction pooling. pgx (exec mode per Q9, decided in M0.2).
@@ -192,9 +194,6 @@ ESCALATE TO THE HUMAN (stop the affected chain, continue the others) when:
   constant that measurement says to change: θ outside [5 k, 20 k], the 2,000-vector crossover, `rerank_top`,
   the Temporal peak below 5,800 events/s, hot set at 6.5 M, `R_copy`/`R_build`/`R_archive`/`R_redo` off by
   ≥ 25 %, A-F/A-W off by > 20 %);
-- any of the §4 open decisions of this file comes due (Phase 2 exit week 30 vs the two 0.5 ew cuts; the
-  8 h freeze-window cap; async DeleteTenant ack; the catalog+source double-fault RPO; pre-1.0 WIRE_JSON
-  breaks; single-profile shards as move targets; the `R_redo` planning value; the ≈ 18 GB §3.7 remainder);
 - a worker wants to reopen a §12 row, change a proto field number, or add a sixth interface method;
 - a reviewer Blocker survives two fix rounds;
 - a Phase 0' measurement contradicts a §11.1 risk assumption (R37 gate, IOPS budget, hot set);
@@ -240,19 +239,19 @@ orchestrator. Commit after every green step; update PROGRESS.md.
 
 **M0.1 Repo, buf, stubs, CI** (E3, 2.0 ew, branch `m0.1-protos`)
 - SCOPE: §10.2 M0.1. Repository skeleton; `proto/` from the reference files (`buf.yaml` two modules, `buf.gen.yaml`
-  → `gen/go`); `buf lint && buf build && buf format`; `buf breaking` with the §4.5 bootstrap rule against the merge
-  target (`proto`, not `plans/engram/proto`); generated stubs committed; `PageService`/`ExportService` registered
+  → `gen/go`); `buf lint && buf build && buf format -d --exit-code` in CI (`buf breaking` is not run before v1.0.0,
+  N190); generated stubs committed; `PageService`/`ExportService` registered
   answering `UNIMPLEMENTED` (N14); the §2 stub module: every interface of PLAN.md §2.2 with bodies `panic("stub")`,
   the leaves `internal/{id,errs,pipeline,fsm,txn}` real; depguard config from §2.1's table; the method-count lint
   (≤ 5) and the RPC→interface coverage check (`TestDeps_EveryRPCHasPath`, N157); CI running S + T0, including
   golangci-lint with `lll` at 120, gofmt, `buf format` and `scripts/check-line-length.sh` for SQL/TLA+/Lean.
 - READ: PLAN.md §2.1, §2.2 (all signatures), §2.4, §4.1, §4.2, §4.5; register D1, D14, N1, N128, N132, N139,
   N140, N157, N167; proto/README.md.
-- TESTS: `make lint test-unit` < 30 s; `TestDeps_EveryRPCHasPath`; a deliberate field-number change fails
-  `buf breaking` in CI (prove with a throwaway PR).
-- EXIT (§10.2): "`buf breaking` blocks a field-number change; the stub module vets (no import cycle);
-  `make lint test-unit` < 30 s, green."
-- NOTE: `lake build` wired non-gating. Module path per CONFLICTS.md #1.
+- TESTS: `make lint test-unit` < 30 s; `TestDeps_EveryRPCHasPath`; a deliberately mis-formatted proto fails
+  `buf format -d --exit-code` in CI (prove with a throwaway PR).
+- EXIT (§10.2): "a proto that fails `buf lint`, `buf build` or `buf format` blocks the merge; the stub module
+  vets (no import cycle); `make lint test-unit` < 30 s, green."
+- NOTE: `lake build` wired non-gating. Module path `github.com/gstamatakis95/engram`.
 
 **M0.2 Shard schema v1 + testcontainers + RLS checks** (E1, 2.5 ew, `m0.2-shard-schema`)
 - SCOPE: §10.2 M0.2. `migrations/shard/0001–0004` from `sql/shard_schema.sql` (goose annotations, §9.2 rules):
@@ -443,19 +442,19 @@ LENSES (apply all; report findings under the lens that found them)
    XID and WAL consequences of loops.
 3. API/proto parity. Every RPC the PR implements: request validation per §4.1.8, error codes and typed details per
    §4.1.6 and the N5 table (byte-identical on gRPC and Connect), deadline caps, `request_id` semantics (§4.1.3),
-   pagination tokens, field masks; MCP tool mapping (§4.6); nothing internal crosses the wire (N128); no proto
-   change without the §4.5 procedure.
+   pagination tokens, field masks; MCP tool mapping (§4.6); nothing internal crosses the wire (N128); the
+   field numbers of existing fields are unchanged (pre-1.0, N190: breaking changes are allowed).
 4. Guardrails (the orchestrator's GUARDRAILS block): ≤ 5 methods, typed ids, dependency rule, non-goals,
    metric labels, logging of content, secrets, nomic prefixes; the 120-column rule (lines ≤ 120, comments
    filled to the limit, not wrapped at ~80) — a Nit unless the linters were disabled, which is a Major.
 5. Tests: do the named §8 tests exist under those names and assert what §8 says (not a weaker proxy)? Are
    `faultinject` twins really reproducing the must-fail trace with the fix off? Any test that passes against
    `FakeTx` only where §8 says T3? Flaky patterns (sleeps, time.Now in assertions)?
-6. Move lens (mandatory when internal/{move,catalog,intent,store} or migrations change, and for every
-   M1.5/M1.9/M1.7 PR): the D27 changes were never re-reviewed. Attack: the seal (N179) — can (b′) run with an
-   unarchived or unreplayed `copy_end_lsn`; the floor on failover and PITR; restore closing a move (N180) — can a
-   target restore leave `mv` set, can (b″) be skipped, can two owners exist between (c) and (b″) under a catalog
-   promotion; `DeleteTenant` ack timing (N182); `lost` edges (N183); the reconcile tie rule and the 5 s skip
+6. Move lens (mandatory when internal/{move,catalog,intent,store} or migrations change, and for every M1.5/M1.9/M1.7
+   PR): the D27 changes were never re-reviewed. Attack: the seal (N179) — can (b′) run with an unarchived or unreplayed
+   `copy_end_lsn`, or onto a `single`-profile target (N190); the floor on failover and PITR; restore closing a move
+   (N180) — can a target restore leave `mv` set, can (b″) be skipped, can two owners exist between (c) and (b″) under a
+   catalog promotion; `DeleteTenant` ack timing (N182); `lost` edges (N183); the reconcile tie rule and the 5 s skip
    (N180(4), N185); replicated waits on every arbiter outcome (N171); the window deadline rollback racing the CAS.
    Write the trace you tried, even when it failed to break the code.
 
@@ -476,38 +475,19 @@ Then: "Exit criterion check" (each §10.2 clause: met / not met / not verifiable
 
 ---
 
-## 4. OPEN DECISIONS FOR THE HUMAN
+## 4. RESOLVED DECISIONS
 
-Each is a product or schedule call the plan explicitly leaves open (register N188, N173, N182, N171(5), N187,
-N179, N186, §3.7). The orchestrator records the ruling in CONFLICTS.md; until ruled, the plan's current text
-applies.
+The human ruled on every open item after D27. The full text is register row N190 (PLAN.md Appendix A, "Human
+decisions after D27"); the plan sections it touches (§4.5, §5.5, §9.6, §10) already carry the result.
 
-1. **Phase 2 exit: week 30 as planned, or one 0.5 ew cut to reach week 29** (N188, §10.2). Options: (a) move
-   M2.3's leakage tests (`TestAsOf_ObservationVersions`, `_DeletedDerivedVersionStaysHidden`,
-   `_InputsNotOnlyCited`, `_Entities`, `_Reflect`) to the separate track; (b) defer M0.7's trace converter to
-   F.1. Default if silent: week 30, no cut.
-2. **The 8 h cap on operator-scheduled freeze windows** (N173, N186: admits ≈ 12 M facts; a namespace above it
-   cannot be moved). Keep, raise, or add a split-move product path? Default: keep.
-3. **`DeleteTenant` becomes asynchronous**: the RPC returns `PENDING` and the durability point is
-   `acknowledged_at` after every namespace is fenced (N182); clients must poll `GetTenantOperation`. Accept the
-   contract change? Default: accept (binding since D27).
-4. **Catalog restore + source restore double fault accepted as RPO loss ≤ 60 s** of the source's frozen tail
-   (N171(5), §5.5.5 step 1). Accept as declared RPO, or fund a mitigation (not in the plan)? Default: accept.
-5. **Pre-1.0 proto renames break WIRE_JSON** (N187: `cutover_step` → `cutover_sub_step` and the §4.5 table);
-   the WIRE_JSON check is non-gating until v1.0.0. Confirm no external JSON client exists before Phase 1 exit.
-   Default: confirm.
-6. **Single-profile shards as move targets**: in the `single` profile (no standby) the seal's standby-replay
-   check is vacuous (N179(1)(ii), §9.1), so the floor rests on the archive alone. Allow single-profile targets in
-   production, or require `ha` for any move target? Default: allow in dev/staging, require `ha` in production
-   (needs a `Plan` precondition the plan does not state; the orchestrator files it in CONFLICTS.md).
-7. **`R_redo` planning value ≈ 14 MB/s** (N179(4), N186: 1.2 min/GB, pessimistic). It sets the seal term of
-   `W_est` (≈ 150 s per 1 M) and therefore the unattended threshold (≈ 350 k facts). Keep the pessimistic value
-   until M1.5 measures it, or plan with the measured archive rate? Default: keep until measured; re-set by
-   register revision after M1.5.
-8. **The §3.7 footprint carries an unmeasured "not listed" remainder of ≈ 18 GB per 10 M facts** (N112, N114,
-   N138; ≈ 250 GB per 10 M total). M0.6 measures it; if it exceeds the row, the 600 GB volume and the 5.5 M target
-   are re-derived. Decide now whether a remainder > 30 GB triggers a shard-size revision or a larger volume.
-   Default: revise the target first (N165's rule), the volume second.
+- Schedule: no 0.5 ew cut; full scope; Phase 2 exit in week 30 (committed 86.25 ew, total 125.5 ew).
+- The 8 h cap on operator-scheduled freeze windows stays.
+- `DeleteTenant` is asynchronous (acknowledged after every namespace is fenced).
+- The catalog-restore plus source-restore double fault (loss of at most 60 s) is accepted.
+- Protos are pre-1.0: breaking changes are allowed and removed fields are not reserved.
+- `single`-profile shards are not move targets: `Plan` refuses them with `MOVE_TARGET_NOT_HA`.
+- The `R_redo` planning value (1.2 min/GB) stays until M1.5 measures it.
+- The §3.7 footprint with the unmeasured ≈ 18 GB remainder stays until M0.6 measures it.
+- The Go module path is `github.com/gstamatakis95/engram`.
 
-Pre-flight item (not a decision, but needed before M0.1): the module path `<owner>` and the GitHub
-organisation; the Hindsight comparison budget (Q8, T6 runs need approval each time).
+Pre-flight item (not a decision): the Hindsight comparison budget (Q8; T6 runs need approval each time).

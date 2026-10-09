@@ -19,7 +19,7 @@ import "memory/v1/common.proto";
 import "memory/v1/errors.proto";
 import "memory/v1/operation.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // NamespaceService creates, reads, updates and deletes namespaces. Create, Update and Delete require scope memory.admin
 // (namespace administration inside a tenant); Get/List require memory.read. A JWT whose `ns` allowlist is not `["*"]`
@@ -110,10 +110,6 @@ message Namespace {
   string display_name = 4;
   // What the agent using this namespace is for; injected into Reflect prompts. ≤ 4 KiB.
   string mission = 5;
-  // Removed in v1.0.0-rc6 (decision N129): `repeated string directives = 6`, replaced by the typed `reflect_directives
-  // = 13`.
-  reserved 6;
-  reserved "directives";
   Disposition disposition = 7;
   // Config overrides layered over tenant and system config (decision D12).
   // Keys: `models.{extract,consolidate,reflect,rerank}`, `chunk.target_chars`, `recall.default_budget`, `quota.*`,
@@ -132,8 +128,6 @@ message Namespace {
   string etag = 12;
   // Standing instructions for Reflect, ≤ 32 entries (decision N129).
   repeated Directive reflect_directives = 13;
-
-  reserved 100 to 199;
 }
 
 // CreateNamespaceRequest creates a namespace in the caller's tenant.
@@ -144,22 +138,16 @@ message CreateNamespaceRequest {
   // Only name, display_name, mission, reflect_directives, disposition and config_overrides are read; other fields must
   // be unset.
   Namespace namespace = 3;
-
-  reserved 100 to 199;
 }
 
 // CreateNamespaceResponse returns the created namespace.
 message CreateNamespaceResponse {
   Namespace namespace = 1;
-
-  reserved 100 to 199;
 }
 
 // GetEffectiveConfigRequest asks for the resolved configuration.
 message GetEffectiveConfigRequest {
   NamespaceRef namespace = 1;
-
-  reserved 100 to 199;
 }
 
 // GetEffectiveConfigResponse returns the merged and the raw configuration.
@@ -168,8 +156,6 @@ message GetEffectiveConfigResponse {
   google.protobuf.Struct effective = 1;
   // Only the namespace's own overrides (Namespace.config_overrides).
   google.protobuf.Struct namespace_overrides = 2;
-
-  reserved 100 to 199;
 }
 
 // GetNamespaceRequest fetches one namespace.
@@ -178,15 +164,11 @@ message GetNamespaceRequest {
   google.protobuf.FieldMask read_mask = 2;
   // Populate `stats` (one extra query on the shard).
   bool include_stats = 3;
-
-  reserved 100 to 199;
 }
 
 // GetNamespaceResponse wraps the namespace.
 message GetNamespaceResponse {
   Namespace namespace = 1;
-
-  reserved 100 to 199;
 }
 
 // ListNamespacesRequest lists a tenant's namespaces, by name.
@@ -198,16 +180,12 @@ message ListNamespacesRequest {
   // Prefix match on `name`.
   string name_prefix = 4;
   google.protobuf.FieldMask read_mask = 5;
-
-  reserved 100 to 199;
 }
 
 // ListNamespacesResponse is a page of namespaces.
 message ListNamespacesResponse {
   repeated Namespace namespaces = 1;
   PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // UpdateNamespaceRequest patches mutable fields.
@@ -222,15 +200,11 @@ message UpdateNamespaceRequest {
   // When set, the update only applies if it equals the current etag (FAILED_PRECONDITION +
   // PreconditionFailed{ETAG_MISMATCH} otherwise).
   string etag = 5;
-
-  reserved 100 to 199;
 }
 
 // UpdateNamespaceResponse returns the updated namespace.
 message UpdateNamespaceResponse {
   Namespace namespace = 1;
-
-  reserved 100 to 199;
 }
 
 // DeleteNamespaceRequest deletes a namespace and all its data.
@@ -240,8 +214,6 @@ message DeleteNamespaceRequest {
   string operation_id = 3;
   // Must equal the namespace `name`; a typed confirmation that guards against deleting the wrong id.
   string confirm_name = 4;
-
-  reserved 100 to 199;
 }
 
 // DeleteNamespaceResponse returns the purge operation.
@@ -252,6 +224,4 @@ message DeleteNamespaceResponse {
   google.protobuf.Timestamp deleted_at = 2;
   // Stated bounds of the asynchronous purge.
   ExpungeSla expunge_sla = 3;
-
-  reserved 100 to 199;
 }

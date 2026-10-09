@@ -9,43 +9,29 @@
 // read by id never differs from the row the event describes, and a fetch that finds no row (a later expunge already
 // ran) is a no-op.
 //
-// The outbox is no longer a replay log: a namespace move reconciles by set difference and never reads it, so there is
-// no event-to-row mapping, no `replay:` annotation and no event for writes that have no other consumer (decisions N124,
-// N128; the N81 events are removed).
+// The outbox is not a replay log: a namespace move reconciles by set difference and never reads it, so there is no
+// event-to-row mapping, no `replay:` annotation and no event for writes that have no other consumer (decisions N124,
+// N128).
 //
 // Bounded size (decision N80):
-//   * every id INSIDE a payload (memory, chunk, entity, observation and page
-//     ids) is a 16-byte `bytes` value, ≈ 18 B encoded instead of ≈ 38 B as text. Client-chosen `document_id` and the
-//     envelope ids (namespace_id, tenant_id, event_id, operation_id) stay strings. Each retyped field got a NEW number
-//     AND a new name with the suffix `_bytes`; the old number and the old name are both reserved, so neither the number
-//     nor the protojson name can be recycled (decision N139, review A-9);
-//   * an event carries at most 256 ids in total across all its lists. A
-//     larger set is paged as consecutive events of the same type written in the SAME transaction, with `page` (0-based)
-//     and `page_count` plus the group key named on each message. A consumer treats a group as complete only when every
-//     page has been seen;
-//   * above 4,096 ids (16 pages) the event is sent ONCE with
-//     `ids_elided = true`, empty id lists and the counts. Consumers then read the ids from the store by `document_id`;
-//   * a delete is an O(1) marker event (`DocumentDeleted`): no id list at all
-//     (decision N115). The async index consumer deletes by the indexed `(namespace_id, document_id)` query, and the
-//     expunge's row purge waits until every registered consumer cursor has passed the tombstone's `event_seq`, the
-//     `seq` of this very event (decisions N119, N139);
-//   * every encoded event is ≤ 16 KiB by construction; the CHECK
-//     `octet_length(payload) <= 16384` on the outbox is only the backstop.
+//   * every id INSIDE a payload (memory, chunk, entity, observation and page ids) is a 16-byte `bytes` value, ≈ 18 B
+//     encoded instead of ≈ 38 B as text. Client-chosen `document_id` and the envelope ids (namespace_id, tenant_id,
+//     event_id, operation_id) stay strings. Id fields carry the suffix `_bytes` (decision N80);
+//   * an event carries at most 256 ids in total across all its lists. A larger set is paged as consecutive events of
+//     the same type written in the SAME transaction, with `page` (0-based) and `page_count` plus the group key named on
+//     each message. A consumer treats a group as complete only when every page has been seen;
+//   * above 4,096 ids (16 pages) the event is sent ONCE with `ids_elided = true`, empty id lists and the counts.
+//     Consumers then read the ids from the store by `document_id`;
+//   * a delete is an O(1) marker event (`DocumentDeleted`): no id list at all (decision N115). The async index consumer
+//     deletes by the indexed `(namespace_id, document_id)` query, and the expunge's row purge waits until every
+//     registered consumer cursor has passed the tombstone's `event_seq`, the `seq` of this very event (decisions N119,
+//     N139);
+//   * every encoded event is ≤ 16 KiB by construction; the CHECK `octet_length(payload) <= 16384` on the outbox is only
+//     the backstop.
 //
-// Versioning and the pre-1.0 breaking-change exception (decision N128, review A-11). `schema_version` in the envelope
-// is 2 for events written by the D22 build; consumers must skip unknown payload variants (proto3 keeps unknown oneof
-// members as unknown fields) and count them in `events_unknown_payload_total`. This package has not shipped v1.0.0, so
-// the round-3 and round-4 redesigns changed it incompatibly. Until v1.0.0, `buf breaking` is baselined on the merge
-// target (`main`) for pull requests and on `main@HEAD~1` only in the push-to-main job, and every intended break carries
-// a labelled exception and a changelog entry (plan section 4.5, decisions N139, N157); the breaks are listed here:
-//   * N80: every id field that changed from `string` to `bytes` got a NEW
-//     field number and (round 4) a new `_bytes` name; the old number and name are `reserved`. A consumer built before
-//     the change therefore ignores the new field instead of decoding a 36-byte ASCII UUID as a 36-byte id;
-//   * the N81 payloads (oneof 40-47) and `RowsPurged` (36) are removed;
-//   * `ChunksRetired` (22) is replaced by `ChunksTombstoned` (49);
-//   * `DocumentDeleted` lost every id list (an O(1) marker, N115) and gained
-//     `up_to_version` (N133c).
-// Removed field numbers are always reserved.
+// `schema_version` in the envelope is 2 for events written by the D22 build; consumers must skip unknown payload
+// variants (proto3 keeps unknown oneof members as unknown fields) and count them in `events_unknown_payload_total`.
+// Pre-1.0 breaking changes are allowed (plan section 4.5).
 syntax = "proto3";
 
 package engram.internal.events.v1;
@@ -53,7 +39,7 @@ package engram.internal.events.v1;
 import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 
-option go_package = "example.com/engram/gen/go/engram/internal/events/v1;eventsv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/engram/internal/events/v1;eventsv1";
 
 // Event is the envelope.
 message Event {
@@ -96,15 +82,6 @@ message Event {
     ChunksTombstoned chunks_tombstoned = 49;
     DocumentTagsUpdated document_tags_updated = 50;
   }
-
-  // Removed in the D22 redesign: 22 `ChunksRetired` (now 49), 36 `RowsPurged` (the expunge no longer needs a
-  // move-replay event), and the N81 events 40-47 `ProposalStored`, `ProposalDiscarded`, `BatchApplied`,
-  // `IdempotencyKeyStored`, `OperationTransitioned`, `BlobTombstoned`, `VersionsFlagged`, `SnapshotsExpired` (decisions
-  // N124, N117).
-  reserved 22, 36, 40 to 47;
-  reserved "chunks_retired", "rows_purged", "proposal_stored", "proposal_discarded", "batch_applied";
-  reserved "idempotency_key_stored", "operation_transitioned", "blob_tombstoned", "versions_flagged";
-  reserved "snapshots_expired";
 }
 
 // DocumentVersionStarted: a new document version row exists (INGESTING).
@@ -135,10 +112,6 @@ message ChunkCommitted {
   // ≤ 256 ids across fact_ids_bytes and entity_ids_bytes per event (N80).
   repeated bytes fact_ids_bytes = 15;
   repeated bytes entity_ids_bytes = 16;
-
-  // Replaced by 14-16 (string → bytes, decisions N80, N139).
-  reserved 3, 5, 6;
-  reserved "chunk_id", "fact_ids", "entity_ids";
 }
 
 // ChunksTombstoned: FinalizeVersion inserted chunk_tombstones (decision N115). The facts of those chunks are hidden
@@ -192,12 +165,6 @@ message DocumentDeleted {
   // The tombstone covers every version of the document up to and including this one; versions above it are live content
   // and must be kept.
   int64 up_to_version = 17;
-
-  // Removed in the D22 redesign (decisions N115, N117, N128): the id lists and counts of the synchronous cascade.
-  reserved 2 to 6, 8 to 15;
-  reserved "fact_ids", "chunk_ids", "observations_marked_stale", "observations_retired", "pages_marked_stale", "page";
-  reserved "page_count", "ids_elided", "fact_count", "chunk_count", "observations_marked_stale_count";
-  reserved "observations_retired_count", "pages_marked_stale_count";
 }
 
 // DocumentTagsUpdated: UpdateDocumentTags changed the filter tags of a document (decision N157, review A-13). A tag
@@ -224,17 +191,11 @@ message FactInvalidated {
   google.protobuf.Timestamp invalidated_at = 2;
   string reason = 3;
   bytes fact_id_bytes = 4;
-
-  reserved 1;
-  reserved "fact_id";
 }
 
 // FactRestored: the `fact_hidden(invalidate)` marker was deleted.
 message FactRestored {
   bytes fact_id_bytes = 2;
-
-  reserved 1;
-  reserved "fact_id";
 }
 
 // ObservationUpserted: a stage-2 consolidation write created a new observation version (decision N121).
@@ -254,9 +215,6 @@ message ObservationUpserted {
   repeated bytes source_fact_ids_bytes = 12;
   // The version's root_version (decision N117): equal to `version` for a root rebuild.
   int64 root_version = 13;
-
-  reserved 1, 3;
-  reserved "observation_id", "source_fact_ids";
 }
 
 // ObservationRetired: a consolidation retire, or the last visible source disappeared.
@@ -264,9 +222,6 @@ message ObservationRetired {
   string op_key = 2;
   bool zero_sources = 3;
   bytes observation_id_bytes = 4;
-
-  reserved 1;
-  reserved "observation_id";
 }
 
 // ObservationsMarkedStale: evidence changed under these observations (`stale_write` from a replace-tombstone or
@@ -280,9 +235,6 @@ message ObservationsMarkedStale {
   int32 observation_count = 6;
   repeated bytes observation_ids_bytes = 7;
   bytes cause_fact_id_bytes = 8;
-
-  reserved 1, 2;
-  reserved "observation_ids", "cause_fact_id";
 }
 
 // EntityUpserted: entity created or canonical name changed (the expunge recomputes it from the remaining mentions,
@@ -292,9 +244,6 @@ message EntityUpserted {
   string type = 3;
   bool created = 4;
   bytes entity_id_bytes = 5;
-
-  reserved 1;
-  reserved "entity_id";
 }
 
 // EntitiesMerged: resolution merged duplicates into `survivor_id_bytes`. Paging group key: survivor_id_bytes.
@@ -305,9 +254,6 @@ message EntitiesMerged {
   int32 merged_count = 6;
   bytes survivor_id_bytes = 7;
   repeated bytes merged_ids_bytes = 8;
-
-  reserved 1, 2;
-  reserved "survivor_id", "merged_ids";
 }
 
 // PageVersionCreated: a refresh wrote a page version.
@@ -318,17 +264,11 @@ message PageVersionCreated {
   bytes page_id_bytes = 5;
   // The version's root_version (decision N117).
   int64 root_version = 6;
-
-  reserved 1;
-  reserved "page_id";
 }
 
 // PageDeleted: the page definition and versions were removed.
 message PageDeleted {
   bytes page_id_bytes = 2;
-
-  reserved 1;
-  reserved "page_id";
 }
 
 // PagesMarkedStale: evidence changed under these pages. Paging group key: (cause fact or document, stale flag pair).
@@ -340,9 +280,6 @@ message PagesMarkedStale {
   bool ids_elided = 6;
   int32 page_id_count = 7;
   repeated bytes page_ids_bytes = 8;
-
-  reserved 1;
-  reserved "page_ids";
 }
 
 // SnapshotCreated: an export finished.

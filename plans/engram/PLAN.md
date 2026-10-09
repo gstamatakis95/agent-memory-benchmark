@@ -120,7 +120,7 @@ Phase 2 exit in week 30, stated in §10).
 ## 1. Architecture overview
 
 All names, numbers and package paths in this section come from the decision register
-(PLAN.md Appendix A, cited as D1…D27 and N1…N188). Assumptions are marked A-n.
+(PLAN.md Appendix A, cited as D1…D27 and N1…N190). Assumptions are marked A-n.
 
 ### 1.1 Thesis, binaries and external infrastructure
 
@@ -841,7 +841,7 @@ writing (A-5).
 ## 2. Module breakdown: the code API
 
 This section presents the Go API as a **small set of interfaces that compose in one obvious way**
-(registers N132, N140, N157). Rules every signature follows: Go 1.25, module `example.com/engram` (D1);
+(registers N132, N140, N157). Rules every signature follows: Go 1.25, module `github.com/gstamatakis95/engram` (D1);
 `context.Context` first and `error` last; optional parameters in `…Options` structs, never in
 variadic option funcs; **one typed id per entity** (`id.FactID`, `id.NamespaceID`, …, never a bare
 `string`); times are UTC `time.Time`; **every interface has at most five methods** (a wider
@@ -1280,7 +1280,8 @@ type NamespaceAdmin interface { // NamespaceService.ListNamespaces / UpdateNames
 // the move ledger: every transition is a CAS on the current state (five methods; the rest is MoveStamps, Replication)
 type Moves interface {
 	// records source_system_id, source_timeline_id, w_est_seconds, window_seconds; window rules and archive health:
-	// PreconditionFailed{MOVE_WINDOW_REQUIRED | MOVE_WINDOW_TOO_SHORT | MOVE_TARGET_ARCHIVE_UNHEALTHY} (N173, N179)
+	// PreconditionFailed{MOVE_WINDOW_REQUIRED | MOVE_WINDOW_TOO_SHORT | MOVE_TARGET_ARCHIVE_UNHEALTHY |
+	// MOVE_TARGET_NOT_HA} (N173, N179, N190)
 	Plan(ctx context.Context, ns id.NamespaceID, target id.ShardID, p PlanParams) (*MoveRow, error)
 	// stamps frozen_at, freeze_deadline = frozen_at + max(1.5 × w_est, w_est + 10 min) capped by window_seconds, and
 	// w_final on planned → frozen
@@ -2421,7 +2422,7 @@ type Readier interface {
 	// under the freeze (maintenance_work_mem = min(2.4 KB × v, 24 GB), shm 32g): request the target's partial indexes for
 	// every table, wait for engram_move_indexes_valid; a failed build retries once
 	BuildIndexes(ctx context.Context, f Fence) (*workflowv1.BuildIndexesReport, error)
-	// pg_switch_wal() → copy_end_lsn; pgbackrest check; shard.Replication.Replayed (vacuous on `single`);
+	// pg_switch_wal() → copy_end_lsn; pgbackrest check; shard.Replication.Replayed (a standby always exists, N190);
 	// MoveStamps.RecordFloor (N179)
 	SealCopy(ctx context.Context, f Fence) (*workflowv1.SealCopyResult, error)
 	// every source outbox consumer cursor past the namespace's final max(seq), bound 120 s
@@ -4443,7 +4444,7 @@ All files live under `plans/engram/proto/` (in the real repository: `proto/`, de
 
 ```
 proto/
-├── buf.yaml                                  # v2 workspace: 2 modules, lint STANDARD, breaking FILE
+├── buf.yaml                                  # v2 workspace: 2 modules, lint STANDARD
 ├── buf.gen.yaml                              # protoc-gen-go, protoc-gen-go-grpc, protoc-gen-connect-go → gen/go
 ├── README.md                                 # file list + CI commands
 ├── memory/v1/{common,errors,operation,memory,document,namespace,export,page}.proto
@@ -4676,7 +4677,7 @@ generated from `internal/errs` (`make gen-docs`): **one gRPC code per detail typ
 | `NamespaceNotReady{namespace_id, retry_after}` (+ `RetryInfo`) | `UNAVAILABLE` | The target shard of a move is `ready` but not yet `active` (cutover sub-steps (b′) to (b″), well under a second, N125). The API retries inside its bounded loop first. | Retry after `retry_after`. |
 | `OperationConflict{operation_id, existing_operation_id, reason}` | `ABORTED` | A concurrent operation owns the state: page already refreshing, snapshot already running, or `NAMESPACE_BUSY` (a delete, or a move before activation, is in progress; `DeleteNamespace` during a move carries `RetryInfo{30 s}`, N177). | `WaitOperation(existing_operation_id)` then resubmit. |
 | `OperationConflict{reason: IDEMPOTENCY_KEY_REUSED}` | `ALREADY_EXISTS` | `request_id`/`operation_id` reused with a different request hash; namespace/page `name` already taken. | Use a fresh id; the stored one is bound to a different request. |
-| `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation (`OPERATION_TERMINAL`) or on a `DELETE_*` operation (`OPERATION_NOT_CANCELLABLE`, N136), etag mismatch, `Invalidate` on a non-fact id (a second `Invalidate` of the same fact succeeds, not an error, and changes no visibility, but still writes its own `deletion_log` row and intent, N139, N143), `Restore` of a fact whose subject has no `invalidate` marker (`NOT_INVALIDATED`), `StartMove` without the operator window the estimate needs (`PreconditionFailed{type: MOVE_WINDOW_REQUIRED}`) or with one below `max(1.5 × W_est, W_est + 10 min)` or above 8 h (`MOVE_WINDOW_TOO_SHORT`, N173; `MOVE_TOO_LARGE` is unused) `StartMove` onto a target with an unhealthy archive (`MOVE_TARGET_ARCHIVE_UNHEALTHY`, N179), `RollbackMove` after (a″) (`MOVE_PAST_COMMIT`, N184), namespace `DELETING` (the delete freeze included), tenant `DELETING` (`TENANT_DELETING`), snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
+| `PreconditionFailed{violations[]}` | `FAILED_PRECONDITION` | Cancel on a terminal operation (`OPERATION_TERMINAL`) or on a `DELETE_*` operation (`OPERATION_NOT_CANCELLABLE`, N136), etag mismatch, `Invalidate` on a non-fact id (a second `Invalidate` of the same fact succeeds, not an error, and changes no visibility, but still writes its own `deletion_log` row and intent, N139, N143), `Restore` of a fact whose subject has no `invalidate` marker (`NOT_INVALIDATED`), `StartMove` without the operator window the estimate needs (`PreconditionFailed{type: MOVE_WINDOW_REQUIRED}`) or with one below `max(1.5 × W_est, W_est + 10 min)` or above 8 h (`MOVE_WINDOW_TOO_SHORT`, N173; `MOVE_TOO_LARGE` is unused) `StartMove` onto a target with an unhealthy archive (`MOVE_TARGET_ARCHIVE_UNHEALTHY`, N179) or onto a `single`-profile target with no standby (`MOVE_TARGET_NOT_HA`, N190), `RollbackMove` after (a″) (`MOVE_PAST_COMMIT`, N184), namespace `DELETING` (the delete freeze included), tenant `DELETING` (`TENANT_DELETING`), snapshot base version pruned, `StreamSnapshot` of a version a delete expired (`SNAPSHOT_EXPIRED`, N126), `GetPage` of a version a delete or invalidation hides until the refresh lands (`PAGE_HIDDEN`, N117). | Read the current state, decide, resubmit. Do not blind-retry. |
 | — | `UNAUTHENTICATED` | Missing/invalid/expired JWT. | Refresh the token. |
 | — | `PERMISSION_DENIED` | Scope or allowlist (4.1.1). | Obtain a broader token. |
 | — (+ `RetryInfo{2 s}`) | `UNAVAILABLE` | Catalog **miss** while the catalog is down (D4 as amended: cached entries of existing namespaces are served indefinitely, only misses fail), shard `READONLY`/`RETIRED` or marked unavailable by the schema-version guard (N22), pgbouncer pool exhausted. | Retry with jittered backoff; idempotent by construction. |
@@ -4776,11 +4777,8 @@ resource carries `created_at`/`updated_at` with the same field numbers.
 //
 // Field-numbering policy (applies to every file in this package):
 //   * numbers 1-15 are for hot fields (1-byte tags);
-//   * numbers 100-199 are reserved in every top-level request/response and
-//     resource message: upstream never assigns them, so downstream forks can add private fields there without ever
-//     colliding with a future release;
-//   * removed fields are never renumbered; they become `reserved N` +
-//     `reserved "name"` with a comment saying which release removed them.
+//   * pre-1.0 breaking changes are allowed (plan section 4.5): a removed field is simply deleted, and the numbers of
+//     existing fields are never changed.
 //
 // Timestamp vocabulary (decision D9, review F-2):
 //   * `mentioned_at` = the RetainItem `timestamp`, set by the server on every
@@ -4797,7 +4795,7 @@ package memory.v1;
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // RequestMeta carries per-call metadata that must travel in the body (not in gRPC metadata) so it is part of the
 // idempotency hash and of the audit log.
@@ -4927,11 +4925,6 @@ message TagFilter {
   // Query tag set Q. 1-32 tags, each 1-64 bytes, matched byte-for-byte after trimming; duplicates are removed before
   // evaluation. Required (non-empty) for every mode other than UNSPECIFIED.
   repeated string tags = 2;
-
-  // Removed in v1.0.0-rc4: `bool include_untagged = 3`. The ANY/ALL vs ANY_STRICT/ALL_STRICT split expresses
-  // untagged-item handling per mode.
-  reserved 3;
-  reserved "include_untagged";
 }
 
 // Provenance says where a memory came from. Every fact, observation source and chunk resolves to a document version and
@@ -5053,7 +5046,7 @@ message MetadataFilter {
 
 #### `memory/v1/errors.proto`
 
-The public typed details of 4.1.6 and their enums (`ResourceKind`, `NamespaceState`, `QuotaScope`, `FreezeReason`, `OperationConflictReason`). `NamespaceState` is defined here because `WrongShardOrEpoch` needs it and `errors.proto` must not import service files. The write-path and routing details (`MovedOutHint`, `FenceBusy`, `DocumentBusy`, `InputBlobMissing`) live in `engram/internal/errors/v1/errors.proto` (N128): a public message can never be removed once `v1.0.0` ships, and "stripped before leaving the API" is a runtime discipline, not a contract. `FREEZE_REASON_DELETE` is deprecated and never emitted (the delete freeze is `PreconditionFailed{NAMESPACE_DELETING}`, N139); `FREEZE_REASON_FENCE_BUSY` and `WrongShardOrEpoch` fields 5 and 6 are reserved. Full file under `plans/engram/proto/memory/v1/errors.proto`.
+The public typed details of 4.1.6 and their enums (`ResourceKind`, `NamespaceState`, `QuotaScope`, `FreezeReason`, `OperationConflictReason`). `NamespaceState` is defined here because `WrongShardOrEpoch` needs it and `errors.proto` must not import service files. The write-path and routing details (`MovedOutHint`, `FenceBusy`, `DocumentBusy`, `InputBlobMissing`) live in `engram/internal/errors/v1/errors.proto` (N128): a public message can never be removed once `v1.0.0` ships, and "stripped before leaving the API" is a runtime discipline, not a contract. `FREEZE_REASON_DELETE` is deprecated and never emitted (the delete freeze is `PreconditionFailed{NAMESPACE_DELETING}`, N139). Full file under `plans/engram/proto/memory/v1/errors.proto`.
 
 #### `memory/v1/operation.proto`
 
@@ -5070,8 +5063,8 @@ version finalised first, so the read barrier reads "after `SUCCEEDED`, Recall ob
 that version **unless `superseded_by` is set**"; a retain that races a delete ends `CANCELLED` with
 `CANCEL_REASON_DOCUMENT_DELETED`; `OPERATION_KIND_DELETE_TENANT` (derived from the catalog's tenant
 row, read through the tenant-scoped `memory.admin.v1.TenantService.GetTenantOperation`) can be
-awaited; `MOVE_NAMESPACE` left the public enum (number 7 reserved) because a move is the catalog's
-`namespace_moves` row, not an operation.
+awaited; a move is the catalog's `namespace_moves` row, not an operation, so the public enum has no
+`MOVE_NAMESPACE`.
 
 **The operation contract per kind (N136, N157).** Retain and export are backed by their own
 workflow at `ns/{namespace_id}/op/{operation_id}`; `DELETE_DOCUMENT` is the per-namespace expunge
@@ -5117,7 +5110,7 @@ return paths are unambiguous. Full file under `plans/engram/proto/memory/v1/oper
   `chunk`) are sub-messages that are simply unset for the other kinds. Facts' 5W slots are flat
   strings because they are display/explain data, not structured queries.
 - **`mentioned_at` is server-set, `said_at` is the model's (D9, review F-2).** `RetainItem.mentioned_at`
-  (field 9) is removed and reserved: a per-item override let a client backdate the `as_of` key,
+  does not exist: a per-item override would let a client backdate the `as_of` key,
   and the extractor's "earlier if the chunk quotes older material" rule did the same, so
   "leak-free" depended on a client and an LLM. Every fact and chunk now carries
   `mentioned_at = RetainItem.timestamp` exactly; the quoted-older-date judgement lands in
@@ -5193,7 +5186,7 @@ import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 import "memory/v1/operation.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // MemoryService is the primary data-plane service. Every method requires a deadline, an `authorization: Bearer <jwt>`
 // metadata entry whose `tenant_id` claim equals `namespace.tenant_id` and whose `ns` allowlist contains
@@ -5296,12 +5289,6 @@ message RetainItem {
   UpdateMode update_mode = 8;
   // MIME-ish content type: "text/plain" (default) or "text/markdown" (enables heading-anchored chunking).
   string content_type = 10;
-
-  // Removed in v1.0.0-rc5 (review F-2, decision D9): `google.protobuf.Timestamp mentioned_at = 9`, a per-item override
-  // of the `as_of` key. A backdated key made "leak-free" depend on the client and the extractor. `mentioned_at` is now
-  // server-set = `timestamp`; a quoted older date lands in Memory.said_at.
-  reserved 9;
-  reserved "mentioned_at";
 }
 
 // RetainRequest submits items. Limits: ≤ 100 items, ≤ 8 MiB total content.
@@ -5316,13 +5303,6 @@ message RetainRequest {
   // normalised protojson of the request, N72) returns the existing operations; with a different hash fails with
   // ALREADY_EXISTS.
   string operation_id = 4;
-
-  // Removed in v1.0.0-rc2: `bool wait_for_visibility = 5` (synchronous retain). Replaced by
-  // OperationService.WaitOperation so that the API never holds a request open for the duration of an LLM pipeline.
-  reserved 5;
-  reserved "wait_for_visibility";
-
-  reserved 100 to 199;
 }
 
 // RetainResponse acknowledges durable acceptance: one Operation per distinct document_id, in order of first appearance
@@ -5332,8 +5312,6 @@ message RetainResponse {
   // Ids of documents that were minted because the item had no document_id, aligned with `operations` (deterministic
   // when operation_id was given, decision N127).
   repeated string document_ids = 2;
-
-  reserved 100 to 199;
 }
 
 // RecallRequest describes a retrieval.
@@ -5395,13 +5373,6 @@ message RecallRequest {
   // result when the observation fits (Hindsight `prefer_observations`). Page refresh (section 5.3) sets it; default
   // false.
   bool prefer_observations = 18;
-
-  // Removed in v1.0.0-rc3: `float min_score = 17`. A raw score threshold is not comparable across arms and rerankers;
-  // budgets and max_results are the supported knobs.
-  reserved 17;
-  reserved "min_score";
-
-  reserved 100 to 199;
 }
 
 // RecallResponse is one stream message: either a ranked result or the single trailing stats message. Clients must
@@ -5411,8 +5382,6 @@ message RecallResponse {
     RecallResult result = 1;
     RecallStats stats = 2;
   }
-
-  reserved 100 to 199;
 }
 
 // RecallResult is one packed result in rank order.
@@ -5556,8 +5525,6 @@ message Memory {
   // forwards older material). Display and ranking only — never an as_of key (decision D9, review F-2). Unset when the
   // extractor gave no explicit date.
   google.protobuf.Timestamp said_at = 22;
-
-  reserved 100 to 199;
 }
 
 // GetMemoryRequest fetches one memory by id.
@@ -5568,15 +5535,11 @@ message GetMemoryRequest {
   google.protobuf.FieldMask read_mask = 3;
   // Observations: also list source facts that are invalidated (never tombstoned or purged ones; those are gone).
   bool include_hidden_sources = 4;
-
-  reserved 100 to 199;
 }
 
 // GetMemoryResponse wraps the memory.
 message GetMemoryResponse {
   Memory memory = 1;
-
-  reserved 100 to 199;
 }
 
 // ListMemoriesOrder selects the sort order of ListMemories.
@@ -5612,16 +5575,12 @@ message ListMemoriesRequest {
   ListMemoriesOrder order = 12;
   google.protobuf.FieldMask read_mask = 13;
   repeated MetadataFilter metadata_filters = 14;
-
-  reserved 100 to 199;
 }
 
 // ListMemoriesResponse is a page of memories.
 message ListMemoriesResponse {
   repeated Memory memories = 1;
   PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // BatchGetMemoriesRequest fetches up to 100 ids.
@@ -5629,16 +5588,12 @@ message BatchGetMemoriesRequest {
   NamespaceRef namespace = 1;
   repeated string memory_ids = 2;
   google.protobuf.FieldMask read_mask = 3;
-
-  reserved 100 to 199;
 }
 
 // BatchGetMemoriesResponse returns found memories in request order and the ids that were not found (no error).
 message BatchGetMemoriesResponse {
   repeated Memory memories = 1;
   repeated string missing_ids = 2;
-
-  reserved 100 to 199;
 }
 
 // InvalidateRequest soft-hides a fact.
@@ -5651,15 +5606,11 @@ message InvalidateRequest {
   string memory_id = 3;
   // Free-text audit reason, ≤ 1 KiB.
   string reason = 4;
-
-  reserved 100 to 199;
 }
 
 // InvalidateResponse returns the updated fact.
 message InvalidateResponse {
   Memory memory = 1;
-
-  reserved 100 to 199;
 }
 
 // RestoreRequest clears a soft invalidation.
@@ -5667,15 +5618,11 @@ message RestoreRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   string memory_id = 3;
-
-  reserved 100 to 199;
 }
 
 // RestoreResponse returns the restored fact.
 message RestoreResponse {
   Memory memory = 1;
-
-  reserved 100 to 199;
 }
 
 // ReflectRequest asks for a reasoned answer.
@@ -5702,8 +5649,6 @@ message ReflectRequest {
   string context = 11;
   // Overrides the namespace mission for this call only, ≤ 4 KiB.
   string mission_override = 12;
-
-  reserved 100 to 199;
 }
 
 // ReflectResponse is one event of the Reflect stream. Order: zero or more
@@ -5718,8 +5663,6 @@ message ReflectResponse {
     ReflectAnswer answer = 5;
     ReflectStats stats = 6;
   }
-
-  reserved 100 to 199;
 }
 
 // TokenDelta is a piece of generated text in emission order.
@@ -5841,8 +5784,7 @@ up_to_version` of a pending tombstone), so a revived document never lists its de
 versions through `GetDocument(include_versions)`; a tombstone view never matches a non-empty tag
 or metadata filter (A-14). `DocumentState` and the SQL `document_state` are generated from one
 table: `deleted` is not exposed and `INGESTING` is `active` with `current_version = 0`. Nothing is counted, walked or stamped, so `DeleteDocumentResponse`
-carries `deleted_at` and `expunge_sla` instead of the old `facts_retired`,
-`observations_marked_stale` and `pages_marked_stale` (fields 2 to 4 reserved). **The asynchronous
+carries `deleted_at` and `expunge_sla`, no counts. **The asynchronous
 half is the throttled per-namespace `Expunge` workflow** (N119) that the returned `Operation` (kind
 `DELETE_DOCUMENT`, not cancellable) tracks: materialize (≤ 15 min), purge rows and blobs (≤ 24 h),
 derived versions reduced to content-free stubs, index rebuilt (≤ 48 h); Recall SLOs may degrade
@@ -5866,8 +5808,8 @@ the shard and sets the catalog state `deleting` (the marker), then writes the in
 after the commit) and acks: from then on reads and writes are rejected as
 `PreconditionFailed{NAMESPACE_DELETING}`; the expunge is `DROP INDEX` by deterministic names,
 batched `DELETE` and the blob prefix, with no graph repair (N112). Deadline cap 40 s. `Disposition{skepticism, literalism, empathy}` ∈ 1..5, 0 = inherit.
-`reflect_directives` are typed `Directive{text, priority, active, tags}` (N129); the plain-string
-`directives` (6) is reserved. The `config_overrides` key list in the proto comment is generated
+`reflect_directives` are typed `Directive{text, priority, active, tags}` (N129); there is
+no plain-string `directives` field. The `config_overrides` key list in the proto comment is generated
 from the same Go table as the server's allow-list (N66, M0.8 check).
 
 **Shard and epoch are both hidden** from the public `Namespace`. Clients address
@@ -5992,8 +5934,7 @@ heartbeat of the copy from the static source), `VerifyFrozenReport` (count and p
 complete copy, per PK range, `VerifyFK`, blobs; one re-copy of mismatching tables, N160, N175), `SealCopyResult` (`copy_end_lsn`, `copy_end_timeline`, `archived_at`, `standby_replayed_at`, N179), `BuildIndexesReport` (the target's
 partial indexes valid before cutover, built under the freeze), `MoveCheckpoint` (`w_final` for the one sequence
 advance, `freeze_deadline`, source `system_identifier` and `timeline_id`, `CutoverStep` including
-`CATALOG_COMMIT`, the report of each phase; the field is `cutover_sub_step`), `MoveResult`. The pre-1.0 breaks of this
-file are listed in its header and in 4.5. Full file under `plans/engram/proto/engram/internal/workflow/v1/workflow.proto`.
+`CATALOG_COMMIT`, the report of each phase; the field is `cutover_sub_step`), `MoveResult`. Full file under `plans/engram/proto/engram/internal/workflow/v1/workflow.proto`.
 
 #### `engram/internal/errors/v1/errors.proto`
 
@@ -6012,13 +5953,11 @@ schema_version (2), event_id, operation_id, shard_id, oneof payload}`. Payloads:
 purge; the `seq` of the first is the tombstone's `event_seq`, which the purge waits for), `FactInvalidated`, `FactRestored`, `ObservationUpserted`, `ObservationRetired`,
 `ObservationsMarkedStale`, `EntityUpserted`, `EntitiesMerged`, `PageVersionCreated`, `PageDeleted`,
 `PagesMarkedStale`, `SnapshotCreated`, `TokenUsageRecorded`, `NamespaceDeleted`,
-`NamespacePurged`, `RestoreMarker`, `DocumentTagsUpdated` (N157). The N81 events (oneof 40–47) and `RowsPurged` are removed
-(reserved): a namespace move reconciles by set difference and never reads the outbox, so there is
+`NamespacePurged`, `RestoreMarker`, `DocumentTagsUpdated` (N157). There are no N81 events or `RowsPurged`:
+a namespace move reconciles by set difference and never reads the outbox, so there is
 no event-to-row replay mapping, no `replay:` annotation and no "covering event" CI rule. Events
-stay **thin and bounded** (N80): ids inside a payload are 16-byte `bytes` on **new field numbers
-and new `*_bytes` names** (the old `string` numbers and names are reserved, so a consumer built
-before the change ignores them instead of decoding a 36-byte UUID string as an id, and the protojson
-name is never recycled, N139), an event carries at most 256 ids, larger sets are
+stay **thin and bounded** (N80): ids inside a payload are 16-byte `bytes` fields with
+`*_bytes` names (N139), an event carries at most 256 ids, larger sets are
 paged with `page`/`page_count`, and above 4,096 ids one event carries `ids_elided = true` and
 counts only; `DocumentDeleted` has no id list at all and consumers delete by the indexed
 `(namespace_id, document_id)` query. Every encoded event is ≤ 16 KiB by construction. Rejected:
@@ -6067,7 +6006,7 @@ bytes after trimming; `mode = UNSPECIFIED` with a non-empty `tags` list is `INVA
 (`INCONSISTENT`) rather than "no filter", because a client that set tags and forgot the mode
 would otherwise silently get the whole namespace back. Rejected alternative: `include_untagged`
 as a separate boolean — it doubled the mode count for no expressive gain once the `_STRICT`
-variants exist (the field number 3 is reserved in `TagFilter` with the removal note).
+variants exist (`TagFilter` has no such field).
 
 Hindsight compatibility: the five names and predicates match Hindsight's `tag_match` so that the
 side-by-side evaluation (section 8) sends identical filters to both systems.
@@ -6087,7 +6026,7 @@ may be combined.
 
 Definitions (D9 as amended, review F-2): a fact's `mentioned_at` is **the item's `timestamp`, set
 by the server** — the time the system learned the content — and it is the only `as_of` key; it
-cannot be overridden per item (the former `RetainItem.mentioned_at` is reserved) and the
+cannot be overridden per item (`RetainItem` has no `mentioned_at` field) and the
 extractor cannot move it. The model's judgement of when the source *said* it (a day-30 session
 quoting "on day 3 Alice wrote …") is `said_at`, used for display and the temporal/recency ranking
 only — never for visibility, because a leak-free cut-off must not depend on an LLM or a client.
@@ -6176,26 +6115,13 @@ Edge rules:
 
 ### 4.5 Evolution policy
 
-**Tooling.** `buf breaking` runs on every pull request with the `FILE` category — the strictest:
-besides wire and JSON compatibility it forbids moving a definition between files and changing
-`go_package`, because both break generated Go import paths for every consumer. A failure blocks
-the merge; there is no `--exclude` override in CI. **The baseline is stated as what is true
-(N139, N157, N167).** No release tag exists before `v1.0.0`, so until then a **pull request is compared
-with the merge target** (from the repository root: `buf breaking plans/engram/proto --against
-'.git#branch=main,subdir=plans/engram/proto'`; in the real repository the module path is `proto`),
-so a break against main's latest commit is reported and a labelled break already on main is not
-reported again by every open PR. **Bootstrap rule:** `buf breaking` fails ("had no .proto files") when the
-baseline subdirectory does not exist on the merge target, which is the case for the pull request that first
-introduces `proto/` and for every plan pull request while `main` has no `plans/engram/`; the job therefore first
-runs `git cat-file -e origin/main:plans/engram/proto/buf.yaml`, and when that fails it runs lint, build and format
-only and records "no baseline" in the job summary. Plan pull requests compare against the plan branch's merge
-base (`--against ".git#ref=$(git merge-base origin/claude/engram-implementation-plan HEAD),subdir=plans/engram/proto"`);
-the commands are in `proto/README.md`. `main@HEAD~1` (`ref=HEAD~1`) is used **only by the push-to-main
-job**. Every intended break needs a `buf-breaking-exception` label on the pull request and an entry
-in the changelog table below. From `v1.0.0` on the baseline is the latest release tag
-(`.git#tag=proto/v1.0.0,…`), so the gate compares against what clients actually run.
+**Tooling.** `buf lint`, `buf build` and `buf format -d --exit-code` gate CI; `buf breaking` is not run
+before `v1.0.0` (N190). The protos are pre-1.0: a breaking change is allowed, a removed or renamed field is
+simply deleted or renamed and is **not** reserved, and the numbers of existing fields are kept as they are.
+From `v1.0.0` on the baseline is the latest release tag (`.git#tag=proto/v1.0.0,…`), `buf breaking` with the
+`FILE` category gates the merge, and the rules below apply.
 
-**What counts as breaking** (and is therefore forbidden within `memory.v1`):
+**What counts as breaking** (and is therefore forbidden within `memory.v1` from `v1.0.0` on):
 
 | Change | Breaking? | Rule |
 |---|---|---|
@@ -6203,7 +6129,6 @@ in the changelog table below. From `v1.0.0` on the baseline is the latest releas
 | Change a field's number, type, cardinality (`optional`/`repeated`), `json_name`, or move it in/out of a `oneof` | yes | Add a new field, deprecate the old one. |
 | Change an RPC's request/response type or streaming kind | yes | Add a new RPC (`RecallV2` is not a name we will ever use — add a field to `RecallRequest` instead; if a new shape is unavoidable it goes to `memory.v2`). |
 | Change `package` or `go_package` | yes | Never. |
-| Delete a `reserved` range or name | yes (FILE) | Reservations are permanent. |
 | Change an enum's zero value | yes | Never. |
 | Add a field, message, enum value, RPC, service, `oneof` member | **no** | Allowed in any minor release; new request fields must have a server-side default that reproduces the previous behaviour. |
 | Add `[deprecated = true]` or change a comment | no | — |
@@ -6215,53 +6140,8 @@ and add a comment `// Deprecated since v1.4: use X.` in the same release that sh
 replacement; (2) keep serving it — identical behaviour — for **at least two minor releases**
 (≈ 2 quarters at the planned cadence); (3) removal happens **only in a new major package**
 (`memory.v2`), served side by side with `memory.v1` for at least two minor releases, with the
-`v1` handler delegating to the `v2` implementation. Nothing is ever removed from `memory.v1`
-itself. Before `v1.0.0` ships a break is still possible, but only through the labelled exception
-procedure above; the `reserved` entries in the files (`RetainRequest.wait_for_visibility = 5`,
-`RecallRequest.min_score = 17`, `TagFilter.include_untagged = 3`, `RetainItem.mentioned_at = 9`)
-are the permanent record of those removals.
-
-**Pre-1.0 exceptions (N128, N139; reviews A-9, A-11, A-12, A-13).** Nothing has shipped at
-`v1.0.0`, so the D22 and D23 redesigns changed the contract incompatibly where the old shape
-encoded withdrawn machinery. The breaks are intended, listed here as the changelog the exception
-procedure requires, and every removed number or name is `reserved`. The gate's baseline moved past
-the round-3 rows when they were committed, so this table, not the tool, is their record:
-
-| Round | Module | Break | Why |
-|---|---|---|---|
-| 3 | `memory.v1` | `DeleteDocumentResponse` fields 2 to 4 (cascade counts) reserved; `deleted_at` and `expunge_sla` added | The delete is an O(1) marker; nothing is counted at delete time (N115). |
-| 3 | `memory.v1` | `OperationKind` 7 (`MOVE_NAMESPACE`) reserved; `DELETE_TENANT` (8), `Operation.cancel_reason` (14), `OperationResult.superseded_by` (10) added | A move is not an operation; tenant deletes and superseded retains were inexpressible (N127). |
-| 3 | `memory.v1` | `Namespace.directives` (6) reserved, `reflect_directives` (13) added; `GetEffectiveConfig` added | Typed directives (N129). |
-| 3 | `memory.v1` | `DocumentBusy`, `InputBlobMissing`, `FREEZE_REASON_FENCE_BUSY` (4) and `WrongShardOrEpoch` fields 5 and 6 left the package | Internal details move to `engram.internal.errors.v1` (N128). |
-| 3 | `memory.v1` | `OperationConflictReason` 2 (`DOCUMENT_PURGING`) reserved | A deleted `document_id` can be retained again at once (N133c). |
-| 3 | `memory.admin.v1` | `MoveState.CATCHING_UP` (3), `MoveProgress` 4 to 7 and `Move.operation_id` (13) reserved; `RECONCILING`, `CutoverStep`, `GetTenantOperation` added | Replay machinery withdrawn (N124, N127). |
-| 3 | `internal.events` | Every `string → bytes` id field moved to a new number (old number reserved); `DocumentDeleted` lost its id lists; `ChunksRetired` and `RowsPurged` and oneof 40 to 47 removed; `schema_version` 2 | N80 retype done safely; N81 events withdrawn (N124). |
-| 3 | `internal.workflow` | Lineage consolidation messages replaced by the two-stage shapes; `Purge*` replaced by `Expunge*`; `ExportInput` lost the outbox cut; `MoveCheckpoint`/`MoveResult` lost the replay floor; `item_index` (9) stays reserved; `schema_version` 2 | N121, N119, N126, N124. |
-| 4 | `internal.events` | The retyped `bytes` fields are renamed `*_bytes` and their old names reserved: `ChunkCommitted` 14 to 16, `FactInvalidated` 4, `FactRestored` 2, `ObservationUpserted` 11 and 12, `ObservationRetired` 4, `ObservationsMarkedStale` 7 and 8, `EntityUpserted` 5, `EntitiesMerged` 7 and 8, `PageVersionCreated` 5, `PageDeleted` 2, `PagesMarkedStale` 8 | The old JSON names stayed in use with a new type, which changes what a protojson consumer decodes (A-9). |
-| 4 | `internal.workflow` | `ExpungeInput.batch_pause` (7) reserved, `wal_mb_per_s` (10) added | The purge is paced by the WAL it writes, not by a fixed pause (N119). |
-| 5 | `memory.v1` | `SnapshotManifest.expired_at` (16) renamed `expires_at` (same number; the old name is reserved) | The manifest field has the DDL column `export_snapshots.expires_at` as its source (N157, A-10). |
-| 6 | `memory.admin.v1` | `MoveState.COPYING` (2) and `RECONCILING` (9) reserved, `COPIED` (11) added; `MoveProgress` 10 to 15 reserved (`copy_started_at`, `rows_recopied`, `mutable_rows_reconciled`, `blobs_reconciled`, `freeze_watchdog`, `rows_catchup_copied`), `rows_estimated` and `verify_attempts` added; `Move` 18 to 20 reserved (`reconciled_in_at`, `cleanup_reconciled_at`, `target_content_checked_at`), `window_estimate`, `window`, `freeze_deadline` and `activated_at` added; `CleanupMoveRequest.skip_grace` (3) reserved; `StartMoveRequest` gains `window`, `freeze_not_before`, `estimate_only` | The move is freeze-then-copy: no dirty copy, no reconcile, no `ReconcileIn`, no content gate (N160, N161). |
-| 6 | `memory.admin.v1` | `UpdateTenantRequest.update_mask` is limited to `display_name` and `config` (a semantic tightening, pre-1.0); `UpdateTenantLimits` added | One scope per method, so the interceptor stays the only enforcement point (N167, A-6). |
-| 6 | `internal.workflow` | `PreVerifyReport`, `AwaitIndexesReport`, `ReconcileReport` and `ReconcileInReport` deleted, `VerifyFrozenReport` and `BuildIndexesReport` added; `MoveInput.freeze_watchdog` (12) reserved; `MoveCheckpoint` 10, 14, 15, 16, 18 and 19 reserved; `MoveResult.rows_recopied` (6) reserved | The withdrawn machinery has no payload (N160). |
-| 7 | `memory.admin.v1` | `Move.target_backup_at` (17) and `target_backup_started_at` (25) renamed (same numbers; old names reserved); `source_blobs_gc_after` (16, derived as `finished_at + 28 d`) and `rerun_count` (26) reserved | The re-run is deleted (N169, N170); the renames were never in a tagged tree. |
-| 7 | `internal.workflow` | `MoveInput.rerun_attempt` (16) reserved | The re-run is deleted (N169). |
-| 7 | `internal.events` | `DocumentDeleted` reserves the names of fields 2 to 6 and 8 to 15 | protojson names could still be recycled (N177). |
-| 8 | `memory.admin.v1` | `Move` 17, 25 (`move_backup_at`, `move_backup_started_at`; second removal of these numbers, pre-1.0) and 11 (`cutover_at`) reserved; `copy_end_lsn`, `copy_end_timeline`, `copy_sealed_at`, `committed_replicated_at`, `rolled_back_replicated_at`, `finished_at`, `reconciled_at`, `lost_at`, `lost_restore_id`, `recovered_from_move_id` and `MOVE_STATE_LOST` added | The seal's WAL floor; a lost move-in is terminal (N179, N183, N184). |
-| 8 | `internal.workflow` | `MoveBackupResult` replaced by `SealCopyResult` (name not reused); `MoveCheckpoint` 13 renamed `cutover_sub_step`, `cutover_step` reserved with 9 | N179, N187. |
-| 8 | `memory.v1` | `Operation.acknowledged_at` (15) added; `request_id` required on the replicated-ack methods | N182, N184. |
-
-Every removed field number and name is `reserved`. CI runs `buf breaking --config WIRE_JSON` against the merge base, non-gating,
-with the generated ignore list of this table's renames (N177, N187).
-
-The `string → bytes` retype of event ids is the one case where the earlier edit was *silently*
-unsafe (the same number decoded a 36-byte ASCII UUID as a 16-byte id); it is therefore done with
-new numbers and, since round 4, new names, not in place.
-
-**Reserved numbers.** Every top-level request/response and resource message carries
-`reserved 100 to 199;` — upstream never assigns those numbers, so a downstream fork (an enterprise
-build, a research branch) can add private fields there and still merge upstream releases without
-renumbering. Removed fields are always both `reserved N;` and `reserved "name";` with a comment
-naming the release and the reason, so that neither the number nor the JSON name can be recycled.
+`v1` handler delegating to the `v2` implementation. Once `v1.0.0` ships, nothing is ever removed from `memory.v1`
+itself. Before `v1.0.0` ships, breaking changes are allowed (N190) and removed fields are not reserved.
 
 **Enum growth.** Enums are append-only; the zero value is `*_UNSPECIFIED` and never changes
 meaning. Clients must treat unknown values as `UNSPECIFIED` (proto3 open enums make this
@@ -6300,8 +6180,8 @@ makes natural).
   unknown field), advance their cursor, and increment `events_unknown_payload_total`; they must
   never fail the relay on it. New payload variants are therefore additive and safe; no consumer
   needs every variant any more, since the move replayer is gone.
-- The internal module follows the same `buf breaking FILE` gate as the public one, even though it
-  is never served: a running Temporal history *is* a wire client that cannot be upgraded.
+- From `v1.0.0` on the internal module follows the same `buf breaking FILE` gate as the public one, even
+  though it is never served: a running Temporal history *is* a wire client that cannot be upgraded.
 
 **Release mechanics.** `memory.v1` is frozen-compatible from `v1.0.0`; the proto module version
 and the Go module version move together (`proto/v1.3.0` git tag = `buf push --label v1.3.0` =
@@ -8261,7 +8141,9 @@ restarted workflow runs there, hence the target queue.
    `build(v) = v / 3,000` per s in memory plus 3 ms per vector beyond it: **≈ 27 min per 1 M live
    facts** (M1.5 measures `R_archive` and `R_redo`). `Plan` refuses a target with no completed
    backup or an unhealthy archiver (`last_failed_wal` not older than `last_archived_wal`, or lag
-   ≥ 60 s): `PreconditionFailed{MOVE_TARGET_ARCHIVE_UNHEALTHY}`. Unattended starts need `W_est ≤ 10 min` (≈ 350 k facts); above that
+   ≥ 60 s): `PreconditionFailed{MOVE_TARGET_ARCHIVE_UNHEALTHY}`. `Plan` also refuses a target that has no streaming
+   standby (no row in the target's `pg_stat_replication`, i.e. the `single` profile): `PreconditionFailed{MOVE_TARGET_NOT_HA}`
+   (N190), so step 7's standby-replay check is never vacuous. Unattended starts need `W_est ≤ 10 min` (≈ 350 k facts); above that
    `StartMove` requires an operator `window ≥ max(1.5 × W_est, W_est + 10 min)` (cap 8 h, default
    4 h; `MOVE_WINDOW_REQUIRED`, `MOVE_WINDOW_TOO_SHORT`); `freeze_not_before` schedules it. **Blob
    pre-warm**, the only work before the freeze: the namespace's owner-keyed blobs (`ver/`,
@@ -8319,7 +8201,7 @@ restarted workflow runs there, hence the target queue.
    committed: (i) `pg_switch_wal()` as `engram_move` gives `copy_end_lsn` (and `copy_end_timeline`); (ii)
    `pgbackrest check` confirms the segment archived (`last_archived_wal ≥ segment(copy_end_lsn)`, no
    newer `last_failed_wal`); (iii) `engram_standby_replayed(copy_end_lsn)` is true for the streaming
-   standby, polled 10 s per attempt (vacuous on `single`); (iv) `MoveStamps.RecordFloor` stores
+   standby, polled 10 s per attempt (`Plan` guarantees one: `MOVE_TARGET_NOT_HA`, N190); (iv) `MoveStamps.RecordFloor` stores
    `copy_end_lsn`, `copy_end_timeline`, `copy_sealed_at` (schema CHECKs refuse `cutover` without them).
    The copy is static after (i), so a retained base backup plus the archive through `copy_end_lsn`
    reproduces it: that LSN is the **floor** of every restore and failover of the target. `AwaitConsumers` waits until every source outbox consumer cursor
@@ -10323,7 +10205,7 @@ Every test name is defined once, here; `make gen-docs` generates §7.4's test co
 | T5 | Chaos | §8.4 fault matrix: kills, pauses, partitions (toxiproxy), gateway faults, duplicate activities, relay double election | T4 stack + `toxiproxy` + build tag `faultinject` | ≤ 40 min | `make e2e-chaos` | nightly; **required** on PRs touching `internal/{move,outbox,catalog,router,store,workflows,expunge,intent}` (path filter) |
 | T6 | Benchmark | §8.5 leakage grid, §8.6 LongMemEval/LoCoMo and the Postgres baselines of 8.6.1 (`make bench-pg`), §8.7 Hindsight side-by-side, §8.8 cost/latency | T4 stack + the real gateway; `bench.lock` pins; the 8.6.1 fixtures run on the ParadeDB image | smoke ≤ 10 min; LME-S ≈ 8–11 h (Table 6.8-B); LME-M ≈ 2–3 days | `make bench-smoke` (PR), `make bench DATASET=lme_s` (weekly), `make bench DATASET=lme_m` (release) | smoke on every PR touching `internal/{recall,chunk,extract,index}`; full weekly; M on release candidates |
 | F | Formal conformance | TLC bounded model checks and `lake build` of the Lean modules; trace validation of recorded Go runs against the TLA+ specs (§7) | Java + TLC, Lean 4 toolchain | ≤ 30 min | `make formal` | nightly; required on PRs touching `formal/` or the packages a spec covers |
-| S | Static | `golangci-lint`, `buf lint`, `buf breaking --against main`, `go vet`, the RLS policy check (§8.3), the metric-label linter (no `namespace` and no `tenant` label, D13/N62), the SQL predicate linter (§8.3), `govulncheck` | none | < 3 min | `make lint` | every push; required |
+| S | Static | `golangci-lint`, `buf lint`, `go vet`, the RLS policy check (§8.3), the metric-label linter (no `namespace` and no `tenant` label, D13/N62), the SQL predicate linter (§8.3), `govulncheck` | none | < 3 min | `make lint` | every push; required |
 
 CI gates, stated once: a PR merges when S, T0–T3 are green and T4 is green for PRs into
 `main`; T5 and F are required only for the path filters above (otherwise nightly, and a red
@@ -10553,6 +10435,7 @@ source, target and catalog, sampled every 500 ms.
 | `TestMove_TargetRestoredAfterSeal` (N180, `ShardMove_TgtRestore`) | complete the move; write and delete a document on the target after activation; restore the **target** at the seal (`incoming`/`ready`), between (a″) and (c), and after activation (`active`); promote a lagging target standby; a `MaxMoves = 2` variant restores a previous life's `moved_out` row; then delete the namespace and move it again | each is an ordinary restore at or above the floor: `freeze_restore`, catalog `(target, e_t + 1, restoring)` first, acknowledged deletes on the lost tail replayed **before** the first read, `restore_done` at `e_t + 1` closes a set `move_id` and stamps `moved_in_at`; the restore tool stamps `activated_at`, so the move reaches `cleaning` after 24 h; the delete and re-move succeed; a lagging standby is not promoted until it replays; no copy runs and the source is untouched; `_UnionRepair`, `_NoFloor`, `_RestoreKeepsMove` fail `NoResurrect`, `NoLossNoDup`, `MoveClosedWhenFinal` | T3 + T5 |
 | `TestMove_TargetPITRBelowFloor` (N183) | `engramctl restore --shard T --target-lsn` below `(copy_end_timeline, copy_end_lsn)` of a move-in at `cutover` or later; with and without `--lose-move-ins`; the same after `done`; a move-in at `copied` | refused without the flag; with it the original row is `lost` (`lost_at`, `lost_restore_id`), the partial row is cleaned and removed (`rollback_target`, after `freeze_restore` for an `active` row), the recovery move's `Plan` succeeds (`recovered_from_move_id`) and the namespace serves again from the scratch source's copy; a move-in at `copied` is rolled back, not `lost` | T3 + T5 |
 | `TestMove_CutWaitsForSealedCopy` (N179) | archive paused; standby paused; both resumed; kill the mover during the seal; an unhealthy target stanza at `Plan` | (b′) does not run while the archive is paused, nor while the standby is paused, and runs once both are resumed; `copy_sealed_at` precedes `cutover` (catalog CHECK, `copy_sealed_at > frozen_at`); `Plan` answers `PreconditionFailed{MOVE_TARGET_ARCHIVE_UNHEALTHY}`; `ShardMove_NoFloor` fails `NoLossNoDup` | T3 + T5 |
+| `TestMove_PlanRefusesSingleProfileTarget` (N190) | `Plan` with a target on the `single` profile (no streaming standby, no `pg_stat_replication` row), then with an `ha` target whose standby is attached; the same through `StartMove` | the `single` target answers `PreconditionFailed{MOVE_TARGET_NOT_HA}` and writes no `namespace_moves` row; the `ha` target plans; `engram_standby_replayed(copy_end_lsn)` is never evaluated against a missing standby | T3 + T5 |
 | `TestMove_FailoverBelowFloorRefused` (N179, `ShardMove_LaggingFailover`) | a target standby paused before the build, then `engramctl shard failover` after (a″) | refused while `pg_last_wal_replay_lsn()` is below the floor; the standby replays the archive (`restore_command`), the re-check passes and it promotes; `_LaggingFailover` fails `NoLossNoDup` | T3 + T5 |
 | `TestMove_ActivateAfterCatalogPromotion` (N180, `ShardMove_EndOnRouting`) | (c) committed, worker killed, catalog promoted losslessly, reconcile ran (routing written) | the retried mover reads the target row `ready`, runs (b″) and ends `done`; `MoveTargetNotActivated` fires at 60 s while the mover is held; `_EndOnRouting` fails `OneOwner` | T3 + T5 |
 | `TestMove_RollbackWaitsForReplicatedAbort` (N171) | pause the catalog standby after the `rolled_back` CAS (mover deadline, operator abort, restore reconcile); promote it; resume | `thaw_move`, `unready_target` and `rollback_target` run only after `catalog_replicated` and a re-read of the row; after a promotion that lost the CAS the shard action does not run and the mover cannot also commit; `ShardMove_ThawOnUnreplicatedAbort` fails `NoLossNoDup` | T3 + T5 |
@@ -11645,7 +11528,7 @@ rebalancer) only at `W_est ≤ 10 min`** (≈ 350 k facts); **scheduled windows 
 | FrozenCopy | first `engram_seq_advance(W_final)` on the target with the source's `nextval` (once, N147); then every table of all three classes by primary-key ranges of ≤ 100 k rows in up to 4 parallel streams, restartable at `(table, last_key)`, through a session `TEMP` table and `INSERT … ON CONFLICT (pk) DO UPDATE` under RLS in replica mode (N91), parents before children in `pg_constraint` order, paced at 25 MB/s of WAL (N119); one blob key per copied row (copy-if-absent); caches not copied; **the target has no HNSW during the copy** | delete target rows, drop target indexes by their `engram_hnsw_ddl` names, delete the blob prefix |
 | VerifyFrozen | per table `count(*)` and, per PK range of the copy (≤ 100 k rows), `bit_xor(hashtextextended(pk::text, 0))` combined in Go, each statement inside the 30 s role timeout, on both sides, `engram_verify_fk(ns)` on the target, owner-keyed blob existence per copied row, the excluded class by `count ≤`. A mismatch re-copies the mismatching tables once and re-verifies; a second mismatch rolls back (`MoveVerifyFailed`) | as above |
 | BuildIndexes | `vector_indexes` requests for every `(vector table, current model)` with ≥ 2,000 copied vectors, served by the index runner at priority; ready when `engram_move_indexes_valid(ns)` (`indisvalid ∧ indisready` of the index named by `engram_hnsw_ddl`; zero rows is false); a `failed` build retries once, then rollback | as above |
-| SealCopy | after the last index build: `pg_switch_wal()` returns `copy_end_lsn`; `pgbackrest check` confirms the segment is archived; `engram_standby_replayed(copy_end_lsn)` is true for the target's standby (vacuous in `single`); the catalog records `copy_end_lsn`, `copy_end_timeline`, `copy_sealed_at` (a CHECK keeps `cutover` behind it); `Plan` refuses `MOVE_TARGET_ARCHIVE_UNHEALTHY`; ≈ 150 s per 1 M facts, inside `W_est` (N179) | as above |
+| SealCopy | after the last index build: `pg_switch_wal()` returns `copy_end_lsn`; `pgbackrest check` confirms the segment is archived; `engram_standby_replayed(copy_end_lsn)` is true for the target's standby (`Plan` guarantees one, `MOVE_TARGET_NOT_HA`, N190); the catalog records `copy_end_lsn`, `copy_end_timeline`, `copy_sealed_at` (a CHECK keeps `cutover` behind it); `Plan` refuses `MOVE_TARGET_ARCHIVE_UNHEALTHY`; ≈ 150 s per 1 M facts, inside `W_est` (N179) | as above |
 | Consumers | wait until every source outbox consumer cursor passes the namespace's final `max(seq)` (bound 120 s, twice the gap horizon, else rollback) | as above |
 | Cutover | (b′) target `incoming → ready` (stamps `floor_lsn`; preconditions: `engram_move_indexes_valid` and `last_value > w_final`; callers get retryable `NamespaceNotReady`); **(a″) catalog CAS `cutover → committed` (`WHERE move_id AND state = 'cutover'` and the exact shards, epochs, timeline and namespace row the mover verified, N143): the point of no return**, then the mover waits for `catalog_replicated` of the CAS's commit LSN (≤ 10 s per attempt, retried while the row reads `committed`, N171); (c) source `frozen/move → moved_out` with the target hint; (b″) target `ready → active` (sub-second, retried forever; unconditional whenever the target row reads `ready` and the move reads `committed`, whatever `namespaces` says; the end test reads the target row, N180); (d) catalog flip `WHERE epoch = e AND state = 'frozen'`; then `Restart` of the drained operations on the target (`TERMINATE_IF_RUNNING`, memo epoch e + 1; across cells on the target cell's cluster). Between (c) and (b″) there is no owner | before (a″): `unready_target`, `thaw_move`; `return_abort` onto a shard with a `moved_out` row; a restore or failover reconcile takes `cutover → rolled_back` only after reading neither `moved_out` on the source nor `active` at the move's epoch on the target, or, reading `committed`, completes (c), (b″), (d) |
 | Cleanup | **gate** at the entry to `cleaning`: the catalog trigger on `committed → cleaning` runs only when `CleanupMove` is called after `activated_at + 24 h` (`Restart` never sets `cleaning`; `activated_at` is stamped by (b″), or by `engramctl restore` for a target the restore activated); no content or timeline check. Source batches (`DROP INDEX` of the namespace's partial indexes, `engram_cleanup_namespace` paced by WAL like the purge, content before markers) run only while the row reads `cleaning`; the cleanup activity records `done` after one further `engram_cleanup_namespace` call returns 0 (`CleanupMove` itself takes `committed → cleaning` only, N184); the `moved_out` row stays; the source **blob prefix goes only after the 28-day backup window** (N170) | |
@@ -11760,7 +11643,7 @@ differential that the post-delete rule would have taken. *Verify:* queue drains,
 **Moves: scheduling a window, stuck, rolled back or failed over.** *Scheduling.* `engramctl move plan --namespace X
 --target T` prints `W_est` (≈ 27 min per 1 M live facts at the planning rates) and the freeze deadline. At `W_est ≤ 10 min`
 the rebalancer may start the move unattended; above that an operator announces the window and runs `engramctl move start
-… --window 2h` (4 h default, 8 h cap; a window below `max(1.5 × W_est, W_est + 10 min)` is refused). For the whole window the namespace is **read-only**:
+… --window 2h` (4 h default, 8 h cap; a window below `max(1.5 × W_est, W_est + 10 min)` is refused). A target on the `single` profile is refused with `MOVE_TARGET_NOT_HA` (N190): choose a target that runs the `ha` profile, or attach a standby to it first. For the whole window the namespace is **read-only**:
 reads continue, writes get `NamespaceFrozen` with `frozen_until_estimate`. *Symptoms:* `MoveStuck`,
 `MoveWindowExceeded`, `CutoverInProgress`, `FenceHolderStuck`. *Checks:* `engramctl move status X` (step, rows per table,
 frozen time against `W_est`, verification mismatches, ownership states), the source's timeline against `catalog.shards`.
@@ -11830,7 +11713,7 @@ Reflect, quotas and `RetainBackfill`, a launch prerequisite in the committed sco
 Phase 3 ≈ 25.25 ew as a **separate track**; formal methods and the evaluation harness ≈ 14 ew:
 **≈ 125.5 ew in total**. The **committed scope is Phases 0 to 2, ≈ 86.25 ew against 78 ew of
 capacity** for three engineers in 26 weeks (3 × 26): an 8.25-ew overrun, so the Phase 2 exit lands in
-**week 30** (day ≈ 204) and the MVP in **week 24** (day ≈ 168, no spare). Week 26 is not reachable by cuts; the committed exit is the date above (options in 10.2). The specs of N96/N141 are **already written
+**week 30** (day ≈ 204) and the MVP in **week 24** (day ≈ 168, no spare). Week 26 is not reachable by cuts, and no cut is applied (N190): the committed exit is the date above. The specs of N96/N141 are **already written
 and model-checked** (`formal/tla/`, summary in `formal/tla/results/`, §7.1). M0.7 is the spec-side work that can exist in week 8
 (the must-fail manifest, the invariant code and the trace converter), and each `faultinject`
 twin is built and costed in the milestone that builds its subject (N156).
@@ -11856,7 +11739,7 @@ Three vertical owners: every §2 package has one owner for its interface, so cro
 
 | Id | Deliverable | Owner | ew | Exit criterion (measurable) |
 |---|---|---|---|---|
-| M0.1 | Repo, `buf` (lint + `breaking` baselined on the merge target, `.git#branch=main`, for pull requests and on `HEAD~1` only in the push-to-main job, until `v1.0.0`; one labelled exception and changelog entry per intended break, N128/N139), generated stubs for `memory.v1`, `memory.admin.v1`, `engram.internal.*` (incl. `engram.internal.errors.v1`); `PageService`/`ExportService` registered answering `UNIMPLEMENTED` (N14); **a stub module of the §2 signatures that `go vet` compiles, with the depguard allow-list (N140)**; CI with S + T0 | E3 | 2.0 | `buf breaking` blocks a field-number change; the stub module vets (no import cycle); `make lint test-unit` < 30 s, green |
+| M0.1 | Repo, `buf` (lint, build and `format -d --exit-code` gate CI; `buf breaking` is not run before `v1.0.0`, N190), generated stubs for `memory.v1`, `memory.admin.v1`, `engram.internal.*` (incl. `engram.internal.errors.v1`); `PageService`/`ExportService` registered answering `UNIMPLEMENTED` (N14); **a stub module of the §2 signatures that `go vet` compiles, with the depguard allow-list (N140)**; CI with S + T0 | E3 | 2.0 | a proto that fails `buf lint`, `buf build` or `buf format` blocks the merge; the stub module vets (no import cycle); `make lint test-unit` < 30 s, green |
 | M0.2 | Shard schema v1 (`migrations/shard/0001–0004`): all tables of §3 (content tables insert-only with `fillfactor 100`, vector side tables, markers, evidence rows without a foreign key to `facts`), 16 hash partitions, RLS, `namespace_ownership` with `ready`, `outbox`, `shard_meta`, roles (`engram_app`, `engram_relay` and `engram_move` without `BYPASSRLS`, `engram_admin` for the Expunge purge and `engramctl`, `engram_migrate` as owner and the index runner's role; no worker or expunge role, N133e; 30 s timeouts on every outbox-writing role), per-role GUCs, the partitioned-index procedure in `engramctl index`; testcontainers harness; `TestEveryTableHasRLS`; RLS canary; **every N19 `EXPLAIN` runs as `engram_app`** (P-5); `TestContent_InsertOnly` trigger | E1 | 2.5 | `make test-integration` green; `--check-rls` returns zero rows; on the real ParadeDB image the BM25 arm keeps Top-K pushdown **under RLS** (or `TsvectorIndex` is declared the MVP lexical arm with its p95), the trigram lookup via the `SECURITY DEFINER` wrapper is an index scan ≤ 10 ms as `engram_app` (308 ms unwrapped), tags resolve outside RLS; no generated column exists |
 | M0.3 | Catalog schema + `Resolver` (LRU 100 k, TTL 60 s, negative 5 s, `LISTEN` invalidation, stale entries served indefinitely); `authz.Interceptor` with N5 codes and the `ns_group` claim (N65); `DeadlineGuard` (N11); `internal/errs` (N1); **the catalog promotion runbook (asynchronous standby, `engramctl catalog reconcile --from-shards` as the first promotion and restore step), `catalog_replicated` with the `catalog.Replication` seam and the `AckAfterReplay` decorator on every client-acknowledged catalog write**, the helper owners (stats-reader roles) with their lint rules, `request_id` on replicated-ack methods (E1, N163, N171, N181, N184) | E3 1.5, E1 1.25 | 2.75 | authz table test green on gRPC and Connect with byte-identical error details; resolve p99 < 2 ms on hit; a catalog paused 30 min serves every cached namespace; `TestCatalog_PromotionRunsReconcile`, `TestCatalog_ReconcileDerivesRouting`, `TestCatalog_ReplicatedHelperAsAdmin`, `TestCatalog_AckWaitsForReplay` and `TestCatalog_ReconcileIgnoresIncomingEpoch` green on a primary and a standby |
 | M0.4 | Dev compose (1 shard, catalog + failover agent, `DeterministicClient`, Envoy), **per-cell Temporal: split services, `numHistoryShards = 512`, its own Postgres with a pgBackRest stanza**, payload codec (N59); `make e2e` smoke; **Temporal load test with the retain activity shape** (P-9) | E1 | 1.5 | `make e2e` < 5 min from cold; Temporal sustains the `RetainBackfill` peak §9 sizes for, **5 800 events/s** (580 to 5 800, 10 to 100× an online cell's ≈ 58 events/s), at < 70 % history-service CPU and persistence p99 < 50 ms, recorded in `bench/results/phase0/` — or the lower peak the rig reached is written into §9 and `RetainBackfill` concurrency is capped to it (N139); the history-shard count is frozen in the register; a `temporal-postgres` restore drill passes |
@@ -11876,7 +11759,7 @@ A-W, A-R1, N112 and N114 numbers are measured, not assumed.
 | M1.2 | Recall: five arms over `PostgresIndex` — vectors in side tables read by the namespace's current model, the **cost-based filtered semantic plan** (eligible-row estimate from `fact_count_by_type` or the monthly `mentioned_at` histogram; **exact path** below θ, HNSW iterative scan with `hnsw.max_scan_tuples = max(20 000, min(4 × ef_search / s, 100 000))` above, an exact re-run in the same transaction on exhaustion while `E ≤ 4 θ`, `RecallStats.partial` only above it, `$allowed_docs` as `= ANY` on the HNSW path and as an array only to 500 documents on the exact path, structurally pinned plans; the **filtered-recall class** (`E ≥ θ`, p95 ≤ 1 s, a second semaphore of 2 per process, `RecallStats.filtered`); `fact_type` on `fact_vectors`; N138, N151, N164), **exact scan below 2,000 vectors and a per-namespace partial HNSW above (built by the index runner)** (N111, N112), BM25 or `TsvectorIndex` per M0.2 — the **visibility predicate** (`doc_tomb`/`chunk_tomb` sets loaded once per request, invalidations by PK anti-join, SQL anti-join above 16 k, `$allowed_docs` for tags and metadata; N116), `store.ReadNamespace` → `ReadSession` with one short read transaction per arm (N140) and an **arm semaphore of 32 per API process per shard** (N164), graph arm seeded from lexical (30 ms) with **one statement per hop** and a 100 ms HIGH sub-budget (N165), two-sided temporal probe (N68), exact-rational RRF (N67), gateway rerank 0/50/150 with the deadline skip at 106 ms (N53, N106), bounded boosts, packer, streaming + `RecallStats`, `as_of` inside every arm, minimal bench harness | E3 | 10.5 | **starts on day 32 with θ a parameter (M0.5 ends day 32); its exit is evaluated after M0.6 (day 43), which fixes θ and the budgets (N156)**; §8.5 grid green at T3; `TestHNSW_PerNamespace`, `TestRecall_FilteredArm` (topic-correlated filters at 1, 2, 5, 10, 20 %), `TestReadSession_ConcurrentArms` (records ≈ 425 connection-ms per MID recall, alerts above 1.25×; the semaphore bounds in-flight arms), the filtered-class benchmark (p95 ≤ 1 s at `E ≥ θ`, unfiltered p95 < 300 ms unaffected by 20 % filtered recalls), `TestPlans_AsEngramApp`, `TestRecall_SmallNamespaceExact`, `TestLexical_TopKPushdown` green; on a synthetic 5.5 M-fact shard at 50 QPS: **critical-path p95 ≤ 236 ms at MID with 50 rerank pairs (pool-wait term ≈ 20 ms, A ≤ 24)**, p95 < 300 ms end to end, **rerank-skip < 1 %** (a p99 property of the pre-rerank path, N106); LME-S retrieval-only R@5 ≥ 0.93; recall p95 with 16 k pending markers is recorded as the degraded-mode number |
 | M1.3 | **Delete and visibility** (N115 to N118, N126, N135, N136): `DeleteDocument` as the O(1) marker transaction (document lock, `expected_version` check inside it, `document_tombstones(document_id, up_to_version)`, `deletion_log` with `prev_operation_id`, summary/context/metadata cleared, outbox) with immediate re-use of the `document_id` from `up_to_version + 1` (N133c), `Invalidate`/`Restore` markers (`fact_hidden` keyed by cause, **no foreign key to `facts`**, `materialized_at`, the twin rule and the per-subject advisory lock; the `purge-sweep` finds unmaterialized invalidations from the marker, never from a signal; N145, N150), evidence-segment predicates for observation and page versions (fail closed on a missing version row, served-at-`T` rule, zero-source rule), `PAGE_HIDDEN`, the DocumentService tombstone view, `DELETE_*` operation mapping, entity `as_of` and delete safety, export expiry inside the marker transaction, namespace and tenant delete with `freeze_delete` before the ack (`DELETE_TENANT` derived from the `tenants` row, N133d), `DeleteTenant` acknowledged only after the fences (N182), `OperationService.Get/Wait` exempt from the `deleting` rejection (N70) | E2 | 3.75 | `TestDelete_O1` (ack p95 ≤ 100 ms at 1 M facts), `TestDelete_ReuseDocumentID`, `TestVisibility_AllSurfaces` (REPLACE, purge, delete in sequence), `_SegmentHiding`, `_Pages`, `TestInvalidate_RestoreExact`, `TestDocument_TombstoneView`, `TestOperation_DeleteKinds`, `TestExport_ExpiresOnMarker`, `TestEntities_DeleteAndAsOfSafe`, `TestDelete_NamespaceAndTenant`, `TestInvalidate_SurvivesChunkPurge`, `TestExpunge_SweeperFindsUnmaterialized`, `TestIntent_ConcurrentCurationOneChain`, `TestInvalidate_ConcurrentReextract`, `TestInvalidate_RepeatedReusesTag`, `TestRestore_AfterReplacePurge`, `TestDelete_BusyDuringMove`, `TestDelete_TenantAckAfterFence` green |
 | M1.4 | Outbox relay (direct connection through the virtual endpoint, **cursor advances batched to 1/s per consumer**, gap watchlist with strict-prefix delivery, A-F1 lint, 7-day trim); consumers `index` and optional `kafka` | E1 | 1.5 | outbox property suite, `TestOutbox_Watch1x`, T5 double-election green; relay drains 5 k events/s with lag < 30 s; `TestXID_Budget` (≤ 55 XIDs/s at 50 writes/s) |
-| M1.5 | Move protocol **behind `moves.enabled`**, freeze-then-copy (D5, N160, N161, N125): `MoveService`, `Move` workflow on the target queue; Plan with the **window estimate** `W_est` (unattended ≤ 10 min ≈ 350 k facts, `MOVE_WINDOW_REQUIRED` above, refused below `max(1.5 × W_est, W_est + 10 min)`, 4 h default, 8 h cap, N173) and blob pre-warm; Freeze (one 35 s attempt, `NamespaceFrozen{retry_after, frozen_until_estimate}`, deadline `frozen_at + max(1.5 × W_est, W_est + 10 min)`, rollback at the deadline); `FrozenCopy` of all three table classes by PK ranges from the static source (`engram_seq_advance` once, N147); `VerifyFrozen` (per-table counts and per-PK-range hash, `engram_verify_fk`, blob existence; one re-copy, then rollback); `BuildIndexes` under the freeze (`engram_move_indexes_valid`, an index request for every table); **`SealCopy`** (`pg_switch_wal`, `pgbackrest check`, standby replay; the floor `copy_end_lsn` before the commit point, N179); consumer cursors; Drain/Restart from `operations` (N97); cutover through `ready` with the **catalog CAS (a″) as the point of no return followed by the replicated-LSN check** (N163), **rollback at every step before (a″)**, `return_abort`; cleanup gated at the entry to `cleaning` (24 h after activation, N170); a restored target closes the move on `restore_done`, `lost` and `--lose-move-ins`, the LSN floor in `engramctl restore` (N180, N183); `engramctl move` with `--window` | E1 | 7.25 (range 6–9; twins +0.25) | §8.4.3 table green at every step under the load generator; every move test of §8.4.3 green, among them `_CutWaitsForSealedCopy`, `_TargetRestoredAfterSeal`, `_TargetPITRBelowFloor`, `_ActivateAfterCatalogPromotion`, `_CleanupGateAtEntry` and `_RollbackWaitsForReplicatedAbort` (the `ShardMove` twins built here, N156); every `ShardMove` must-fail configuration of §8.4.6 (the D27 set `_NoFloor`, `_LaggingFailover`, `_RestoreKeepsMove`, `_EndOnRouting` included) fails on its invariant; `MoveTerminates` and `FrozenBounded` pass at the §7 bounds; a 1 M-fact move (consolidation backlog included) measures `R_copy`, `R_build` (in and out of memory), `R_archive` and `R_redo` and the window against `W_est`, recorded, not gated (a ≥ 25 % error re-sets the planning rates in the register); cutover read-unavailability < 5 s with a dead mover |
+| M1.5 | Move protocol **behind `moves.enabled`**, freeze-then-copy (D5, N160, N161, N125): `MoveService`, `Move` workflow on the target queue; Plan with the **window estimate** `W_est` (unattended ≤ 10 min ≈ 350 k facts, `MOVE_WINDOW_REQUIRED` above, refused below `max(1.5 × W_est, W_est + 10 min)`, 4 h default, 8 h cap, N173; refused onto a `single`-profile target, `MOVE_TARGET_NOT_HA`, N190) and blob pre-warm; Freeze (one 35 s attempt, `NamespaceFrozen{retry_after, frozen_until_estimate}`, deadline `frozen_at + max(1.5 × W_est, W_est + 10 min)`, rollback at the deadline); `FrozenCopy` of all three table classes by PK ranges from the static source (`engram_seq_advance` once, N147); `VerifyFrozen` (per-table counts and per-PK-range hash, `engram_verify_fk`, blob existence; one re-copy, then rollback); `BuildIndexes` under the freeze (`engram_move_indexes_valid`, an index request for every table); **`SealCopy`** (`pg_switch_wal`, `pgbackrest check`, standby replay; the floor `copy_end_lsn` before the commit point, N179); consumer cursors; Drain/Restart from `operations` (N97); cutover through `ready` with the **catalog CAS (a″) as the point of no return followed by the replicated-LSN check** (N163), **rollback at every step before (a″)**, `return_abort`; cleanup gated at the entry to `cleaning` (24 h after activation, N170); a restored target closes the move on `restore_done`, `lost` and `--lose-move-ins`, the LSN floor in `engramctl restore` (N180, N183); `engramctl move` with `--window` | E1 | 7.25 (range 6–9; twins +0.25) | §8.4.3 table green at every step under the load generator; every move test of §8.4.3 green, among them `_CutWaitsForSealedCopy`, `_TargetRestoredAfterSeal`, `_TargetPITRBelowFloor`, `_ActivateAfterCatalogPromotion`, `_CleanupGateAtEntry` and `_RollbackWaitsForReplicatedAbort` (the `ShardMove` twins built here, N156); every `ShardMove` must-fail configuration of §8.4.6 (the D27 set `_NoFloor`, `_LaggingFailover`, `_RestoreKeepsMove`, `_EndOnRouting` included) fails on its invariant; `MoveTerminates` and `FrozenBounded` pass at the §7 bounds; a 1 M-fact move (consolidation backlog included) measures `R_copy`, `R_build` (in and out of memory), `R_archive` and `R_redo` and the window against `W_est`, recorded, not gated (a ≥ 25 % error re-sets the planning rates in the register); cutover read-unavailability < 5 s with a dead mover |
 | M1.6 | Adapters: Connect, MCP server (`/mcp/{tenant_id}/{namespace_id}`; token validated before listing tools, `/.well-known/oauth-protected-resource`, `request_id = sha256(session ‖ jsonrpc id ‖ tool)`, N127/N129), `engramctl` (migrate, shard add/check, secret rotate, stats, report), `WaitOperation` on long-poll with DB fallback (N70), protojson idempotency hashes (N72), generated config allow-list (N66) | E3 | 4.0 | §8.3 isolation matrix 100 % green on every surface; MCP tool list equals §4's mapping table (golden); 10 k concurrent `WaitOperation` long-polls stay under the per-process cap |
 | M1.7 | Ops baseline: production compose by host class (§9.1), DNS endpoints, `engramctl shard failover` (the §9.3 restore path, with the floor check, N179), the alerts `MoveTargetNotActivated`, `ReconcileIncomplete`, `BackupRepoInvalid` and the weekly `pgbackrest verify` (N179, N180, N185), automated catalog failover (D4) onto the **asynchronous hot standby** (promotion after 30 s, `catalog reconcile --from-shards` first; `CatalogStandbyDown` at 60 s, N163), **shard image with pgBackRest and block incremental, `postgres_exporter` and its alerts, the generated GUC table and `config lint`, per-role DSNs and pgbouncer aliases (`engram_app` recall pool 32, `engram_worker` 8, P = 4 processes per shard, direct `engram_subject`, N164), `tcp_keepalives_*` and `tcp_user_timeout` (N167), the FPI-dominated WAL budget with `checkpoint_timeout = 30 min` and the shard-level WAL watcher for the 32 GB differential trigger (N166)**, restore drill, dashboards and alerts without a `tenant` label (relation-byte capacity, WAL pacing, index runner), runbooks, rate quotas in the interceptor | E1 1.75 (compose, failover, image, exporter), E3 3.0 (dashboards, alerts, quota interceptor) | 4.75 | restore and failover drills (both variants) pass with the relay on the new primary and the intent replay applied; `TestBackup_WalWatcherAt32GB`, `TestMove_FailoverBelowFloorRefused` green; a promotion drill with the standby paused and resumed passes; every §9.4 alert links a runbook; `OutboxLagHigh`, `MoveStuck`, `CutoverInProgress`, `XIDAgeHigh`, `WALArchiveLag`, `ExpungeMaterializeSlow` fire in `make e2e-chaos`; `TestIso_Metrics_Labels`, `TestConfig_Lint` green |
 | M1.8 | **Advisory-lock fence and ownership state machine** (D2, N64, N82, N113, N125): writers `pg_try_advisory_xact_lock_shared` (never waiting, `NamespaceFrozen`), exclusive takers a single 35 s attempt, three disjoint lock key spaces, the states × roles × statements table incl. `ready`, `frozen/{move,delete,restore}`, `reconcile_out`, `return_abort`, and the read fence that accepts only `active` and `frozen/move`, executed against the real DDL **before any move code exists** | E1 | 2.0 | `TestFence_*` and `TestDocLock_NoStarvation` green; every transition executed by `TestIso_Ownership_Transitions` as the role the table names; `TestIso_Move_Epoch` green |
@@ -11932,7 +11815,7 @@ Totals: Phase 0 14.25 (M0.1 to M0.6 = 11.25, M0.7 = 1.5, M0.8 = 1.5) + Phase 1 5
 10.5 + 10.5 + 3.75 + 1.5 + 7.25 + 4 + 4.75 + 2 + 2.5 + 4) + Phase 2 21.25 (8.25 + 6 + 2 + 2 + 3) = **86.25 ew
 committed** (E1 28.75, E2 29.0, E3 28.5 over 26 weeks of 26.0 each: overrun E1 2.75, E2 3.0, E3 2.5 =
 8.25 ew); Phase 3 25.25 + Track F/B 14.0 = **39.25 ew on the separate track**; **125.5 ew in total**.
-**Exit slip:** E2's chain ends on day ≈ 204, so the Phase 2 exit is **week 30**, one week later than before D27. Pending a decision and **not applied**, either 0.5 ew cut gives E2 28.5 ew and week 29 (day ≈ 201): (a) M2.3's leakage tests move to the separate track, (b) M0.7's trace converter is deferred to F.1 (N188).
+**Exit slip:** E2's chain ends on day ≈ 204, so the Phase 2 exit is **week 30**, one week later than before D27. No 0.5 ew cut is applied (N190): the full scope stays, the Phase 2 exit is week 30 and the committed scope is 86.25 ew (total 125.5 ew).
 
 ### 10.3 Calendar
 
@@ -12315,9 +12198,9 @@ This register fixes the cross-cutting decisions that every section of the implem
 plan must agree with. Sections may add detail; they may not contradict a row here without
 changing the row. Each decision names the alternative that was rejected.
 
-**Status.** Rewritten after round 4 (D23), amended after round 5 (D24), round 6 (D25), round 7 (D26) and round 8 (D27): rows the round-4 to round-8 findings touched were replaced in place (marked "(rev. D23)" to "(rev. D27)") and keep their ids so citations resolve; D22 holds the round-3 decisions, D23 (N135 to N143) the round-4 decisions, D24 (N144 to N159) the round-5 decisions, D25 (N160 to N168) the round-6 decisions, D26 (N169 to N178) the round-7 decisions and D27 (N179 to N188) the round-8 decisions that had no row to rewrite. Where a D27 clause and older text in the same row disagree, the D27 clause wins (then D26, then D25); rows marked "Withdrawn in D25" or "withdrawn by N1xx" are kept only so that citations resolve.
+**Status.** Rewritten after round 4 (D23), amended after round 5 (D24), round 6 (D25), round 7 (D26) and round 8 (D27): rows the round-4 to round-8 findings touched were replaced in place (marked "(rev. D23)" to "(rev. D27)") and keep their ids so citations resolve; D22 holds the round-3 decisions, D23 (N135 to N143) the round-4 decisions, D24 (N144 to N159) the round-5 decisions, D25 (N160 to N168) the round-6 decisions, D26 (N169 to N178) the round-7 decisions and D27 (N179 to N188) the round-8 decisions that had no row to rewrite; N189 and N190 follow D27 (model-checking corrections; the human's decisions). Where a D27 clause and older text in the same row disagree, the D27 clause wins (then D26, then D25); rows marked "Withdrawn in D25" or "withdrawn by N1xx" are kept only so that citations resolve.
 
-Project name: **Engram** (an engram is a physical memory trace). Go module `example.com/engram`,
+Project name: **Engram** (an engram is a physical memory trace). Go module `github.com/gstamatakis95/engram`,
 Go 1.25. Reference system: Hindsight (github.com/vectorize-io/hindsight, MIT). This document is
 a standalone design and is unrelated to the benchmark code that shares this repository.
 
@@ -12736,5 +12619,6 @@ Rows marked "(superseded in D22)" or "Withdrawn in D22" were rewritten in place 
 | N185 | **A shard restore's catalog writes wait for replication; `restore_done` re-asserts the epoch; an unreadable shard is skipped by the reconcile.** The restore's "catalog first" write `(S, e + 1, restoring)` and its final `active` write wait `catalog_replicated` like a client ack (restores are rare; a stalled standby pages `CatalogStandbyDown` and the operator's `ack-unreplicated` override applies); `restore_done` ends with a catalog CAS `epoch = max(catalog, shard)` for every namespace of the shard, so a promotion that reverted the first write cannot leave the catalog one epoch behind (C8-6). The reconcile's rule for a shard it cannot read within 5 s (restricted `listen_addresses` during bring-up, or down): keep the catalog's current rows for that shard's namespaces, record the shard in `reconcile_incomplete`, page `ReconcileIncomplete`, and re-run for that shard when it answers; the promotion does not block on it. *Spec:* the `~cdirty` guard is dropped from `RestoreCore`/`Restore` and `frozen/restore` counts as an owner (N172), so a promotion's reads interleave with a shard restore (N188). *Test:* `TestRestore_CatalogWritesReplicated` (standby paused during a shard restore: the restore waits; catalog promoted between the epoch write and the shard rewrite: `restore_done` leaves the catalog at the shard's epoch and every namespace routable). | N163(2), N123, N171(3) | C8-6, A8-3 |
 | N186 | **Numbers restated.** *Footprint (PG8-11, A8-11):* ≈ **250 GB per 10 M facts** (rows regenerated by `make gen-docs` from N165's fill: links at 224 B, other B-trees × 1.7, then the 12 % `ins_seq` index term, named in §3.7; 225 GB is the sum before that term), ≈ **138 GB at 5.5 M**, ≈ **250 GB at the 10 M cap**; `W_est`'s 25 KB per fact already matches. *Connections (PG8-13, A8-9):* one list in §9.1 — recall pool 32, worker 8, subject 2P, admin 2, move 4, relay 1, migrate 1, runner 2 (PG7-17), exporter 2, `engramctl` 2, pgBackRest 1 = **55 + 2P**, **63 at P = 4**, 67 at 6; N155, N164(5), N176 and every connection total are generated from it. *RTO (PG8-10, A8-12):* ≤ 60 min; **≤ 80 min at the 5.5 M target and ≤ 95 min at the 10 M cap while a move-in is landing** (a watcher differential reads every file changed since the weekly full, 12–21 min at 200 MB/s, while the copy adds 25 MB/s: 50–63 GB of WAL past the last completed differential at 1.2 min/GB, plus base restore and reconcile). *Window (N179):* `W_est = rows / R_copy + build(vectors) + max(wal_build / R_archive, wal_build / R_redo) + verify` ≈ **27 min per 1 M** (1,000 + 408 + 150 + 60 s); unattended ≤ 10 min ≈ **350 k facts** (371 k computed); 8 h cap ≈ 12 M. *Build memory (PG8-9):* `Plan` and the rebalancer prefer targets with `hot set + maintenance_work_mem ≤ usable cache` (≈ 80 GB); otherwise the build's memory is capped at `usable − hot set` (never below 5 GB) and the piecewise term applies; §9.1 states the IOPS consequence of a build on a full target (miss rate up for ≈ 1 h, inside the degraded window). *Schedule (A8-7):* §10.2's week-26 sentence is replaced by "week 26 is not reachable by cuts; the committed Phase 2 exit is the date N188 states". | D3, N165(3), N166(3), N155, N164(4)(5), N173(1)(2), N176 | PG8-9, PG8-10, PG8-11, PG8-13, A8-7, A8-9, A8-11, A8-12 |
 | N187 | **Folds of the round-8 minors and nits** (no new mechanism). *Generated text (C8-11):* §3.2's epoch and replication sentences are generated from N163(2)/N171/N172 by `make gen-docs`, as §7.4's tests are. *DDL:* `CHECK (invalidation_op IS NULL OR kind = 'invalidate')` on `deletion_log` (PG8-14); `shm_size` is a container-creation setting, 32g on every shard image, 8g elsewhere (PG8-16); backups are a weekly full with daily differentials everywhere (§3.7 said daily full; PG8-12). *Proto and CI:* `MoveCheckpoint` field 13 is renamed `cutover_sub_step` and the name `cutover_step` is reserved with field 9 (A8-10; §4.5 row); `Move.cutover_at` is reserved (no column) and `Move.finished_at` is exposed (the 28-day blob GC derives from it); the `cutover_step`/`cutover_sub_step` comment reads "set while `COMMITTED` ((c), (b″), (d))"; the `NAMESPACE_BUSY` comment reads "a delete, or a move before activation, in progress"; `proto/README.md`'s `workflow.proto` row lists `SealCopyResult` and the rounds "3 to 8"; §4.5's rows are in round order; the WIRE_JSON check runs against the merge base (the FILE baseline), **non-gating**, with a generated `buf.breaking.ignore` of the §4.5 renames, and the README sentence says so (A8-6). *Prose:* §9's `W_est` loses "+ blob delta" (the pre-warm precedes the freeze; A8-12); `RollbackMove` is listed with the replicated-ack RPCs in §4.1.6 and `catalog.AckAfterReplay` (N184). *Spec (C8-12):* N188. | N177, N167 | C8-11, C8-12, PG8-12, PG8-14, PG8-16, A8-6, A8-10, A8-12 |
-| N188 | **Specs and tests after D27 (TLA+ manifest).** *`ShardMove.tla`.* **Renamed:** `MoveBackup` → `SealCopy` (`mp: built → sealed`; requires `sb[tgt] ⊇ frozenSet` under `FloorBeforeCut`, i.e. the standby replayed the copy, and sets `flr[tgt] = TRUE`), knob `BackupBeforeCut` → `FloorBeforeCut`, state `backed` → `sealed`. **New state:** `sb[s]` (the standby's replayed snapshot) and `mv[s]` (the ownership row's move bit, set by `Plan` on the target and `start_move` on the source, cleared by `Activate`, `Thaw` and — under `RestoreCloses` — `RestoreDone`). **New actions:** `StandbyReplay(s)` (`sb[s]' = store[s]`, any time), `Failover(s)` (`store[s]' = sb[s]`; refused under `FailoverChecksFloor` when `s = tgt ∧ flr[tgt] ∧ sb[tgt] ⊉ frozenSet`; otherwise the restore path), `CatalogPromote` (a lossless promotion: `cdirty' = TRUE`, nothing reverted; so the reconcile runs after (c), C8-2), `ApplyReconcile` writes `cat' = (tgt, me)` when it re-derives `committed` from `moved_out` (N172's routing write), `RestoreDone` (split out of `ReconcileDesign(tgt)`: `fin[tgt] = Row("active", me + 1)`, clears `mv` under `RestoreCloses`, sets `mp' = "done"` only through `Activate`-equivalent stamping). **Changed:** `Cut`'s continuation (`Activate`) is enabled on `own[tgt].st = "ready" ∧ cm = "committed"` regardless of `cat`; under `¬EndFromTargetRow` the mover may instead end `done` when `cat = (tgt, ≥ me)` (the C8-2 shortcut); `Backup`/`Restore` to `bak[tgt]` is refused when `flr[tgt] ∧ bak[tgt] ⊉ frozenSet` (`--lose-move-ins` and the recovery move stay unmodelled, §7.1); `~cdirty` is dropped from `RestoreCore`/`Restore`; `frozen/restore` is an owner in `ApplyReconcile`, which prefers the higher epoch (N180(4)); `Recoverable(tgt)` reads `flr[tgt]`. **Invariants:** all of N178 kept; **new** `MoveClosedWhenFinal` (`mp ∈ {done, rolled_back} ⇒ ∀ s: ¬mv[s]`) and `OwnerHasNoStaleMove` (`own[s].st = "active" ∧ mv[s] ⇒ mp ∉ Final`). **Knobs:** `FloorBeforeCut`, `FailoverChecksFloor`, `RestoreCloses`, `EndFromTargetRow` (design TRUE, TRUE, TRUE, TRUE), `ThawNeedsReplicated` and `EpochFromAnyRow` kept. **Configurations:** kept `ShardMove.cfg`, `_Live`, `_ActiveWriters`, `_Twice`, `_TgtRestore`, `_TgtRestore2` (both now with `StandbyReplay`/`Failover` and one `CatalogPromote`), `_UnfencedSteps`, `_NoReady`, `_RestoreNoReconcile`, `_NoVerify`, `_StampAfterCut`, `_SweepNotPaused`, `_NoSeqAdvance`, `_CatalogLossNoShardTruth`, `_UnionRepair`, `_CopyBeforeFreeze`, `_ReadyBeforeIndex`, `_CutOnUnreplicatedCommit`, `_ThawOnUnreplicatedAbort`, `_CatalogLossDuringFreeze`; **renamed** `_NoMoveBackup` → `_NoFloor` (`FloorBeforeCut = FALSE`) violates `NoLossNoDup`; **new must-fail** `_LaggingFailover` (`FailoverChecksFloor = FALSE`, a `Failover(tgt)` after `CommitCAS` with `sb[tgt]` from before the copy) violates `NoLossNoDup` (and `ServedFromIndex`); `_RestoreKeepsMove` (`RestoreCloses = FALSE`, a target restore before activation) violates `MoveClosedWhenFinal`; `_EndOnRouting` (`EndFromTargetRow = FALSE`, with `CatalogPromote` between `Cut` and `Activate` — the C8-2 trace) violates `OneOwner`. *`Durability.tla`:* a tenant-level delete with knob `TenantAckBeforeFence` (design FALSE); `Durability_CatalogRestoreInFenceWindow.cfg` violates `AckedDeleteSurvives` (N182). *`Derivation.tla`:* `clog[subj]` (the subject's last `curation_log` action and tag), written by `Invalidate`/`Restore`, read by `LazyTwinRead` instead of `itag[f]`; invariant `TagFromLog` (`clog[subj].tag = ` the tag of every hidden twin of `subj`); `Derivation_LazyTagFromLastLog.cfg` keeps failing `RestoreExact` (C8-12). *`Storage.tla`, `Outbox.tla`, `Consolidation.tla`:* unchanged. *`EXPECT`, §7.7 and `results/RESULTS.md`* regenerated; §7.1's omissions column gains "a standby's replay is a snapshot, not a WAL position; `--lose-move-ins` and the recovery move are not modelled". *§7.4, §8.4.x:* `TestMove_TargetRestoredAfterMoveBackup` → `TestMove_TargetRestoredAfterSeal`, `TestMove_TargetPITRBeforeMoveBackup` → `TestMove_TargetPITRBelowFloor`, `TestMove_CutWaitsForMoveBackup` → `TestMove_CutWaitsForSealedCopy`; new `TestMove_FailoverBelowFloorRefused`, `TestMove_ActivateAfterCatalogPromotion`, `TestDelete_TenantAckAfterFence`, `TestRestore_CatalogWritesReplicated`; `TestCatalog_ReplicatedHelperAsAdmin`, `TestCatalog_ReconcileDerivesRouting`, `TestMove_CleanupGateAtEntry`, `TestDelete_BusyDuringMove`, `TestDeps_EveryRPCHasPath` restated; citations follow §8 by generation (N177). *Schedule (§10 is authoritative):* M0.3 +0.25 ew (E1: the stats-reader owners, the lint rules, `request_id` on the ack methods); M0.7 +0.25 ew (E2: the five must-fail configurations); M1.3 +0.25 ew (E2: the `DeleteTenant` operation's acknowledged point); M1.5 net 0 (`MoveBackup` → `SealCopy`, the `lost` state and runbook, the restore edges that close a move, the LSN floor in `engramctl restore`; measures `R_archive`/`R_redo` instead of `R_backup`); M1.7 +0.25 ew (E1: the failover floor check, `MoveTargetNotActivated`, `ReconcileIncomplete`, weekly `pgbackrest verify`). Totals: Phase 0 **14.25**, Phase 1 **50.75**, Phase 2 21.25; committed **86.25** (8.25 over 78); separate 39.25; **125.5 ew in total**. Chains: E1 28.75, **E2 29.0**, E3 28.5 ew; the MVP moves to day ≈ 168 (still week 24, no spare day; E1 gains M0.3 and M1.7); E2's chain ends on day ≈ 204, so the **Phase 2 exit is week 30** unless 0.5 ew is cut from E2's chain (a human decision; the candidates are M2.3's leakage tests moved to the separate track, or M0.7's trace converter deferred to F.1). | N178, N168, N156, N158, §7, §8, §10 | C8-2, C8-12, A8-7, and the spec rows of N179 to N185 |
+| N188 | **Specs and tests after D27 (TLA+ manifest).** *`ShardMove.tla`.* **Renamed:** `MoveBackup` → `SealCopy` (`mp: built → sealed`; requires `sb[tgt] ⊇ frozenSet` under `FloorBeforeCut`, i.e. the standby replayed the copy, and sets `flr[tgt] = TRUE`), knob `BackupBeforeCut` → `FloorBeforeCut`, state `backed` → `sealed`. **New state:** `sb[s]` (the standby's replayed snapshot) and `mv[s]` (the ownership row's move bit, set by `Plan` on the target and `start_move` on the source, cleared by `Activate`, `Thaw` and — under `RestoreCloses` — `RestoreDone`). **New actions:** `StandbyReplay(s)` (`sb[s]' = store[s]`, any time), `Failover(s)` (`store[s]' = sb[s]`; refused under `FailoverChecksFloor` when `s = tgt ∧ flr[tgt] ∧ sb[tgt] ⊉ frozenSet`; otherwise the restore path), `CatalogPromote` (a lossless promotion: `cdirty' = TRUE`, nothing reverted; so the reconcile runs after (c), C8-2), `ApplyReconcile` writes `cat' = (tgt, me)` when it re-derives `committed` from `moved_out` (N172's routing write), `RestoreDone` (split out of `ReconcileDesign(tgt)`: `fin[tgt] = Row("active", me + 1)`, clears `mv` under `RestoreCloses`, sets `mp' = "done"` only through `Activate`-equivalent stamping). **Changed:** `Cut`'s continuation (`Activate`) is enabled on `own[tgt].st = "ready" ∧ cm = "committed"` regardless of `cat`; under `¬EndFromTargetRow` the mover may instead end `done` when `cat = (tgt, ≥ me)` (the C8-2 shortcut); `Backup`/`Restore` to `bak[tgt]` is refused when `flr[tgt] ∧ bak[tgt] ⊉ frozenSet` (`--lose-move-ins` and the recovery move stay unmodelled, §7.1); `~cdirty` is dropped from `RestoreCore`/`Restore`; `frozen/restore` is an owner in `ApplyReconcile`, which prefers the higher epoch (N180(4)); `Recoverable(tgt)` reads `flr[tgt]`. **Invariants:** all of N178 kept; **new** `MoveClosedWhenFinal` (`mp ∈ {done, rolled_back} ⇒ ∀ s: ¬mv[s]`) and `OwnerHasNoStaleMove` (`own[s].st = "active" ∧ mv[s] ⇒ mp ∉ Final`). **Knobs:** `FloorBeforeCut`, `FailoverChecksFloor`, `RestoreCloses`, `EndFromTargetRow` (design TRUE, TRUE, TRUE, TRUE), `ThawNeedsReplicated` and `EpochFromAnyRow` kept. **Configurations:** kept `ShardMove.cfg`, `_Live`, `_ActiveWriters`, `_Twice`, `_TgtRestore`, `_TgtRestore2` (both now with `StandbyReplay`/`Failover` and one `CatalogPromote`), `_UnfencedSteps`, `_NoReady`, `_RestoreNoReconcile`, `_NoVerify`, `_StampAfterCut`, `_SweepNotPaused`, `_NoSeqAdvance`, `_CatalogLossNoShardTruth`, `_UnionRepair`, `_CopyBeforeFreeze`, `_ReadyBeforeIndex`, `_CutOnUnreplicatedCommit`, `_ThawOnUnreplicatedAbort`, `_CatalogLossDuringFreeze`; **renamed** `_NoMoveBackup` → `_NoFloor` (`FloorBeforeCut = FALSE`) violates `NoLossNoDup`; **new must-fail** `_LaggingFailover` (`FailoverChecksFloor = FALSE`, a `Failover(tgt)` after `CommitCAS` with `sb[tgt]` from before the copy) violates `NoLossNoDup` (and `ServedFromIndex`); `_RestoreKeepsMove` (`RestoreCloses = FALSE`, a target restore before activation) violates `MoveClosedWhenFinal`; `_EndOnRouting` (`EndFromTargetRow = FALSE`, with `CatalogPromote` between `Cut` and `Activate` — the C8-2 trace) violates `OneOwner`. *`Durability.tla`:* a tenant-level delete with knob `TenantAckBeforeFence` (design FALSE); `Durability_CatalogRestoreInFenceWindow.cfg` violates `AckedDeleteSurvives` (N182). *`Derivation.tla`:* `clog[subj]` (the subject's last `curation_log` action and tag), written by `Invalidate`/`Restore`, read by `LazyTwinRead` instead of `itag[f]`; invariant `TagFromLog` (`clog[subj].tag = ` the tag of every hidden twin of `subj`); `Derivation_LazyTagFromLastLog.cfg` keeps failing `RestoreExact` (C8-12). *`Storage.tla`, `Outbox.tla`, `Consolidation.tla`:* unchanged. *`EXPECT`, §7.7 and `results/RESULTS.md`* regenerated; §7.1's omissions column gains "a standby's replay is a snapshot, not a WAL position; `--lose-move-ins` and the recovery move are not modelled". *§7.4, §8.4.x:* `TestMove_TargetRestoredAfterMoveBackup` → `TestMove_TargetRestoredAfterSeal`, `TestMove_TargetPITRBeforeMoveBackup` → `TestMove_TargetPITRBelowFloor`, `TestMove_CutWaitsForMoveBackup` → `TestMove_CutWaitsForSealedCopy`; new `TestMove_FailoverBelowFloorRefused`, `TestMove_ActivateAfterCatalogPromotion`, `TestDelete_TenantAckAfterFence`, `TestRestore_CatalogWritesReplicated`; `TestCatalog_ReplicatedHelperAsAdmin`, `TestCatalog_ReconcileDerivesRouting`, `TestMove_CleanupGateAtEntry`, `TestDelete_BusyDuringMove`, `TestDeps_EveryRPCHasPath` restated; citations follow §8 by generation (N177). *Schedule (§10 is authoritative):* M0.3 +0.25 ew (E1: the stats-reader owners, the lint rules, `request_id` on the ack methods); M0.7 +0.25 ew (E2: the five must-fail configurations); M1.3 +0.25 ew (E2: the `DeleteTenant` operation's acknowledged point); M1.5 net 0 (`MoveBackup` → `SealCopy`, the `lost` state and runbook, the restore edges that close a move, the LSN floor in `engramctl restore`; measures `R_archive`/`R_redo` instead of `R_backup`); M1.7 +0.25 ew (E1: the failover floor check, `MoveTargetNotActivated`, `ReconcileIncomplete`, weekly `pgbackrest verify`). Totals: Phase 0 **14.25**, Phase 1 **50.75**, Phase 2 21.25; committed **86.25** (8.25 over 78); separate 39.25; **125.5 ew in total**. Chains: E1 28.75, **E2 29.0**, E3 28.5 ew; the MVP moves to day ≈ 168 (still week 24, no spare day; E1 gains M0.3 and M1.7); E2's chain ends on day ≈ 204, so the **Phase 2 exit is week 30** and no 0.5 ew cut is applied to E2's chain (a human decision, N190). | N178, N168, N156, N158, §7, §8, §10 | C8-2, C8-12, A8-7, and the spec rows of N179 to N185 |
 | N189 | **Corrections from model checking D27 (binding).** (1) **A restoring move target is not an owner yet:** a `frozen/restore` row with `move_id` set and `moved_in_at IS NULL` is not an owner for the reconcile's owner rule (N180(4), N172) until the source row reads `moved_out`; otherwise a catalog promotion during the freeze routes the namespace to an empty target (`NoRouteToTargetBeforeC`). (2) **No lossy restore during a catalog reconcile:** `engramctl restore` and `shard failover` to an image older than the live primary refuse while a `catalog reconcile` is running (and the reconcile refuses to start while such a restore is in progress); a catalog restore after (c) combined with a source restore to a pre-move backup inside the reconcile otherwise leaves no witness of the commit (`RollbackPossibleBeforeC`). A lossless failover is unaffected. (3) **The floor covers the index:** a target standby or restore image below `floor_lsn` lacks the HNSW build; `SealCopy` waits for the standby to replay through `copy_end_lsn`, which includes the index. (4) Model bounds after D27 (`ShardMove.cfg` `MaxBak = 0`, `ShardMove_Live.cfg` `NRows = 1`, `Durability.cfg` `MaxT = 6`, reduced standby image) are recorded in §7.2.6; `ShardMove_NoMoveBackup` is renamed `ShardMove_NoFloor`. 79 configurations in `formal/tla/EXPECT`. | N172, N180, N185, N188 | TLC (D27 fix pass) |
+| N190 | **Human decisions after D27 (binding).** (1) **Schedule:** no 0.5 ew cut is applied, the full scope stays and the Phase 2 exit is week 30 (committed 86.25 ew, total 125.5 ew; §10, N188). (2) **Freeze window:** the 8 h cap on the operator window is accepted (N173). (3) **`DeleteTenant` is asynchronous:** the operation is acknowledged after every namespace is fenced (N182), accepted. (4) **Double fault:** a catalog restore combined with a source restore, with a loss of at most 60 s of acknowledged-after-RPO work, is accepted (N171, N182, N189(2)). (5) **Proto evolution:** breaking changes are allowed before `v1.0.0` and removed fields are NOT reserved; the `reserved` statements, the comments that only documented a removed or renamed field, the reservation rule, the `WIRE_JSON` check, the `buf breaking` gate and the per-round break table are removed (§4.5); `buf lint`, `buf build` and `buf format -d --exit-code` gate CI and `buf breaking` is not run before `v1.0.0`; field numbers of existing fields are kept; this supersedes the reservation and `WIRE_JSON` clauses of N128, N139, N157, N177 and N187. (6) **Move targets must be HA:** a `single`-profile shard (no standby) is not a move target; `Plan` refuses it with `PreconditionFailed{MOVE_TARGET_NOT_HA}` (no row in the target's `pg_stat_replication`; a new type in the proto errors, the §4 error table, §5.5 step 7 and the §9.6 runbook; test `TestMove_PlanRefusesSingleProfileTarget`), so N179's standby-replay check is never vacuous. (7) **`R_redo`:** the planning value of N166 (crash recovery 1.2 min per GB) is accepted and M1.5 measures it. (8) **Footprint:** the §3.7 rows with the unmeasured remainder of ≈ 18 GB per 10 M facts are accepted and M0.6 measures it. (9) **Module path:** `github.com/gstamatakis95/engram` replaces the placeholder module path of D1 in the plan, in every `go_package` and in the implementation prompt. | N128, N139, N157, N177, N187 (reservation and `WIRE_JSON` clauses); N188 (the pending cut); D1 (module path) | the human's decisions after D27 |

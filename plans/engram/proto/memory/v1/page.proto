@@ -23,7 +23,7 @@ import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 import "memory/v1/operation.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // PageService manages knowledge pages. Create/Update/Delete/Refresh require memory.write; Get/List require memory.read.
 service PageService {
@@ -125,8 +125,6 @@ message Page {
   PageContent content = 16;
   // Optional author guidance for the page-refresh prompt, ≤ 4 KiB.
   string instructions = 17;
-
-  reserved 100 to 199;
 }
 
 // CreatePageRequest defines a page.
@@ -138,16 +136,12 @@ message CreatePageRequest {
   // Do not start the first refresh now.
   bool defer_refresh = 4;
   string operation_id = 5;
-
-  reserved 100 to 199;
 }
 
 // CreatePageResponse returns the page and, if started, the refresh operation.
 message CreatePageResponse {
   Page page = 1;
   Operation refresh_operation = 2;
-
-  reserved 100 to 199;
 }
 
 // GetPageRequest fetches a page by id or name.
@@ -165,15 +159,11 @@ message GetPageRequest {
   // `version` > 0.
   google.protobuf.Timestamp as_of = 6;
   google.protobuf.FieldMask read_mask = 7;
-
-  reserved 100 to 199;
 }
 
 // GetPageResponse wraps the page.
 message GetPageResponse {
   Page page = 1;
-
-  reserved 100 to 199;
 }
 
 // ListPagesRequest lists pages by name.
@@ -184,16 +174,12 @@ message ListPagesRequest {
   bool stale_only = 3;
   string name_prefix = 4;
   google.protobuf.FieldMask read_mask = 5;
-
-  reserved 100 to 199;
 }
 
 // ListPagesResponse is a page of pages.
 message ListPagesResponse {
   repeated Page pages = 1;
   PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // SearchPagesRequest ranks pages by relevance to a query.
@@ -213,8 +199,6 @@ message SearchPagesRequest {
   // Return `content` (markdown of the matched version) on every hit.
   bool include_content = 7;
   google.protobuf.FieldMask read_mask = 8;
-
-  reserved 100 to 199;
 }
 
 // PageHit is one ranked page.
@@ -237,8 +221,6 @@ message SearchPagesResponse {
   PagingResponse paging = 2;
   // The cut-off actually applied (echo of as_of).
   google.protobuf.Timestamp as_of_applied = 3;
-
-  reserved 100 to 199;
 }
 
 // UpdatePageRequest patches the definition.
@@ -249,15 +231,11 @@ message UpdatePageRequest {
   // Allowed paths: display_name, source_query, tag_filter, refresh_policy, refresh_policy.*, instructions.
   google.protobuf.FieldMask update_mask = 4;
   string etag = 5;
-
-  reserved 100 to 199;
 }
 
 // UpdatePageResponse returns the updated page.
 message UpdatePageResponse {
   Page page = 1;
-
-  reserved 100 to 199;
 }
 
 // DeletePageRequest deletes a page synchronously.
@@ -265,16 +243,12 @@ message DeletePageRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   string page_id = 3;
-
-  reserved 100 to 199;
 }
 
 // DeletePageResponse acknowledges the delete.
 message DeletePageResponse {
   // Versions removed.
   int32 versions_deleted = 1;
-
-  reserved 100 to 199;
 }
 
 // RefreshPageRequest starts a refresh.
@@ -285,13 +259,9 @@ message RefreshPageRequest {
   string operation_id = 4;
   // Refresh even when the page is not stale (full rewrite instead of a delta edit).
   bool force = 5;
-
-  reserved 100 to 199;
 }
 
 // RefreshPageResponse returns the refresh operation.
 message RefreshPageResponse {
   Operation operation = 1;
-
-  reserved 100 to 199;
 }

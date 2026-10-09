@@ -1,18 +1,16 @@
 // engram/internal/errors/v1/errors.proto
 //
 // Error details that travel between the shard store, the workflow activities and `engram-api`, and never to a public
-// caller (decision N128, review A-12). They used to live in memory/v1/errors.proto, where "nothing is ever removed from
-// memory.v1" would have frozen them forever and where hiding their shard fields depended on the API remembering to
-// strip them. They are packed into `google.rpc.Status.details` (or a Temporal ApplicationError) with type URL
-// `type.googleapis.com/engram.internal.errors.v1.<Name>` and are consumed by the router or the retry policy; the API
-// interceptor drops any detail of this package before a response leaves the process.
+// caller (decision N128, review A-12). They are packed into `google.rpc.Status.details` (or a Temporal
+// ApplicationError) with type URL `type.googleapis.com/engram.internal.errors.v1.<Name>` and are consumed by the router
+// or the retry policy; the API interceptor drops any detail of this package before a response leaves the process.
 syntax = "proto3";
 
 package engram.internal.errors.v1;
 
 import "google/protobuf/duration.proto";
 
-option go_package = "example.com/engram/gen/go/engram/internal/errors/v1;errorsv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/engram/internal/errors/v1;errorsv1";
 
 // MovedOutHint → attached to WrongShardOrEpoch{MOVED_OUT}. The shard's
 // permanent `moved_out` ownership row stores the target shard and epoch (decision N93), so the API routes the call to

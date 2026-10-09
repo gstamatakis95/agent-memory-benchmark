@@ -27,5 +27,4 @@ lint:
 breaking:
   use:
     - FILE
-  # FILE is the strictest category: it also forbids moving a definition between
-  # files and changing go_package. Section 4.5 of the plan states the policy.
+  # FILE is the strictest category, used from v1.0.0 on. `buf breaking` is not run before v1.0.0 (section 4.5).

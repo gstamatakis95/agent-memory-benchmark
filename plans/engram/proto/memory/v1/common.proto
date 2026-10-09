@@ -6,11 +6,8 @@
 //
 // Field-numbering policy (applies to every file in this package):
 //   * numbers 1-15 are for hot fields (1-byte tags);
-//   * numbers 100-199 are reserved in every top-level request/response and
-//     resource message: upstream never assigns them, so downstream forks can add private fields there without ever
-//     colliding with a future release;
-//   * removed fields are never renumbered; they become `reserved N` +
-//     `reserved "name"` with a comment saying which release removed them.
+//   * pre-1.0 breaking changes are allowed (plan section 4.5): a removed field is simply deleted, and the numbers of
+//     existing fields are never changed.
 //
 // Timestamp vocabulary (decision D9, review F-2):
 //   * `mentioned_at` = the RetainItem `timestamp`, set by the server on every
@@ -27,7 +24,7 @@ package memory.v1;
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // RequestMeta carries per-call metadata that must travel in the body (not in gRPC metadata) so it is part of the
 // idempotency hash and of the audit log.
@@ -157,11 +154,6 @@ message TagFilter {
   // Query tag set Q. 1-32 tags, each 1-64 bytes, matched byte-for-byte after trimming; duplicates are removed before
   // evaluation. Required (non-empty) for every mode other than UNSPECIFIED.
   repeated string tags = 2;
-
-  // Removed in v1.0.0-rc4: `bool include_untagged = 3`. The ANY/ALL vs ANY_STRICT/ALL_STRICT split expresses
-  // untagged-item handling per mode.
-  reserved 3;
-  reserved "include_untagged";
 }
 
 // Provenance says where a memory came from. Every fact, observation source and chunk resolves to a document version and

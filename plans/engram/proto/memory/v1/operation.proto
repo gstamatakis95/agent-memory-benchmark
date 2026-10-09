@@ -35,7 +35,7 @@ import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 import "memory/v1/errors.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // OperationService reads, waits on and cancels asynchronous operations.
 service OperationService {
@@ -86,10 +86,6 @@ enum OperationKind {
   OPERATION_KIND_REFRESH_PAGE = 5;
   // ExportService.CreateSnapshot.
   OPERATION_KIND_CREATE_SNAPSHOT = 6;
-  // Removed in v1.0.0-rc6 (decision N127): a move has no operations row; it is the catalog's `namespace_moves` row and
-  // lives in memory.admin.v1.
-  reserved 7;
-  reserved "OPERATION_KIND_MOVE_NAMESPACE";
   // TenantService.DeleteTenant: the tenant-level umbrella over one DELETE_NAMESPACE operation per namespace (decision
   // N127). It is derived from the catalog's tenant row, not stored on a shard, and is read through the tenant-scoped
   // memory.admin.v1.TenantService.GetTenantOperation. The per-namespace operations are created as the TenantDelete
@@ -158,8 +154,6 @@ message Operation {
   // the delete survives a catalog restore. FAILED with reason CATALOG_RESTORED (in `error.details`) if a catalog
   // restore reverted the `deleting` row before it was set.
   google.protobuf.Timestamp acknowledged_at = 15;
-
-  reserved 100 to 199;
 }
 
 // ExpungeSla states the bounds of the asynchronous expunge that follows an acknowledged delete (decision N119). They
@@ -246,15 +240,11 @@ message GetOperationRequest {
   string operation_id = 2;
   // Optional projection; empty = all fields.
   google.protobuf.FieldMask read_mask = 3;
-
-  reserved 100 to 199;
 }
 
 // GetOperationResponse wraps the operation.
 message GetOperationResponse {
   Operation operation = 1;
-
-  reserved 100 to 199;
 }
 
 // ListOperationsRequest lists operations, newest first.
@@ -270,16 +260,12 @@ message ListOperationsRequest {
   // Only operations created at or after this time.
   google.protobuf.Timestamp created_after = 6;
   google.protobuf.FieldMask read_mask = 7;
-
-  reserved 100 to 199;
 }
 
 // ListOperationsResponse is a page of operations.
 message ListOperationsResponse {
   repeated Operation operations = 1;
   PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // CancelOperationRequest requests cooperative cancellation.
@@ -289,16 +275,12 @@ message CancelOperationRequest {
   RequestMeta meta = 3;
   // Free-text reason recorded on the operation.
   string reason = 4;
-
-  reserved 100 to 199;
 }
 
 // CancelOperationResponse returns the operation after the cancel request was recorded (state may still be RUNNING until
 // the workflow observes it).
 message CancelOperationResponse {
   Operation operation = 1;
-
-  reserved 100 to 199;
 }
 
 // WaitOperationRequest blocks until terminal or timeout.
@@ -308,8 +290,6 @@ message WaitOperationRequest {
   // Maximum server-side wait; 0 = 30 s; clamped to 60 s and to the call deadline minus 500 ms. The response is always
   // the current state.
   google.protobuf.Duration timeout = 3;
-
-  reserved 100 to 199;
 }
 
 // WaitOperationResponse returns the operation; `timed_out` tells the two return paths apart.
@@ -317,6 +297,4 @@ message WaitOperationResponse {
   Operation operation = 1;
   // True when the wait ended by timeout and the operation is not terminal.
   bool timed_out = 2;
-
-  reserved 100 to 199;
 }

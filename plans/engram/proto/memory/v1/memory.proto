@@ -25,7 +25,7 @@ import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 import "memory/v1/operation.proto";
 
-option go_package = "example.com/engram/gen/go/memory/v1;memoryv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
 
 // MemoryService is the primary data-plane service. Every method requires a deadline, an `authorization: Bearer <jwt>`
 // metadata entry whose `tenant_id` claim equals `namespace.tenant_id` and whose `ns` allowlist contains
@@ -128,12 +128,6 @@ message RetainItem {
   UpdateMode update_mode = 8;
   // MIME-ish content type: "text/plain" (default) or "text/markdown" (enables heading-anchored chunking).
   string content_type = 10;
-
-  // Removed in v1.0.0-rc5 (review F-2, decision D9): `google.protobuf.Timestamp mentioned_at = 9`, a per-item override
-  // of the `as_of` key. A backdated key made "leak-free" depend on the client and the extractor. `mentioned_at` is now
-  // server-set = `timestamp`; a quoted older date lands in Memory.said_at.
-  reserved 9;
-  reserved "mentioned_at";
 }
 
 // RetainRequest submits items. Limits: ≤ 100 items, ≤ 8 MiB total content.
@@ -148,13 +142,6 @@ message RetainRequest {
   // normalised protojson of the request, N72) returns the existing operations; with a different hash fails with
   // ALREADY_EXISTS.
   string operation_id = 4;
-
-  // Removed in v1.0.0-rc2: `bool wait_for_visibility = 5` (synchronous retain). Replaced by
-  // OperationService.WaitOperation so that the API never holds a request open for the duration of an LLM pipeline.
-  reserved 5;
-  reserved "wait_for_visibility";
-
-  reserved 100 to 199;
 }
 
 // RetainResponse acknowledges durable acceptance: one Operation per distinct document_id, in order of first appearance
@@ -164,8 +151,6 @@ message RetainResponse {
   // Ids of documents that were minted because the item had no document_id, aligned with `operations` (deterministic
   // when operation_id was given, decision N127).
   repeated string document_ids = 2;
-
-  reserved 100 to 199;
 }
 
 // RecallRequest describes a retrieval.
@@ -227,13 +212,6 @@ message RecallRequest {
   // result when the observation fits (Hindsight `prefer_observations`). Page refresh (section 5.3) sets it; default
   // false.
   bool prefer_observations = 18;
-
-  // Removed in v1.0.0-rc3: `float min_score = 17`. A raw score threshold is not comparable across arms and rerankers;
-  // budgets and max_results are the supported knobs.
-  reserved 17;
-  reserved "min_score";
-
-  reserved 100 to 199;
 }
 
 // RecallResponse is one stream message: either a ranked result or the single trailing stats message. Clients must
@@ -243,8 +221,6 @@ message RecallResponse {
     RecallResult result = 1;
     RecallStats stats = 2;
   }
-
-  reserved 100 to 199;
 }
 
 // RecallResult is one packed result in rank order.
@@ -388,8 +364,6 @@ message Memory {
   // forwards older material). Display and ranking only — never an as_of key (decision D9, review F-2). Unset when the
   // extractor gave no explicit date.
   google.protobuf.Timestamp said_at = 22;
-
-  reserved 100 to 199;
 }
 
 // GetMemoryRequest fetches one memory by id.
@@ -400,15 +374,11 @@ message GetMemoryRequest {
   google.protobuf.FieldMask read_mask = 3;
   // Observations: also list source facts that are invalidated (never tombstoned or purged ones; those are gone).
   bool include_hidden_sources = 4;
-
-  reserved 100 to 199;
 }
 
 // GetMemoryResponse wraps the memory.
 message GetMemoryResponse {
   Memory memory = 1;
-
-  reserved 100 to 199;
 }
 
 // ListMemoriesOrder selects the sort order of ListMemories.
@@ -444,16 +414,12 @@ message ListMemoriesRequest {
   ListMemoriesOrder order = 12;
   google.protobuf.FieldMask read_mask = 13;
   repeated MetadataFilter metadata_filters = 14;
-
-  reserved 100 to 199;
 }
 
 // ListMemoriesResponse is a page of memories.
 message ListMemoriesResponse {
   repeated Memory memories = 1;
   PagingResponse paging = 2;
-
-  reserved 100 to 199;
 }
 
 // BatchGetMemoriesRequest fetches up to 100 ids.
@@ -461,16 +427,12 @@ message BatchGetMemoriesRequest {
   NamespaceRef namespace = 1;
   repeated string memory_ids = 2;
   google.protobuf.FieldMask read_mask = 3;
-
-  reserved 100 to 199;
 }
 
 // BatchGetMemoriesResponse returns found memories in request order and the ids that were not found (no error).
 message BatchGetMemoriesResponse {
   repeated Memory memories = 1;
   repeated string missing_ids = 2;
-
-  reserved 100 to 199;
 }
 
 // InvalidateRequest soft-hides a fact.
@@ -483,15 +445,11 @@ message InvalidateRequest {
   string memory_id = 3;
   // Free-text audit reason, ≤ 1 KiB.
   string reason = 4;
-
-  reserved 100 to 199;
 }
 
 // InvalidateResponse returns the updated fact.
 message InvalidateResponse {
   Memory memory = 1;
-
-  reserved 100 to 199;
 }
 
 // RestoreRequest clears a soft invalidation.
@@ -499,15 +457,11 @@ message RestoreRequest {
   NamespaceRef namespace = 1;
   RequestMeta meta = 2;
   string memory_id = 3;
-
-  reserved 100 to 199;
 }
 
 // RestoreResponse returns the restored fact.
 message RestoreResponse {
   Memory memory = 1;
-
-  reserved 100 to 199;
 }
 
 // ReflectRequest asks for a reasoned answer.
@@ -534,8 +488,6 @@ message ReflectRequest {
   string context = 11;
   // Overrides the namespace mission for this call only, ≤ 4 KiB.
   string mission_override = 12;
-
-  reserved 100 to 199;
 }
 
 // ReflectResponse is one event of the Reflect stream. Order: zero or more
@@ -550,8 +502,6 @@ message ReflectResponse {
     ReflectAnswer answer = 5;
     ReflectStats stats = 6;
   }
-
-  reserved 100 to 199;
 }
 
 // TokenDelta is a piece of generated text in emission order.

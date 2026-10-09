@@ -9,19 +9,9 @@
 // replay with defaults); removing or re-interpreting a field requires a `workflow.GetVersion` patch in the workflow
 // code and a drain window for running histories (section 4.5).
 //
-// Pre-1.0 breaking-change exception (decisions N128, N139, review A-9, A-11). This package has not shipped v1.0.0, so
-// the round-3 redesign (D22) and the round-4 changes (D23) changed it incompatibly. Until v1.0.0, `buf breaking` is
-// baselined on the merge target (`main`) for pull requests and on `main@HEAD~1` only in the push-to-main job, and every
-// intended break carries a labelled exception and a changelog entry (plan section 4.5, decision N157). Round 5 (N144 to
-// N157) only added fields and messages. The breaks, all intended: N86 `ChunkWork.item_index = 9`
-// became `item_indexes = 17` (old number reserved); the lineage-based consolidation messages (`ObservationVersionRef`,
-// `candidate_versions`, `flagged_candidate_versions`, N79) were replaced by the two-stage shapes of N121;
-// `PurgeTarget`/`PurgeInput`/`PurgeResult` were replaced by the Expunge messages of N119; `ExportInput` lost its outbox
-// cut (N126); and the move messages lost the replay floor, `applied_seq` and the verify watermark (N124). Round 4
-// (N119, N121, N135 to N137) reserved `ExpungeInput.batch_pause` (the purge is paced by WAL, not by a fixed pause),
-// moved the proposal key to `(batch_key, attempt)` and added `base_version` to the stored writes. Every top-level input
-// written by the D22 build carries `schema_version = 2`; the worker branches on it for in-flight histories started at 1
-// and keeps that branch until they have drained (30 days).
+// Pre-1.0 breaking changes are allowed (plan section 4.5). Every top-level input written by the D22 build carries
+// `schema_version = 2`; the worker branches on it for in-flight histories started at 1 and keeps that branch until they
+// have drained (30 days).
 //
 // Payload size and confidentiality (decision N59, review F-13/F-18/F-25):
 //   * every activity result larger than 4 KiB travels by blob key under the
@@ -46,7 +36,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "memory/v1/common.proto";
 
-option go_package = "example.com/engram/gen/go/engram/internal/workflow/v1;workflowv1";
+option go_package = "github.com/gstamatakis95/engram/gen/go/engram/internal/workflow/v1;workflowv1";
 
 // WorkflowScope is the fencing token carried by every payload.
 message WorkflowScope {
@@ -193,14 +183,6 @@ message ChunkWork {
   // decision N87. The extraction cache key and chunks.extraction_key are sha256(content_hash ‖ prompt_version ‖ model ‖
   // schema_version ‖ render_hash), so a change to any prompt input is a new key.
   string render_hash = 18;
-
-  // Removed in v1.0.0-rc5 (decision N59): `string text = 5` (≤ 8 KiB of chunk text inline in every activity input).
-  // Read from the manifest blob instead.
-  reserved 5;
-  reserved "text";
-  // Removed in N86: `int32 item_index = 9` (a chunk may cover several items).
-  reserved 9;
-  reserved "item_index";
 }
 
 // ChunkPlan is the result of the Chunk activity: the delta against the previous version by content hash (decision D8).
@@ -380,11 +362,6 @@ message CommitChunkInput {
   string links_blob_key = 12;
   // Usage of the extract and embed calls, folded into token_usage_events in the same transaction (PD-1).
   repeated TokenUsage usage = 13;
-
-  // Removed in v1.0.0-rc5 (decision N59): the inline copies `ExtractChunkResult extraction = 4`, `EmbedChunkResult
-  // embeddings = 5`, `ResolveEntitiesResult entities = 6`, `BuildLinksResult links = 7`.
-  reserved 4 to 7;
-  reserved "extraction", "embeddings", "entities", "links";
 }
 
 // CommitChunkResult reports the committed ids.
@@ -598,12 +575,6 @@ message StoreProposalInput {
   // "" or "capacity": the capacity re-run is its own attempt with the note "do not use create; attach or merge
   // instead".
   string prompt_variant = 10;
-
-  // Removed in the D22 redesign (decisions N117, N121, N128): lineage and the stage-1 candidate text are no longer
-  // recorded. `repeated ObservationOp ops = 3`, `repeated string input_fact_ids = 4` (now per write) and `repeated
-  // ObservationVersionRef candidate_versions = 5`.
-  reserved 3 to 5;
-  reserved "ops", "input_fact_ids", "candidate_versions";
 }
 
 // StoreProposalResult returns the list that won (the stored one).
@@ -612,9 +583,6 @@ message StoreProposalResult {
   // call's writes were discarded.
   bool stored_new = 1;
   repeated ObservationWrite writes = 3;
-
-  reserved 2;
-  reserved "ops";
 }
 
 // ApplyBatchInput applies the STORED proposal of a batch under the derivation
@@ -652,11 +620,6 @@ message ApplyBatchResult {
   // the same batch_key.
   bool base_moved = 5;
   int32 next_attempt = 6;
-
-  // Removed in the D22 redesign (decision N79 is withdrawn): `repeated ObservationVersionRef flagged_candidate_versions
-  // = 4`.
-  reserved 4;
-  reserved "flagged_candidate_versions";
 }
 
 // RefreshPageInput starts a page refresh workflow.
@@ -751,10 +714,6 @@ message ExpungeInput {
   repeated string document_ids = 5;
   // Rows per delete batch (default 1,000).
   int32 batch_size = 6;
-  // Removed in round 4 (decision N119): `Duration batch_pause = 7`. The purge is paced by the WAL it writes
-  // (`wal_mb_per_s`), not by a fixed pause.
-  reserved 7;
-  reserved "batch_pause";
   // xcache/ecache/staging blobs are deleted only when no visible chunk references the hash AND the blob is older than
   // this (default 24 h, longer than the maximum in-flight activity age; decision N100).
   google.protobuf.Duration xcache_grace = 8;
@@ -946,11 +905,6 @@ message ExportInput {
   int64 base_version = 5;
   bool include_chunks = 6;
   bool include_pages = 7;
-
-  // Removed in the D22 redesign (decision N126): the outbox cut `int64 base_outbox_seq = 8`, `int64 outbox_seq = 9` and
-  // `repeated int64 base_open_gaps = 10`.
-  reserved 8 to 10;
-  reserved "base_outbox_seq", "outbox_seq", "base_open_gaps";
 }
 
 // ExportResult reports the written files.
@@ -983,9 +937,6 @@ message MoveInput {
   string source_blob_prefix = 9;
   string target_blob_prefix = 10;
   bool pause_before_freeze = 11;
-  // Removed in v1.0.0-rc7 (decision N160): `freeze_watchdog = 12`, replaced by the window deadline below.
-  reserved 12;
-  reserved "freeze_watchdog";
   // W_est computed by Plan (rows / R_copy + build(vectors) + max(wal_build / R_archive, wal_build / R_redo) + verify,
   // decisions N173, N179) and the operator window, at most 8 h. The freeze deadline is
   // `frozen_at + max(1.5 × W_est, W_est + 10 min)`, capped by the window; the workflow rolls back at the deadline
@@ -994,9 +945,6 @@ message MoveInput {
   google.protobuf.Duration window = 14;
   // Do not freeze before this time (a scheduled window).
   google.protobuf.Timestamp freeze_not_before = 15;
-  // Removed in v1.0.0-rc8 (decision N169): `uint32 rerun_attempt = 16`.
-  reserved 16;
-  reserved "rerun_attempt";
 }
 
 // CopyProgress is the FrozenCopy activity's heartbeat and resume payload (decisions N124, N160): the source is static
@@ -1051,7 +999,7 @@ message VerifyFrozenReport {
 // SealCopyResult is the SealCopy activity's result (decision N179): `copy_end_lsn` (pg_lsn text form) and its timeline
 // from `pg_switch_wal()` on the target after the last index build, the time `pgbackrest check` confirmed the segment
 // archived, and the time the target's standby replayed it (unset on the `single` profile).
-// `catalog.MoveStamps.RecordFloor` stores the floor. The name `MoveBackupResult` (removed in v1.0.0-rc8) is not reused.
+// `catalog.MoveStamps.RecordFloor` stores the floor.
 message SealCopyResult {
   string copy_end_lsn = 1;
   int32 copy_end_timeline = 2;
@@ -1080,13 +1028,11 @@ message MoveCheckpoint {
   // singletons (never from Temporal visibility, decision N97). Restart starts each on the target queue with a memo
   // `epoch = e + 1` and WorkflowIDReusePolicy TERMINATE_IF_RUNNING.
   repeated string drained_workflow_ids = 7;
-  // Removed in v1.0.0-rc7 (decision N160): `copy_started_at = 10` (T_copy), `reconcile = 14`, `pre_verify = 15`,
-  // `w_plan = 16`, `await_indexes = 18` and `reconcile_in = 19`.
   // Source `pg_control_system().system_identifier` and `pg_control_checkpoint().timeline_id`, recorded by Plan; every
   // later activity on the source re-reads them and fails MoveFenced on mismatch (decision N123).
   uint64 source_system_identifier = 11;
   int32 source_timeline_id = 12;
-  // Sub-step last committed; renamed from `cutover_step` (decision N187).
+  // Sub-step last committed.
   CutoverStep cutover_sub_step = 13;
   // The source's final `nextval('engram_ins_seq')` under the freeze; the target's sequence is advanced past it once, at
   // the start of FrozenCopy (engram_seq_advance, decisions N147, N160).
@@ -1096,14 +1042,6 @@ message MoveCheckpoint {
   // frozen_at + max(1.5 × W_est, W_est + 10 min), capped by the window; the workflow rolls back at this time unless
   // (a″) committed.
   google.protobuf.Timestamp freeze_deadline = 22;
-
-  // Removed in the D22 redesign (decision N124): the replay floor `int64 copy_start_seq = 2` (p0), `int64 applied_seq =
-  // 3`, the pre-freeze verify watermark `Timestamp verify_watermark = 8` and the string `cutover_step = 9` ("a" to "d";
-  // replaced by the enum in 13). Removed in v1.0.0-rc7 (decision N160): the dirty-copy and reconcile fields listed
-  // above.
-  reserved 2, 3, 8, 9, 10, 14, 15, 16, 18, 19;
-  reserved "copy_start_seq", "applied_seq", "verify_watermark", "copy_started_at", "reconcile", "pre_verify", "w_plan";
-  reserved "await_indexes", "reconcile_in", "cutover_step";
 }
 
 // MoveResult is the terminal outcome.
@@ -1114,9 +1052,4 @@ message MoveResult {
   string error = 5;
   // VerifyFrozen rounds run (1, or 2 after one mismatch was re-copied).
   int32 verify_attempts = 7;
-
-  // Removed in the D22 redesign (decision N124): `int64 events_replayed = 3`. Removed in v1.0.0-rc7 (decision N160):
-  // `int64 rows_recopied = 6`; the per-table re-copy is reported in `VerifyFrozenReport.tables_recopied`.
-  reserved 3, 6;
-  reserved "events_replayed", "rows_recopied";
 }

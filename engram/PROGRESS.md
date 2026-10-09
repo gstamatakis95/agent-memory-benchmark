@@ -18,13 +18,15 @@ open review findings. The orchestrator updates this file on every state change; 
 
 | Milestone | State | Branch | Last green tier | Next step / findings |
 |---|---|---|---|---|
-| M0.1 Repo, buf, stubs, CI | not started | m0.1-protos | — | E3 worker: brief docs/briefs/M0.1.md |
-| M0.2 Shard schema v1 | not started | m0.2-shard-schema | — | E1 worker; T3 verification blocked (CONFLICTS #3) |
+| M0.1 Repo, buf, stubs, CI | in review | m0.1-protos | S + T0 (8 s warm) | Opus review round 1 running; worker
+report docs/briefs/reports/M0.1-report.md on the branch |
+| M0.2 Shard schema v1 | in review | m0.2-shard-schema | T3 (73 s, host-network containers) | Opus review round 1
+running; Q18/Q9 → CONFLICTS #12/#13; DDL defects #14; bootstrap role #15 |
 | M0.3 Catalog, Resolver, authz | not started | m0.3-catalog-authz | — | after M0.1 |
 | M0.4 Compose, Temporal, codec | not started | m0.4-compose | — | after M0.2; needs Docker (CONFLICTS #3) |
 | M0.5 Recall measurements | not started | m0.5-measure-recall | — | after M0.3 (E3) |
 | M0.6 Storage measurements | not started | m0.6-measure-storage | — | after M0.3 (E1) |
-| M0.7 Formal conformance | not started | m0.7-formal | — | E2 worker: brief docs/briefs/M0.7.md |
+| M0.7 Formal conformance | in progress | m0.7-formal | — | E2 worker: brief docs/briefs/M0.7.md |
 | M0.8 Migrations and generators | not started | m0.8-gen | — | after M0.6 (E1) and M0.7 (E2) |
 
 ## Phase 1
@@ -57,3 +59,12 @@ open review findings. The orchestrator updates this file on every state change; 
 - 2026-10-09 skeleton: `docs/plan/` frozen copy (source commit in `docs/plan/SOURCE_COMMIT`), shared `Makefile` with the
   §8.1 target names, `go.mod`, `.golangci.yml` (lll 120), `scripts/check-line-length.sh`, `cmd/engramctl` dispatcher,
   CONFLICTS.md #1–#5.
+- 2026-10-09 M0.1 worker finished (5 commits, 45 packages, 149 interfaces ≤ 5 methods); orchestrator verified
+  `make lint test-unit` green in 8 s; CONFLICTS #5 withdrawn, #7–#11 added from the worker report; review round 1
+started.
+- 2026-10-09 M0.1 review round 1 (docs/briefs/reports/M0.1-review-1.md on the branch): 3 Major, 8 Minor, 5 Nit, 0
+Blocker.
+  Fix round 1 sent. F2 asserts a strict reading of N184(1)/(5) with the four #11 columns as a visible exception.
+- 2026-10-09 M0.2 worker finished (2 commits, 4 migrations, harness, 7 named tests + extras); orchestrator verified
+  `make test-integration` green in 73 s with ENGRAM_TEST_DOCKER_HOST_NETWORK=1; CONFLICTS #12–#15 added; review
+round 1 started.

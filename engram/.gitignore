@@ -9,3 +9,7 @@ go.work.sum
 /formal/tla/*.log
 /formal/lean/.lake/
 /bench/results/**/*.raw
+/engramctl
+/engram-api
+/engram-worker
+/engram-mcp

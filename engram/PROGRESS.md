@@ -35,7 +35,9 @@ Temporal re-run needs dedicated hardware | review round 1: 1 Blocker
 (failure payloads under the cell key survive Shred), 2 Major (no per-shard key; failover agent promotes unfenced), 16
 Minor; fix round sent | Opus review round 1
 running; Temporal peak ≈ 300 events/s → CONFLICTS #27 (escalation); §9.1 defects #28 |
-| M0.5 Recall measurements | in progress | m0.5-measure-recall | — | E3 worker on docs/briefs/M0.5.md; reranker
+| M0.5 Recall measurements | in review | m0.5-measure-recall | S + T0; rigs + note | Opus review (measurement
+validity) running; CONFLICTS #34 (CPU budget escalation, three definer BM25 functions, §3.8 temporal SQL defect);
+reranker blocked on gateway | E3 worker on docs/briefs/M0.5.md; reranker
 clause blocked on gateway access (human) |
 | M0.6 Storage measurements | not started | m0.6-measure-storage | — | after M0.3 (E1) |
 | M0.7 Formal conformance | done | m0.7-formal (squash-merged) | F (quick 228 s, TLC 2.18; sweep 77/79, #23 re-run
@@ -134,3 +136,7 @@ carry-over);
 - 2026-10-09 M0.3-E1 worker finished (reconcile, promotion, replicated ack, standby harness, config lint); orchestrator
   verified the five TestCatalog_* and the fault twin; CONFLICTS #33 added; review round 1 (move lens) started.
 - 2026-10-09 M0.8-E2 merged (squash) after review round 3: 0 Blocker, 0 Major. main: lint+unit 55 s, gen-docs check ok.
+- 2026-10-09 M0.3-E1 review round 1 (docs/briefs/reports/M0.3-E1-review-1.md): 3 Blocker, 5 Major, 17 Minor, 3 Nit.
+  Fix round sent; CONFLICTS #33 extended (items 1–3, 8–10).
+- 2026-10-09 M0.5 worker finished (synth corpus, recall-path rig, rerank harness, note); CONFLICTS #34 added; review
+started.

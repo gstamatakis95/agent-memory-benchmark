@@ -466,14 +466,22 @@ and
    from the owner rows. N163(2)'s "target `active` and no catalog move ⇒ `done`" has no row to mark; a catalog move
 still
    at `planned` while the shards prove it committed has no `frozen_at` to derive and is reported as a `Conflict`.
-   Open: allow the reconcile to insert a re-derived row (register change) or keep the report-only behaviour.
+   Open: allow the reconcile to insert a re-derived row (register change) or keep the report-only behaviour. The
+   M0.3-E1 reviewer recommends allowing the insert (identity columns from the shard rows, `created_by = 'reconcile'`):
+   without a row the target's floor guard is gone (`engramctl restore` reads `copy_end_lsn` from the catalog, so a
+   target PITR below the floor is accepted, `ShardMove_NoFloor`) and `restore cleanup-moved-out` never cleans the
+source.
 2. **N184(5) "the CHECKs hold without invention" is false for `committed_at`**: `CHECK (state NOT IN ('committed', …)
    OR committed_at IS NOT NULL)` requires it and N184(1) gives it to `Moves.Commit` alone; the reconcile writes
    `committed_at = reconciled_at` and the column-writer allow-list of `TestDeps_EveryRPCHasPath` names the reconcile as
-   its second writer (next to the five columns N184(5) lists).
+   its second writer (next to the five columns N184(5) lists). Review F4 extends this to `moved_out_at` and
+   `activated_at`, stamped through `MoveStamps.Stamp` as N180(1)'s `engramctl restore` does, so a re-derived move can
+   reach `cleaning` and the N184(3) busy rule clears.
 3. **Catalog ahead of the shards**: where the catalog holds `(S, e+1, restoring)` from a restore's catalog-first write
    (N185) and the shard row still reads `e`, the reconcile leaves it untouched (N172 "raised" vs N163 "derived"); on a
-   different shard the owner row wins.
+   different shard the owner row wins. Reading adopted after review F15: the catalog is kept only while the shard row
+   is `frozen/restore` or a restore marker exists for the shard; otherwise the shard row is derived (the spec lowers
+it).
 4. **§9.6 ordering**: "run the reconcile by hand, then `pg_ctl promote`" cannot work (the reconcile writes; a hot
    standby is read-only). The runbook and `catalog.RunPromotion` do fence → promote → reconcile → alias flip, with
    engram-api serving its cache meanwhile (D4).
@@ -485,3 +493,59 @@ still
 7. The MANIFEST row for `ShardMove_CatalogLossDuringFreeze` stays `pending(M0.3)` because a `paired(<path>)` cell would
    exceed 120 columns; `scripts/formal-manifest-check.sh` should accept a path relative to `internal/` (M0.8-E2 or the
    next E2 brief), after which the row is paired with `internal/catalog/promotion_integration_test.go`.
+8. `copy_end_timeline` "from `catalog.shards`" (N184(5)) can be stale after a lossy catalog restore (a target failover
+   registered after the backup) and the ownership row carries no timeline; the reconcile refuses (`FloorMissing`) on a
+   NULL timeline and reads the target's timeline from the target at read time. N184(5)'s text needs a fix.
+9. The reconcile re-derives namespace `deleting` from `frozen/delete` but never re-derives `tenants.state`;
+   `Durability.tla` keeps `tdp ≥ 2` across `CatalogRestore` because "the reconcile re-derives deleting". A restored
+   catalog can show an `active` tenant whose delete was acknowledged (N182). Needs a ruling before M1.3: the source of
+   truth for the tenant row after a catalog restore (the intent log's tenant-delete marker is the candidate).
+10. N185's `reconcile_incomplete` record has no home in the DDL; M0.3-E1 adds a catalog table in migration 0002 so the
+   re-run is driven durably (M1.7's agent reads it).
+
+## #34 M0.5 recall-path measurements (reviewer to confirm numbers; items 1, 2 and 5 need rulings; escalation)
+
+Rig: `bench/synth` + `bench/recallpath` on the pinned ParadeDB image, 60 k-fact synthetic namespaces, the §3.8 arm SQL
+as `engram_app` in six short transactions with the N138 `SET LOCAL`s, load average 1.0–3.5 on the shared 4-core
+machine (latencies are upper bounds; CPU figures repeat within 15 %), synthetic text (inflates BM25 execution cost, not
+planning cost), embedding and authz modelled as sleeps, arm deadlines observe-only. Full note:
+`bench/results/phase0/m0.5-recall-path.md`.
+1. **#12 by measurement, all three BM25 indexes**: planning alone costs the RLS-shaped form 50 ms (facts), 208 ms
+   (chunks) and 111 ms (observation versions) at p50 versus 1.4–1.5 ms with a literal namespace; the facts Top-K p95
+   is 76.7 ms shipped against 13.1 ms through a `SECURITY DEFINER` function, identical ranking. Proposed: definer Top-K
+   functions for all three BM25 arms (register row on D7/N19/N76/N131; expand-only migration in M1.2). With the
+   definer form the Σ connection-ms per MID recall is 187–239 ms (unfiltered) and 431 ms (filtered) against N164's
+   ≈ 425; with the shipped form 647–824 ms.
+2. **§9.1 CPU split not met (escalation, §11.1)**: a recall costs ≈ 170–200 CPU-ms with the definer form
+(8.5–10 cores at
+   50 recalls/s against "recall ≤ 5 of 8 vCPU"; unfiltered recalls alone ≈ 6 cores against 2.5) and ≈ 620
+CPU-ms with
+   the shipped form; the chunk BM25 arm is 90 of 177 CPU-ms in a 60 k namespace. Writer cost is 80 CPU-ms per 10-fact
+   commit (0.42 cores at 50 facts/s, inside "commits ≤ 1.5"). Levers, none chosen: ≈ 28 recalls/s per shard; the
+chunk
+   BM25 half optional until the N73 ablation justifies it; a 16-vCPU shard class; wait for real-text numbers (M1.2).
+3. **Pool-wait term (N176)**: a replay of the measured service times through 32 connections (Erlang-C checked) gives a
+   max-of-six p95 of 20.6 ms at A = 24 with the measured sum (239 ms) and 35.8 ms (p99 60 ms) with the sum scaled to
+   N164's 425 ms; the critical path would be ≈ 252 ms, under 300. Proposed text: "20–36 ms depending on the sum".
+4. **N106 skip rate**: at a 300 ms deadline ≈ 8 % of recalls would skip the reranker on this corpus and hardware (SLO
+   < 1 %); the chunk arm, not the 60 ms lexical/semantic box, sets the pre-rerank path in a large namespace (p50/p95/
+   p99 117/207/276 ms, definer form, 3/s). Not a register change; M1.2's judgement should expect it.
+5. **Plan and reference defects**: (a) the §3.8 temporal arm SQL is invalid (`ORDER BY` expression on a bare
+   `UNION ALL`, SQLSTATE 0A000; needs a subquery); (b) page touches per MID recall are ≈ 32 k at execution against
+   N114's 10 k, BM25 1.4–6.5 k per arm against "≈ 200, unmeasured"; (c) a filtered recall has up to three vector
+arms
+   against N164's two filtered slots; (d) the lexical over-fetch loop makes a selective-tag arm cost 3–4× and still
+   return 94 of 150 rows; (e) the plan's 5 s read `statement_timeout` for the arms vs the 30 s the migrations set;
+   (f) is `|||` (match-any) over the whole question text the intended lexical query shape (matches thousands of rows)?
+6. **Recall under concurrent ingest (N114)**: no measurable degradation (pre-rerank p95 351 ms alone, 259 ms at 11.6
+   facts/s, 269 ms at 50 facts/s). **Filtered class**: 19–22 % of connection-ms at a 20 % share, 202 CPU-ms per
+   recall, p95 384 ms against the 1 s SLO, exact-path fallback in 7 % of requests.
+7. **A-R1 reranker throughput (bge-reranker-base / v2-m3 at 50/150/300 pairs)**: BLOCKED on the real AI gateway (T6
+   rule). `bench/rerank` refuses the gateway without `-approved`; one command once access exists:
+   `go run ./bench/rerank -client http -url https://gateway.internal -key-file … -approved` (`-style cohere|tei`; the
+   gateway wire format is not in the plan). `rerank_top` 0/50/150 and the default reranker stay proposed-pending.
+8. **M0.3 review carry-over G1 (needs acceptance)**: while the Resolver knows the catalog is down, the interceptor
+   answers `UNAVAILABLE` alike for a never-seen id, a cached entry of another tenant and an id probed absent before the
+   outage (the N5/D4 "miss" row); negative entries are still held 10 min but not surfaced during the outage. G2: a
+   pool-wait timeout no longer marks the catalog down (`catalog.ErrPoolBusy`). G4: the depguard test allowance is
+   confined to `_test.go`.

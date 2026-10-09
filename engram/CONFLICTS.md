@@ -549,3 +549,32 @@ arms
    outage (the N5/D4 "miss" row); negative entries are still held 10 min but not surfaced during the outage. G2: a
    pool-wait timeout no longer marks the catalog down (`catalog.ErrPoolBusy`). G4: the depguard test allowance is
    confined to `_test.go`.
+
+## #35 ParadeDB community edition cannot run a streaming standby of a shard with a BM25 index — open (escalation)
+
+- What (M0.3-E1 fix round, reviewer to confirm): a hot standby of a ParadeDB community server stops at the first
+  `pg_search/INIT_INDEX` WAL record with `FATAL: replicas are not supported on community and require paradedb
+  enterprise`. The catalog has no BM25 index and is unaffected. Every shard does (D7: `USING bm25` on facts, chunks,
+  observation versions, pages), and every retain writes BM25 WAL.
+- Plan parts that assume a shard standby: the `ha` shard profile and shard failover (§9.3, §9.6), N179's
+  `engram_standby_replayed` seal floor, N190's `MOVE_TARGET_NOT_HA` (moves only onto HA shards), M1.7's failover image.
+  With the community image no shard can be HA, so under N190 no move target exists.
+- Readings: (a) license ParadeDB Enterprise for shard servers; (b) drop pg_search and make `TsvectorIndex` the lexical
+  arm (D7's documented fallback; M0.5 measured it at p95 80–162 ms behind a definer function, against the 60 ms arm
+  budget); (c) keep pg_search, give shards no physical standby, and rebuild HA on pgBackRest restore + WAL archive only
+  (RPO > 0, a register change to N179/N190/§9.3); (d) an external BM25 engine fed by the outbox (D7's `Async` index,
+  rejected for the MVP as "extra system").
+- Needs from the human: a choice before M1.5 (moves) and M1.7 (failover). M0.x and M1.1–M1.4 are not blocked.
+- Register rows: D7, N131, N163, N179, N190, §9.3, §9.6, §11.2 Q18.
+
+## #36 M0.5 review corrections (not applied: the project was stopped before the fix round)
+
+The M0.5 review (`docs/briefs/reports/M0.5-review-1.md` on branch `m0.5-measure-recall`) found 2 Major: the chunk BM25
+arm ran under the HNSW-path `enable_sort = off`, whose 1e10 Sort cost triggered JIT (≈ 70 of the note's 90 ms chunk
+arm
+is compilation; `engram_app` has `jit = on`). Corrected figures from the review: ≈ 134 CPU-ms per unfiltered recall
+and
+≈ 156 for the mix (still over the §9.1 budget), pre-rerank p50/p95/p99 83.6/161.4/199.9 ms, 2.65 % of recalls above
+194 ms (not 7.9 %); the "drop the chunk BM25 half" lever in #34.2 is an artifact. New proposed entry: run arm
+transactions with `jit = off` and scope the HNSW `SET LOCAL`s to their own statement (N138, N151(3), N164(4)). §11.1
+assumptions contradicted: R37 (26–31 k page touches ⇒ ≈ 65–78 k IOPS against 50 k), R45, R25.

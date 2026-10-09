@@ -1,5 +1,15 @@
 # PROGRESS.md
 
+**STATUS: STOPPED by the human on 2026-10-10.** No agent is running. Every branch, including unmerged and WIP work, is
+in `engram.bundle` (restore: `git clone engram.bundle engram && cd engram && git branch -a`). To resume: restore the
+bundle, read this file and CONFLICTS.md, then continue each in-flight milestone from its report under
+`docs/briefs/reports/` on its branch. In flight at the stop:
+- M0.3-E1 (`m0.3-catalog-e1`): fix round 1 done (all 28 review findings), review round 2 interrupted; last commit is a
+  WIP commit with one uncommitted file.
+- M0.5 (`m0.5-measure-recall`): review round 1 done (2 Major, CONFLICTS #36); fix round not started.
+- M1.1 (`m1.1-retain`): worker interrupted mid-build; last commit is a WIP commit (6 files, may not build).
+- Not started: M0.6, M0.8 (E1 half), M1.2–M1.10, Phase 2. Briefs exist for M0.6.
+
 Per milestone: state ∈ {not started, in progress, in review, blocked, done}, branch, last green tier, next concrete
 open review findings. The orchestrator updates this file on every state change; a worker's first action on resume is
 `git log --oneline -20`, `cat PROGRESS.md`, then its brief (orchestrator prompt, "USAGE LIMITS AND RESTARTS").
@@ -140,3 +150,5 @@ carry-over);
   Fix round sent; CONFLICTS #33 extended (items 1–3, 8–10).
 - 2026-10-09 M0.5 worker finished (synth corpus, recall-path rig, rerank harness, note); CONFLICTS #34 added; review
 started.
+- 2026-10-10 M0.3-E1 fix round 1 verified; review round 2 started. CONFLICTS #35 (pg_search WAL cannot replay on a
+  community standby) escalated.

@@ -1,0 +1,11 @@
+/bin/
+/dist/
+*.test
+*.out
+*.prof
+go.work
+go.work.sum
+/formal/tla/states/
+/formal/tla/*.log
+/formal/lean/.lake/
+/bench/results/**/*.raw

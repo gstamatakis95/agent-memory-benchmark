@@ -1,0 +1,273 @@
+// memory/v1/common.proto
+//
+// Types shared by every public Engram service: request metadata, namespace addressing, pagination, enums (budgets, fact
+// types, memory kinds, tag-match modes), tag filters, provenance, per-stage scores, temporal windows and resource
+// timestamps.
+//
+// Field-numbering policy (applies to every file in this package):
+//   * numbers 1-15 are for hot fields (1-byte tags);
+//   * pre-1.0 breaking changes are allowed (plan section 4.5): a removed field is simply deleted, and the numbers of
+//     existing fields are never changed.
+//
+// Timestamp vocabulary (decision D9, review F-2):
+//   * `mentioned_at` = the RetainItem `timestamp`, set by the server on every
+//     fact and chunk; it is the time the system learned the content and the ONLY `as_of` key. Neither the client (no
+//     per-item override) nor the extractor can move it.
+//   * `said_at` (facts only) = the extractor's judgement of when the source
+//     said it; may precede mentioned_at when a chunk quotes older material. Display and ranking only — never a
+//     visibility key.
+//   * `occurred_start` / `occurred_end` = when the fact happened.
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
+
+// RequestMeta carries per-call metadata that must travel in the body (not in gRPC metadata) so it is part of the
+// idempotency hash and of the audit log.
+message RequestMeta {
+  // Client-supplied idempotency key for unary writes (Retain, Delete*, Invalidate, Restore, Create*/Update*). Required
+  // (INVALID_ARGUMENT, REQUEST_ID_REQUIRED) on every write whose ack waits for catalog replication (decision N184:
+  // CreateTenant, UpdateTenant, UpdateTenantLimits, DeleteTenant, CreateNamespace, UpdateNamespace, DeleteNamespace,
+  // StartMove, CleanupMove, RollbackMove); a retry after UNAVAILABLE reuses it. Opaque, 1-128 bytes, unique per
+  // (tenant, namespace, method) for 24 h. A replay with the same key and an identical request hash returns the stored
+  // response; the same key with a different hash fails with ALREADY_EXISTS + OperationConflict {reason =
+  // IDEMPOTENCY_KEY_REUSED}. Optional on other writes and on reads (tracing only).
+  string request_id = 1;
+  // Wall-clock time at the client when the request was built. Informational: logged next to the server time to diagnose
+  // clock skew; never used for `mentioned_at` or `as_of` defaults.
+  google.protobuf.Timestamp client_timestamp = 2;
+}
+
+// NamespaceRef addresses a namespace. Clients never see or supply a shard id or an ownership epoch: the API resolves
+// (tenant_id, namespace_id) through the catalog and fences the call on the shard (decisions D2 and D4).
+message NamespaceRef {
+  // Opaque tenant id, `[a-z0-9-]{1,64}`. Must equal the `tenant_id` claim of the caller's JWT, otherwise the call fails
+  // with NOT_FOUND (the namespace is indistinguishable from a nonexistent one across tenants).
+  string tenant_id = 1;
+  // Server-assigned UUIDv7 of the namespace (see NamespaceService.CreateNamespace).
+  string namespace_id = 2;
+}
+
+// PagingRequest is embedded in every List request. Pagination is keyset-based: tokens are opaque, encode the sort key
+// of the last returned row plus a hash of the filter, never expire, and are rejected with INVALID_ARGUMENT if reused
+// with a different filter, order or namespace.
+message PagingRequest {
+  // Maximum number of items to return. 0 means the method default (100); values above the method maximum (1000 unless
+  // stated) are clamped, not rejected.
+  int32 page_size = 1;
+  // Token from the previous PagingResponse.next_page_token. Empty for the first page.
+  string page_token = 2;
+}
+
+// PagingResponse is embedded in every List response.
+message PagingResponse {
+  // Token for the next page; empty when this was the last page.
+  string next_page_token = 1;
+  // Best-effort estimate of the total number of matching items (from planner statistics, not a COUNT(*)); -1 when
+  // unknown. Never use it for paging.
+  int64 total_size_estimate = 2;
+}
+
+// Budget selects the recall/reflect effort level. It fixes per-arm candidate caps (low/mid/high = 50/150/400), graph
+// node budgets (100/300/1000), rerank depth (0/50/150 — decision N53: the cross-encoder is a sized dependency,
+// assumption A-R1) and the default token budget (4k/8k/16k) as fixed by decisions D10 and N53.
+enum Budget {
+  // Not set: the namespace's `recall.default_budget` (system default MID).
+  BUDGET_UNSPECIFIED = 0;
+  // Cheapest: 50 candidates per arm, 100 graph nodes, no rerank (results carry Scores.stage = FUSED), 4k tokens.
+  BUDGET_LOW = 1;
+  // Default: 150 candidates per arm, 300 graph nodes, rerank top 50, 8k tokens.
+  BUDGET_MID = 2;
+  // Deepest: 400 candidates per arm, 1000 graph nodes, rerank top 150, 16k tokens.
+  BUDGET_HIGH = 3;
+}
+
+// UpdateMode says how a retain relates to the previous version of the same document_id.
+enum UpdateMode {
+  // Not set: REPLACE.
+  UPDATE_MODE_UNSPECIFIED = 0;
+  // The items are the whole new content of the document. Chunks whose content hash is unchanged are kept (no LLM, no
+  // embedding); chunks missing from the new set are hidden together with their facts by chunk tombstones (decision
+  // N115) and purged later by the expunge.
+  UPDATE_MODE_REPLACE = 1;
+  // The items are appended to the document; nothing is hidden. Chunk hashes that already exist are skipped.
+  UPDATE_MODE_APPEND = 2;
+}
+
+// FactType classifies an extracted fact.
+enum FactType {
+  // Not set. In a filter list it is rejected; on a Memory it never appears.
+  FACT_TYPE_UNSPECIFIED = 0;
+  // A statement about the world that is true independently of the speaker ("Paris is the capital of France", "the
+  // invoice is due on March 3").
+  FACT_TYPE_WORLD = 1;
+  // A statement about the agent's or user's own experience, preference or action ("I prefer window seats", "we deployed
+  // v2 on Friday").
+  FACT_TYPE_EXPERIENCE = 2;
+}
+
+// MemoryKind distinguishes the three things Recall can return.
+enum MemoryKind {
+  // Not set. In a filter list it is rejected; on a Memory it never appears.
+  MEMORY_KIND_UNSPECIFIED = 0;
+  // An extracted fact (the unit of retain, link and invalidate).
+  MEMORY_KIND_FACT = 1;
+  // A consolidated observation: an evolving belief with cited source facts. Returned only when
+  // RecallRequest.include_observations is true.
+  MEMORY_KIND_OBSERVATION = 2;
+  // A raw document chunk (the fifth recall arm). Returned only when RecallRequest.include_chunks is true.
+  MEMORY_KIND_CHUNK = 3;
+}
+
+// TagMatchMode defines how TagFilter.tags (Q) is compared with an item's tag set (I), Hindsight-compatible (decision
+// D10). Q and I are sets of exact, case-sensitive strings. Five filtering modes plus "unset = no filter". The
+// non-STRICT modes let untagged items through; the STRICT variants do not — that is the only difference between each
+// pair.
+enum TagMatchMode {
+  // No filtering: every item matches. This is also the meaning of leaving TagFilter unset. A TagFilter with mode
+  // UNSPECIFIED and a non-empty `tags` list is rejected with INVALID_ARGUMENT (reason INCONSISTENT), because it is
+  // almost certainly a client bug.
+  TAG_MATCH_MODE_UNSPECIFIED = 0;
+  // ANY: I = ∅ ∨ I ∩ Q ≠ ∅. Untagged items pass; tagged items need at least one query tag.
+  TAG_MATCH_MODE_ANY = 1;
+  // ANY_STRICT: I ∩ Q ≠ ∅. At least one query tag is on the item; untagged items do not pass.
+  TAG_MATCH_MODE_ANY_STRICT = 2;
+  // ALL: I = ∅ ∨ Q ⊆ I. Untagged items pass; tagged items must carry every query tag (extra tags allowed).
+  TAG_MATCH_MODE_ALL = 3;
+  // ALL_STRICT: Q ⊆ I ∧ I ≠ ∅. Every query tag is on the item (extra tags allowed); untagged items do not pass.
+  TAG_MATCH_MODE_ALL_STRICT = 4;
+  // EXACT: I = Q. The item's tag set equals the query tag set; with Q ≠ ∅ untagged items never pass.
+  TAG_MATCH_MODE_EXACT = 5;
+}
+
+// TagFilter restricts results to items whose tag set satisfies `mode` against `tags`. Tags are item-level and live on
+// the document; the filter is resolved once into an allowed-document set that every recall arm applies (before
+// ranking), never after fusion, so budgets are not spent on filtered-out rows (decision N116). Tags are filters, never
+// security (decision D13): a caller with access to a namespace can read every tag in it.
+message TagFilter {
+  // Comparison mode. UNSPECIFIED = no filtering (see enum).
+  TagMatchMode mode = 1;
+  // Query tag set Q. 1-32 tags, each 1-64 bytes, matched byte-for-byte after trimming; duplicates are removed before
+  // evaluation. Required (non-empty) for every mode other than UNSPECIFIED.
+  repeated string tags = 2;
+}
+
+// Provenance says where a memory came from. Every fact, observation source and chunk resolves to a document version and
+// a chunk inside it.
+message Provenance {
+  // Client-chosen document id (the Retain upsert key).
+  string document_id = 1;
+  // Version of the document the memory was extracted from (1-based, incremented by every REPLACE/APPEND retain).
+  int64 document_version = 2;
+  // UUIDv7 of the chunk; for a MEMORY_KIND_CHUNK memory this equals Memory.id.
+  string chunk_id = 3;
+  // 0-based position of the chunk within the document version.
+  int32 chunk_ordinal = 4;
+  // Half-open [char_start, char_end) offsets of the chunk inside the concatenated item content of the document version
+  // (UTF-8 code points).
+  int32 char_start = 5;
+  int32 char_end = 6;
+  // Index of the RetainItem the chunk was cut from, so callers can map back to their own item list.
+  int32 item_index = 7;
+}
+
+// RecallStage names the last pipeline stage that produced a result's rank.
+enum RecallStage {
+  RECALL_STAGE_UNSPECIFIED = 0;
+  // Ranks come from RRF fusion only; the reranker was skipped (deadline).
+  RECALL_STAGE_FUSED = 1;
+  // Ranks come from the cross-encoder rerank plus bounded boosts.
+  RECALL_STAGE_RERANKED = 2;
+}
+
+// Scores exposes every per-stage score of a recall result so that clients (and the evaluation harness) can explain a
+// ranking. Arm scores use explicit presence: an absent field means the arm did not return the item at all, which is
+// different from a score of 0.
+message Scores {
+  // Semantic-arm score, normalised PER QUERY over the arm's candidate list to [0, 1] (1 = best candidate of this
+  // query). The raw cosine is not exposed (decision N67).
+  optional float semantic = 1;
+  // Lexical-arm score, normalised PER QUERY over the arm's candidate list to [0, 1]. Raw BM25 scores are never exposed:
+  // pg_search statistics are per hash partition, so a raw score is shard-relative, changes under other tenants' writes
+  // and is a weak cross-tenant channel (review F-28, N67).
+  optional float lexical = 2;
+  // Graph-expansion score: sum of link weights along the best path from a seed, decayed per hop; in (0, 1].
+  optional float graph = 3;
+  // Temporal-arm score: 1 / (1 + |distance to query_timestamp| in days) for
+  // items whose occurrence window overlaps the query window; in (0, 1].
+  optional float temporal = 4;
+  // Chunk-arm score (RRF of the chunk BM25 and chunk HNSW sub-arms).
+  optional float chunk = 5;
+  // Reciprocal-rank-fusion score, sum over arms of 1 / (60 + rank_arm), computed in exact rational arithmetic
+  // (math/big.Rat, decision N67) so that fusion is permutation-invariant; rounded to float for transport.
+  float rrf = 6;
+  // Cross-encoder relevance logit mapped to [0, 1] by a sigmoid; absent when the rerank stage was skipped.
+  optional float rerank = 7;
+  // Combined multiplicative boost factor (recency ≤ +10 %, temporal proximity ≤ +10 %, observation proof count ≤ +5 %),
+  // clamped to [0.75, 1.25].
+  float boost = 8;
+  // Final ranking score: (rerank if present, else rrf) × boost.
+  float final = 9;
+  // Stage that produced `final` and the rank.
+  RecallStage stage = 10;
+  // Per-arm rank (1-based) for the arms that returned the item; only populated when RecallRequest.explain is true.
+  repeated ArmRank arm_ranks = 11;
+}
+
+// ArmRank is one arm's rank for an item (explain mode only).
+message ArmRank {
+  // Arm name: "semantic", "lexical", "graph", "temporal", "chunk", "observation_semantic", "observation_lexical".
+  string arm = 1;
+  // 1-based rank of the item within that arm's candidate list.
+  int32 rank = 2;
+}
+
+// TemporalWindow is a closed interval of when something happened. Either bound may be unset: unset start = "since
+// forever", unset end = "still ongoing / unknown end". A point event has start == end.
+message TemporalWindow {
+  google.protobuf.Timestamp occurred_start = 1;
+  google.protobuf.Timestamp occurred_end = 2;
+}
+
+// Timestamps are the server-maintained lifecycle timestamps of a resource. Output only.
+message Timestamps {
+  google.protobuf.Timestamp created_at = 1;
+  google.protobuf.Timestamp updated_at = 2;
+}
+
+// EntityRef is a resolved entity attached to a memory. Under RecallRequest.as_of only `mention` is set (decision N118):
+// entity ids, canonical names, types and alias merges may postdate the cut-off.
+message EntityRef {
+  // UUIDv7 of the entity, unique per namespace.
+  string entity_id = 1;
+  // Canonical name after per-namespace fuzzy resolution.
+  string canonical_name = 2;
+  // Coarse type label from the extractor: "person", "organization", "place", "product", "event", "concept", "other".
+  string type = 3;
+  // How the entity was written in the source text.
+  string mention = 4;
+}
+
+// EntityHint is a client-provided hint that helps entity resolution: a name the extractor should treat as a known
+// entity, optionally with its type and aliases. Hints are advisory; they never create entities without a mention.
+message EntityHint {
+  string name = 1;
+  string type = 2;
+  repeated string aliases = 3;
+}
+
+// Metadata attached by clients is a free-form JSON object (google.protobuf.Struct). It is stored verbatim (≤ 16 KiB
+// serialised) on the document (the metadata of the first item of its current version), returned on Memory and Document,
+// and never interpreted by the pipeline. Filters resolve at DOCUMENT level, exactly like tags (decision N139): the
+// recall layer evaluates them once against `documents.metadata` (GIN `jsonb_path_ops`) into the allowed-document set
+// that every arm receives, so facts, chunks and observations are filtered through their documents. Only equality on
+// top-level string values is supported.
+message MetadataFilter {
+  // Top-level key whose value must equal `value` (string comparison).
+  string key = 1;
+  google.protobuf.Value value = 2;
+}

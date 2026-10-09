@@ -1,0 +1,29 @@
+# golangci-lint v2 configuration. `lll` enforces the 120-column rule (tabs count as 4). depguard carries the dependency
+# rule of PLAN.md section 2.1 and is completed by M0.1 (E3 owns this file from then on).
+version: "2"
+run:
+  timeout: 5m
+  build-tags: [integration, faultinject, testauth]
+linters:
+  default: standard
+  enable: [lll, depguard, errcheck, govet, staticcheck, unused, ineffassign, misspell, gocritic]
+  settings:
+    lll:
+      line-length: 120
+      tab-width: 4
+    depguard:
+      rules:
+        placeholder:
+          files: ["$all"]
+          deny:
+            - pkg: "github.com/gstamatakis95/engram/placeholder-never-exists"
+              desc: "replaced by the section 2.1 dependency rule in M0.1"
+  exclusions:
+    paths: [gen/, docs/plan/]
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/gstamatakis95/engram]
+  exclusions:
+    paths: [gen/]

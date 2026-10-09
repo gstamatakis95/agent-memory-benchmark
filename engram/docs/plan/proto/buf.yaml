@@ -1,0 +1,30 @@
+# Engram protobuf workspace (buf v2).
+#
+# One workspace, two modules that share the root directory and are split by
+# `includes` so that the directory layout fixed by decision D14
+# (memory/v1, memory/admin/v1, engram/internal/...) satisfies
+# PACKAGE_DIRECTORY_MATCH while still publishing as two BSR modules:
+#   buf.build/engram/memory    public + admin contracts (served over gRPC/Connect)
+#   buf.build/engram/internal  Temporal payloads and outbox/Kafka events (never served)
+# `engram/internal` depends on `engram/memory` (common enums, NamespaceRef);
+# the public module never imports the internal one.
+version: v2
+modules:
+  - path: .
+    name: buf.build/engram/memory
+    includes:
+      - memory
+  - path: .
+    name: buf.build/engram/internal
+    includes:
+      - engram
+lint:
+  use:
+    - STANDARD
+  # Well-known-type imports only; no BSR dependencies, so `buf lint`/`buf build`
+  # work offline. google.rpc / google.api are intentionally NOT imported (see
+  # memory/v1/errors.proto).
+breaking:
+  use:
+    - FILE
+  # FILE is the strictest category, used from v1.0.0 on. `buf breaking` is not run before v1.0.0 (section 4.5).

@@ -1,0 +1,634 @@
+// memory/admin/v1/admin.proto
+//
+// Control-plane API served on the same port as memory.v1 behind the admin interceptor. Scopes and routes (decisions
+// D13, N139, N157, N167, reviews A-4, A-6, A-12): `engram.operator` is fleet-wide with its own audience and covers
+// ShardService, MoveService, ListTenants, CreateTenant, UpdateTenantLimits, and GetTenant, DeleteTenant and
+// GetTenantOperation on the admin route (an operator token carries no tenant, so the tenant-bound check is skipped for
+// it on that route only); those methods are served ONLY on the separate Envoy admin route that is not exposed to
+// tenants. `tenant.admin` is tenant-bound (the interceptor enforces token.tenant_id == request.tenant_id) and covers
+// the tenant's own lifecycle: GetTenant, DeleteTenant, GetTenantOperation and UpdateTenant (display_name, config),
+// served on the tenant-facing listener. A tenant administrator can therefore never raise its own quotas or change its
+// isolation. `engram.worker` is the workers' service identity, valid on exactly ReleaseNamespace and CleanupMove and
+// bound to the worker's cell by a `cell` claim checked against the shard's cell; it carries no other operator right.
+// Every method has exactly one scope, so the interceptor's per-method policy table is the only enforcement point. Three
+// services fixed by decision D1:
+//   TenantService — tenants, quotas, config, isolation;
+//   ShardService  — shard registry and namespace → shard resolution;
+//   MoveService   — the per-namespace move protocol of decision D5: freeze,
+//                   then copy every table from the static source, verify by equality, build the indexes under the
+//                   freeze, cut over with a `ready` state and a catalog CAS as the point of no
+//                   return (decisions N160, N161).
+// The tenant-scoped GetTenantOperation also lives here (decision N127). This is the ONLY place where shard ids and
+// epochs appear in an API.
+syntax = "proto3";
+
+package memory.admin.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+import "memory/v1/errors.proto";
+import "memory/v1/operation.proto";
+
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/admin/v1;adminv1";
+
+// TenantService manages tenants.
+service TenantService {
+  // CreateTenant mints the tenant row; `tenant_id` is chosen by the control plane caller and must match
+  // `[a-z0-9-]{1,64}`. Scope engram.operator only (admin route).
+  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+  // GetTenant returns one tenant. Scope tenant.admin (tenant-bound) or engram.operator on the admin route.
+  rpc GetTenant(GetTenantRequest) returns (GetTenantResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListTenants lists tenants by id.
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // UpdateTenant patches display_name and config. Scope tenant.admin (the tenant's own token). The paths quotas,
+  // isolation and state moved to UpdateTenantLimits (decision N167, review A-6): an update_mask naming one of them is
+  // INVALID_ARGUMENT, so each method has one scope and the interceptor is the only enforcement point.
+  rpc UpdateTenant(UpdateTenantRequest) returns (UpdateTenantResponse);
+  // UpdateTenantLimits patches quotas, isolation and state (ACTIVE ↔ SUSPENDED only). Scope engram.operator, admin
+  // route only. Changing isolation to DEDICATED does not move namespaces; it only constrains future placement (use
+  // MoveService to relocate).
+  rpc UpdateTenantLimits(UpdateTenantLimitsRequest) returns (UpdateTenantLimitsResponse);
+  // DeleteTenant marks the tenant DELETING in the catalog (acknowledged only after the standby replayed it), writes the
+  // tenant-level delete intent object (decision N122) and returns the DELETE_TENANT operation PENDING: from here every
+  // request for the tenant fails with PreconditionFailed{TENANT_DELETING}, the read barrier. The TenantDelete workflow
+  // then fences every namespace (`freeze_delete`, one intent object each) and runs one DELETE_NAMESPACE expunge per
+  // namespace. The delete is acknowledged (Operation.acknowledged_at, decision N182) once every namespace is fenced; a
+  // client treats that as the durability point. If a catalog restore reverted the `deleting` row before it, the
+  // operation ends FAILED with reason CATALOG_RESTORED and the client retries the delete. `meta.request_id` is required
+  // (INVALID_ARGUMENT otherwise). Deadline cap 40 s (decision N139). Scope tenant.admin (tenant-bound) or
+  // engram.operator on the admin route, so the control plane can offboard a tenant without a tenant-bound token.
+  rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
+  // GetTenantOperation reads a tenant-scoped operation (kind DELETE_TENANT), which no namespace-scoped
+  // OperationService.GetOperation can address (decision N127). Exempt from the TENANT_DELETING rejection. The
+  // operation's `acknowledged_at` is the delete's durability point (N182). Scope
+  // tenant.admin (tenant-bound) or engram.operator on the admin route.
+  rpc GetTenantOperation(GetTenantOperationRequest) returns (GetTenantOperationResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+// ShardService manages the shard registry.
+service ShardService {
+  // RegisterShard adds a provisioned Postgres instance to the catalog.
+  rpc RegisterShard(RegisterShardRequest) returns (RegisterShardResponse);
+  // GetShard returns one shard.
+  rpc GetShard(GetShardRequest) returns (GetShardResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListShards lists shards with occupancy.
+  rpc ListShards(ListShardsRequest) returns (ListShardsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // DrainShard stops new namespace placement on the shard (state DRAINING). Moving existing namespaces off is a
+  // separate, explicit MoveService call per namespace so that the operator controls the pace.
+  rpc DrainShard(DrainShardRequest) returns (DrainShardResponse);
+  // UpdateShard patches capacity, cell and state (DRAINING → ACTIVE).
+  rpc UpdateShard(UpdateShardRequest) returns (UpdateShardResponse);
+  // ResolveNamespace returns the catalog's current placement of a namespace (shard, epoch, state) — the ops view that
+  // memory.v1 hides.
+  rpc ResolveNamespace(ResolveNamespaceRequest) returns (ResolveNamespaceResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ReleaseNamespace records that a shard no longer holds a namespace: after the Expunge workflow removed the last rows
+  // of a deleted namespace it marks the catalog row DELETED (decisions D8, N119). Called by the workflow through
+  // engram-api because workers never write the catalog directly (decision D4). Scope engram.worker (cell-bound,
+  // decision N167) or engram.operator. Idempotent.
+  rpc ReleaseNamespace(ReleaseNamespaceRequest) returns (ReleaseNamespaceResponse);
+}
+
+// MoveService drives namespace moves between shards (decisions D5, N160, N161). A move is an operator tool for
+// rebalancing: the namespace is read-only (reads continue, writes get NamespaceFrozen) for the whole copy.
+service MoveService {
+  // StartMove plans a move and starts the move executor in engram-worker. Plan computes the window estimate W_est from
+  // the namespace's stats. The rebalancer starts a move unattended only at W_est <= 10 min (about 350 k facts); above
+  // that the caller must pass an explicit `window` (PreconditionFailed MOVE_WINDOW_REQUIRED otherwise), and the call is
+  // refused (MOVE_WINDOW_TOO_SHORT) unless window >= max(1.5 W_est, W_est + 10 min); the window is capped at 8 h, the
+  // default is 4 h (decision N173). `estimate_only` returns the estimate without planning. One move per namespace at a
+  // time (ABORTED + OperationConflict). The target must have a completed backup and a healthy WAL archiver, else
+  // PreconditionFailed{MOVE_TARGET_ARCHIVE_UNHEALTHY} (decision N179), and must run an HA profile (a standby that
+  // replays the seal); a `single`-profile target is refused with PreconditionFailed{MOVE_TARGET_NOT_HA} (decision
+  // N190). `meta.request_id` is required. Scope engram.operator.
+  rpc StartMove(StartMoveRequest) returns (StartMoveResponse);
+  // GetMove returns the move with progress.
+  rpc GetMove(GetMoveRequest) returns (GetMoveResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // ListMoves lists moves, newest first.
+  rpc ListMoves(ListMovesRequest) returns (ListMovesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // RollbackMove aborts a move that has not passed its point of no return
+  // (the catalog CAS (a″) `cutover → committed`, decision N125): before
+  // Freeze the source is `abort_move`d; after Freeze the rollback wins the `rolled_back` CAS, waits until the standby
+  // replayed it (decision N171), thaws the source (also while the target is
+  // unreachable: a `ready` target accepts nothing and is un-readied at its next contact) and the target goes back to
+  // `incoming`; then the target's copied rows, indexes and ownership row are deleted. Onto a shard that had a
+  // `moved_out` row the permanent fence value is restored. The executor takes the same path by itself at the freeze
+  // deadline (MoveWindowExceeded, decision N160). After (a″) it fails PreconditionFailed{MOVE_PAST_COMMIT} (a rollback
+  // is a new move back); no MoveFenced reaches the wire. `meta.request_id` is required (INVALID_ARGUMENT otherwise).
+  rpc RollbackMove(RollbackMoveRequest) returns (RollbackMoveResponse);
+  // CleanupMove takes `committed -> cleaning` under the 24 h gate (decision N170: `now() >= Move.activated_at + 24 h`;
+  // FAILED_PRECONDITION before that) and nothing else; the cleanup activity records `done` after one further zero-row
+  // `engram_cleanup_namespace` (decision N184). A call on a `cleaning` or `done` move returns it. `meta.request_id` is
+  // required. The physical work is
+  // driven by the cleanup activity, which holds both shard handles: it drops the namespace's partial indexes on the
+  // source shard by their deterministic names and deletes its rows (`engram_cleanup_namespace`, batched, only while the
+  // row reads `cleaning`). The source blob prefix is kept until `finished_at + 28 d` (decision N123). The `moved_out`
+  // ownership row stays forever. Scope engram.worker (cell-bound, decision N167) or engram.operator. Idempotent.
+  rpc CleanupMove(CleanupMoveRequest) returns (CleanupMoveResponse);
+}
+
+// Isolation says whether a tenant's namespaces may share shards.
+enum Isolation {
+  // SHARED.
+  ISOLATION_UNSPECIFIED = 0;
+  // Namespaces are bin-packed onto the default pool with other tenants.
+  ISOLATION_SHARED = 1;
+  // Namespaces are placed only on shards flagged dedicated_tenant_id.
+  ISOLATION_DEDICATED = 2;
+}
+
+// TenantState is the lifecycle of a tenant.
+enum TenantState {
+  TENANT_STATE_UNSPECIFIED = 0;
+  TENANT_STATE_ACTIVE = 1;
+  // New namespaces and writes rejected; reads allowed.
+  TENANT_STATE_SUSPENDED = 2;
+  TENANT_STATE_DELETING = 3;
+  TENANT_STATE_DELETED = 4;
+}
+
+// Quotas are the enforceable limits (decision D13). 0 = inherit the system default.
+message Quotas {
+  // Admission-time rate limits (RESOURCE_EXHAUSTED + QuotaExceeded).
+  int64 recalls_per_min = 1;
+  int64 retains_per_min = 2;
+  // Workflow-time volume limits (operation DEFERRED until window reset; every gateway call class passes quota.Reserve
+  // first, decision N130).
+  int64 llm_tokens_per_day = 3;
+  int64 max_facts = 4;
+  // Control-plane limit.
+  int32 max_namespaces = 5;
+  // Largest accepted RetainRequest in bytes.
+  int64 max_request_bytes = 6;
+}
+
+// Tenant is the control-plane resource.
+message Tenant {
+  string tenant_id = 1;
+  string display_name = 2;
+  TenantState state = 3;
+  Isolation isolation = 4;
+  // Tenant-level quotas (namespace overrides live in Namespace.config_overrides under `quota.*`, capped by these).
+  Quotas quotas = 5;
+  // Tenant-level config layered over the system config (decision D12 keys).
+  google.protobuf.Struct config = 6;
+  memory.v1.Timestamps timestamps = 7;
+  string etag = 8;
+  int32 namespace_count = 9;
+}
+
+// CreateTenantRequest creates a tenant.
+message CreateTenantRequest {
+  memory.v1.RequestMeta meta = 1;
+  // tenant_id, display_name, isolation, quotas and config are read.
+  Tenant tenant = 2;
+}
+
+// CreateTenantResponse returns the tenant.
+message CreateTenantResponse {
+  Tenant tenant = 1;
+}
+
+// GetTenantRequest fetches one tenant.
+message GetTenantRequest {
+  string tenant_id = 1;
+  google.protobuf.FieldMask read_mask = 2;
+}
+
+// GetTenantResponse wraps the tenant.
+message GetTenantResponse {
+  Tenant tenant = 1;
+}
+
+// ListTenantsRequest lists tenants by id.
+message ListTenantsRequest {
+  memory.v1.PagingRequest paging = 1;
+  repeated TenantState states = 2;
+  string tenant_id_prefix = 3;
+}
+
+// ListTenantsResponse is a page of tenants.
+message ListTenantsResponse {
+  repeated Tenant tenants = 1;
+  memory.v1.PagingResponse paging = 2;
+}
+
+// UpdateTenantRequest patches a tenant.
+message UpdateTenantRequest {
+  memory.v1.RequestMeta meta = 1;
+  Tenant patch = 2;
+  // Allowed paths: display_name, config. Any other path is INVALID_ARGUMENT (isolation, quotas and state are
+  // UpdateTenantLimits, decision N167).
+  google.protobuf.FieldMask update_mask = 3;
+  string etag = 4;
+}
+
+// UpdateTenantResponse returns the updated tenant.
+message UpdateTenantResponse {
+  Tenant tenant = 1;
+}
+
+// UpdateTenantLimitsRequest patches the operator-owned fields of a tenant.
+message UpdateTenantLimitsRequest {
+  memory.v1.RequestMeta meta = 1;
+  Tenant patch = 2;
+  // Allowed paths: isolation, quotas, quotas.*, state (ACTIVE ↔ SUSPENDED only).
+  google.protobuf.FieldMask update_mask = 3;
+  string etag = 4;
+}
+
+// UpdateTenantLimitsResponse returns the updated tenant.
+message UpdateTenantLimitsResponse {
+  Tenant tenant = 1;
+}
+
+// DeleteTenantRequest deletes a tenant and every namespace in it.
+message DeleteTenantRequest {
+  memory.v1.RequestMeta meta = 1;
+  string tenant_id = 2;
+  // Must equal tenant_id (typed confirmation).
+  string confirm_tenant_id = 3;
+}
+
+// DeleteTenantResponse returns the tenant (DELETING) and the tenant-level operation.
+message DeleteTenantResponse {
+  Tenant tenant = 1;
+  // Per-namespace DELETE_NAMESPACE operations that exist now; normally empty, the operations appear in
+  // GetTenantOperationResponse.namespace_operations as the workflow fences each namespace (decisions N122, N182).
+  repeated memory.v1.Operation namespace_operations = 2;
+  // Kind DELETE_TENANT; read it with TenantService.GetTenantOperation.
+  memory.v1.Operation operation = 3;
+  // Commit time of the catalog `deleting` state: from here every request for the tenant is rejected with
+  // TENANT_DELETING.
+  google.protobuf.Timestamp deleted_at = 4;
+}
+
+// GetTenantOperationRequest fetches a tenant-scoped operation.
+message GetTenantOperationRequest {
+  string tenant_id = 1;
+  string operation_id = 2;
+}
+
+// GetTenantOperationResponse wraps the operation and the per-namespace expunge operations created so far.
+message GetTenantOperationResponse {
+  memory.v1.Operation operation = 1;
+  // DELETE_NAMESPACE operations the TenantDelete workflow has created.
+  repeated memory.v1.Operation namespace_operations = 2;
+}
+
+// ShardState is the lifecycle of a shard. The values mirror the catalog's `shard_state` enum one-to-one (provisioning,
+// active, full, draining, readonly, retired — sql/catalog_schema.sql; review F-27).
+enum ShardState {
+  SHARD_STATE_UNSPECIFIED = 0;
+  // Accepts new namespaces.
+  SHARD_STATE_ACTIVE = 1;
+  // Serves existing namespaces; no new placement (operator-initiated, moves follow).
+  SHARD_STATE_DRAINING = 2;
+  // Being created by `engramctl shard provision`: DB, roles, extensions, partitions and RLS not yet complete; not
+  // routable.
+  SHARD_STATE_PROVISIONING = 5;
+  // At or above its soft capacity (decision D3): serves existing namespaces, the placer skips it.
+  SHARD_STATE_FULL = 6;
+  // Reads served, every write fails UNAVAILABLE (maintenance, restore in progress, or marked unavailable by the
+  // schema-version guard, N22).
+  SHARD_STATE_READONLY = 7;
+  // Hosts no namespaces; decommissioned, never reused.
+  SHARD_STATE_RETIRED = 8;
+}
+
+// Shard is one dedicated PostgreSQL instance (decision D2).
+message Shard {
+  // Dense int32 assigned by the catalog; the metrics label.
+  int32 shard_id = 1;
+  ShardState state = 2;
+  // Cell (API + worker stack) that serves this shard; ≤ 32 shards per cell.
+  string cell_id = 3;
+  // Secret reference (not the DSN itself), e.g. "vault:engram/shards/7/dsn".
+  string dsn_secret_ref = 4;
+  // Blob key prefix = the shard id as text, e.g. "7" (the catalog enforces `blob_prefix = shard_id::text`). Keys are
+  // `{prefix}/{tenant}/{ns}/…`.
+  string blob_prefix = 5;
+  // Set when the shard is dedicated to one tenant (isolation DEDICATED).
+  string dedicated_tenant_id = 6;
+  // Soft capacity used by the placer (default 10 M live facts).
+  int64 capacity_facts = 7;
+  int32 namespace_count = 8;
+  int64 live_facts = 9;
+  int64 volume_bytes = 10;
+  memory.v1.Timestamps timestamps = 11;
+  string etag = 12;
+  // Last schema migration applied on the shard (mirror of the shard's `shard_meta.schema_version` and the catalog's
+  // integer column).
+  int32 schema_version = 13;
+}
+
+// RegisterShardRequest adds a shard.
+message RegisterShardRequest {
+  memory.v1.RequestMeta meta = 1;
+  // cell_id, dsn_secret_ref, blob_prefix, dedicated_tenant_id and capacity_facts are read; shard_id is assigned by the
+  // catalog.
+  Shard shard = 2;
+}
+
+// RegisterShardResponse returns the shard with its id.
+message RegisterShardResponse {
+  Shard shard = 1;
+}
+
+// GetShardRequest fetches one shard.
+message GetShardRequest {
+  int32 shard_id = 1;
+}
+
+// GetShardResponse wraps the shard.
+message GetShardResponse {
+  Shard shard = 1;
+}
+
+// ListShardsRequest lists shards by id.
+message ListShardsRequest {
+  memory.v1.PagingRequest paging = 1;
+  repeated ShardState states = 2;
+  string cell_id = 3;
+}
+
+// ListShardsResponse is a page of shards.
+message ListShardsResponse {
+  repeated Shard shards = 1;
+  memory.v1.PagingResponse paging = 2;
+}
+
+// DrainShardRequest sets a shard to DRAINING.
+message DrainShardRequest {
+  memory.v1.RequestMeta meta = 1;
+  int32 shard_id = 2;
+  string reason = 3;
+}
+
+// DrainShardResponse returns the shard and the namespaces still on it.
+message DrainShardResponse {
+  Shard shard = 1;
+  repeated memory.v1.NamespaceRef remaining_namespaces = 2;
+}
+
+// UpdateShardRequest patches a shard.
+message UpdateShardRequest {
+  memory.v1.RequestMeta meta = 1;
+  Shard patch = 2;
+  // Allowed paths: state, cell_id, capacity_facts, dedicated_tenant_id, dsn_secret_ref.
+  google.protobuf.FieldMask update_mask = 3;
+  string etag = 4;
+}
+
+// UpdateShardResponse returns the updated shard.
+message UpdateShardResponse {
+  Shard shard = 1;
+}
+
+// ResolveNamespaceRequest looks up placement.
+message ResolveNamespaceRequest {
+  memory.v1.NamespaceRef namespace = 1;
+}
+
+// ResolveNamespaceResponse is the catalog's answer.
+message ResolveNamespaceResponse {
+  memory.v1.NamespaceRef namespace = 1;
+  int32 shard_id = 2;
+  int64 epoch = 3;
+  memory.v1.NamespaceState state = 4;
+  // Set while a move is in progress.
+  string move_id = 5;
+  // Target shard of the in-progress move, if any.
+  int32 target_shard_id = 6;
+}
+
+// ReleaseNamespaceRequest finalises a namespace delete (ShardService).
+message ReleaseNamespaceRequest {
+  memory.v1.RequestMeta meta = 1;
+  memory.v1.NamespaceRef namespace = 2;
+  int32 shard_id = 3;
+  // Epoch the purge ran under; FAILED_PRECONDITION if the catalog disagrees.
+  int64 epoch = 4;
+  string operation_id = 5;
+}
+
+// ReleaseNamespaceResponse echoes the catalog state (DELETED).
+message ReleaseNamespaceResponse {
+  memory.v1.NamespaceRef namespace = 1;
+  google.protobuf.Timestamp deleted_at = 2;
+}
+
+// MoveState follows decision D5 (freeze-then-copy, decision N160): planned →
+// frozen → copied → cutover → committed → cleaning → done, or rolled_back
+// before the point of no return (the catalog CAS `cutover → committed`,
+// decision N125). Drain, the copy, VerifyFrozen, BuildIndexes and SealCopy all run in FROZEN; COPIED means verify,
+// indexes, seal and consumer wait are all done (decision N175). LOST is terminal (decision N183).
+enum MoveState {
+  MOVE_STATE_UNSPECIFIED = 0;
+  // Plan done: catalog row, target `incoming`, source `start_move`, blob pre-warm. The source is still writable.
+  MOVE_STATE_PLANNED = 1;
+  // Source frozen (`frozen/move`, reads continue): drain, copy of every table from the static source, VerifyFrozen,
+  // BuildIndexes, SealCopy. Bounded by the freeze deadline.
+  MOVE_STATE_FROZEN = 4;
+  // Cutover sub-steps (b′) and (a″) pending; see Move.cutover_step. Rollback still possible.
+  MOVE_STATE_CUTOVER = 5;
+  MOVE_STATE_CLEANING = 6;
+  MOVE_STATE_DONE = 7;
+  MOVE_STATE_ROLLED_BACK = 8;
+  // The catalog CAS (a″) was taken: the point of no return. Sub-steps (c), (b″) and (d) run; the move can only complete
+  // (decision N125).
+  MOVE_STATE_COMMITTED = 10;
+  // Verify, indexes, seal and consumer wait all done: ready for cutover (decisions N160, N175).
+  MOVE_STATE_COPIED = 11;
+  // Terminal (admin only, from COMMITTED or CLEANING): a restore of the target below the copy's floor lost the move-in;
+  // `engramctl restore --lose-move-ins` records it and a recovery move re-creates the namespace (decision N183).
+  MOVE_STATE_LOST = 12;
+}
+
+// CutoverStep names the sub-step of MOVE_STATE_CUTOVER (decision N125).
+enum CutoverStep {
+  CUTOVER_STEP_UNSPECIFIED = 0;
+  // (b′) target `incoming → ready`; rollback is still possible.
+  CUTOVER_STEP_READY_TARGET = 1;
+  // (c) source `frozen/move → moved_out`, after (a″) was read and replicated
+  // (decision N171).
+  CUTOVER_STEP_MOVED_OUT_SOURCE = 2;
+  // (b″) target `ready → active`, retried indefinitely.
+  CUTOVER_STEP_ACTIVE_TARGET = 3;
+  // (d) catalog flip, retried forever.
+  CUTOVER_STEP_CATALOG_FLIP = 4;
+  // (a″) catalog CAS `namespace_moves.state: cutover → committed`: the point
+  // of no return (decision N125).
+  CUTOVER_STEP_CATALOG_COMMIT = 5;
+}
+
+// MoveProgress reports copy and verification progress.
+message MoveProgress {
+  int64 rows_copied = 1;
+  int64 bytes_copied = 2;
+  // Owner-keyed blobs copied (the pre-warm before the freeze plus the per-row copy-if-absent under it).
+  int64 blobs_copied = 3;
+  // Operation ids terminated during drain and restarted after cutover.
+  repeated string restarted_operation_ids = 8;
+  // Tables fully copied so far.
+  repeated string tables_done = 9;
+  // Partial indexes the mover requested on the target under the freeze and how many are valid; cutover waits until all
+  // are (BuildIndexes).
+  int32 indexes_requested = 16;
+  int32 indexes_ready = 17;
+  // Rows the copy has to move (from namespace_stats at Plan), so that rows_copied / rows_estimated is the progress
+  // fraction.
+  int64 rows_estimated = 18;
+  // VerifyFrozen attempts run (1, or 2 after one mismatch re-copied the mismatching tables, reported in
+  // VerifyFrozenReport.tables_recopied; a second mismatch rolls the move back).
+  int32 verify_attempts = 19;
+}
+
+// Move is one namespace relocation.
+message Move {
+  // UUIDv7.
+  string move_id = 1;
+  memory.v1.NamespaceRef namespace = 2;
+  int32 source_shard_id = 3;
+  int32 target_shard_id = 4;
+  // Epoch at source (e) and the epoch the target will own (e+1).
+  int64 source_epoch = 5;
+  int64 target_epoch = 6;
+  MoveState state = 7;
+  MoveProgress progress = 8;
+  memory.v1.Timestamps timestamps = 9;
+  google.protobuf.Timestamp frozen_at = 10;
+  // Set when state is ROLLED_BACK or the executor is retrying after an error.
+  string error = 12;
+  // Set while state is CUTOVER, and while COMMITTED for (c), (b″) and (d).
+  CutoverStep cutover_step = 14;
+  // True once the catalog CAS (a″) committed (state COMMITTED or later); RollbackMove is refused from then on.
+  bool past_point_of_no_return = 15;
+  // W_est: the window estimate computed by Plan, rows / R_copy + build(vectors)
+  // + max(wal_build / R_archive, wal_build / R_redo) + verify (decisions N173, N179; about 27 min per 1 M live facts).
+  google.protobuf.Duration window_estimate = 21;
+  // The operator window the move was started with (default 4 h, cap 8 h); StartMove refuses unless window >= max(1.5
+  // W_est, W_est + 10 min).
+  google.protobuf.Duration window = 22;
+  // frozen_at + max(1.5 × W_est, W_est + 10 min), capped by the window: the move rolls back at this time unless it
+  // passed (a″) (MoveWindowExceeded). Also the `frozen_until_estimate` carried by NamespaceFrozen.
+  google.protobuf.Timestamp freeze_deadline = 23;
+  // Target `ready → active`; the 24 h cleanup gate counts from it (N170).
+  google.protobuf.Timestamp activated_at = 24;
+  // The copy's WAL floor (decision N179): `pg_switch_wal()` on the target after the last index build; `copy_end_lsn` is
+  // the `pg_lsn` text form. Restores and failovers of the target below it are refused.
+  string copy_end_lsn = 27;
+  int32 copy_end_timeline = 28;
+  // WAL archived and standby-replayed through copy_end_lsn (SealCopy done).
+  google.protobuf.Timestamp copy_sealed_at = 29;
+  // The standby replayed the catalog CAS (a″) / the rollback (decision N171).
+  google.protobuf.Timestamp committed_replicated_at = 30;
+  google.protobuf.Timestamp rolled_back_replicated_at = 31;
+  // Row reached DONE or ROLLED_BACK; the source blob prefix is kept until finished_at + 28 d (decision N123).
+  google.protobuf.Timestamp finished_at = 32;
+  // Set when the row was re-derived from shard truth after a catalog restore (decision N184).
+  google.protobuf.Timestamp reconciled_at = 33;
+  // Set when state is LOST: when, and the `_control/restores/` marker of the restore that caused it (decision N183).
+  google.protobuf.Timestamp lost_at = 34;
+  string lost_restore_id = 35;
+  // On a recovery move: the LOST move it replaces.
+  string recovered_from_move_id = 36;
+}
+
+// StartMoveRequest plans a move.
+message StartMoveRequest {
+  memory.v1.RequestMeta meta = 1;
+  memory.v1.NamespaceRef namespace = 2;
+  int32 target_shard_id = 3;
+  // Operator note.
+  string reason = 4;
+  // Plan and pre-warm the blobs, then wait before the freeze for an explicit RollbackMove or a second StartMove with
+  // `resume = true`. Lets an operator pick the moment of the window.
+  bool pause_before_freeze = 5;
+  // Continue a move paused before freeze.
+  bool resume = 6;
+  // The window the operator grants: the longest the namespace may stay read-only. Required when the window estimate
+  // exceeds 10 min (the rebalancer's unattended limit); the default is 4 h, the cap 8 h, and it must be >= max(1.5
+  // W_est, W_est + 10 min) (decision N173).
+  google.protobuf.Duration window = 7;
+  // Do not freeze before this time (a scheduled window). Plan and the blob pre-warm run at once; the freeze waits.
+  google.protobuf.Timestamp freeze_not_before = 8;
+  // Compute and return the window estimate without planning anything.
+  bool estimate_only = 9;
+}
+
+// StartMoveResponse returns the move.
+message StartMoveResponse {
+  Move move = 1;
+  // W_est for the namespace and target (also when `estimate_only` is set, in which case `move` is unset).
+  google.protobuf.Duration window_estimate = 2;
+}
+
+// GetMoveRequest fetches a move.
+message GetMoveRequest {
+  string move_id = 1;
+}
+
+// GetMoveResponse wraps the move.
+message GetMoveResponse {
+  Move move = 1;
+}
+
+// ListMovesRequest lists moves, newest first.
+message ListMovesRequest {
+  memory.v1.PagingRequest paging = 1;
+  repeated MoveState states = 2;
+  memory.v1.NamespaceRef namespace = 3;
+  int32 shard_id = 4;
+}
+
+// ListMovesResponse is a page of moves.
+message ListMovesResponse {
+  repeated Move moves = 1;
+  memory.v1.PagingResponse paging = 2;
+}
+
+// RollbackMoveRequest aborts a move before its point of no return (the catalog CAS (a″)).
+message RollbackMoveRequest {
+  memory.v1.RequestMeta meta = 1;
+  string move_id = 2;
+  string reason = 3;
+}
+
+// RollbackMoveResponse returns the move (ROLLED_BACK or rolling back).
+message RollbackMoveResponse {
+  Move move = 1;
+}
+
+// CleanupMoveRequest takes a committed move to CLEANING under the 24 h gate (decision N170); the activity purges the
+// rows and records DONE. The blob prefix goes at `finished_at + 28 d`. The source's `moved_out` ownership row is never
+// deleted (decision N93).
+message CleanupMoveRequest {
+  memory.v1.RequestMeta meta = 1;
+  string move_id = 2;
+}
+
+// CleanupMoveResponse returns the move (DONE, or CLEANING while batches run).
+message CleanupMoveResponse {
+  Move move = 1;
+  int64 rows_purged = 2;
+  int64 blobs_purged = 3;
+}

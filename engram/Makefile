@@ -13,6 +13,7 @@ lint:
 	cd proto && buf lint && buf build && buf format -d --exit-code
 	$(GO) vet -tags integration,faultinject,testauth $(PKGS)
 	golangci-lint run $(PKGS)
+	$(GO) run ./scripts/methodcount ./internal/... ./adapters/...
 	scripts/check-line-length.sh
 
 proto:

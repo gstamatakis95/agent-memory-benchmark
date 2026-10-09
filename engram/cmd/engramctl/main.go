@@ -1,6 +1,6 @@
-// Command engramctl is the operator CLI (PLAN.md section 1.1). Every subcommand lives in its own file and registers itself
-// with Register from an init function, so the chains that own `migrate`, `index`, `catalog`, `formal`, `backup` and the
-// rest never edit a shared file. The dispatcher is deliberately minimal; flags are parsed by each subcommand.
+// Command engramctl is the operator CLI (PLAN.md section 1.1). Every subcommand lives in its own file and registers
+// itself with Register from an init function, so the chains that own `migrate`, `index`, `catalog`, `formal`, `backup`
+// and the rest never edit a shared file. The dispatcher is deliberately minimal; flags are parsed by each subcommand.
 package main
 
 import (

@@ -1,5 +1,26 @@
-# golangci-lint v2 configuration. `lll` enforces the 120-column rule (tabs count as 4). depguard carries the dependency
-# rule of PLAN.md section 2.1 and is completed by M0.1 (E3 owns this file from then on).
+# golangci-lint v2 configuration (E3 owns this file from M0.1 on). `lll` enforces the 120-column rule (tabs count as
+# 4). `depguard` encodes the dependency rule of PLAN.md section 2.1: one rule per package of internal/ plus adapters/,
+# with test files held to the same rules (a test may import its own package, including its fakes such as
+# internal/gateway/fakegw, which sit under the package's own path). Leaves and internal/workflows run in `strict` mode
+# (everything is denied unless listed); the other layers run in `lax` mode: every import of this module's internal/
+# tree is denied except the ones the table and its edge list name, and the more specific allow entry wins over the
+# prefix deny. A catch-all rule (`default_internal`) denies every non-leaf internal import for an internal/ directory
+# that has no rule yet, so a new package gets no free pass. Leaf modules, exactly: internal/id uuid; internal/pipeline
+# go.opentelemetry.io/otel; internal/errs google.golang.org/grpc/status, google.golang.org/grpc/codes, genproto
+# googleapis/rpc/status and googleapis/rpc/errdetails (section 4.1.6 mandates errdetails; CONFLICTS.md #10),
+# google.golang.org/protobuf and connectrpc.com/connect; fsm and txn none. The import graph is acyclic by construction
+# (Go refuses a cycle, N140); `go vet ./...` over the stub module is the M0.1 exit.
+#
+# Remaining widenings of the table, each with its justification: (1) services, api and infrastructure may import
+# third-party modules the table does not list, except the drivers and the Temporal SDK that services and api are
+# denied here (section 2.1 reserves drivers for infrastructure: "leaves, gen/go, drivers, and only the edges named
+# below", and the Temporal SDK for internal/workflows); (2) infrastructure packages may import any driver (same
+# sentence); (3) ledger may import store (CONFLICTS.md #10: section 2.2.24 `Append(ctx, tx, Entry)` needs a store.Tx
+# and the edge list omits it); (4) recall, pages, reflectagent and move carry the extra edges of the table's services
+# row (reflectagent: recall, pages; pages: recall; move: catalog); (5) pgregory.net/rapid is allowed in the strict
+# rules because section 8.1 T1 property tests live next to leaves and workflows; it is not enforced to be test-only;
+# (6) workflows also imports go.temporal.io/api and google.golang.org/protobuf, which the Temporal data converter
+# needs.
 version: "2"
 run:
   timeout: 5m
@@ -13,11 +34,810 @@ linters:
       tab-width: 4
     depguard:
       rules:
-        placeholder:
-          files: ["$all"]
+        leaf_id:
+          files:
+            - "**/internal/id/**"
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/gen/go
+            - pgregory.net/rapid
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+            - github.com/google/uuid
           deny:
-            - pkg: "github.com/gstamatakis95/engram/placeholder-never-exists"
-              desc: "replaced by the section 2.1 dependency rule in M0.1"
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "a leaf imports only other leaves (PLAN.md section 2.1)"
+        leaf_errs:
+          files:
+            - "**/internal/errs/**"
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/gen/go
+            - pgregory.net/rapid
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+            - google.golang.org/grpc/status
+            - google.golang.org/grpc/codes
+            - google.golang.org/genproto/googleapis/rpc/status
+            - google.golang.org/genproto/googleapis/rpc/errdetails
+            - google.golang.org/protobuf
+            - connectrpc.com/connect
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "a leaf imports only other leaves (PLAN.md section 2.1)"
+        leaf_pipeline:
+          files:
+            - "**/internal/pipeline/**"
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/gen/go
+            - pgregory.net/rapid
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+            - go.opentelemetry.io/otel
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "a leaf imports only other leaves (PLAN.md section 2.1)"
+        leaf_fsm:
+          files:
+            - "**/internal/fsm/**"
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/gen/go
+            - pgregory.net/rapid
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "a leaf imports only other leaves (PLAN.md section 2.1)"
+        leaf_txn:
+          files:
+            - "**/internal/txn/**"
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/gen/go
+            - pgregory.net/rapid
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "a leaf imports only other leaves (PLAN.md section 2.1)"
+        layer_store:
+          files:
+            - "**/internal/store/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/store may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_index:
+          files:
+            - "**/internal/index/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/index may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_outbox:
+          files:
+            - "**/internal/outbox/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/outbox
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/outbox may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_quota:
+          files:
+            - "**/internal/quota/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/quota may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_catalog:
+          files:
+            - "**/internal/catalog/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/catalog
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/catalog may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_router:
+          files:
+            - "**/internal/router/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/router
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/catalog
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/router may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_blob:
+          files:
+            - "**/internal/blob/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/blob may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_authz:
+          files:
+            - "**/internal/authz/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/authz
+            - github.com/gstamatakis95/engram/internal/catalog
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/authz may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_config:
+          files:
+            - "**/internal/config/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/config may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_telemetry:
+          files:
+            - "**/internal/telemetry/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/telemetry may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_gateway:
+          files:
+            - "**/internal/gateway/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/gateway may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_intent:
+          files:
+            - "**/internal/intent/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/intent may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_ledger:
+          files:
+            - "**/internal/ledger/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/ledger may import only the packages PLAN.md section 2.1 lists for its layer"
+        layer_api:
+          files:
+            - "**/internal/api/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/api
+            - github.com/gstamatakis95/engram/internal/authz
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/catalog
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/export
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/move
+            - github.com/gstamatakis95/engram/internal/pages
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/recall
+            - github.com/gstamatakis95/engram/internal/reflectagent
+            - github.com/gstamatakis95/engram/internal/router
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+            - github.com/gstamatakis95/engram/internal/workflows
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/api may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_recall:
+          files:
+            - "**/internal/recall/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/recall
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/recall may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_consolidate:
+          files:
+            - "**/internal/consolidate/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/consolidate
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/consolidate may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_export:
+          files:
+            - "**/internal/export/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/export
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/export may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_expunge:
+          files:
+            - "**/internal/expunge/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/expunge
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/expunge may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_entity:
+          files:
+            - "**/internal/entity/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/entity
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/entity may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_link:
+          files:
+            - "**/internal/link/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/link
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/link may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_extract:
+          files:
+            - "**/internal/extract/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/extract
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/extract may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_chunk:
+          files:
+            - "**/internal/chunk/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/chunk
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/chunk may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_pages:
+          files:
+            - "**/internal/pages/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/pages
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/recall
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/pages may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_reflectagent:
+          files:
+            - "**/internal/reflectagent/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/reflectagent
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pages
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/recall
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/reflectagent may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_move:
+          files:
+            - "**/internal/move/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/move
+            - github.com/gstamatakis95/engram/internal/blob
+            - github.com/gstamatakis95/engram/internal/catalog
+            - github.com/gstamatakis95/engram/internal/config
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/gateway
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/index
+            - github.com/gstamatakis95/engram/internal/intent
+            - github.com/gstamatakis95/engram/internal/ledger
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/quota
+            - github.com/gstamatakis95/engram/internal/store
+            - github.com/gstamatakis95/engram/internal/telemetry
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/move may import only the packages PLAN.md section 2.1 lists for its layer"
+            - pkg: database/sql
+              desc: "a database driver belongs to store/index/catalog only"
+            - pkg: github.com/jackc
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/lib/pq
+              desc: "a Postgres driver belongs to store/index/catalog only"
+            - pkg: github.com/aws
+              desc: "the S3 driver belongs to blob only"
+            - pkg: go.temporal.io
+              desc: "the Temporal SDK belongs to internal/workflows and the cmd roots only"
+        layer_workflows:
+          files:
+            - "**/internal/workflows/**"
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/workflows
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+            - github.com/gstamatakis95/engram/gen/go/engram/private/workflow/v1
+            - go.temporal.io/sdk
+            - go.temporal.io/api
+            - google.golang.org/protobuf
+            - pgregory.net/rapid
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/workflows imports only itself, the leaves and the workflow protos (PLAN.md 2.1)"
+            - pkg: github.com/gstamatakis95/engram/gen/go
+              desc: "internal/workflows may import only gen/go/engram/private/workflow/v1"
+        adapters:
+          files:
+            - "**/adapters/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/authz
+            - github.com/gstamatakis95/engram/internal/errs
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "adapters import only gen/go, authz (scope names) and the leaf errs (PLAN.md section 2.1)"
+        default_internal:
+          files:
+            - "**/internal/**"
+            - "!**/internal/id/**"
+            - "!**/internal/errs/**"
+            - "!**/internal/pipeline/**"
+            - "!**/internal/fsm/**"
+            - "!**/internal/txn/**"
+            - "!**/internal/api/**"
+            - "!**/internal/authz/**"
+            - "!**/internal/workflows/**"
+            - "!**/internal/store/**"
+            - "!**/internal/index/**"
+            - "!**/internal/gateway/**"
+            - "!**/internal/blob/**"
+            - "!**/internal/intent/**"
+            - "!**/internal/catalog/**"
+            - "!**/internal/router/**"
+            - "!**/internal/outbox/**"
+            - "!**/internal/ledger/**"
+            - "!**/internal/config/**"
+            - "!**/internal/quota/**"
+            - "!**/internal/telemetry/**"
+            - "!**/internal/recall/**"
+            - "!**/internal/consolidate/**"
+            - "!**/internal/reflectagent/**"
+            - "!**/internal/pages/**"
+            - "!**/internal/export/**"
+            - "!**/internal/move/**"
+            - "!**/internal/expunge/**"
+            - "!**/internal/entity/**"
+            - "!**/internal/link/**"
+            - "!**/internal/extract/**"
+            - "!**/internal/chunk/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "a new internal package needs its own layer rule in .golangci.yml (PLAN.md 2.1)"
+        internal_not_outward:
+          files:
+            - "**/internal/**"
+          list-mode: lax
+          allow:
+            - $gostd
+          deny:
+            - pkg: github.com/gstamatakis95/engram/cmd
+              desc: "internal packages never import a composition root"
+            - pkg: github.com/gstamatakis95/engram/adapters
+              desc: "internal packages never import adapters"
   exclusions:
     paths: [gen/, docs/plan/]
 formatters:

@@ -1,0 +1,251 @@
+// memory/v1/errors.proto
+//
+// Typed error details. Engram returns errors as `google.rpc.Status` (code, message, details[]) — the standard gRPC
+// rich-error model. The detail messages are defined HERE instead of importing `google/rpc/error_details.proto` because
+// (a) the workspace must build without any BSR dependency and
+// (b) Engram needs domain-specific details (WrongShardOrEpoch, NamespaceFrozen) that google.rpc does not have. At
+// runtime the server packs them with `status.WithDetails(...)`; on the wire they are `google.protobuf.Any` entries in
+// `Status.details` with type URL `type.googleapis.com/memory.v1.<Name>`. For generic clients the server additionally
+// attaches the standard `google.rpc.RetryInfo` (from the errdetails Go package, no proto import needed) whenever a
+// `retry_after` is present here.
+//
+// Each message comments the gRPC status code it is attached to. A response carries at most one Engram detail plus
+// (optionally) RetryInfo.
+//
+// Only details a public caller can see and act on live here. The details that travel between the shard store, the
+// workflows and the API (the moved-out routing hint, DocumentBusy, InputBlobMissing, FenceBusy) are defined in
+// engram/internal/errors/v1/errors.proto and never cross the API boundary (decision N128): a public message can never
+// be removed once v1.0.0 ships, and a stripped field is a runtime discipline, not a contract.
+syntax = "proto3";
+
+package memory.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "memory/v1/common.proto";
+
+option go_package = "github.com/gstamatakis95/engram/gen/go/memory/v1;memoryv1";
+
+// ValidationError → INVALID_ARGUMENT. The request is malformed; fix it, do
+// not retry as-is. Also used when the call has no deadline (violation on the pseudo-field "grpc-timeout") and when a
+// field mask names an unknown path.
+message ValidationError {
+  // One entry per violated field; at least one.
+  repeated FieldViolation violations = 1;
+}
+
+// FieldViolation is one field-level validation failure.
+message FieldViolation {
+  // Path of the offending field in the request, proto field-name syntax with repeated indexes, e.g. "items[3].content",
+  // "tag_filter.mode", "read_mask.paths[1]". "grpc-timeout" denotes the missing deadline.
+  string field = 1;
+  // Human-readable description (English, not localised).
+  string description = 2;
+  // Stable machine code: "REQUIRED", "TOO_LONG", "OUT_OF_RANGE", "BAD_FORMAT", "UNKNOWN_ENUM_VALUE",
+  // "UNKNOWN_FIELD_MASK_PATH", "OUTPUT_ONLY", "MISSING_DEADLINE", "DEADLINE_TOO_LONG", "INCONSISTENT",
+  // "REQUEST_ID_REQUIRED" (field "meta.request_id" missing on a write whose ack waits for catalog replication; decision
+  // N184).
+  string reason = 3;
+}
+
+// QuotaExceeded → RESOURCE_EXHAUSTED. A per-tenant or per-namespace rate or
+// volume quota was hit at admission (decision D13: `recalls_per_min`, `retains_per_min`) or by a synchronous gateway
+// call (Reflect). Volume quotas that workflows hit (`llm_tokens_per_day`, `max_facts`) do NOT produce this error:
+// `quota.Reserve` defers the operation (OperationState.DEFERRED, decision N130). Client action: back off for
+// `retry_after`, then retry the identical request.
+message QuotaExceeded {
+  // Quota key as configured: "recalls_per_min", "retains_per_min", "max_namespaces", "max_request_bytes".
+  string quota = 1;
+  // Configured limit for the window.
+  int64 limit = 2;
+  // Observed usage that triggered the rejection (≥ limit).
+  int64 current = 3;
+  // Earliest time at which a retry can succeed; also emitted as google.rpc.RetryInfo.
+  google.protobuf.Duration retry_after = 4;
+  // Which level of the hierarchy was exhausted.
+  QuotaScope scope = 5;
+}
+
+// QuotaScope says which configured quota level rejected the request.
+enum QuotaScope {
+  QUOTA_SCOPE_UNSPECIFIED = 0;
+  QUOTA_SCOPE_TENANT = 1;
+  QUOTA_SCOPE_NAMESPACE = 2;
+}
+
+// ResourceKind names the kind of resource an error refers to.
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  RESOURCE_KIND_TENANT = 1;
+  RESOURCE_KIND_NAMESPACE = 2;
+  RESOURCE_KIND_MEMORY = 3;
+  RESOURCE_KIND_DOCUMENT = 4;
+  RESOURCE_KIND_DOCUMENT_VERSION = 5;
+  RESOURCE_KIND_OPERATION = 6;
+  RESOURCE_KIND_SNAPSHOT = 7;
+  RESOURCE_KIND_PAGE = 8;
+  RESOURCE_KIND_ENTITY = 9;
+  RESOURCE_KIND_SHARD = 10;
+  RESOURCE_KIND_MOVE = 11;
+}
+
+// NotFound → NOT_FOUND. The named resource does not exist in the caller's
+// namespace, was purged, or belongs to another tenant (cross-tenant access is reported as NOT_FOUND on purpose, so that
+// existence cannot be probed). Client action: do not retry; the id is wrong or the resource is gone.
+message NotFound {
+  ResourceKind kind = 1;
+  // The id that was looked up (memory_id, document_id, operation_id, ...).
+  string id = 2;
+  // Namespace the lookup was scoped to (unset for tenant/shard lookups).
+  NamespaceRef namespace = 3;
+  // Optional stable code refining why the resource is gone. Currently "DOCUMENT_DELETED": the document version is
+  // covered by a delete marker (GetDocumentVersion, GetDocumentBody of a deleted version, and UpdateDocumentTags on a
+  // DELETING document; decisions N136, N157), and Restore of a fact whose `invalidate` row was purged with its deleted
+  // document (decision N162). Empty for a plain unknown id.
+  string reason = 4;
+}
+
+// NamespaceState mirrors the catalog state of a namespace as seen by the shard's ownership row, for diagnostics in
+// WrongShardOrEpoch and as the public Namespace.state.
+enum NamespaceState {
+  NAMESPACE_STATE_UNSPECIFIED = 0;
+  // Being created; ownership row not yet active.
+  NAMESPACE_STATE_PROVISIONING = 1;
+  // Normal.
+  NAMESPACE_STATE_ACTIVE = 2;
+  // A shard move is planned (target prepared, blobs pre-warmed); writes are still accepted at the source until the
+  // freeze (decision N160).
+  NAMESPACE_STATE_MOVING = 3;
+  // Move freeze window (drain, copy, verify, index build, cutover): writes rejected (NamespaceFrozen with
+  // `frozen_until_estimate`), reads served (decision N160).
+  NAMESPACE_STATE_FROZEN = 4;
+  // Delete in progress: reads and writes rejected (except OperationService.GetOperation/WaitOperation, decision N70).
+  NAMESPACE_STATE_DELETING = 5;
+  // Purged from every shard and the catalog keeps a tombstone.
+  NAMESPACE_STATE_DELETED = 6;
+  // Restore-from-backup in progress on the hosting shard (decision N64): reads and writes are rejected as
+  // NamespaceFrozen{RESTORE} (the read fence rejects `frozen/restore`, decision N122).
+  NAMESPACE_STATE_RESTORING = 7;
+  // The shard's ownership row says the namespace has moved out (move cutover sub-step (c) committed). Only ever seen in
+  // WrongShardOrEpoch; a call that meets it re-resolves in a bounded loop (≤ 5 s) instead of once (decisions N52,
+  // N125).
+  NAMESPACE_STATE_MOVED_OUT = 8;
+}
+
+// WrongShardOrEpoch → FAILED_PRECONDITION. The shard that received the call
+// does not hold the namespace at the epoch the caller resolved (stale catalog cache, a move cut over between resolve
+// and execute, or a restore bumped the epoch). The API invalidates its catalog entry, re-resolves and retries: once for
+// writes; for calls that observe namespace_state = MOVED_OUT (the window between move cutover sub-steps (c) and (d)) in
+// a bounded loop of up to 5 s, exactly like NamespaceFrozen (decision N52) — so public clients see it only when that
+// also fails. FAILED_PRECONDITION returned during a move counts against the availability SLI. The shard id is never
+// part of this message: the routing hint a moved-out shard returns to the API is the internal MovedOutHint
+// (engram/internal/errors/v1). Client action: retry the whole call with backoff (new resolve), do not persist anything
+// from this detail.
+message WrongShardOrEpoch {
+  string namespace_id = 1;
+  // Epoch the caller (API or worker) believed to be current.
+  int64 expected_epoch = 2;
+  // Epoch recorded in the shard's ownership row (0 if the shard has no row for the namespace, i.e. wrong shard).
+  int64 actual_epoch = 3;
+  // Ownership state on the shard that rejected the call.
+  NamespaceState namespace_state = 4;
+}
+
+// NamespaceFrozen → FAILED_PRECONDITION. The namespace is in the freeze
+// window of a shard move (decision D5) or a restore, or an exclusive taker (freeze, restore) is queued on the namespace
+// fence and the writer's `pg_try_advisory_xact_lock_shared` was refused (decision N82: the fence never waits, so no
+// pooled connection is held behind a queued exclusive request; `retry_after` = 200 ms then, reason UNSPECIFIED). Writes
+// are rejected; reads continue at the source for a move freeze only, not for a restore freeze (decision N122). A
+// namespace that is being DELETED is never reported here: the delete freeze surfaces as
+// PreconditionFailed{NAMESPACE_DELETING}, which is not retryable (decision N139). The API already retried with backoff
+// for up to 30 s before surfacing this. A move freeze lasts for the whole copy (minutes to hours, decision N160):
+// `frozen_until_estimate` carries the move's freeze deadline so clients and workflow activities back off to it instead
+// of polling. Client action: retry after `retry_after` (also emitted as google.rpc.RetryInfo), or not before
+// `frozen_until_estimate` when set.
+message NamespaceFrozen {
+  string namespace_id = 1;
+  google.protobuf.Duration retry_after = 2;
+  // Why the namespace is frozen.
+  FreezeReason reason = 3;
+  // Set for FREEZE_REASON_MOVE: the move's freeze deadline, `frozen_at + max(1.5 × W_est, W_est + 10 min)` capped by
+  // the operator window; the move is rolled back at that time at the latest (decision N160). Unset for the other
+  // reasons.
+  google.protobuf.Timestamp frozen_until_estimate = 4;
+}
+
+// FreezeReason says why a namespace is frozen.
+enum FreezeReason {
+  FREEZE_REASON_UNSPECIFIED = 0;
+  FREEZE_REASON_MOVE = 1;
+  FREEZE_REASON_RESTORE = 2;
+  // Delete freeze (freeze_reason = 'delete' in namespace_ownership). Never emitted: a delete freeze is
+  // PreconditionFailed{NAMESPACE_DELETING} (decision N139).
+  FREEZE_REASON_DELETE = 3 [deprecated = true];
+}
+
+// NamespaceNotReady → UNAVAILABLE (retryable). The namespace's target shard
+// is in the `ready` ownership state: the move passed its point of no return on the source and the target is about to
+// become `active` (cutover sub-steps (c) to (b″), decision N125). Nothing routes to a `ready` shard, so the window has
+// no owner at all; it lasts well under a second and the API retries it inside its bounded re-resolve loop. Client
+// action: retry after `retry_after`.
+message NamespaceNotReady {
+  string namespace_id = 1;
+  google.protobuf.Duration retry_after = 2;
+}
+
+// OperationConflict → ABORTED (concurrent conflict) or ALREADY_EXISTS
+// (idempotency-key or operation_id reuse with a different payload). Client action for ABORTED: wait for
+// `existing_operation_id` (WaitOperation) and resubmit; for ALREADY_EXISTS: use a fresh id, the stored one is bound to
+// a different request.
+message OperationConflict {
+  // Operation id or request id the caller supplied.
+  string operation_id = 1;
+  // The operation that owns the conflicting state (e.g. the move or delete of the namespace you are writing to, or the
+  // refresh of the page).
+  string existing_operation_id = 2;
+  OperationConflictReason reason = 3;
+}
+
+// OperationConflictReason enumerates conflict causes.
+enum OperationConflictReason {
+  OPERATION_CONFLICT_REASON_UNSPECIFIED = 0;
+  // The same request_id/operation_id was reused with a different request hash within the retention window
+  // (ALREADY_EXISTS).
+  OPERATION_CONFLICT_REASON_IDEMPOTENCY_KEY_REUSED = 1;
+  // A delete, or a move before activation, is in progress (ABORTED). DeleteNamespace during an open move answers this
+  // with RetryInfo 30 s (decisions N177, N184).
+  OPERATION_CONFLICT_REASON_NAMESPACE_BUSY = 3;
+  // A refresh of the same page is already running (ABORTED).
+  OPERATION_CONFLICT_REASON_PAGE_REFRESHING = 4;
+}
+
+// PreconditionFailed → FAILED_PRECONDITION. The request was well-formed but
+// the resource is in a state that forbids it (terminal operation cancelled, etag mismatch, document still ingesting,
+// namespace deleting). Client action: read the current state, decide, resubmit; do not blindly retry.
+message PreconditionFailed {
+  repeated Precondition violations = 1;
+}
+
+// Precondition is one failed precondition.
+message Precondition {
+  // Stable type: "OPERATION_TERMINAL", "OPERATION_NOT_CANCELLABLE" (a DELETE_* operation: a delete is effective at its
+  // ack and is only tracked, decision N136), "ETAG_MISMATCH", "DOCUMENT_INGESTING", "NAMESPACE_DELETING" (also the
+  // delete freeze, decision N139), "SNAPSHOT_BASE_UNAVAILABLE", "SNAPSHOT_EXPIRED" (the snapshot contained, or was
+  // being built while, a document was deleted and was expired by the delete marker transaction, decision N126),
+  // "PAGE_NO_VERSION", "PAGE_HIDDEN" (the requested page version is hidden by a delete or invalidation until the
+  // refresh lands, decision N117), "MEMORY_NOT_A_FACT", "NOT_INVALIDATED" (Restore of a fact with no `invalidate`
+  // marker; a second Invalidate succeeds without changing visibility and still writes its own deletion-log row and
+  // intent, decisions N139 and N143), "TENANT_DELETING", "SCHEMA_VERSION_MISMATCH" (a move or migration refused because
+  // source and target shards run different schema versions), "MOVE_WINDOW_REQUIRED" (StartMove of a namespace whose
+  // window estimate exceeds the 10 min an unattended move may take, without an operator `window`) and
+  // "MOVE_WINDOW_TOO_SHORT" (the given `window` is below max(1.5 W_est, W_est + 10 min); cap 8 h; decision N173),
+  // "MOVE_TARGET_ARCHIVE_UNHEALTHY" (StartMove: the target has no completed backup or its WAL archiver is failing or
+  // lagging; decision N179), "MOVE_TARGET_NOT_HA" (Plan: the target shard runs the `single` profile, with no standby,
+  // so it cannot be a move target; decision N190) and "MOVE_PAST_COMMIT" (RollbackMove after the catalog commit (a″);
+  // decision N184).
+  string type = 1;
+  // Resource the precondition applies to (id).
+  string subject = 2;
+  // Human-readable explanation.
+  string description = 3;
+}

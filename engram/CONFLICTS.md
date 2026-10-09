@@ -118,7 +118,8 @@ proposed resolution)
   leaf package. A shared type would need a new leaf or a §2.1 exception.
 - `ledger → store`: §2.2.24's ledger implementation needs the store; the edge is not in the §2.1 infrastructure edge
   list and depguard allows exactly that edge.
-- `internal/errs` imports `google.golang.org/genproto/googleapis/rpc/{status,errdetails}`: §2.4 attaches the typed
+- `internal/errs` imports `google.golang.org/grpc/codes` and
+`google.golang.org/genproto/googleapis/rpc/{status,errdetails}`: §2.4 attaches the typed
   details to `google.rpc.Status`, which lives in that module; the §2.1 leaf-permitted list names `grpc/status`, which
   depends on it, so it is treated as covered.
 - `workflow.proto`: three messages the §2.2.17 prose names (`RetainDocumentResult`, `MarkProgressInput`,
@@ -196,3 +197,12 @@ under
 until then
   the superuser bootstrap stands.
 - Register rows: §9.2, §9.5, N133e.
+
+## #16 `DeferredInfo.scope` has no column in the `operations` DDL — noted (M0.8 to decide)
+
+- What: §5.1 gives the deferral information a `scope` (what the deferral covers); `workflow.proto`'s `DeferredInfo` now
+  carries it (M0.1, F4), but the reference `operations` table has no matching column.
+- Proposed resolution: M0.8 (E1, finalising `sql/ → migrations/`) adds the column by an expand-only migration if
+§5.1's
+  prose requires persistence, or records that the field is workflow-only. No code reads it before M1.1.
+- Register rows: §5.1, N35, N139.

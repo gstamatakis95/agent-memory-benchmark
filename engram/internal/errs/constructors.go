@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -26,11 +27,51 @@ const (
 	ErrorDomain          = "engram"
 	ReasonPermanentLLM   = "PERMANENT_LLM_ERROR"
 	ReasonMissingScope   = "MISSING_SCOPE"
+	ReasonNotAllowed     = "NAMESPACE_NOT_ALLOWED" // PERMISSION_DENIED: same tenant, outside ns / ns_group
+	ReasonWrongCell      = "WRONG_CELL"            // PERMISSION_DENIED: an engram.worker token for another cell (N167)
 	reasonDocumentDelete = "DOCUMENT_DELETED"
 )
 
+// The machine-readable reasons of ValidationError.violations[].reason that the cross-cutting code produces.
+const (
+	ReasonRequired        = "REQUIRED"
+	ReasonBadFormat       = "BAD_FORMAT"
+	ReasonOutOfRange      = "OUT_OF_RANGE"
+	ReasonMissingDeadline = "MISSING_DEADLINE"
+	ReasonDeadlineTooLong = "DEADLINE_TOO_LONG"
+	ReasonRequestIDNeeded = "REQUEST_ID_REQUIRED"
+)
+
+// The Precondition.type values the authorization path produces (section 4.1.1).
+const (
+	PreconditionNamespaceDeleting = "NAMESPACE_DELETING"
+	PreconditionTenantDeleting    = "TENANT_DELETING"
+)
+
+// DeadlineField is the pseudo-field a missing or out-of-range deadline is reported on, on both transports.
+const DeadlineField = "grpc-timeout"
+
 // Validation is INVALID_ARGUMENT with one violation.
 func Validation(field, desc string) *Error { return ValidationReason(field, "", desc) }
+
+// Violation is one field-level failure for ValidationErrors.
+type Violation struct{ Field, Reason, Description string }
+
+// ValidationErrors is INVALID_ARGUMENT with every violation the request has (at least one), in the order given.
+func ValidationErrors(vs ...Violation) *Error {
+	out := make([]*memoryv1.FieldViolation, len(vs))
+	msg := "invalid request"
+	for i, v := range vs {
+		out[i] = &memoryv1.FieldViolation{Field: v.Field, Reason: v.Reason, Description: v.Description}
+	}
+	if len(vs) > 0 {
+		msg = vs[0].Field + ": " + vs[0].Description
+	}
+	if len(vs) > 1 {
+		msg += fmt.Sprintf(" (and %d more)", len(vs)-1)
+	}
+	return &Error{Kind: KindValidation, Msg: msg, Public: &memoryv1.ValidationError{Violations: out}}
+}
 
 // ValidationReason is Validation with a machine-readable reason such as MISSING_DEADLINE or DEADLINE_TOO_LONG.
 func ValidationReason(field, reason, desc string) *Error {
@@ -41,6 +82,21 @@ func ValidationReason(field, reason, desc string) *Error {
 // NotFound is NOT_FOUND for a typed resource (N140).
 func NotFound(kind memoryv1.ResourceKind, ref fmt.Stringer) *Error {
 	return notFound(kind, ref, "")
+}
+
+// NotFoundNamespace is NOT_FOUND{NAMESPACE} with the NamespaceRef the caller addressed. It is the one answer for "no
+// such namespace", "a namespace of another tenant" and "a deleted namespace", byte for byte, so that the response is no
+// existence oracle (section 4.1.1, N5): the detail echoes the request, never the catalog.
+func NotFoundNamespace(tenant id.TenantID, ns id.NamespaceID) *Error {
+	e := notFound(memoryv1.ResourceKind_RESOURCE_KIND_NAMESPACE, ns, "")
+	e.Public.(*memoryv1.NotFound).Namespace = &memoryv1.NamespaceRef{TenantId: tenant.String(),
+		NamespaceId: ns.String()}
+	return e
+}
+
+// NotFoundTenant is NOT_FOUND{TENANT}: an unknown tenant, or another tenant's id on a tenant-bound method.
+func NotFoundTenant(t id.TenantID) *Error {
+	return notFound(memoryv1.ResourceKind_RESOURCE_KIND_TENANT, t, "")
 }
 
 // NotFoundDeleted is NotFound with reason DOCUMENT_DELETED: a version a delete tombstone covers (N136), or a fact whose
@@ -54,8 +110,13 @@ func notFound(kind memoryv1.ResourceKind, ref fmt.Stringer, reason string) *Erro
 	if ref != nil {
 		idText = ref.String()
 	}
-	return &Error{Kind: KindNotFound, Msg: fmt.Sprintf("%s %s not found", kind, idText),
+	return &Error{Kind: KindNotFound, Msg: fmt.Sprintf("%s %s not found", kindWord(kind), idText),
 		Public: &memoryv1.NotFound{Kind: kind, Id: idText, Reason: reason}}
+}
+
+// kindWord renders RESOURCE_KIND_DOCUMENT_VERSION as "document version".
+func kindWord(k memoryv1.ResourceKind) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(k.String(), "RESOURCE_KIND_"), "_", " "))
 }
 
 // QuotaExceeded is RESOURCE_EXHAUSTED with RetryInfo{retryAfter}.
@@ -176,6 +237,20 @@ func Unauthenticated(desc string) *Error { return &Error{Kind: KindUnauthenticat
 func PermissionDenied(scope string) *Error {
 	return &Error{Kind: KindPermissionDenied, Msg: "missing scope " + scope, Public: &errdetails.ErrorInfo{
 		Reason: ReasonMissingScope, Domain: ErrorDomain, Metadata: map[string]string{"scope": scope}}}
+}
+
+// NamespaceNotAllowed is PERMISSION_DENIED for a namespace of the caller's own tenant that the token's `ns` and
+// `ns_group` claims do not admit (within a tenant existence is not secret, so the answer differs from NOT_FOUND).
+func NamespaceNotAllowed(ns id.NamespaceID) *Error {
+	return &Error{Kind: KindPermissionDenied, Msg: "namespace " + ns.String() + " is not in the token's allowlist",
+		Public: &errdetails.ErrorInfo{Reason: ReasonNotAllowed, Domain: ErrorDomain,
+			Metadata: map[string]string{"namespace_id": ns.String()}}}
+}
+
+// WrongCell is PERMISSION_DENIED for an engram.worker token whose `cell` claim is not the cell of the shard (N167).
+func WrongCell(cell string) *Error {
+	return &Error{Kind: KindPermissionDenied, Msg: "the token is bound to cell " + cell, Public: &errdetails.ErrorInfo{
+		Reason: ReasonWrongCell, Domain: ErrorDomain, Metadata: map[string]string{"cell": cell}}}
 }
 
 // DeadlineExceeded is DEADLINE_EXCEEDED.

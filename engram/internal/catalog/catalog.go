@@ -44,6 +44,9 @@ type Entry struct {
 	EmbeddingDims  int
 	Config         config.Layer
 	TenantEntry    *TenantEntry
+	// Group is the tenant-defined namespace group the `ns_group` claim is matched against (N65). The DDL has no column
+	// for it; it is read from namespaces.profile ->> 'group' (CONFLICTS proposal in the M0.3-E3 report).
+	Group string
 }
 
 // EpochReason says why an epoch was bumped (move cutover, restore, failover).
@@ -52,8 +55,12 @@ type EpochReason string
 // CreateParams, NamespaceQuery and NamespacePatch are the inputs of Namespaces and NamespaceAdmin.
 type (
 	CreateParams struct {
+		// Namespace is the id to create the namespace under; the zero value mints a UUIDv7. A retry after a lost ack
+		// passes the id it first minted.
+		Namespace      id.NamespaceID
 		Tenant         id.TenantID
 		Name           string
+		Group          string // stored as namespaces.profile.group
 		Shard          id.ShardID
 		EmbeddingModel string
 		EmbeddingDims  int
@@ -344,10 +351,25 @@ type Resolver interface {
 	Run(ctx context.Context) error // LISTEN loop; full flush on reconnect
 }
 
-// ResolverOptions configure the Resolver: MaxEntries 100 000, TTL, NegativeTTL and StaleMax (0 = unbounded).
+// ResolverOptions configure the Resolver: MaxEntries 100 000, TTL 60 s, NegativeTTL 5 s and StaleMax (0 = unbounded).
+// The remaining fields are optional and default as NewResolver documents.
 type ResolverOptions struct {
 	MaxEntries  int
 	TTL         time.Duration
 	NegativeTTL time.Duration
 	StaleMax    time.Duration
+	// NegativeStaleTTL bounds how long a negative entry is served while the catalog is unreachable (10 min, D4).
+	NegativeStaleTTL time.Duration
+	// LoadTimeout bounds one read of the catalog (2 s); ProbeInterval is the least time between two load attempts
+	// while the catalog is known to be down (1 s); ReconnectMin and ReconnectMax bound the LISTEN reconnect backoff (1
+	// s, 30 s).
+	LoadTimeout   time.Duration
+	ProbeInterval time.Duration
+	ReconnectMin  time.Duration
+	ReconnectMax  time.Duration
+	// OnTenant is called with a tenant id when a notification says that tenant changed, and with "" when the whole
+	// cache is flushed: the hook of a cache of tenant states (TenantStates) that follows the Resolver's invalidation.
+	OnTenant func(id.TenantID)
+	// Clock replaces time.Now (tests advance a fake clock instead of sleeping).
+	Clock ResolverClock
 }

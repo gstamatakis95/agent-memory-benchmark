@@ -103,7 +103,11 @@ func TestFS_UnknownSet(t *testing.T) {
 	if _, err := FS("nope"); err == nil {
 		t.Fatal("expected an error for an unknown set")
 	}
-	if _, err := FS(Catalog); err == nil {
-		t.Fatal("the catalog set must not exist before M0.3")
+	cat, err := FS(Catalog)
+	if err != nil {
+		t.Fatalf("the catalog set exists since M0.3: %v", err)
+	}
+	if _, err := fs.Stat(cat, "0001_init.sql"); err != nil {
+		t.Errorf("the catalog set lacks 0001_init.sql: %v", err)
 	}
 }

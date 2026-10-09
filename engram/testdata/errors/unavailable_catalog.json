@@ -1,0 +1,14 @@
+{
+  "code": "Unavailable",
+  "connect_code": "unavailable",
+  "message": "catalog unavailable",
+  "details": [
+    {
+      "type": "google.rpc.RetryInfo",
+      "json": {
+        "retryDelay": "2s"
+      },
+      "hex": "0a020802"
+    }
+  ]
+}

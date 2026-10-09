@@ -1,0 +1,20 @@
+{
+  "code": "FailedPrecondition",
+  "connect_code": "failed_precondition",
+  "message": "NAMESPACE_DELETING: the namespace is being deleted",
+  "details": [
+    {
+      "type": "memory.v1.PreconditionFailed",
+      "json": {
+        "violations": [
+          {
+            "type": "NAMESPACE_DELETING",
+            "subject": "018f0000-0000-7000-8000-00000000000a",
+            "description": "the namespace is being deleted"
+          }
+        ]
+      },
+      "hex": "0a5a0a124e414d4553504143455f44454c4554494e47122430313866303030302d303030302d373030302d383030302d3030303030303030303030611a1e746865206e616d657370616365206973206265696e672064656c65746564"
+    }
+  ]
+}

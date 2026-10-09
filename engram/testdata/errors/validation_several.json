@@ -1,0 +1,25 @@
+{
+  "code": "InvalidArgument",
+  "connect_code": "invalid_argument",
+  "message": "items[0].content: over 1 MiB (and 1 more)",
+  "details": [
+    {
+      "type": "memory.v1.ValidationError",
+      "json": {
+        "violations": [
+          {
+            "field": "items[0].content",
+            "description": "over 1 MiB",
+            "reason": "TOO_LONG"
+          },
+          {
+            "field": "tag_filter.mode",
+            "description": "UNSPECIFIED with tags",
+            "reason": "INCONSISTENT"
+          }
+        ]
+      },
+      "hex": "0a280a106974656d735b305d2e636f6e74656e74120a6f7665722031204d69421a08544f4f5f4c4f4e470a360a0f7461675f66696c7465722e6d6f64651215554e535045434946494544207769746820746167731a0c494e434f4e53495354454e54"
+    }
+  ]
+}

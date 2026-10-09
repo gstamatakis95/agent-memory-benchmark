@@ -1,0 +1,20 @@
+{
+  "code": "FailedPrecondition",
+  "connect_code": "failed_precondition",
+  "message": "TENANT_DELETING: the tenant is being deleted",
+  "details": [
+    {
+      "type": "memory.v1.PreconditionFailed",
+      "json": {
+        "violations": [
+          {
+            "type": "TENANT_DELETING",
+            "subject": "acme",
+            "description": "the tenant is being deleted"
+          }
+        ]
+      },
+      "hex": "0a340a0f54454e414e545f44454c4554494e47120461636d651a1b7468652074656e616e74206973206265696e672064656c65746564"
+    }
+  ]
+}

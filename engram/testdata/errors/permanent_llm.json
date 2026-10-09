@@ -1,0 +1,19 @@
+{
+  "code": "Internal",
+  "connect_code": "internal",
+  "message": "permanent LLM error (bge-reranker-base, 400)",
+  "details": [
+    {
+      "type": "google.rpc.ErrorInfo",
+      "json": {
+        "reason": "PERMANENT_LLM_ERROR",
+        "domain": "engram",
+        "metadata": {
+          "model": "bge-reranker-base",
+          "status": "400"
+        }
+      },
+      "hex": "0a135045524d414e454e545f4c4c4d5f4552524f521206656e6772616d1a1a0a056d6f64656c12116267652d726572616e6b65722d626173651a0d0a067374617475731203343030"
+    }
+  ]
+}

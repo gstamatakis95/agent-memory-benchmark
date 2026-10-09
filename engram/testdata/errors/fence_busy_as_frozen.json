@@ -1,0 +1,22 @@
+{
+  "code": "FailedPrecondition",
+  "connect_code": "failed_precondition",
+  "message": "namespace 018f0000-0000-7000-8000-00000000000a fence is busy",
+  "details": [
+    {
+      "type": "memory.v1.NamespaceFrozen",
+      "json": {
+        "namespaceId": "018f0000-0000-7000-8000-00000000000a",
+        "retryAfter": "0.200s"
+      },
+      "hex": "0a2430313866303030302d303030302d373030302d383030302d3030303030303030303030611205108084af5f"
+    },
+    {
+      "type": "google.rpc.RetryInfo",
+      "json": {
+        "retryDelay": "0.200s"
+      },
+      "hex": "0a05108084af5f"
+    }
+  ]
+}

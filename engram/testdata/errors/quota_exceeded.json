@@ -1,0 +1,25 @@
+{
+  "code": "ResourceExhausted",
+  "connect_code": "resource_exhausted",
+  "message": "quota exceeded: recalls_per_min",
+  "details": [
+    {
+      "type": "memory.v1.QuotaExceeded",
+      "json": {
+        "quota": "recalls_per_min",
+        "limit": "100",
+        "current": "101",
+        "retryAfter": "1.500s",
+        "scope": "QUOTA_SCOPE_NAMESPACE"
+      },
+      "hex": "0a0f726563616c6c735f7065725f6d696e10641865220808011080cab5ee012802"
+    },
+    {
+      "type": "google.rpc.RetryInfo",
+      "json": {
+        "retryDelay": "1.500s"
+      },
+      "hex": "0a0808011080cab5ee01"
+    }
+  ]
+}

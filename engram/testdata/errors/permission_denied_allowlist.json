@@ -1,0 +1,18 @@
+{
+  "code": "PermissionDenied",
+  "connect_code": "permission_denied",
+  "message": "namespace 018f0000-0000-7000-8000-00000000000a is not in the token's allowlist",
+  "details": [
+    {
+      "type": "google.rpc.ErrorInfo",
+      "json": {
+        "reason": "NAMESPACE_NOT_ALLOWED",
+        "domain": "engram",
+        "metadata": {
+          "namespace_id": "018f0000-0000-7000-8000-00000000000a"
+        }
+      },
+      "hex": "0a154e414d4553504143455f4e4f545f414c4c4f5745441206656e6772616d1a340a0c6e616d6573706163655f6964122430313866303030302d303030302d373030302d383030302d303030303030303030303061"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "code": "InvalidArgument",
+  "connect_code": "invalid_argument",
+  "message": "grpc-timeout: the call has no deadline",
+  "details": [
+    {
+      "type": "memory.v1.ValidationError",
+      "json": {
+        "violations": [
+          {
+            "field": "grpc-timeout",
+            "description": "the call has no deadline",
+            "reason": "MISSING_DEADLINE"
+          }
+        ]
+      },
+      "hex": "0a3a0a0c677270632d74696d656f757412187468652063616c6c20686173206e6f20646561646c696e651a104d495353494e475f444541444c494e45"
+    }
+  ]
+}

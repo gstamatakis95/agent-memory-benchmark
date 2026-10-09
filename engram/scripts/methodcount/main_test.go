@@ -7,10 +7,17 @@ import (
 )
 
 // probe writes src as package p of a throw-away module and returns the module directory.
-func probe(t *testing.T, src string) string {
+func probe(t *testing.T, src string) string { return probeFiles(t, map[string]string{"x.go": src}) }
+
+// probeFiles writes the given files (name -> body) next to a go.mod.
+func probeFiles(t *testing.T, files map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()
-	for name, body := range map[string]string{"go.mod": "module probe\n\ngo 1.25\n", "x.go": src} {
+	all := map[string]string{"go.mod": "module probe\n\ngo 1.25\n"}
+	for k, v := range files {
+		all[k] = v
+	}
+	for name, body := range all {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -51,6 +58,19 @@ type D interface { L; R }`, nil},
 		{"embedding a foreign interface within the limit", `package p
 import "fmt"
 type A interface { fmt.Stringer; M1(); M2(); M3(); M4() }`, nil},
+		// Review-2 finding N1: files behind the repository's build tags and local type declarations are checked too.
+		{"a tagged file is loaded", "//go:build integration\n\npackage p\n" +
+			`type A interface { M1(); M2(); M3(); M4(); M5(); M6() }`, map[string]int{"A": 6}},
+		{"a tag outside the set is not loaded", "//go:build neverset\n\npackage p\n" +
+			`type A interface { M1(); M2(); M3(); M4(); M5(); M6() }` + "\ntype B interface { M1() }", nil},
+		{"an interface declared in a function body", `package p
+func f() {
+	type local interface { M1(); M2(); M3(); M4(); M5(); M6() }
+	var _ local
+}`, map[string]int{"local": 6}},
+		{"a local alias is not a declaration", `package p
+type A interface { M1(); M2(); M3(); M4(); M5() }
+func f() { type L = A; var _ L }`, nil},
 		{"anonymous interfaces are not type declarations", `package p
 func f(x interface { M1(); M2(); M3(); M4(); M5(); M6() }) {}`, nil},
 	}
@@ -93,5 +113,37 @@ func TestRepositoryInterfacesAreWithinTheLimit(t *testing.T) {
 	}
 	for _, e := range over {
 		t.Error(e.Violation())
+	}
+}
+
+// TestCheckTestFiles is review F14: most tagged code is _test.go, so a six-method interface there must fail the lint,
+// package-level or local, behind a tag or not, in an external test package too, and be reported once.
+func TestCheckTestFiles(t *testing.T) {
+	six := "type A interface { M1(); M2(); M3(); M4(); M5(); M6() }"
+	tests := []struct {
+		name  string
+		files map[string]string
+		want  int // violations
+	}{
+		{"package-level in a test file", map[string]string{"x.go": "package p\n", "x_test.go": "package p\n" + six}, 1},
+		{"local in a test file", map[string]string{"x.go": "package p\n",
+			"x_test.go": "package p\nfunc f() {\n" + six + "\nvar _ A\n}"}, 1},
+		{"in a tagged test file", map[string]string{"x.go": "package p\n",
+			"x_test.go": "//go:build integration\n\npackage p\n" + six}, 1},
+		{"in an external test package", map[string]string{"x.go": "package p\n",
+			"x_test.go": "package p_test\n" + six}, 1},
+		{"a test file within the limit", map[string]string{"x.go": "package p\n",
+			"x_test.go": "package p\ntype A interface { M1(); M2() }"}, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, over, err := Inventory(probeFiles(t, tc.files), []string{"./..."})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(over) != tc.want {
+				t.Errorf("violations = %v; want %d", over, tc.want)
+			}
+		})
 	}
 }

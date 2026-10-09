@@ -1,0 +1,15 @@
+{
+  "code": "NotFound",
+  "connect_code": "not_found",
+  "message": "document doc-1 not found",
+  "details": [
+    {
+      "type": "memory.v1.NotFound",
+      "json": {
+        "kind": "RESOURCE_KIND_DOCUMENT",
+        "id": "doc-1"
+      },
+      "hex": "08041205646f632d31"
+    }
+  ]
+}

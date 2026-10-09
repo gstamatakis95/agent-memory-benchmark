@@ -1,0 +1,23 @@
+{
+  "code": "FailedPrecondition",
+  "connect_code": "failed_precondition",
+  "message": "namespace 018f0000-0000-7000-8000-00000000000a is frozen",
+  "details": [
+    {
+      "type": "memory.v1.NamespaceFrozen",
+      "json": {
+        "namespaceId": "018f0000-0000-7000-8000-00000000000a",
+        "retryAfter": "1s",
+        "reason": "FREEZE_REASON_RESTORE"
+      },
+      "hex": "0a2430313866303030302d303030302d373030302d383030302d303030303030303030303061120208011802"
+    },
+    {
+      "type": "google.rpc.RetryInfo",
+      "json": {
+        "retryDelay": "1s"
+      },
+      "hex": "0a020801"
+    }
+  ]
+}

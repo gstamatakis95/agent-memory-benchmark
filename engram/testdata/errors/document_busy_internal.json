@@ -1,0 +1,14 @@
+{
+  "code": "Aborted",
+  "connect_code": "aborted",
+  "message": "document doc-1 is busy",
+  "details": [
+    {
+      "type": "google.rpc.RetryInfo",
+      "json": {
+        "retryDelay": "0.100s"
+      },
+      "hex": "0a051080c2d72f"
+    }
+  ]
+}

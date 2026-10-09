@@ -30,9 +30,13 @@ running; Q18/Q9 → CONFLICTS #12/#13; DDL defects #14; bootstrap role #15 |
 | M0.3 Catalog, Resolver, authz | in progress (E3 half) | m0.3-catalog-authz | — | E3 worker running on
 docs/briefs/M0.3-E3.md; E1 half after M0.4 |
 | M0.4 Compose, Temporal, codec | in progress | m0.4-compose | — | E1 worker running on docs/briefs/M0.4.md |
-| M0.5 Recall measurements | not started | m0.5-measure-recall | — | after M0.3 (E3) |
+| M0.5 Recall measurements | in progress | m0.5-measure-recall | — | E3 worker on docs/briefs/M0.5.md; reranker
+clause blocked on gateway access (human) |
 | M0.6 Storage measurements | not started | m0.6-measure-storage | — | after M0.3 (E1) |
-| M0.7 Formal conformance | in progress | m0.7-formal | — | E2 worker: brief docs/briefs/M0.7.md |
+| M0.7 Formal conformance | in review | m0.7-formal | F (quick 165 s; sweep 77/79) | review round 1: 0 Blocker, 5
+Major (changed-job timeout, twin milestones per twin, jar source, liveness in quick tier, Served pin), 11 Minor; fix
+round sent incl. merge of main | Opus review
+round 1 running; CONFLICTS #22 (tiering) needs a ruling; #23 re-run planned |
 | M0.8 Migrations and generators | not started | m0.8-gen | — | after M0.6 (E1) and M0.7 (E2) |
 
 ## Phase 1
@@ -81,3 +85,17 @@ round 1 started.
 - 2026-10-09 M0.2 merged (squash) after review round 2: 0 Blocker, 0 Major. main: lint+unit 74 s (cold lint), T3 119
 s green.
   Makefile test-prop fixed to target only rapid packages. M0.3-E3 worker finished; review round 1 started. M0.4 started.
+- 2026-10-09 M0.3-E3 review round 1 (docs/briefs/reports/M0.3-E3-review-1.md): 0 Blocker, 4 Major, 18 Minor, 3 Nit.
+  Fix round sent; CONFLICTS #19 (catalog DDL move CHECKs), #20 (ns_group storage), #21 (DeadlineGuard wording) added.
+- 2026-10-09 12:30 UTC: all three Sonnet workers (M0.3-E3 fix round, M0.4, M0.7) were terminated by the session rate
+limit;
+  resumed at 12:45 UTC from their worktrees (committed state + uncommitted files preserved). dockerd and the local
+  cluster were restarted.
+- 2026-10-09 M0.7 worker finished (manifest 79 rows, scripts, invariant code, converter + proofs, full sweep);
+orchestrator
+  verified go test and the trace proof; CONFLICTS #22–#24 added; review round 1 started.
+- 2026-10-09 M0.3-E3 merged (squash) after review round 2: 0 Blocker, 0 Major. T3 latency gates made opt-in
+  (ENGRAM_T3_LATENCY_GATES=1) after the shipped BM25 arm missed 60 ms at load 2.1 on main (CONFLICTS #12 addendum).
+  Docker daemon moved to overlay2 (disk 94 % → 52 %). M0.5 (E3) started.
+- 2026-10-09 M0.7 review round 1 (docs/briefs/reports/M0.7-review-1.md): 0 Blocker, 5 Major, 11 Minor, 2 Nit. Fix round
+  sent; CONFLICTS #22 addendum, #24 items 9–10, #26 (jar source) added.

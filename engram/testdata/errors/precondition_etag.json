@@ -1,0 +1,20 @@
+{
+  "code": "FailedPrecondition",
+  "connect_code": "failed_precondition",
+  "message": "ETAG_MISMATCH: stale etag",
+  "details": [
+    {
+      "type": "memory.v1.PreconditionFailed",
+      "json": {
+        "violations": [
+          {
+            "type": "ETAG_MISMATCH",
+            "subject": "namespace",
+            "description": "stale etag"
+          }
+        ]
+      },
+      "hex": "0a260a0d455441475f4d49534d4154434812096e616d6573706163651a0a7374616c652065746167"
+    }
+  ]
+}

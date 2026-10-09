@@ -1,0 +1,22 @@
+{
+  "code": "Unavailable",
+  "connect_code": "unavailable",
+  "message": "namespace 018f0000-0000-7000-8000-00000000000a is not ready",
+  "details": [
+    {
+      "type": "memory.v1.NamespaceNotReady",
+      "json": {
+        "namespaceId": "018f0000-0000-7000-8000-00000000000a",
+        "retryAfter": "0.250s"
+      },
+      "hex": "0a2430313866303030302d303030302d373030302d383030302d30303030303030303030306112051080e59a77"
+    },
+    {
+      "type": "google.rpc.RetryInfo",
+      "json": {
+        "retryDelay": "0.250s"
+      },
+      "hex": "0a051080e59a77"
+    }
+  ]
+}

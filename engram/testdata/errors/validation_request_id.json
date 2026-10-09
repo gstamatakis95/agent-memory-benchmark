@@ -1,0 +1,20 @@
+{
+  "code": "InvalidArgument",
+  "connect_code": "invalid_argument",
+  "message": "meta.request_id: required",
+  "details": [
+    {
+      "type": "memory.v1.ValidationError",
+      "json": {
+        "violations": [
+          {
+            "field": "meta.request_id",
+            "description": "required",
+            "reason": "REQUEST_ID_REQUIRED"
+          }
+        ]
+      },
+      "hex": "0a300a0f6d6574612e726571756573745f6964120872657175697265641a13524551554553545f49445f5245515549524544"
+    }
+  ]
+}

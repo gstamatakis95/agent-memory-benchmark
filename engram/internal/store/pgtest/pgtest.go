@@ -70,6 +70,7 @@ const (
 var AllRoles = []Role{Migrate, App, Relay, Move, Admin}
 
 type server struct {
+	ref        string // container name or id, for Pause and Unpause (empty with EnvDSN)
 	host, port string
 	superUser  string
 	superPass  string
@@ -100,9 +101,16 @@ var (
 )
 
 // Main starts the package's server, builds its database and runs the tests; it returns the exit code for os.Exit.
-func Main(m *testing.M) int {
+func Main(m *testing.M) int { return run(m, true) }
+
+// MainServerOnly is Main for a package that builds its own databases (the catalog tests migrate the catalog schema,
+// not the shard schema): it starts the server and runs the tests, and creates no package database. Databases come from
+// NewDatabase(tb, false).
+func MainServerOnly(m *testing.M) int { return run(m, false) }
+
+func run(m *testing.M, packageDB bool) int {
 	ctx := context.Background()
-	stop, err := start(ctx)
+	stop, err := start(ctx, packageDB)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pgtest: %v\n", err)
 		return 1
@@ -117,7 +125,7 @@ func Main(m *testing.M) int {
 	return code
 }
 
-func start(ctx context.Context) (func(), error) {
+func start(ctx context.Context, packageDB bool) (func(), error) {
 	var err error
 	if dsn := os.Getenv(EnvDSN); dsn != "" {
 		srv, err = fromDSN(dsn)
@@ -136,13 +144,14 @@ func start(ctx context.Context) (func(), error) {
 			}
 		}
 	}
-	pkgDB, err = createDatabase(ctx, true)
-	if err != nil {
-		stop()
-		return nil, err
+	if packageDB {
+		if pkgDB, err = createDatabase(ctx, true); err != nil {
+			stop()
+			return nil, err
+		}
 	}
 	return func() {
-		if os.Getenv(EnvDSN) != "" {
+		if os.Getenv(EnvDSN) != "" && pkgDB != "" {
 			_ = dropDatabase(context.Background(), pkgDB)
 		}
 		stop()
@@ -191,7 +200,7 @@ func startContainer(ctx context.Context) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start %s: %w", Image, err)
 	}
-	s := &server{superUser: "postgres", superPass: Password}
+	s := &server{superUser: "postgres", superPass: Password, ref: c.GetContainerID()}
 	s.stop = func(ctx context.Context) error {
 		return testcontainers.TerminateContainer(c, testcontainers.StopContext(ctx))
 	}
@@ -232,7 +241,7 @@ func startHostNetwork(ctx context.Context) (*server, error) {
 	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("docker run %s: %w\n%s", Image, err, out)
 	}
-	s := &server{host: "127.0.0.1", port: port, superUser: "postgres", superPass: Password}
+	s := &server{host: "127.0.0.1", port: port, superUser: "postgres", superPass: Password, ref: name}
 	s.stop = func(ctx context.Context) error {
 		out, err := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
 		if err != nil {
@@ -362,6 +371,31 @@ type Database struct {
 
 // DSN returns the connection string of role on this database.
 func (d Database) DSN(role Role) string { return srv.dsn(role, d.Name) }
+
+// RoleDSN returns the connection string of a login that is not one of the shard roles (the catalog's catalog_app,
+// catalog_admin, ...) with the password the test gave it.
+func (d Database) RoleDSN(user, password string) string {
+	u := url.URL{Scheme: "postgres", User: url.UserPassword(user, password),
+		Host: net.JoinHostPort(srv.host, srv.port), Path: "/" + d.Name, RawQuery: "sslmode=disable"}
+	return u.String()
+}
+
+// Pause freezes the server's container (docker pause): connections hang instead of being refused, which is how a
+// catalog outage looks to the Resolver (a partition, not a crash). Unpause resumes it. Neither works with EnvDSN.
+func Pause(ctx context.Context) error { return docker(ctx, "pause") }
+
+// Unpause resumes a paused server.
+func Unpause(ctx context.Context) error { return docker(ctx, "unpause") }
+
+func docker(ctx context.Context, verb string) error {
+	if srv == nil || srv.ref == "" {
+		return fmt.Errorf("pgtest: cannot %s a server that was not started by the harness", verb)
+	}
+	if out, err := exec.CommandContext(ctx, "docker", verb, srv.ref).CombinedOutput(); err != nil {
+		return fmt.Errorf("pgtest: docker %s: %w\n%s", verb, err, out)
+	}
+	return nil
+}
 
 // NewDatabase creates an extra database on the package server: empty when migrated is false (for up/down tests),
 // otherwise fully migrated and provisioned like the package database.

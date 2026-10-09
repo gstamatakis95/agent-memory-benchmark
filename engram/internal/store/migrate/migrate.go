@@ -25,7 +25,7 @@ import (
 // Set names one of the two independent migration sets of section 9.2.
 type Set string
 
-// The migration sets. The catalog set arrives with M0.3.
+// The migration sets (section 9.2): the shard schema and, since M0.3, the catalog schema.
 const (
 	Shard   Set = "shard"
 	Catalog Set = "catalog"
@@ -65,7 +65,7 @@ func FS(set Set) (fs.FS, error) {
 	case "", Shard:
 		return fs.Sub(migrations.Shard, "shard")
 	case Catalog:
-		return nil, errors.New("migrate: the catalog migration set arrives with M0.3")
+		return fs.Sub(migrations.Catalog, "catalog")
 	default:
 		return nil, fmt.Errorf("migrate: unknown migration set %q", set)
 	}

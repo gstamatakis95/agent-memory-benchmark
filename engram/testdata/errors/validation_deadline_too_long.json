@@ -1,0 +1,20 @@
+{
+  "code": "InvalidArgument",
+  "connect_code": "invalid_argument",
+  "message": "grpc-timeout: over the 10s cap of Recall",
+  "details": [
+    {
+      "type": "memory.v1.ValidationError",
+      "json": {
+        "violations": [
+          {
+            "field": "grpc-timeout",
+            "description": "over the 10s cap of Recall",
+            "reason": "DEADLINE_TOO_LONG"
+          }
+        ]
+      },
+      "hex": "0a3d0a0c677270632d74696d656f7574121a6f766572207468652031307320636170206f6620526563616c6c1a11444541444c494e455f544f4f5f4c4f4e47"
+    }
+  ]
+}

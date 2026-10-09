@@ -1,0 +1,17 @@
+{
+  "code": "FailedPrecondition",
+  "connect_code": "failed_precondition",
+  "message": "namespace 018f0000-0000-7000-8000-00000000000a: expected epoch 2, found 3 (NAMESPACE_STATE_ACTIVE)",
+  "details": [
+    {
+      "type": "memory.v1.WrongShardOrEpoch",
+      "json": {
+        "namespaceId": "018f0000-0000-7000-8000-00000000000a",
+        "expectedEpoch": "2",
+        "actualEpoch": "3",
+        "namespaceState": "NAMESPACE_STATE_ACTIVE"
+      },
+      "hex": "0a2430313866303030302d303030302d373030302d383030302d303030303030303030303061100218032002"
+    }
+  ]
+}

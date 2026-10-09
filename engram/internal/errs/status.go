@@ -3,6 +3,7 @@ package errs
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"connectrpc.com/connect"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -39,7 +40,7 @@ func (e *Error) message() string {
 // renderings carry byte-identical details.
 func (e *Error) details(withInternal bool) []*anypb.Any {
 	var ms []proto.Message
-	if e.Public != nil {
+	if e.Public != nil && !isInternalMessage(e.Public) { // N128 by type, however the error was built
 		ms = append(ms, e.Public)
 	}
 	if e.Retry > 0 {
@@ -50,13 +51,29 @@ func (e *Error) details(withInternal bool) []*anypb.Any {
 	}
 	out := make([]*anypb.Any, 0, len(ms))
 	for _, m := range ms {
-		a, err := anypb.New(m)
+		a, err := packDetail(m)
 		if err != nil {
 			continue // a detail that cannot be marshalled is dropped; the code and message still carry the error
 		}
 		out = append(out, a)
 	}
 	return out
+}
+
+// packDetail is anypb.New with a deterministic marshal: ErrorInfo.metadata is a map, and the default encoding orders
+// map entries differently from call to call, which would make the gRPC and the Connect rendering of one error differ
+// in bytes (and a golden flake). The type URL is the standard one.
+func packDetail(m proto.Message) (*anypb.Any, error) {
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return &anypb.Any{TypeUrl: "type.googleapis.com/" + string(m.ProtoReflect().Descriptor().FullName()), Value: b}, nil
+}
+
+// isInternalMessage reports whether m belongs to the engram.internal.* protos, which never leave the process.
+func isInternalMessage(m proto.Message) bool {
+	return strings.HasPrefix(string(m.ProtoReflect().Descriptor().FullName()), internalTypePrefix)
 }
 
 func (e *Error) status(withInternal bool) *status.Status {
@@ -95,7 +112,41 @@ func foreign(err error) *status.Status {
 	case errors.Is(err, context.Canceled):
 		return status.New(codes.Canceled, "canceled")
 	}
+	// A status or a Connect error that is not ours (a handler returning status.Error, a forwarded peer error) keeps its
+	// code, message and public details; every engram.internal.* detail is dropped (N128).
+	var gs interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &gs) {
+		if st := gs.GRPCStatus(); st != nil && st.Code() != codes.OK {
+			return stripInternal(st)
+		}
+	}
+	var ce *connect.Error
+	if errors.As(err, &ce) {
+		p := &spb.Status{Code: int32(ce.Code()), Message: ce.Message()} //nolint:gosec // the code spaces coincide
+		for _, d := range ce.Details() {
+			if m, derr := d.Value(); derr == nil {
+				if a, aerr := packDetail(m); aerr == nil {
+					p.Details = append(p.Details, a)
+				}
+			}
+		}
+		return stripInternal(status.FromProto(p))
+	}
 	return status.New(codes.Internal, RedactedMessage)
+}
+
+// internalTypePrefix is the proto package of the details that never cross the API boundary (N128).
+const internalTypePrefix = "engram.internal."
+
+func stripInternal(st *status.Status) *status.Status {
+	p := st.Proto()
+	kept := p.Details[:0:0]
+	for _, a := range p.GetDetails() {
+		if !strings.HasPrefix(string(a.MessageName()), internalTypePrefix) {
+			kept = append(kept, a)
+		}
+	}
+	return status.FromProto(&spb.Status{Code: p.GetCode(), Message: p.GetMessage(), Details: kept})
 }
 
 // ToConnect renders err once for a Connect response: the same code, message and details as ToStatus, attached with
@@ -123,7 +174,7 @@ func FromConnect(ce *connect.Error) *Error {
 	p := &spb.Status{Code: int32(ce.Code()), Message: ce.Message()} //nolint:gosec // codes coincide
 	for _, d := range ce.Details() {
 		if m, err := d.Value(); err == nil {
-			if a, aerr := anypb.New(m); aerr == nil {
+			if a, aerr := packDetail(m); aerr == nil {
 				p.Details = append(p.Details, a)
 			}
 		}

@@ -1,0 +1,16 @@
+{
+  "code": "AlreadyExists",
+  "connect_code": "already_exists",
+  "message": "operation conflict: OPERATION_CONFLICT_REASON_IDEMPOTENCY_KEY_REUSED",
+  "details": [
+    {
+      "type": "memory.v1.OperationConflict",
+      "json": {
+        "operationId": "01000000-0000-0000-0000-000000000000",
+        "existingOperationId": "02000000-0000-0000-0000-000000000000",
+        "reason": "OPERATION_CONFLICT_REASON_IDEMPOTENCY_KEY_REUSED"
+      },
+      "hex": "0a2430313030303030302d303030302d303030302d303030302d303030303030303030303030122430323030303030302d303030302d303030302d303030302d3030303030303030303030301801"
+    }
+  ]
+}

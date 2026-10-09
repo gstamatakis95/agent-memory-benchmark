@@ -5,6 +5,7 @@ go 1.25.7
 require (
 	connectrpc.com/connect v1.21.0
 	github.com/docker/docker v28.5.1+incompatible
+	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/pressly/goose/v3 v3.26.0
@@ -18,6 +19,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260720211330-0afa2a65878a
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
+	pgregory.net/rapid v1.2.0
 )
 
 require (

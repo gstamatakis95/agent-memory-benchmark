@@ -1,0 +1,18 @@
+{
+  "code": "PermissionDenied",
+  "connect_code": "permission_denied",
+  "message": "missing scope memory.write",
+  "details": [
+    {
+      "type": "google.rpc.ErrorInfo",
+      "json": {
+        "reason": "MISSING_SCOPE",
+        "domain": "engram",
+        "metadata": {
+          "scope": "memory.write"
+        }
+      },
+      "hex": "0a0d4d495353494e475f53434f50451206656e6772616d1a150a0573636f7065120c6d656d6f72792e7772697465"
+    }
+  ]
+}

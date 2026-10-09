@@ -1,0 +1,19 @@
+{
+  "code": "NotFound",
+  "connect_code": "not_found",
+  "message": "namespace 018f0000-0000-7000-8000-00000000000a not found",
+  "details": [
+    {
+      "type": "memory.v1.NotFound",
+      "json": {
+        "kind": "RESOURCE_KIND_NAMESPACE",
+        "id": "018f0000-0000-7000-8000-00000000000a",
+        "namespace": {
+          "tenantId": "acme",
+          "namespaceId": "018f0000-0000-7000-8000-00000000000a"
+        }
+      },
+      "hex": "0802122430313866303030302d303030302d373030302d383030302d3030303030303030303030611a2c0a0461636d65122430313866303030302d303030302d373030302d383030302d303030303030303030303061"
+    }
+  ]
+}

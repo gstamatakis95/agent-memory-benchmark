@@ -1,0 +1,15 @@
+{
+  "code": "NotFound",
+  "connect_code": "not_found",
+  "message": "tenant acme not found",
+  "details": [
+    {
+      "type": "memory.v1.NotFound",
+      "json": {
+        "kind": "RESOURCE_KIND_TENANT",
+        "id": "acme"
+      },
+      "hex": "0801120461636d65"
+    }
+  ]
+}

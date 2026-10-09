@@ -1,0 +1,18 @@
+{
+  "code": "PermissionDenied",
+  "connect_code": "permission_denied",
+  "message": "the token is bound to cell cell-b",
+  "details": [
+    {
+      "type": "google.rpc.ErrorInfo",
+      "json": {
+        "reason": "WRONG_CELL",
+        "domain": "engram",
+        "metadata": {
+          "cell": "cell-b"
+        }
+      },
+      "hex": "0a0a57524f4e475f43454c4c1206656e6772616d1a0e0a0463656c6c120663656c6c2d62"
+    }
+  ]
+}

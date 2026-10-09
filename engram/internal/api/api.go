@@ -160,22 +160,6 @@ type OperationWaiter interface {
 // cleared (keys sorted, unknown fields dropped, canonical Timestamp/Duration/int64 rendering; N72).
 func RequestHash(m proto.Message) [32]byte { panic("stub") }
 
-// DeadlineGuard enforces the mandatory per-call deadline (4.1.2): a missing deadline is INVALID_ARGUMENT
-// (MISSING_DEADLINE), one over the method's cap is INVALID_ARGUMENT (DEADLINE_TOO_LONG), never silently clamped.
-// `Connect-Timeout-Ms` maps to the deadline.
-type DeadlineGuard struct {
-	Options Options
-}
-
-// Unary returns the gRPC unary interceptor.
-func (g DeadlineGuard) Unary() grpc.UnaryServerInterceptor { panic("stub") }
-
-// Stream returns the gRPC stream interceptor.
-func (g DeadlineGuard) Stream() grpc.StreamServerInterceptor { panic("stub") }
-
-// Connect returns the Connect interceptor.
-func (g DeadlineGuard) Connect() connect.Interceptor { panic("stub") }
-
 // StreamBatcher batches stream elements in groups of 10 and flushes on deadline pressure (Recall).
 type StreamBatcher[T any] struct {
 	Size  int

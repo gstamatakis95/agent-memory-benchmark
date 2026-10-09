@@ -2,17 +2,13 @@
 // N139, N157, N167). It verifies the JWT, resolves the namespace, checks tenant ownership, the allowlist (ns, ns_group)
 // and the scope, takes the rate token and attaches a RequestScope. One implementation serves gRPC unary, gRPC stream
 // and Connect; MCP and Connect forward the JWT. Pattern: interceptor chain (a pipeline of three checks) with a
-// declarative Policy table instead of per-handler code. M0.1 declares the signatures only.
+// declarative Policy table instead of per-handler code.
 package authz
 
 import (
 	"context"
 	"time"
 
-	"connectrpc.com/connect"
-	"google.golang.org/grpc"
-
-	"github.com/gstamatakis95/engram/internal/catalog"
 	"github.com/gstamatakis95/engram/internal/config"
 	"github.com/gstamatakis95/engram/internal/id"
 	"github.com/gstamatakis95/engram/internal/quota"
@@ -88,23 +84,3 @@ type MethodPolicy struct {
 
 // Policy maps a full method name, e.g. "/memory.v1.MemoryService/Recall", to its row.
 type Policy map[string]MethodPolicy
-
-// Interceptor is the one enforcement point; it holds the verifier, the resolver, the limiter and the policy table.
-type Interceptor struct{}
-
-// NewInterceptor wires the interceptor.
-func NewInterceptor(v TokenVerifier, r catalog.Resolver, l quota.Limiter, p Policy) *Interceptor {
-	panic("stub")
-}
-
-// Unary returns the gRPC unary interceptor.
-func (i *Interceptor) Unary() grpc.UnaryServerInterceptor { panic("stub") }
-
-// Stream returns the gRPC stream interceptor; the scope is fixed for the stream's life (N8).
-func (i *Interceptor) Stream() grpc.StreamServerInterceptor { panic("stub") }
-
-// Connect returns the Connect interceptor.
-func (i *Interceptor) Connect() connect.Interceptor { panic("stub") }
-
-// FromContext returns the RequestScope the interceptor attached.
-func FromContext(ctx context.Context) (RequestScope, bool) { panic("stub") }

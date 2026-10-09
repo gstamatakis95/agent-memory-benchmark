@@ -198,6 +198,9 @@ linters:
             - github.com/gstamatakis95/engram/internal/id
             - github.com/gstamatakis95/engram/internal/pipeline
             - github.com/gstamatakis95/engram/internal/txn
+            # T3 tests only: the shared harness and the code path of `engramctl migrate` (PLAN.md 8.1)
+            - github.com/gstamatakis95/engram/internal/store/migrate
+            - github.com/gstamatakis95/engram/internal/store/pgtest
           deny:
             - pkg: github.com/gstamatakis95/engram/internal
               desc: "internal/catalog may import only the packages PLAN.md section 2.1 lists for its layer"

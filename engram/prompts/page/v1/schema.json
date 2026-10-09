@@ -1,0 +1,111 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operations"
+  ],
+  "properties": {
+    "operations": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "op",
+              "section",
+              "markdown",
+              "cites"
+            ],
+            "properties": {
+              "op": {
+                "const": "replace_section"
+              },
+              "section": {
+                "type": "string"
+              },
+              "markdown": {
+                "type": "string"
+              },
+              "cites": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "op",
+              "section",
+              "markdown",
+              "cites"
+            ],
+            "properties": {
+              "op": {
+                "const": "append_block"
+              },
+              "section": {
+                "type": "string"
+              },
+              "markdown": {
+                "type": "string"
+              },
+              "cites": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "op",
+              "block_id",
+              "reason"
+            ],
+            "properties": {
+              "op": {
+                "const": "remove_block"
+              },
+              "block_id": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "op",
+              "section",
+              "new_name"
+            ],
+            "properties": {
+              "op": {
+                "const": "rename_section"
+              },
+              "section": {
+                "type": "string"
+              },
+              "new_name": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

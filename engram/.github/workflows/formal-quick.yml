@@ -78,6 +78,8 @@ jobs:
         run: make formal-quick
       - name: Trace converter proof (one counterexample per specification through TraceNext)
         run: scripts/formal-trace-check.sh proof
+      - name: Trace converter refuses a log whose action names were changed (state-level replay conjoins the action)
+        run: scripts/formal-trace-check.sh tamper
       - name: Lean sorry count
         run: scripts/sorry-count.sh
 

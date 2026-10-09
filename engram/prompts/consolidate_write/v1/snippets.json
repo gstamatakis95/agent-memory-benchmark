@@ -1,0 +1,6 @@
+{
+  "source_line": "[{fact_id}] \"{quote}\"",
+  "attached_line": "[{id} mentioned_at={mentioned_at}{said_at}] {text}",
+  "said_at": " said_at={said_at}",
+  "none": "(none)"
+}

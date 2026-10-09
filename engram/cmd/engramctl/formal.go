@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -70,11 +71,19 @@ func runTraceToTLA(args []string) error {
 		return fmt.Errorf("specification: %w", err)
 	}
 	defer func() { _ = src.Close() }()
-	ops, err := trace.OperatorArities(src)
+	raw, err := io.ReadAll(src)
 	if err != nil {
 		return err
 	}
-	opt := trace.Options{Operators: ops}
+	ops, err := trace.OperatorArities(bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	doms, err := trace.ActionDomains(bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	opt := trace.Options{Operators: ops, Domains: doms}
 	if *cfgPath != "" {
 		cfg, err := os.ReadFile(*cfgPath)
 		if err != nil {

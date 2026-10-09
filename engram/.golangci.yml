@@ -800,6 +800,22 @@ linters:
           deny:
             - pkg: github.com/gstamatakis95/engram/internal
               desc: "internal/formal imports the leaves and itself only (M0.7, PLAN.md section 7.4)"
+        layer_prompts:
+          files:
+            - "**/internal/prompts/**"
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/prompts
+            - github.com/gstamatakis95/engram/prompts
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/prompts imports the standard library, the package prompts and the leaves only (M0.8)"
         default_internal:
           files:
             - "**/internal/**"
@@ -835,6 +851,7 @@ linters:
             - "!**/internal/extract/**"
             - "!**/internal/chunk/**"
             - "!**/internal/formal/**"
+            - "!**/internal/prompts/**"
           list-mode: lax
           allow:
             - $gostd

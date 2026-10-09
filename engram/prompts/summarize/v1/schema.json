@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "language"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "language": {
+      "type": "string",
+      "description": "BCP-47 tag of the document"
+    }
+  }
+}

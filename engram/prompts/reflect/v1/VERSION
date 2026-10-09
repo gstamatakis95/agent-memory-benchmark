@@ -1,0 +1,10 @@
+# The released identity of this prompt (PLAN.md section 6.0). A released version is never edited: change the
+# text, the schema, the defenses or the snippets and the next number is a new directory.
+id: reflect/v1
+name: reflect
+version: 1
+schema_version: 1
+model_class: models.reflect
+temperature: 0.7
+max_output_tokens: request
+default_max_output_tokens: 4096

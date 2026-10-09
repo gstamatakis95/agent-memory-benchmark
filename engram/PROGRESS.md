@@ -45,14 +45,22 @@ N3 (nightly log upload) → carry-over to M0.8-E2; #22 awaits ruling | fix round
 Major (changed-job timeout, twin milestones per twin, jar source, liveness in quick tier, Served pin), 11 Minor; fix
 round sent incl. merge of main | Opus review
 round 1 running; CONFLICTS #22 (tiering) needs a ruling; #23 re-run planned |
-| M0.8 Migrations and generators | in progress (E2 half) | m0.8-gen | — | E2 worker on docs/briefs/M0.8-E2.md; E1
+| M0.8 Migrations and generators | E2 half done (squash-merged); E1 half after M0.6 | m0.8-gen-e2 | S + T0 (55 s cold
+lint), gen-docs idempotent, gendocs T3 | review-3 merge-ready; minors N1 (duplicate §8 name detection), N2 (golden
+per version) → M1.1 carry-over; CONFLICTS #30 ruling pending | S + T0 (20 s), gen-docs
+check | review round 1: 0 Blocker, 5 Major (constant values unchecked, ownership statements not executable,
+render_hash contradiction, Reflect delimiters, GUC-derived constants), 10 Minor; fix round sent | S + T0 (20 s),
+gen-docs
+check | Opus review round 1 running; CONFLICTS #30 (N177 ratchet) needs a ruling; #31 noted | E2 worker on
+docs/briefs/M0.8-E2.md; E1
 half after M0.6 |
 
 ## Phase 1
 
 | Milestone | State | Branch | Last green tier | Next step / findings |
 |---|---|---|---|---|
-| M1.1 Retain pipeline | not started | m1.1-retain | — | after M0.8 (E2) |
+| M1.1 Retain pipeline | in progress | m1.1-retain | — | E2 worker on docs/briefs/M1.1.md; store repositories
+pending E1 (M1.8 brief carries the request list) |
 | M1.2 Recall | not started | m1.2-recall | — | after M0.5 (E3) |
 | M1.3 Delete and visibility | not started | m1.3-delete | — | after M1.1, M1.8 |
 | M1.4 Outbox relay | not started | m1.4-outbox | — | after M1.8 |
@@ -117,3 +125,12 @@ started.
   trace proof 24 ok. M0.8-E2 started.
 - 2026-10-09 M0.4 merged (squash) after review round 3: 0 Blocker, 0 Major. main: lint+unit 61 s, make e2e 95 s cold.
   M0.3-E1 started.
+- 2026-10-09 17:40 UTC: the session rate limit cut the M0.3-E1, M0.5 and M0.8-E2 workers; resumed 21:05 UTC from their
+  worktrees after restarting dockerd (overlay2) and the local cluster.
+- 2026-10-09 M0.8-E2 worker finished (prompts + goldens, internal/prompts, cmd/gendocs, docs/generated, M0.7
+carry-over);
+  orchestrator verified lint/unit and gen-docs --check; CONFLICTS #30–#31 added; review round 1 started.
+- 2026-10-09 M0.8-E2 review round 1: 0 Blocker, 5 Major, 10 Minor, 2 Nit. Fix round sent; CONFLICTS #32 added.
+- 2026-10-09 M0.3-E1 worker finished (reconcile, promotion, replicated ack, standby harness, config lint); orchestrator
+  verified the five TestCatalog_* and the fault twin; CONFLICTS #33 added; review round 1 (move lens) started.
+- 2026-10-09 M0.8-E2 merged (squash) after review round 3: 0 Blocker, 0 Major. main: lint+unit 55 s, gen-docs check ok.

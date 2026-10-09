@@ -1,0 +1,4 @@
+{
+  "evidence_line": "[{id}] ({kind}, {date}) {text}",
+  "none": "(none)"
+}

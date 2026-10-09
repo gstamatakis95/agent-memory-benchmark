@@ -45,5 +45,18 @@ jobs:
         run: make formal
       - name: Trace converter proof, every must-fail counterexample through TraceNext
         run: scripts/formal-trace-check.sh proof-all
+      - name: Trace converter refuses a log whose action names were changed (state-level replay conjoins the action)
+        run: scripts/formal-trace-check.sh tamper
       - name: Lean sorry count
         run: scripts/sorry-count.sh
+      # N141 keeps every configuration's log: a red or INCOMPLETE nightly must leave the raw TLC output to read.
+      # `make formal` rewrites formal/tla/results/ (79 logs and RESULTS.md); the artifact is uploaded even when an
+      # earlier step failed. v4.6.2 resolved with `git ls-remote --tags https://github.com/actions/upload-artifact`.
+      - name: Keep the TLC logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: formal-tla-results
+          path: formal/tla/results/
+          if-no-files-found: error
+          retention-days: 30

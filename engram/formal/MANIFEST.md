@@ -152,6 +152,61 @@ their specification or its mapped test files. The tiering is the outcome of the 
 - Durability_ReplayStampsCurrentEpoch
 - Durability_RaiseOnReopen
 
+### Fast group of the quick tier
+
+`scripts/formal-run.sh quick` runs the configurations below as up to four parallel one-worker TLC processes (JVM
+start-up dominates them, each took at most 4 s in the M0.7 measurement) and every other quick-tier configuration one at
+a time with all workers. A breadth-first search with one worker is deterministic, so a fast-group configuration always
+writes the same counts and counterexample; the group is listed here, not derived from the wall time of the previous run,
+so the worker count of a configuration does not flip with machine load. Every configuration still has its own log and
+its own comparison with `EXPECT`. A name is listed with `- `, one per line, and must be a configuration that is not in
+the nightly-only list (`scripts/formal-manifest-check.sh` checks both).
+
+- Consolidation_Live
+- Consolidation_NonAtomicKey
+- Derivation_CasBeforeIdem
+- Derivation_CascadeEvidence
+- Derivation_CascadeHidden
+- Derivation_EffCited
+- Derivation_LazyTagFromLastLog
+- Derivation_LazyTwinNoLock
+- Derivation_MatOnce
+- Derivation_MatSignalOnly
+- Derivation_NoLock
+- Derivation_PageNoVerify
+- Derivation_ReextractHides
+- Derivation_RestoreByVisibleTwin
+- Derivation_RestoreNoLock
+- Derivation_RestoreOnlySelf
+- Derivation_TombByDocId
+- Durability_AckBeforeIntent
+- Durability_AckNoRecheck
+- Durability_CatalogLossNoBlobFloor
+- Durability_CatalogRestoreInFenceWindow
+- Durability_DupNoReput
+- Durability_IntentBeforeCommit
+- Durability_NarrowWindow
+- Durability_ReopenEarly
+- Durability_RetargetRestore
+- Durability_UnorderedReplay
+- Outbox_NoWatch
+- Outbox_Watch1x
+- ShardMove_CatalogLossDuringFreeze
+- ShardMove_CopyBeforeFreeze
+- ShardMove_EndOnRouting
+- ShardMove_NoSeqAdvance
+- ShardMove_NoVerify
+- ShardMove_ReadyBeforeIndex
+- ShardMove_RestoreKeepsMove
+- ShardMove_SweepNotPaused
+- ShardMove_UnionRepair
+- Storage_AutoRepair
+- Storage_FlipEarly
+- Storage_PerIndexHygiene
+- Storage_PurgeDuringRebuildSet
+- Storage_PurgeUnmarked
+- Storage_Update
+
 ## 2. Specifications and their Go test files (PLAN.md section 7.4)
 
 `scripts/formal-manifest-check.sh` fails a change to a file in the first column, or to a configuration of that

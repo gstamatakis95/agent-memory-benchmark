@@ -16,6 +16,11 @@
 #       committed modules are not touched. With --regenerate the state-level fixtures are rewritten first from the
 #       counterexample in formal/tla/results/<CONFIG>.log (a configuration with SYMMETRY is re-run without it, one
 #       worker, so the trace is deterministic); commit the result with the logs it came from.
+#   scripts/formal-trace-check.sh tamper
+#       the action names of the state-level replay (N2 of the M0.7 review). Each state-level fixture is rewritten with
+#       its action names rotated by one event (event i gets the action of event i+1), which keeps every state and so
+#       every step a valid step of Next; TLC must refuse the log, because the step is not a step of the action the log
+#       names ("No error has been found": no execution consumes the log).
 #   scripts/formal-trace-check.sh proof-all [CONFIG...]
 #       the same replay for every (or the named) must-fail configuration that has a TLC log with an error trace, in a
 #       temporary directory. A configuration with SYMMETRY is first re-run without it (see proof_one).
@@ -51,6 +56,13 @@ check_trace() {
     -metadir "$WORK/states" -config "${spec}Trace.cfg" "${spec}Trace.tla") >"$tlc" 2>&1 || rc=$?
   rm -rf "$WORK/states"
   states=$(grep -c '^State [0-9]*:' "$tlc" || true)
+  if [ "$want" = rejected ]; then
+    if grep -q '^Model checking completed. No error has been found' "$tlc"; then
+      echo "ok   $cfg: the replay was refused (no execution consumes the log)"; return 0
+    fi
+    echo "FAIL $cfg: expected the replay refused; $(grep -m1 -E '^(Error|Fatal)' "$tlc" || echo 'no verdict')"
+    return 1
+  fi
   if [ "$want" = violates ]; then
     if grep -q "^Error: Invariant $inv is violated\." "$tlc"; then
       echo "ok   $cfg: replay violates $inv after $states states"; echo "$states" >"$WORK/last-states"; return 0
@@ -149,6 +161,22 @@ case $mode in
     if [ "${2:-}" = --regenerate ]; then how=regenerate; fi
     for p in $PROOF; do proof_one "${p%%:*}" "${p##*:}" "$how" || status=1; done
     exit $status ;;
+  tamper)
+    status=0
+    for p in $PROOF; do
+      spec=${p%%:*} cfg=${p##*:}
+      awk '{ line[NR] = $0; if (match($0, /"action":"[A-Za-z0-9_]+"/)) act[NR] = substr($0, RSTART + 10, RLENGTH - 11) }
+        END { for (i = 1; i <= NR; i++) {
+                j = (i % NR) + 1
+                sub(/"action":"[A-Za-z0-9_]+"/, "\"action\":\"" act[j] "\"", line[i]); print line[i] } }' \
+        "$TRACE_DIR/$spec.states.jsonl" >"$WORK/$spec.tampered.jsonl"
+      if cmp -s "$WORK/$spec.tampered.jsonl" "$TRACE_DIR/$spec.states.jsonl"; then
+        echo "FAIL $cfg: the rotation changed nothing"; status=1; continue
+      fi
+      mkdir -p "$WORK/$spec.tampered"
+      check_trace "$spec" "$cfg" "$WORK/$spec.tampered.jsonl" "$WORK/$spec.tampered" rejected || status=1
+    done
+    exit $status ;;
   proof-all)
     status=0
     configs=${*:2}
@@ -159,5 +187,5 @@ case $mode in
       proof_one "${cfg%%_*}" "$cfg" log || status=1
     done
     exit $status ;;
-  *) die "usage: formal-trace-check.sh run|proof [--regenerate]|proof-all" ;;
+  *) die "usage: formal-trace-check.sh run|proof [--regenerate]|tamper|proof-all" ;;
 esac

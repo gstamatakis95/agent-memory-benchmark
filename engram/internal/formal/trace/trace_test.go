@@ -21,6 +21,24 @@ func formalDir(t *testing.T) string {
 	return filepath.Join(filepath.Dir(file), "..", "..", "..", "formal")
 }
 
+// specOptions reads the operator table and the parameter domains of a committed specification.
+func specOptions(t *testing.T, spec string) Options {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(formalDir(t), "tla", spec+".tla"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops, err := OperatorArities(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doms, err := ActionDomains(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Options{Operators: ops, Domains: doms}
+}
+
 func TestLogger_WritesVersionedSequencedLines(t *testing.T) {
 	var buf bytes.Buffer
 	l := NewLogger(&buf, "Outbox")
@@ -262,21 +280,13 @@ func TestFromTLCLog_AgainstTheCommittedLogs(t *testing.T) {
 		}
 		name := strings.TrimSuffix(filepath.Base(path), ".log")
 		spec := strings.SplitN(name, "_", 2)[0]
-		src, err := os.Open(filepath.Join(formalDir(t), "tla", spec+".tla"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		ops, err := OperatorArities(src)
-		_ = src.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
+		opt := specOptions(t, spec)
 		evs, err := FromTLCLog(spec, bytes.NewReader(raw))
 		if err != nil {
 			t.Errorf("%s: %v", name, err)
 			continue
 		}
-		if _, err := ToTLA(evs, Options{Operators: ops}); err != nil {
+		if _, err := ToTLA(evs, opt); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
 		checked++
@@ -406,12 +416,20 @@ State 3: <Tick line 1, col 1 to line 2, col 2 of module Outbox>
 	if len(evs) != 2 || evs[0].State == nil || len(evs[0].Args) != 0 {
 		t.Fatalf("events = %+v", evs)
 	}
-	res, err := ToTLA(evs, Options{Operators: map[string]int{"Draw": 2, "Tick": 0}, BaseConfig: outboxCfg})
+	opt := Options{
+		Operators:  map[string]int{"Draw": 2, "Tick": 0},
+		Domains:    map[string][]string{"Draw": {"Writers", "Namespaces"}},
+		BaseConfig: outboxCfg,
+	}
+	res, err := ToTLA(evs, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"TraceStates == <<", `cursor |-> 0, log |-> (index :> << >> @@ kafka :> <<1>>)`,
-		"  /\\ Next\n", "cursor' = TraceStates[l].cursor", "log' = TraceStates[l].log", "CONSTANTS index, kafka"} {
+		"  /\\ Next\n", "cursor' = TraceStates[l].cursor", "log' = TraceStates[l].log", "CONSTANTS index, kafka",
+		// the named action is conjoined: zero-arity directly, the others over the domains of their parameters
+		`\/ TraceEvents[l].act = "Tick" /\ Tick`,
+		`\/ TraceEvents[l].act = "Draw" /\ \E trArg1 \in Writers, trArg2 \in Namespaces : Draw(trArg1, trArg2)`} {
 		if !strings.Contains(res.TLA, want) {
 			t.Errorf("module lacks %q:\n%s", want, res.TLA)
 		}
@@ -449,13 +467,105 @@ func TestFixtures_StateLevelConvert(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		res, err := ToTLA(events, Options{BaseConfig: string(base)})
+		opt := specOptions(t, spec)
+		opt.BaseConfig = string(base)
+		res, err := ToTLA(events, opt)
 		if err != nil {
 			t.Errorf("%s: %v", spec, err)
 			continue
 		}
 		if !strings.Contains(res.TLA, "TraceStates == <<") || !strings.Contains(res.TLA, "  /\\ Next\n") {
 			t.Errorf("%s: the module is not in state mode", spec)
+		}
+	}
+}
+
+func TestActionDomains_ReadsTheQuantifiersOfNext(t *testing.T) {
+	src := `Next ==
+  \/ \E w \in Writers : \E n \in Namespaces : Draw(w, n)
+  \/ \E w \in Writers : Commit(w) \/ Abort(w)
+  \/ (\E x \in Rows \X Gens : IndexAdd(x)) \/ (\E a, b \in Gens : Pair(a, b))
+  \/ \E p \in 0..MaxT : RestoreTo(p) \/ Tick
+Draw(w, n) == w # n
+Commit(w) == TRUE
+Abort(w) == Commit(w)
+IndexAdd(x) == TRUE
+Pair(a, b) == TRUE
+RestoreTo(p) == TRUE
+Tick == TRUE
+Lone(z) == Commit(z)
+`
+	got, err := ActionDomains(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{
+		"Draw": {"Writers", "Namespaces"}, "Commit": {"Writers"}, "Abort": {"Writers"}, "IndexAdd": {`Rows \X Gens`},
+		"Pair": {"Gens", "Gens"}, "RestoreTo": {"0..MaxT"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("domains = %v, want %v", got, want)
+	}
+}
+
+// The committed specifications give a domain to every parameterised action their state-level fixtures name.
+func TestActionDomains_CommittedSpecifications(t *testing.T) {
+	for spec, want := range map[string]map[string][]string{
+		"Outbox":        {"Draw": {"Writers", "Namespaces"}, "Commit": {"Writers"}},
+		"Consolidation": {"ProposeOk": {"Batches", "Proposals"}, "ApplyEffectOnly": {"Batches"}},
+		"Storage":       {"Insert": {"Rows"}, "EmbedRow": {"Rows", "Gens"}, "IndexAdd": {`Rows \X Gens`}},
+		"Derivation":    {"Ingest": {"Facts"}, "Verify": {"Writers"}},
+		"Durability":    {"Commit": {"OpIds"}, "RestoreTo": {"0..MaxT"}},
+		"ShardMove":     {"Begin": {"Clients", "Rows"}, "Backup": {"Shards"}},
+	} {
+		got := specOptions(t, spec).Domains
+		for op, doms := range want {
+			if !reflect.DeepEqual(got[op], doms) {
+				t.Errorf("%s.%s: domains = %v, want %v", spec, op, got[op], doms)
+			}
+		}
+	}
+}
+
+// A log of states is replayed through Next conjoined with the action each event names (N2 of the M0.7 review), so a
+// log whose action names were changed is a different module, and a log naming an action the specification does not
+// have, or a parameterised one without a domain, is refused.
+func TestStateMode_ConjoinsTheNamedAction(t *testing.T) {
+	ev := func(seq int, act string) Event {
+		return Event{V: 1, Spec: "Outbox", Seq: seq, Action: act, State: map[string]any{"cursor": json.Number("0")}}
+	}
+	opt := Options{Operators: map[string]int{"Draw": 2, "Tick": 0, "Relay": 0}, Domains: map[string][]string{
+		"Draw": {"Writers", "Namespaces"}}}
+	good, err := ToTLA([]Event{ev(1, "Draw"), ev(2, "Tick")}, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := ToTLA([]Event{ev(1, "Draw"), ev(2, "Relay")}, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if good.TLA == renamed.TLA {
+		t.Fatal("the action names do not reach the generated module")
+	}
+	for _, want := range []string{`TraceEvents[l].act = "Tick" /\ Tick`, `TraceEvents[l].act = "Draw" /\ \E trArg1`} {
+		if !strings.Contains(good.TLA, want) {
+			t.Errorf("module lacks %q:\n%s", want, good.TLA)
+		}
+	}
+	relay := `TraceEvents[l].act = "Relay" /\ Relay`
+	if strings.Contains(good.TLA, `act = "Relay"`) || !strings.Contains(renamed.TLA, relay) {
+		t.Errorf("only the actions of the log are dispatched:\n%s\n%s", good.TLA, renamed.TLA)
+	}
+	for name, c := range map[string]struct {
+		evs []Event
+		opt Options
+	}{
+		"unknown action": {[]Event{ev(1, "Nope")}, opt},
+		"no domain":      {[]Event{ev(1, "Draw")}, Options{Operators: opt.Operators}},
+		"no operators":   {[]Event{ev(1, "Tick")}, Options{}},
+	} {
+		if _, err := ToTLA(c.evs, c.opt); err == nil {
+			t.Errorf("%s: ToTLA accepted the log", name)
 		}
 	}
 }

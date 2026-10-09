@@ -1,0 +1,10 @@
+# A small settings table for the gendocs tests (the real one is deploy/postgres/gucs.yaml, M0.4).
+container:
+  prod: { cpus: "8", memory: 112g, shm_size: 32g }
+  dev: { cpus: "2", memory: 2g, shm_size: 1g }
+settings:
+  - { name: shared_buffers, prod: 32GB, dev: 256MB, scope: server, ref: "N114" }
+  - { name: lock_timeout_exclusive, prod: 35s, scope: txn, ref: "N82" }
+roles:
+  engram_app:
+    lock_timeout: 2s

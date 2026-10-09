@@ -410,3 +410,78 @@ not a
   target shard's key (M1.5 item). Failure payloads are encrypted under the namespace key too (review B1), so `Shred`
   covers them.
 - Register rows: N59, N99, §2.2.17, §8.3.
+
+## #30 N177 cannot hold literally for Go test names — open
+
+- What: N177 / §8 preamble: `gen-docs` fails any `Test[A-Z]\w+` token outside §8 without a definition there. The
+repository
+  already has 251 Go test functions (223 from M0.1–M0.7) that §8 does not name: leaf unit tests, harness tests, probe
+  tests the reviews asked for. Read literally, every ordinary unit test needs a §8 row.
+- Implemented pending ruling: a ratchet. A Go test name must be defined in §8 or listed in
+`cmd/gendocs/local-tests.txt`
+  (one line per test, with its file); a stale entry fails too; the §8-named tests must exist under exactly their names.
+  §10.2 citations are checked against §8 under the lenient reading ("the name occurs in §8"); under the strict
+reading
+  (a table's first cell or bold lead) five cited names are defined only inside prose cells: `TestIso_Metrics_Labels`,
+  `TestIso_Move_Epoch`, `TestIso_Ownership_Transitions`, `TestOutbox_Watch1x`, `TestRetain_HistoryBudget`.
+- Needs from the human: accept the ratchet (N177 governs the plan-named tests; other tests are listed) or require a §8
+  row for every test; and the lenient vs strict reading of "defined".
+- Register rows: N177, §8 preamble.
+
+## #31 Prompt and extraction details the plan leaves open — noted (M0.8-E2 decisions, reviewer to confirm)
+
+1. Layout: §6.0 says `internal/<pkg>/prompts/<name>/v<N>.txt`; the repository uses `prompts/<name>/v1/` (template,
+schema,
+   `VERSION`, `HASH`) embedded through `prompts/embed.go` and served by `internal/prompts` (depguard `layer_prompts`).
+2. Cache key: §8.2 lists four inputs (`chunk_hash ‖ prompt_version ‖ model ‖ schema_version`); §2.2.10 and
+N87 list five
+   (`render_hash` too). Five, length-prefixed, is implemented (register over section). `RenderHash`/`ExtractionKey` live
+   in `internal/prompts` until `internal/extract` (M1.1) wraps them.
+3. Template details chosen by the worker: `{name}` placeholders, a concrete `page/v1` layout, whole-section placeholders
+   for optional sections, RFC 3339 UTC dates, `language_hint` dropped (no slot), `judge/v1` out of scope, two
+   schema/disposition texts re-flowed to 120 columns.
+4. Enum divergences found and NOT put under the enum lint (it would fail today; needs a ruling on which side is right):
+   catalog `namespace_state` has `creating` where proto `NamespaceState` has `PROVISIONING` plus a proto-only
+`MOVED_OUT`;
+   proto `DocumentState` (`ACTIVE`/`INGESTING`/`DELETING`) vs SQL `document_state` (`active`/`deleting`/`deleted`).
+5. The prompt `HASH` pin is a convention (an editor can rewrite it); a merge-base check is not built. No lint forbids a
+   literal for a register constant in code yet (the generated `internal/gen/constants` is the intended source).
+6. The GUC table is generated from `deploy/postgres/gucs.yaml`, which merged with M0.4 after this branch forked; re-run
+   `make gen-docs` at merge.
+
+## #32 Is the document summary part of `render_hash`? The plan says both — noted (register reading applied)
+
+- What (M0.8-E2 review F3): N87, N110(a), §2.2.10 and §5.1.2 define the chunk's `render_hash` over the heading path
+and
+  the chunk text (the summary is not an input, so an append re-embeds ≈ 1 chunk, §10.2 M1.1); §6.0 and the §8.4
+  `TestExtraction_RenderHashKey` row include the document summary.
+- Resolution: the register binds (N87, N110): the summary is not part of `render_hash`; `TestExtraction_RenderHashKey`
+  asserts it explicitly. §6.0 and the §8.4 row need a text fix.
+- Register rows: N87, N110(a), §2.2.10, §5.1.2, §6.0, §8.4.
+
+## #33 Reconcile findings from M0.3-E1 (reviewer to confirm; items 1–3 need rulings before M1.5)
+
+1. **A move row the catalog lost entirely is not re-created** by the reconcile: inserting it would make the reconcile a
+   second writer of every identity column (N184(1)). It is reported as `MovesMissing` while routing is still derived
+   from the owner rows. N163(2)'s "target `active` and no catalog move ⇒ `done`" has no row to mark; a catalog move
+still
+   at `planned` while the shards prove it committed has no `frozen_at` to derive and is reported as a `Conflict`.
+   Open: allow the reconcile to insert a re-derived row (register change) or keep the report-only behaviour.
+2. **N184(5) "the CHECKs hold without invention" is false for `committed_at`**: `CHECK (state NOT IN ('committed', …)
+   OR committed_at IS NOT NULL)` requires it and N184(1) gives it to `Moves.Commit` alone; the reconcile writes
+   `committed_at = reconciled_at` and the column-writer allow-list of `TestDeps_EveryRPCHasPath` names the reconcile as
+   its second writer (next to the five columns N184(5) lists).
+3. **Catalog ahead of the shards**: where the catalog holds `(S, e+1, restoring)` from a restore's catalog-first write
+   (N185) and the shard row still reads `e`, the reconcile leaves it untouched (N172 "raised" vs N163 "derived"); on a
+   different shard the owner row wins.
+4. **§9.6 ordering**: "run the reconcile by hand, then `pg_ctl promote`" cannot work (the reconcile writes; a hot
+   standby is read-only). The runbook and `catalog.RunPromotion` do fence → promote → reconcile → alias flip, with
+   engram-api serving its cache meanwhile (D4).
+5. `CommitLSN` "in the same session": `pg_current_wal_lsn()` is server-global; what matters is that the read follows
+   the COMMIT with `synchronous_commit = on` (the T3 harness no longer sets it off). `Replayed` in the brief is
+   `Replicated` in §2.2.3 and the stub; `Replicated` is kept.
+6. `UpdateTenantLimits` quotas are stored under `tenants.config -> 'quotas'`; the config schema (M0.8) must accept the
+   key or a column is needed.
+7. The MANIFEST row for `ShardMove_CatalogLossDuringFreeze` stays `pending(M0.3)` because a `paired(<path>)` cell would
+   exceed 120 columns; `scripts/formal-manifest-check.sh` should accept a path relative to `internal/` (M0.8-E2 or the
+   next E2 brief), after which the row is paired with `internal/catalog/promotion_integration_test.go`.

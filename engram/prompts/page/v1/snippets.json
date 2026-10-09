@@ -1,0 +1,8 @@
+{
+  "section_line": "## {name} [s:{id}]",
+  "block_line": "[b:{id}] {text}",
+  "added_line": "[{id}] ({kind}, {date}) {text}",
+  "changed_line": "[{id}] OLD: {old} NEW: {new}",
+  "retired_line": "[{id}] {text}",
+  "none": "(none)"
+}

@@ -1,0 +1,294 @@
+# The register constants as data (PLAN.md Appendix A; GUARDRAILS: "register constants ... come from one generated
+# table"). gendocs reads this file, checks every entry against the plan (each cited register row or section must
+# exist and the witness text must occur in the union of the cited texts, whitespace-insensitive) and writes
+# docs/generated/constants.md and internal/gen/constants/constants_gen.go. Code reads these values only through that Go
+# package. Changing a number means changing the plan's register first; this file follows it.
+#
+# unit: ms | s | min | h | d  (time.Duration)      count | chars | tokens  (int)      KiB | MiB  (int64 bytes)
+#       ratio (float64)                              string
+# rows: register rows (N106, D3) and sections (§5.0); budget: "connections" marks a component of the connection
+# budget, whose sum must equal ConnectionBudgetAtP4.
+constants:
+  # ---- recall path (D3, D10, N54, N106, N164, N176) ----
+  - { id: RerankMinRemaining, group: recall, value: 106, unit: ms, rows: [N106, D10], witness: "+ 8 ms` = {v} ms (was",
+      what: "Rerank is skipped below this remaining deadline: rerank p95 90 + pack 3 + stream 5 + 8" }
+  - { id: RecallCriticalPathP95Mid, group: recall, value: 236, unit: ms, rows: [N54, N176],
+      witness: "**{v} ms p95 at MID**",
+      what: "Critical-path p95 of a MID recall, 216 ms of stages plus the pool-wait term" }
+  - { id: PoolWaitP95, group: recall, value: 20, unit: ms, rows: [N164, N176],
+      witness: "{v} ms p95 as the maximum over six parallel acquisitions",
+      what: "Pool-wait term: the maximum over six parallel arm acquisitions" }
+  - { id: RecallP95Target, group: recall, value: 300, unit: ms, rows: [D3], witness: "p95 < {v} ms",
+      what: "p95 target of an unfiltered MID recall at 50 QPS per shard" }
+  - { id: RecallQPSPerShard, group: recall, value: 50, unit: count, rows: [D3], witness: "{v} QPS/shard",
+      what: "Recall rate per shard the SLO is stated for" }
+  - { id: FilteredRecallP95, group: recall, value: 1000, unit: ms, rows: [N164], witness: "p95 ≤ {v:k} s",
+      what: "p95 of a filtered recall (a vector arm at E >= theta)" }
+  - { id: FilteredTheta, group: recall, value: 10000, unit: count, rows: [N164, D3], witness: "HNSW path, θ = {v:k} k",
+      what: "Eligible rows above which a filtered vector arm leaves the exact path (theta)" }
+  - { id: FilteredFallbackFactor, group: recall, value: 4, unit: count, rows: [N164], witness: "{v} θ",
+      what: "The fallback bound of the exact path is 4 theta rows" }
+  - { id: ArmCapLow, group: recall, value: 50, unit: count, rows: [D10], witness: "{v}/150/400",
+      what: "Per-arm candidate cap at budget LOW" }
+  - { id: ArmCapMid, group: recall, value: 150, unit: count, rows: [D10], witness: "50/{v}/400",
+      what: "Per-arm candidate cap at budget MID (also hnsw.ef_search)" }
+  - { id: ArmCapHigh, group: recall, value: 400, unit: count, rows: [D10], witness: "50/150/{v}",
+      what: "Per-arm candidate cap at budget HIGH (also hnsw.ef_search)" }
+  - { id: RerankTopLow, group: recall, value: 0, unit: count, rows: [D10], witness: "{v}/50/150",
+      what: "Fused candidates reranked at LOW" }
+  - { id: RerankTopMid, group: recall, value: 50, unit: count, rows: [D10], witness: "0/{v}/150",
+      what: "Fused candidates reranked at MID" }
+  - { id: RerankTopHigh, group: recall, value: 150, unit: count, rows: [D10], witness: "0/50/{v}",
+      what: "Fused candidates reranked at HIGH" }
+  - { id: RRFK, group: recall, value: 60, unit: count, rows: [D10], witness: "k = {v}",
+      what: "Reciprocal rank fusion constant" }
+  - { id: BoostMin, group: recall, value: 0.75, unit: ratio, rows: [D10], witness: "[{v}, 1.25]",
+      what: "Lower clamp of the combined multiplicative boost" }
+  - { id: BoostMax, group: recall, value: 1.25, unit: ratio, rows: [D10], witness: "[0.75, {v}]",
+      what: "Upper clamp of the combined multiplicative boost" }
+  - { id: GraphSeeds, group: recall, value: 20, unit: count, rows: [D10], witness: "top-{v} seeds",
+      what: "Seeds of the graph arm" }
+  - { id: GraphNodeBudgetLow, group: recall, value: 100, unit: count, rows: [D10], witness: "{v}/300/1000",
+      what: "Graph-arm node budget at LOW" }
+  - { id: GraphNodeBudgetMid, group: recall, value: 300, unit: count, rows: [D10], witness: "100/{v}/1000",
+      what: "Graph-arm node budget at MID" }
+  - { id: GraphNodeBudgetHigh, group: recall, value: 1000, unit: count, rows: [D10], witness: "100/300/{v}",
+      what: "Graph-arm node budget at HIGH" }
+  # ---- vectors and storage (D2, D3, N111, N112) ----
+  - { id: VectorDims, group: vectors, value: 768, unit: count, rows: [D3, N111], witness: "halfvec({v})",
+      what: "Dimensions of the nomic-class embedding" }
+  - { id: VectorStorageType, group: vectors, value: halfvec, unit: string, rows: [D3, N111],
+      witness: "{v}(768)", what: "Column type of the vector side tables" }
+  - { id: VectorElementBytes, group: vectors, value: 2048, unit: count, rows: [D3],
+      witness: "HNSW element are {v:,} B (",
+      what: "Bytes of one vector heap element and of one HNSW element" }
+  - { id: HNSWM, group: vectors, value: 16, unit: count, rows: [D3], witness: "m={v}, ef_construction=128",
+      what: "HNSW m" }
+  - { id: HNSWEfConstruction, group: vectors, value: 128, unit: count, rows: [D3],
+      witness: "m=16, ef_construction={v}", what: "HNSW ef_construction" }
+  - { id: HNSWCreateAtVectors, group: vectors, value: 2000, unit: count, rows: [D3, "§5.0"],
+      witness: "created at {v:,} live vectors",
+      what: "Live vectors of a namespace at which its partial HNSW is created" }
+  - { id: HNSWDropBelowVectors, group: vectors, value: 1000, unit: count, rows: ["§5.0"],
+      witness: "drop below {v:,}", what: "Live vectors below which the partial HNSW is dropped" }
+  - { id: ExactScanBelowVectors, group: vectors, value: 2000, unit: count, rows: [D3, D10],
+      witness: "exact scan below {v:,}", what: "Exact scan below this many live vectors (N112)" }
+  - { id: PartitionsPerBigTable, group: vectors, value: 16, unit: count, rows: [D2], witness: "{v} partitions",
+      what: "Hash partitions of every big shard table" }
+  # ---- sizing (D3) ----
+  - { id: ShardTargetFacts, group: sizing, value: 5500000, unit: count, rows: [D3],
+      witness: "{v:M} M live facts target",
+      what: "Live facts per shard at target" }
+  - { id: ShardHardCapFacts, group: sizing, value: 10000000, unit: count, rows: [D3], witness: "{v:M} M hard cap",
+      what: "Live facts per shard at the hard cap" }
+  - { id: ShardVolumeGB, group: sizing, value: 600, unit: count, rows: [D3], witness: "{v} GB volume",
+      what: "Local NVMe volume of a shard" }
+  - { id: CellMaxShards, group: sizing, value: 32, unit: count, rows: [D3], witness: "≤ {v} shards",
+      what: "Shards one cell (API, worker, Temporal) serves" }
+  - { id: ShardsFor1BFacts, group: sizing, value: 182, unit: count, rows: [D3], witness: "{v} shards at target",
+      what: "Shards for 1 B facts at the target fill" }
+  # ---- connections (N164, N176, N186) ----
+  - { id: RecallPool, group: pools, value: 32, unit: count, rows: [N164, D3], witness: "recall pool {v}",
+      what: "pgbouncer pool of the engram_app alias per shard", budget: connections }
+  - { id: WorkerPool, group: pools, value: 8, unit: count, rows: [N164], witness: "engram_worker` **pool {v}**",
+      what: "pgbouncer pool of the engram_worker alias per shard", budget: connections }
+  - { id: APIProcessesPerShard, group: pools, value: 4, unit: count, rows: [N176],
+      witness: "P = {v} API processes per shard", what: "API processes per shard at steady state (6 during a rollout)" }
+  - { id: SubjectConnsPerProcess, group: pools, value: 2, unit: count, rows: [N164],
+      witness: "{v} per API process", what: "Direct engram_subject connections per API process" }
+  - { id: ArmSemaphorePerProcess, group: pools, value: 32, unit: count, rows: [N164],
+      witness: "arm semaphore is **{v}**", what: "Concurrent arm transactions per API process per shard" }
+  - { id: FilteredArmSemaphorePerProcess, group: pools, value: 2, unit: count, rows: [N164, N176],
+      witness: "{v} per API process per shard",
+      what: "Filtered arm transactions per API process per shard (inside the 32)" }
+  - { id: MaxConnections, group: pools, guc: max_connections, unit: count, rows: [N164],
+      witness: "`max_connections` {v}",
+      what: "max_connections of a shard" }
+  - { id: ConnectionBudgetAtP4, group: pools, value: 63, unit: count, rows: [N164, N186], witness: "{v} at P = 4",
+      what: "Connections held at P = 4 (55 + 2P); the components below sum to it" }
+  - { id: ConnAdmin, group: pools, value: 2, unit: count, rows: ["§8.4"], witness: "admin {v}", budget: connections,
+      what: "engram_admin connections" }
+  - { id: ConnMove, group: pools, value: 4, unit: count, rows: ["§8.4"], witness: "move {v}", budget: connections,
+      what: "engram_move connections" }
+  - { id: ConnRelay, group: pools, value: 1, unit: count, rows: ["§8.4"], witness: "relay {v}", budget: connections,
+      what: "Outbox relay connection" }
+  - { id: ConnMigrate, group: pools, value: 1, unit: count, rows: ["§8.4"], witness: "migrate {v}", budget: connections,
+      what: "engram_migrate connection" }
+  - { id: ConnRunner, group: pools, value: 2, unit: count, rows: ["§8.4"], witness: "runner {v}", budget: connections,
+      what: "Index runner connections" }
+  - { id: ConnExporter, group: pools, value: 2, unit: count, rows: ["§8.4"], witness: "exporter {v}",
+      budget: connections,
+      what: "Exporter connections" }
+  - { id: ConnEngramctl, group: pools, value: 2, unit: count, rows: ["§8.4"], witness: "`engramctl` {v}",
+      budget: connections, what: "engramctl connections" }
+  - { id: ConnPgBackRest, group: pools, value: 1, unit: count, rows: ["§8.4"], witness: "pgBackRest {v}",
+      budget: connections, what: "pgBackRest connection" }
+  - { id: ConnMsPerMidRecall, group: pools, value: 425, unit: count, rows: [N164, N176], witness: "{v} connection-ms",
+      what: "Connection-milliseconds a MID recall holds over its six arm transactions" }
+  - { id: ConnMsAlertFactor, group: pools, value: 1.25, unit: ratio, rows: [N176], witness: "alerts above {v}×",
+      what: "TestReadSession_ConcurrentArms alerts above this multiple of the recorded connection-ms" }
+  - { id: ErlangAlertLine, group: pools, value: 24, unit: count, rows: ["§1"], witness: "A ≤ {v} is the alert line",
+      what: "Erlangs on the recall pool above which the pool-saturation alert fires" }
+  - { id: PoolSaturationWaitP95, group: pools, value: 50, unit: ms, rows: ["§1"],
+      witness: "`PoolSaturation` alerts at wait p95 ≥ {v} ms", what: "Pool-wait p95 at which PoolSaturation alerts" }
+  # ---- fence, locks and timeouts (N82, N83, N113, N139, N157, N164, N167) ----
+  - { id: FenceRetryAfter, group: locks, value: 200, unit: ms, rows: [N82], witness: "{v} ms",
+      what: "retry_after of a refused shared fence try-lock (NamespaceFrozen)" }
+  - { id: DocumentBusyRetryAfter, group: locks, value: 100, unit: ms, rows: [N83], witness: "{v} ms",
+      what: "Backoff of a refused shared document try-lock (DocumentBusy)" }
+  - { id: ExclusiveLockTimeout, group: locks, guc: lock_timeout_exclusive, unit: s, rows: [N82, N139],
+      witness: "a {v} s single attempt",
+      what: "The one attempt of every exclusive taker (lock_timeout)" }
+  - { id: ExclusiveStatementTimeout, group: locks, value: 36, unit: s, rows: ["§5.0"],
+      witness: "SET LOCAL statement_timeout = '{v} s'",
+      what: "statement_timeout of the statement that takes the exclusive document lock" }
+  - { id: AppLockTimeout, group: locks, guc: roles.engram_app.lock_timeout, unit: s, rows: ["§5.0"],
+      witness: "`lock_timeout = {v} s` for `engram_app`",
+      what: "lock_timeout role default of engram_app" }
+  - { id: MoveAdminLockTimeout, group: locks, guc: roles.engram_move.lock_timeout,
+      guc_also: [roles.engram_admin.lock_timeout], unit: s, rows: ["§5.0"], witness: "{v} s for `engram_move`",
+      what: "lock_timeout role default of engram_move and engram_admin" }
+  - { id: WriteStatementTimeout, group: locks, guc: roles.engram_app.statement_timeout,
+      guc_also: [roles.engram_move.statement_timeout], unit: s, rows: ["§5.0"],
+      witness: "statement_timeout = idle_in_transaction_session_timeout = {v} s",
+      what: "statement_timeout and idle_in_transaction_session_timeout of every write transaction" }
+  - { id: SubjectLeasePoll, group: locks, value: 50, unit: ms, rows: [N164], witness: "polled every {v} ms",
+      what: "Poll interval of pg_try_advisory_lock for the subject lease" }
+  - { id: SubjectLeaseMax, group: locks, value: 3, unit: s, rows: [N164], witness: "polled every 50 ms for ≤ {v} s",
+      what: "Longest wait for a subject lease before UNAVAILABLE" }
+  - { id: LockSeedFence, group: locks, value: 0, unit: count, rows: [N113],
+      witness: "namespace fence = one-argument `hashtextextended(ns, {v})`",
+      what: "Seed of the namespace fence key" }
+  - { id: LockSeedDerivation, group: locks, value: 1, unit: count, rows: [N113],
+      witness: "derivation lock = one-argument `hashtextextended(ns, {v})`",
+      what: "Seed of the derivation lock key" }
+  - { id: LockSeedSubject, group: locks, value: 2, unit: count, rows: ["§5.0"], witness: "seed {v}",
+      what: "Seed of the subject lock key" }
+  - { id: TCPKeepaliveIdle, group: locks, guc: tcp_keepalives_idle, unit: s, rows: [N167],
+      witness: "tcp_keepalives_idle = {v} s",
+      what: "tcp_keepalives_idle of every shard and catalog server" }
+  - { id: TCPKeepaliveInterval, group: locks, guc: tcp_keepalives_interval, unit: s, rows: [N167],
+      witness: "_interval = {v} s",
+      what: "tcp_keepalives_interval" }
+  - { id: TCPKeepaliveCount, group: locks, guc: tcp_keepalives_count, unit: count, rows: [N167],
+      witness: "_count = {v}",
+      what: "tcp_keepalives_count" }
+  - { id: TCPUserTimeout, group: locks, guc: tcp_user_timeout, unit: s, rows: [N167],
+      witness: "tcp_user_timeout = {v} s",
+      what: "tcp_user_timeout of every direct connection" }
+  # ---- workflows, outbox and payloads (5.0, N59, N80) ----
+  - { id: HeartbeatEvery, group: pipeline, value: 10, unit: s, rows: ["§5.0"],
+      witness: "heartbeats every {v} s", what: "Heartbeat interval of an activity longer than 30 s" }
+  - { id: HeartbeatTimeout, group: pipeline, value: 30, unit: s, rows: ["§5.0"], witness: "heartbeat timeout = {v} s",
+      what: "Heartbeat timeout" }
+  - { id: HistoryMaxEvents, group: pipeline, value: 10000, unit: count, rows: ["§5.0"],
+      witness: "history reaches {v:k} k events", what: "Continue-as-new before this many history events" }
+  - { id: HistoryMaxBytes, group: pipeline, value: 20, unit: MB, rows: ["§5.0"], witness: "**or {v} MB**",
+      what: "Continue-as-new before this much history" }
+  - { id: RetainContinueAsNewChunks, group: pipeline, value: 100, unit: count, rows: ["§5.0"],
+      witness: "retain: every {v} chunks", what: "RetainDocument continues as new every this many chunks" }
+  - { id: ExpungeContinueAsNewBatches, group: pipeline, value: 200, unit: count, rows: ["§5.0"],
+      witness: "expunge: every {v} batches", what: "Expunge continues as new every this many batches" }
+  - { id: InlinePayloadMax, group: pipeline, value: 4, unit: KiB, rows: ["§5.0"], witness: "larger than **{v} KiB**",
+      what: "An activity result above this size travels by blob key" }
+  - { id: RelayGapWatchlist, group: pipeline, value: 60, unit: s, rows: ["§5.0"], witness: "{v} s gap watchlist",
+      what: "The relay's gap watchlist horizon (a drawn seq commits or aborts within one writer timeout)" }
+  - { id: OutboxMaxIDsPerEvent, group: pipeline, value: 256, unit: count, rows: [N80],
+      witness: "an event carries ≤ {v} ids",
+      what: "Ids per outbox event across all its lists" }
+  - { id: OutboxMaxEventBytes, group: pipeline, value: 16, unit: KiB, rows: [N80], witness: "{v} KiB",
+      what: "Encoded size of an outbox event (CHECK octet_length(payload) <= 16384)" }
+  - { id: OutboxElideAboveIDs, group: pipeline, value: 4096, unit: count, rows: [N80],
+      witness: "a set above {v:,} ids is sent as one event",
+      what: "Above this many ids an event is sent once with ids_elided" }
+  # ---- retain (5.1, D11) ----
+  - { id: ChunkTargetChars, group: retain, value: 3000, unit: chars, rows: ["§5.1"], witness: "target {v:,}",
+      what: "Target chunk size (content-defined boundaries)" }
+  - { id: ChunkMinChars, group: retain, value: 500, unit: chars, rows: ["§5.1"], witness: "min {v}",
+      what: "Minimum chunk size" }
+  - { id: ChunkMaxChars, group: retain, value: 4000, unit: chars, rows: ["§5.1"], witness: "max {v:,}",
+      what: "Maximum chunk size" }
+  - { id: ItemBoundaryGap, group: retain, value: 24, unit: h, rows: ["§5.1", "§6.2"], witness: "more than {v} h",
+      what: "A hard chunk boundary is forced between items whose timestamps differ by more than this" }
+  - { id: ContentMaxBytes, group: retain, value: 1, unit: MiB, rows: ["§5.1"], witness: "`content` ≤ {v} MiB",
+      what: "Largest content of one Retain item" }
+  - { id: RequestMaxBytes, group: retain, value: 8, unit: MiB, rows: ["§5.1"], witness: "{v} MiB per request",
+      what: "Largest Retain request" }
+  - { id: RawBodyBlobThreshold, group: retain, value: 64, unit: KiB, rows: ["§5.1"], witness: "Bodies > {v} KiB",
+      what: "Raw bodies above this size are put to blob storage" }
+  - { id: IdempotencyRetention, group: retain, value: 24, unit: h, rows: ["§5.1"], witness: "now() + {v} h",
+      what: "Retention of an idempotency key" }
+  - { id: ConfigSnapshotMaxBytes, group: retain, value: 1, unit: KiB, rows: ["§5.1"], witness: "≤ {v} KiB: model ids",
+      what: "Largest config_snapshot of a workflow input" }
+  # ---- prompts (6.1 to 6.6) ----
+  - { id: SummaryMaxChars, group: prompts, value: 200, unit: chars, rows: ["§6.1"], witness: "maxLength\": {v}",
+      what: "Longest document summary" }
+  - { id: ExtractMaxFacts, group: prompts, value: 40, unit: count, rows: ["§6.2"], witness: "≤ {v} facts",
+      what: "Facts per chunk the extraction schema allows" }
+  - { id: ExtractMaxOutputTokens, group: prompts, value: 4000, unit: tokens, rows: ["§6.2"],
+      witness: "{v:k} 000 (≤ 40 facts)", what: "Output cap of extract/v1" }
+  - { id: RouteBatchFacts, group: prompts, value: 8, unit: count, rows: ["§6.3"], witness: "≤ {v} facts",
+      what: "Facts per consolidation routing call" }
+  - { id: RouteMaxCandidates, group: prompts, value: 10, unit: count, rows: ["§6.3"], witness: "at most {v} candidates",
+      what: "Candidate observations per routing call" }
+  - { id: RouteMaxSourcesPerCandidate, group: prompts, value: 5, unit: count, rows: ["§6.3"],
+      witness: "at most {v} quoted sources", what: "Quoted sources per candidate" }
+  - { id: RouteMaxTouched, group: prompts, value: 16, unit: count, rows: ["§6.3"], witness: "has\n≤ {v} members",
+      what: "Observations touched by one batch (attach targets, new groups, survivors)" }
+  - { id: BatchRequeueMax, group: prompts, value: 3, unit: count, rows: ["§6.3"],
+      witness: "re-queued at most {v} times",
+      what: "A consolidation batch is re-queued at most this often, then failed" }
+  - { id: ReflectMaxIterations, group: prompts, value: 10, unit: count, rows: ["§6.5"],
+      witness: "≤ {v} free iterations",
+      what: "Free tool iterations of a Reflect session after the forced searches" }
+  - { id: ReflectContextTokens, group: prompts, value: 100000, unit: tokens, rows: ["§6.5"],
+      witness: "{v:k} k-token context cap",
+      what: "Context cap of a Reflect session (map/reduce above it)" }
+  - { id: ReflectWall, group: prompts, value: 300, unit: s, rows: ["§6.5"], witness: "{v} s wall",
+      what: "Wall-clock cap of a Reflect session" }
+  - { id: ReflectToolTimeout, group: prompts, value: 10, unit: s, rows: ["§6.5"], witness: "{v} s per tool",
+      what: "Timeout of one Reflect tool call" }
+  - { id: ReflectMapShards, group: prompts, value: 4, unit: count, rows: ["§6.5"], witness: "≤ {v} shards",
+      what: "Shards of the map step at the context cap" }
+  # ---- gateway and throughput (D3, D13) ----
+  - { id: GatewayRPMCap, group: gateway, value: 600, unit: count, rows: [D3], witness: "{v} RPM",
+      what: "Requests per minute of the gateway cap" }
+  - { id: CallsPerChunk, group: gateway, value: 3.5, unit: ratio, rows: [D3], witness: "calls_per_chunk ≈ {v}",
+      what: "Gateway calls per chunk (extract, summaries, routing, writes, dedup)" }
+  - { id: ChunksPerSecPerCell, group: gateway, value: 2.9, unit: ratio, rows: [D3], witness: "≈ {v} chunks/s",
+      what: "Retain throughput of one cell at the RPM cap" }
+  - { id: ReflectTypicalCostUSD, group: gateway, value: 0.114, unit: ratio, rows: ["§6.8"],
+      witness: "(per M) | **${v}**",
+      what: "Typical cost in US dollars of one Reflect (mid budget, 6 iterations) at the A-P3 prices" }
+# Retry policies of PLAN.md 5.0, "initial / coefficient / max interval / max attempts" (0 attempts = unlimited within
+# the activity's ScheduleToClose). Each entry is checked against its row of the section 5.0 table.
+policies:
+  - { id: PPure, name: P-pure, initial: 0s, coefficient: 0, max_interval: 0s, attempts: 3,
+      non_retryable: [everything], used_for: "Chunk, GroupBatches, ApplyDeltaOps" }
+  - { id: PDB, name: P-db, initial: 500ms, coefficient: 2.0, max_interval: 10s, attempts: 10,
+      non_retryable: [WrongShardOrEpoch, Validation, IntegrityViolation],
+      used_for: "every read and write transaction activity" }
+  - { id: PFrozen, name: P-frozen, initial: 1s, coefficient: 1.5, max_interval: 5s, attempts: 0,
+      non_retryable: [WrongShardOrEpoch, Validation, InputBlobMissing],
+      used_for: "write activities that may meet a freeze" }
+  - { id: PLLM, name: P-llm, initial: 2s, coefficient: 2.0, max_interval: 60s, attempts: 8,
+      non_retryable: [PermanentLLMError, Validation, WrongShardOrEpoch],
+      used_for: "gateway structured and chat calls, after quota.Reserve" }
+  - { id: PEmbed, name: P-embed, initial: 1s, coefficient: 2.0, max_interval: 30s, attempts: 8,
+      non_retryable: [PermanentLLMError, Validation],
+      used_for: "gateway embed calls" }
+  - { id: PBlob, name: P-blob, initial: 200ms, coefficient: 2.0, max_interval: 5s, attempts: 10,
+      non_retryable: [Validation],
+      used_for: "blob get, put, list, delete" }
+  - { id: PPoll, name: P-poll, initial: 30s, coefficient: 1.0, max_interval: 30s, attempts: 0,
+      non_retryable: [PermanentLLMError],
+      used_for: "batch-job polling (ScheduleToClose 48 h)" }
+  - { id: PCatalog, name: P-catalog, initial: 500ms, coefficient: 2.0, max_interval: 5s, attempts: 20,
+      non_retryable: [Validation, MovePrecondition],
+      used_for: "catalog transactions in the move" }
+  - { id: PCutover, name: P-cutover, initial: 100ms, coefficient: 1.5, max_interval: 1s, attempts: 0,
+      non_retryable: [Validation, MovePrecondition],
+      used_for: "the cutover sub-step activities (ScheduleToClose 60 s)" }
+  - { id: PTemporal, name: P-temporal, initial: 1s, coefficient: 2.0, max_interval: 10s, attempts: 10,
+      non_retryable: [Validation],
+      used_for: "activities that call the Temporal client" }

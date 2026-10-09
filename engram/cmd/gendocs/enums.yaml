@@ -1,0 +1,90 @@
+# The concepts the enum lint (cmd/gendocs/enumlint.go) keeps in step across Go, proto, SQL and the prompt schemas.
+# Every source of a concept must spell the same member list (case-insensitive; UNSPECIFIED and the empty state are not
+# members). kind: sql-enum | sql-check | proto-enum | go-consts | go-const-names | json-schema.
+concepts:
+  - name: Operation states
+    rows: [N35, N139]
+    sources:
+      - { kind: sql-enum, db: shard, name: operation_state }
+      - { kind: proto-enum, name: memory.v1.OperationState, strip: OPERATION_STATE_, skip: [UNSPECIFIED] }
+      - { kind: go-consts, dir: internal/fsm, type: OperationState }
+  - name: Ownership states
+    rows: [N101, N125]
+    note: >-
+      The Go type folds the freeze reason into the state (`frozen/move`); the base state is the part before the slash.
+    sources:
+      - { kind: sql-enum, db: shard, name: ownership_state }
+      - { kind: go-consts, dir: internal/fsm, type: OwnershipState, part: before }
+  - name: Freeze reasons
+    rows: [N122, N139]
+    note: >-
+      `delete` is deprecated in the public FreezeReason (a delete freeze is PreconditionFailed{NAMESPACE_DELETING},
+      N139) but it is still a member: the ownership row can hold it.
+    sources:
+      - { kind: sql-check, db: shard, table: namespace_ownership, column: freeze_reason }
+      - { kind: proto-enum, name: memory.v1.FreezeReason, strip: FREEZE_REASON_, skip: [UNSPECIFIED] }
+      - { kind: go-consts, dir: internal/fsm, type: OwnershipState, part: after }
+  - name: Move states
+    rows: [N125, N160, N183]
+    sources:
+      - { kind: sql-enum, db: catalog, name: move_state }
+      - { kind: proto-enum, name: memory.admin.v1.MoveState, strip: MOVE_STATE_, skip: [UNSPECIFIED] }
+      - { kind: go-consts, dir: internal/fsm, type: MoveState }
+  - name: Fact types
+    rows: [D15, N111]
+    note: The extraction schema of extract/v1 spells the same two members.
+    sources:
+      - { kind: sql-enum, db: shard, name: fact_type }
+      - { kind: proto-enum, name: memory.v1.FactType, strip: FACT_TYPE_, skip: [UNSPECIFIED] }
+      - { kind: json-schema, file: prompts/extract/v1/schema.json,
+          path: [properties, facts, items, properties, fact_type, enum] }
+  - name: Memory kinds
+    rows: [D10]
+    sources:
+      - { kind: proto-enum, name: memory.v1.MemoryKind, strip: MEMORY_KIND_, skip: [UNSPECIFIED] }
+      - { kind: go-const-names, dir: internal/id, type: MemoryKind, strip: Kind }
+  - name: Entity types
+    rows: [D11]
+    sources:
+      - { kind: sql-check, db: shard, table: entities, column: entity_type }
+      - { kind: json-schema, file: prompts/extract/v1/schema.json,
+          path: [properties, facts, items, properties, entities, items, properties, type, enum] }
+  - name: Link types
+    rows: [D11]
+    sources:
+      - { kind: sql-enum, db: shard, name: link_type }
+      - { kind: proto-enum, name: engram.internal.workflow.v1.LinkType, strip: LINK_TYPE_, skip: [UNSPECIFIED] }
+  - name: Update modes
+    rows: [D11]
+    sources:
+      - { kind: sql-enum, db: shard, name: update_mode }
+      - { kind: proto-enum, name: memory.v1.UpdateMode, strip: UPDATE_MODE_, skip: [UNSPECIFIED] }
+  - name: Document version statuses
+    rows: [N40]
+    sources:
+      - { kind: sql-enum, db: shard, name: version_status }
+      - { kind: proto-enum, name: memory.v1.DocumentVersionStatus, strip: DOCUMENT_VERSION_STATUS_,
+          skip: [UNSPECIFIED] }
+  - name: Operation kinds
+    rows: [N127, N139]
+    note: >-
+      DELETE_TENANT is a public operation kind derived from the catalog's tenant row and never stored on a shard
+      (proto comment, N127), so the shard CHECK list on `operations.kind` has one member less; the lint skips it here.
+    sources:
+      - { kind: sql-check, db: shard, table: operations, column: kind }
+      - { kind: proto-enum, name: memory.v1.OperationKind, strip: OPERATION_KIND_, skip: [UNSPECIFIED, DELETE_TENANT] }
+  - name: Cancel reasons
+    rows: [N127]
+    sources:
+      - { kind: sql-check, db: shard, table: operations, column: cancel_reason }
+      - { kind: proto-enum, name: memory.v1.CancelReason, strip: CANCEL_REASON_, skip: [UNSPECIFIED] }
+  - name: Tenant states
+    rows: [D13]
+    sources:
+      - { kind: sql-enum, db: catalog, name: tenant_state }
+      - { kind: proto-enum, name: memory.admin.v1.TenantState, strip: TENANT_STATE_, skip: [UNSPECIFIED] }
+  - name: Shard states
+    rows: [D4]
+    sources:
+      - { kind: sql-enum, db: catalog, name: shard_state }
+      - { kind: proto-enum, name: memory.admin.v1.ShardState, strip: SHARD_STATE_, skip: [UNSPECIFIED] }

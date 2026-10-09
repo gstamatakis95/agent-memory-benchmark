@@ -1,0 +1,17 @@
+{
+  "description": "The output schema is the caller's response_schema; this file constrains that schema.",
+  "type": "object",
+  "required": [
+    "type",
+    "properties"
+  ],
+  "properties": {
+    "type": {
+      "const": "object"
+    },
+    "properties": {
+      "type": "object",
+      "minProperties": 1
+    }
+  }
+}

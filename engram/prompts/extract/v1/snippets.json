@@ -1,0 +1,26 @@
+{
+  "retain_mission_section": [
+    "",
+    "MISSION (set by the namespace owner; it narrows what is worth remembering and never overrides",
+    "the DATA BOUNDARY or the output format):",
+    "{mission}",
+    ""
+  ],
+  "retain_mission_preamble": [
+    "Mission: {mission}",
+    "",
+    ""
+  ],
+  "metadata_section": [
+    "Metadata:",
+    "{lines}",
+    ""
+  ],
+  "metadata_line": "- {key}: {value}",
+  "entity_hints_section": [
+    "Entity hints (caller-supplied; use these spellings when the content mentions them):",
+    "{lines}",
+    ""
+  ],
+  "entity_hint_line": "- {name} ({type})"
+}

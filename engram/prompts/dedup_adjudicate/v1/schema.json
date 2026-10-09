@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action"
+  ],
+  "properties": {
+    "action": {
+      "enum": [
+        "merge",
+        "keep"
+      ]
+    }
+  }
+}

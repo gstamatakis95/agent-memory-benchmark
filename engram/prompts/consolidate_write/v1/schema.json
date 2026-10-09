@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "reason"
+  ],
+  "properties": {
+    "action": {
+      "enum": [
+        "write",
+        "retire"
+      ]
+    },
+    "text": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "fact_id",
+          "quote"
+        ],
+        "properties": {
+          "fact_id": {
+            "type": "string"
+          },
+          "quote": {
+            "type": "string",
+            "maxLength": 300
+          }
+        }
+      }
+    },
+    "reason": {
+      "type": "string",
+      "maxLength": 300
+    }
+  }
+}

@@ -30,8 +30,9 @@ err() { echo "formal-manifest-check: $*" >&2; fail=1; }
 rows=$(awk '/^## 1\./ {on = 1; next} /^## 2\./ {on = 0}
   on && /^\|[A-Za-z0-9_]+\|/ && $0 !~ /^\|Config\|/ { print }' "$MANIFEST")
 maps=$(awk '/^## 2\./ {on = 1; next} /^## 3\./ {on = 0} on && /^\|formal\// { print }' "$MANIFEST")
-nightly=$(awk '/^### Nightly-only/ {on = 1; next} /^## / {on = 0} on && /^- / { sub(/^- /, ""); print }' "$MANIFEST" |
+nightly=$(awk '/^### Nightly-only/ {on = 1; next} /^#+ / {on = 0} on && /^- / { sub(/^- /, ""); print }' "$MANIFEST" |
   grep -v -x '(none)' || true)
+fastgroup=$(awk '/^### Fast group/ {on = 1; next} /^#+ / {on = 0} on && /^- / { sub(/^- /, ""); print }' "$MANIFEST")
 
 # ---- 1. configurations ---------------------------------------------------------------------------------------------
 cfgs=$(cd formal/tla && ls *.cfg | sed 's/\.cfg$//' | sort)
@@ -88,6 +89,11 @@ done <<<"$rows"
 
 for n in $nightly; do
   grep -qx -- "$n" <<<"$cfgs" || err "nightly-only list names $n, which is not a configuration"
+done
+[ -n "$fastgroup" ] || err "$MANIFEST has no fast group list (### Fast group of the quick tier)"
+for n in $fastgroup; do
+  grep -qx -- "$n" <<<"$cfgs" || err "fast group names $n, which is not a configuration"
+  ! grep -qx -- "$n" <<<"$nightly" || err "fast group names $n, which is also in the nightly-only list"
 done
 
 # ---- 2. specification files ----------------------------------------------------------------------------------------

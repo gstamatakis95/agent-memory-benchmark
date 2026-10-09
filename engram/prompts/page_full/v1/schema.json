@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "markdown",
+    "cites"
+  ],
+  "properties": {
+    "markdown": {
+      "type": "string"
+    },
+    "cites": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+# The released identity of this prompt (PLAN.md section 6.0). A released version is never edited: change the
+# text, the schema, the defenses or the snippets and the next number is a new directory.
+id: summarize/v1
+name: summarize
+version: 1
+schema_version: 1
+model_class: models.extract
+temperature: 0.0
+max_output_tokens: 120

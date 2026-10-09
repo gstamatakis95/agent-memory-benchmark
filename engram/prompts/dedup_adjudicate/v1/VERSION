@@ -1,0 +1,9 @@
+# The released identity of this prompt (PLAN.md section 6.0). A released version is never edited: change the
+# text, the schema, the defenses or the snippets and the next number is a new directory.
+id: dedup_adjudicate/v1
+name: dedup_adjudicate
+version: 1
+schema_version: 1
+model_class: models.consolidate
+temperature: 0.0
+max_output_tokens: 20

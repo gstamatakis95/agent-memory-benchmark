@@ -1,0 +1,135 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "facts"
+  ],
+  "properties": {
+    "facts": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "text",
+          "fact_type",
+          "fact_kind",
+          "who",
+          "what",
+          "when",
+          "where",
+          "why",
+          "entities",
+          "said_at"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "The fact as one or two self-contained sentences"
+          },
+          "fact_type": {
+            "enum": [
+              "world",
+              "experience"
+            ]
+          },
+          "fact_kind": {
+            "enum": [
+              "event",
+              "state"
+            ]
+          },
+          "who": {
+            "type": "string"
+          },
+          "what": {
+            "type": "string"
+          },
+          "when": {
+            "type": "string"
+          },
+          "where": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          },
+          "occurred_start": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "occurred_end": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "said_at": {
+            "type": "string",
+            "format": "date-time",
+            "description":
+            "Informational: when the source said it. Display and temporal ranking only; never the as_of key"
+          },
+          "entities": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "type"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "type": {
+                  "enum": [
+                    "person",
+                    "organization",
+                    "location",
+                    "product",
+                    "event",
+                    "concept",
+                    "other"
+                  ]
+                }
+              }
+            }
+          },
+          "causal_relations": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "target_index",
+                "relation_type"
+              ],
+              "properties": {
+                "target_index": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "relation_type": {
+                  "enum": [
+                    "caused_by"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

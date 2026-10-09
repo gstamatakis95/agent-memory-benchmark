@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Fails when any source line in the repository exceeds 120 characters (counted as UTF-8 characters, not bytes).
 # golangci-lint `lll` covers Go and `buf format` does not check length, so this script covers every other source kind
-# the orchestrator prompt names (SQL, TLA+, TLC configs, Lean, YAML, proto, Makefile, shell) plus repository Markdown.
+# the orchestrator prompt names (SQL, TLA+, TLC configs, Lean, YAML, proto, Makefile, shell) plus repository Markdown
+# and everything under prompts/ (templates, schemas, snippets, goldens: a prompt is source, M0.8).
 # docs/plan/ is the frozen plan copy and is exempt; gen/ is generated.
 set -euo pipefail
 export LC_ALL=C.UTF-8
@@ -13,5 +14,5 @@ while IFS= read -r -d '' f; do
   grep -n -E '^.{121,}' "$f" | cut -d: -f1 | sed "s|^|  $f:|" >&2
   rc=1
 done < <(git ls-files -z -- '*.sql' '*.tla' '*.cfg' '*.lean' '*.yaml' '*.yml' '*.proto' '*.sh' '*.md' 'Makefile' \
-  '*Dockerfile' '*.conf' '*.tmpl' '*.env' ':!docs/plan/**' ':!gen/**')
+  '*Dockerfile' '*.conf' '*.tmpl' '*.env' 'prompts/*' ':!docs/plan/**' ':!gen/**')
 exit $rc

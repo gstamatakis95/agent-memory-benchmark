@@ -22,11 +22,17 @@ proto:
 test-unit:
 	$(GO) test -short -count=1 $(PKGS)
 
+# Only packages whose tests import pgregory.net/rapid accept the -rapid.checks flag.
+RAPID_PKGS = $(shell $(GO) list -f '{{.ImportPath}} {{join .TestImports " "}} {{join .XTestImports " "}}' ./... \
+	| grep -F pgregory.net/rapid | cut -d' ' -f1)
+
 test-prop:
-	$(GO) test -count=1 -run 'Prop|Property|^Test[A-Za-z]+_[A-Za-z]+$$' -rapid.checks=200 ./internal/...
+	@if [ -z "$(RAPID_PKGS)" ]; then echo "test-prop: no package imports pgregory.net/rapid yet"; \
+	else $(GO) test -count=1 $(RAPID_PKGS) -rapid.checks=200; fi
 
 test-prop-deep:
-	$(GO) test -count=1 -timeout 60m -rapid.checks=20000 ./internal/...
+	@if [ -z "$(RAPID_PKGS)" ]; then echo "test-prop-deep: no package imports pgregory.net/rapid yet"; \
+	else $(GO) test -count=1 -timeout 60m $(RAPID_PKGS) -rapid.checks=20000; fi
 
 test-workflow:
 	$(GO) test -count=1 ./internal/workflows/...

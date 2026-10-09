@@ -22,11 +22,14 @@ open review findings. The orchestrator updates this file on every state change; 
 merge-ready; carry-over to M0.3-E3: methodcount lint must load with build tags and walk local types (review-2 N1) |
 Opus review round 1 running; worker
 report docs/briefs/reports/M0.1-report.md on the branch |
-| M0.2 Shard schema v1 | in review | m0.2-shard-schema | T3 (73 s, host-network containers) | Opus review round 1
+| M0.2 Shard schema v1 | done | m0.2-shard-schema (squash-merged) | T3 (119 s) | review-2 merge-ready; open:
+CONFLICTS #12 (BM25 p95 at budget), #15 (bootstrap role), #17; reviewer nit N2 (shared test role collision) carried
+into M0.4 | review round 1: 1 Blocker (F1 N175 readiness), 1
+Major (F2 BM25 p95 not gated), 9 Minor; fix round 1 sent incl. merge of main; re-review next | Opus review round 1
 running; Q18/Q9 → CONFLICTS #12/#13; DDL defects #14; bootstrap role #15 |
 | M0.3 Catalog, Resolver, authz | in progress (E3 half) | m0.3-catalog-authz | — | E3 worker running on
 docs/briefs/M0.3-E3.md; E1 half after M0.4 |
-| M0.4 Compose, Temporal, codec | not started | m0.4-compose | — | after M0.2; needs Docker (CONFLICTS #3) |
+| M0.4 Compose, Temporal, codec | in progress | m0.4-compose | — | E1 worker running on docs/briefs/M0.4.md |
 | M0.5 Recall measurements | not started | m0.5-measure-recall | — | after M0.3 (E3) |
 | M0.6 Storage measurements | not started | m0.6-measure-storage | — | after M0.3 (E1) |
 | M0.7 Formal conformance | in progress | m0.7-formal | — | E2 worker: brief docs/briefs/M0.7.md |
@@ -73,3 +76,8 @@ Blocker.
 round 1 started.
 - 2026-10-09 M0.1 merged (squash) after review round 2 (docs/briefs/reports/M0.1-review-{1,2}.md): 0 Blocker, 0 Major.
   Reviewer minor N1 (methodcount build tags/local types) carried into M0.3-E3; CONFLICTS #16 added, #10 amended.
+- 2026-10-09 M0.2 review round 1 (docs/briefs/reports/M0.2-review-1.md): 1 Blocker, 1 Major, 9 Minor, 4 Nit. Fix round
+  sent; CONFLICTS #17 (N175 reading) and #18 (reference-DDL defects) added.
+- 2026-10-09 M0.2 merged (squash) after review round 2: 0 Blocker, 0 Major. main: lint+unit 74 s (cold lint), T3 119
+s green.
+  Makefile test-prop fixed to target only rapid packages. M0.3-E3 worker finished; review round 1 started. M0.4 started.

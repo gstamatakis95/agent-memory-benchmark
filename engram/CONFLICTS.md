@@ -157,6 +157,11 @@ under
   predicate as the explicit `namespace_id` predicate for this arm.
 - Needs from the human: a register row for the definer function, or acceptance of a 50–60 ms BM25 p95 inside the N164
   arm budgets.
+- Review round 2 addendum: `TestLexical_TopKPushdown` now gates the shipped arm at p95 < 60 ms (skipping visibly when
+the
+  load average exceeds the CPU count). Twelve measurements on this loaded 4-core host ranged 57–73 ms, so T3 can go
+red
+  on a busy runner until the ruling lands; run T3 on an idle runner meanwhile. The definer function measured 23–27 ms.
 - Register rows: D7, N19, N76, N131, N164.
 
 ## #13 Q9: pgx `QueryExecModeExec` behind pgbouncer transaction pooling — resolved by measurement (noted)
@@ -206,3 +211,28 @@ until then
 §5.1's
   prose requires persistence, or records that the field is workflow-only. No code reads it before M1.1.
 - Register rows: §5.1, N35, N139.
+
+## #17 N175 readiness clause: "zero rows is false" — noted (reading adopted; reference-file defect)
+
+- What: N175 says `engram_move_indexes_valid(ns)` "requires, for every (vector table, current model) with ≥ 2,000
+  copied vectors, a `vector_indexes` request whose index is `indisvalid ∧ indisready`; zero rows is false". The
+  reference function ignores vector counts: it refuses `ready` for every namespace below 2,000 vectors and accepts
+  `ready` when a vector table with ≥ 2,000 copied vectors has no request (M0.2 review F1, `ShardMove`
+`ServedFromIndex`).
+  Read literally, "zero rows is false" would make every namespace under 2,000 vectors unmovable, contradicting the exact
+  scan below 2,000 vectors (N111/N112) and `ShardMove_ActiveWriters`.
+- Reading adopted: the clause guards the vacuous `bool_and`: a required (table, model) without a request row is false;
+  a namespace with no (table, model) at ≥ 2,000 vectors is true. The function is rewritten in M0.2 with this reading;
+  the reference file is defective (prose wins).
+- Register rows: N175, N160(5), N125, N111, N112.
+
+## #18 Further reference-DDL defects from the M0.2 review — noted (fixed in M0.2 unless stated)
+
+- The exclusive fence helpers set only `lock_timeout = 35s`; the role's 30 s `statement_timeout` would end the attempt
+  first. §5 has the caller `SET LOCAL statement_timeout = '36s'`; documented and pinned (55P03 after 35 s).
+- The `return_move` guard checked only `ingest_ledger`, `documents` and `facts`; cleanup deletes markers last, so an
+  interrupted cleanup passed the guard. The guard now covers every class-tagged table the cleanup deletes.
+- `engram_cleanup_namespace` set the scope GUC transaction-locally, leaking it into the caller's transaction; dropped.
+- `shard_meta.schema_version` had no writer; `engramctl migrate` maintains it.
+- `--check-rls` followed one level of role membership and ignored definer views; fixed (transitive `pg_has_role`,
+  views without `security_invoker`).

@@ -29,15 +29,22 @@ Major (F2 BM25 p95 not gated), 9 Minor; fix round 1 sent incl. merge of main; re
 running; Q18/Q9 → CONFLICTS #12/#13; DDL defects #14; bootstrap role #15 |
 | M0.3 Catalog, Resolver, authz | in progress (E3 half) | m0.3-catalog-authz | — | E3 worker running on
 docs/briefs/M0.3-E3.md; E1 half after M0.4 |
-| M0.4 Compose, Temporal, codec | in progress | m0.4-compose | — | E1 worker running on docs/briefs/M0.4.md |
+| M0.4 Compose, Temporal, codec | in review | m0.4-compose | T4 smoke (89 s cold), S + T0 | review round 1: 1 Blocker
+(failure payloads under the cell key survive Shred), 2 Major (no per-shard key; failover agent promotes unfenced), 16
+Minor; fix round sent | Opus review round 1
+running; Temporal peak ≈ 300 events/s → CONFLICTS #27 (escalation); §9.1 defects #28 |
 | M0.5 Recall measurements | in progress | m0.5-measure-recall | — | E3 worker on docs/briefs/M0.5.md; reranker
 clause blocked on gateway access (human) |
 | M0.6 Storage measurements | not started | m0.6-measure-storage | — | after M0.3 (E1) |
-| M0.7 Formal conformance | in review | m0.7-formal | F (quick 165 s; sweep 77/79) | review round 1: 0 Blocker, 5
+| M0.7 Formal conformance | done | m0.7-formal (squash-merged) | F (quick 228 s, TLC 2.18; sweep 77/79, #23 re-run
+pending) | review-2 merge-ready; minors N1 (fast group listed in MANIFEST), N2 (state replay ignores action names),
+N3 (nightly log upload) → carry-over to M0.8-E2; #22 awaits ruling | fix round 1 done
+(jar pinned to Maven Central TLC 2.18); Opus review round 2 running | review round 1: 0 Blocker, 5
 Major (changed-job timeout, twin milestones per twin, jar source, liveness in quick tier, Served pin), 11 Minor; fix
 round sent incl. merge of main | Opus review
 round 1 running; CONFLICTS #22 (tiering) needs a ruling; #23 re-run planned |
-| M0.8 Migrations and generators | not started | m0.8-gen | — | after M0.6 (E1) and M0.7 (E2) |
+| M0.8 Migrations and generators | in progress (E2 half) | m0.8-gen | — | E2 worker on docs/briefs/M0.8-E2.md; E1
+half after M0.6 |
 
 ## Phase 1
 
@@ -99,3 +106,10 @@ orchestrator
   Docker daemon moved to overlay2 (disk 94 % → 52 %). M0.5 (E3) started.
 - 2026-10-09 M0.7 review round 1 (docs/briefs/reports/M0.7-review-1.md): 0 Blocker, 5 Major, 11 Minor, 2 Nit. Fix round
   sent; CONFLICTS #22 addendum, #24 items 9–10, #26 (jar source) added.
+- 2026-10-09 M0.4 worker finished (compose with host networking, split Temporal, codec, e2e, restore drill, load test);
+  orchestrator verified make e2e 89 s cold and lint+unit; CONFLICTS #27 (Temporal peak, escalation) and #28 added.
+- 2026-10-09 M0.4 review round 1 (docs/briefs/reports/M0.4-review-1.md): 1 Blocker, 2 Major, 16 Minor, 6 Nit; fix round
+  sent; CONFLICTS #29 and #28 item 9 added. M0.7 fix round 1 verified (lint/unit, proof, manifest); review round 2
+started.
+- 2026-10-09 M0.7 merged (squash) after review round 2: 0 Blocker, 0 Major. main: lint+unit 64 s, manifest check ok,
+  trace proof 24 ok. M0.8-E2 started.

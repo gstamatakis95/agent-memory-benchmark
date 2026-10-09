@@ -1,0 +1,4 @@
+{"v":1,"spec":"Consolidation","seq":1,"action":"ProposeOk","args":[{"$set":[1,2,3,4]},[{"kind":"create","o":"@o2"}]]}
+{"v":1,"spec":"Consolidation","seq":2,"action":"ApplyEffectOnly","args":[{"$set":[1,2,3,4]}]}
+{"v":1,"spec":"Consolidation","seq":3,"action":"Crash"}
+{"v":1,"spec":"Consolidation","seq":4,"action":"ApplyEffectOnly","args":[{"$set":[1,2,3,4]}]}

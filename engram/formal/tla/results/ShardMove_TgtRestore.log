@@ -1,0 +1,39 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=41777 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+TLC2 Version 2026.10.06.014338 (rev: 94d0c50)
+Running breadth-first search Model-Checking with fp 113 and seed 2834043794686123467 with 4 workers on 4 cores with 5461MB heap and 64MB offheap memory [pid: 21742] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.12.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/engram-wt/m0.7-formal/formal/tla/ShardMove.tla
+Parsing file /tmp/tlc-13568591905956295659/Integers.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-13568591905956295659/FiniteSets.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-13568591905956295659/TLC.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-13568591905956295659/Naturals.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-13568591905956295659/Sequences.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module ShardMove
+Linting of module ShardMove
+Starting... (2026-10-09 10:27:26)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-09 10:27:26.
+Progress(13) at 2026-10-09 10:27:29: 227,387 states generated (227,387 s/min), 71,740 distinct states found (71,740 ds/min), 36,085 states left on queue.
+Progress(20) at 2026-10-09 10:28:29: 9,167,161 states generated (8,939,774 s/min), 2,790,482 distinct states found (2,718,742 ds/min), 822,169 states left on queue.
+Progress(22) at 2026-10-09 10:29:29: 16,940,191 states generated (7,773,030 s/min), 5,026,055 distinct states found (2,235,573 ds/min), 1,089,523 states left on queue.
+Progress(23) at 2026-10-09 10:30:29: 21,000,910 states generated (4,060,719 s/min), 6,181,103 distinct states found (1,155,048 ds/min), 1,134,143 states left on queue.
+Progress(25) at 2026-10-09 10:31:29: 26,543,639 states generated (5,542,729 s/min), 7,708,975 distinct states found (1,527,872 ds/min), 1,129,040 states left on queue.
+Progress(27) at 2026-10-09 10:32:29: 35,916,010 states generated (9,372,371 s/min), 10,330,920 distinct states found (2,621,945 ds/min), 1,033,736 states left on queue.
+Progress(29) at 2026-10-09 10:33:29: 43,445,479 states generated (7,529,469 s/min), 12,310,796 distinct states found (1,979,876 ds/min), 934,988 states left on queue.
+Progress(32) at 2026-10-09 10:34:29: 52,898,951 states generated (9,453,472 s/min), 14,678,902 distinct states found (2,368,106 ds/min), 656,797 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 3.6E-5
+  based on the actual fingerprints:  val = 7.5E-6
+58194803 states generated, 15835227 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 35.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 12 and the 95th percentile is 3).
+Finished in 07min 36s at (2026-10-09 10:35:02)
+@@ engram-formal config=ShardMove_TgtRestore expect="pass" outcome=pass verdict=OK wall_seconds=458 workers=4 heap=6g cap_seconds=1800

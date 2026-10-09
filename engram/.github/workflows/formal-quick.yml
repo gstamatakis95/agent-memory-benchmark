@@ -1,0 +1,115 @@
+# PR jobs of tier F (PLAN.md sections 7.6 and 8.1). `formal-quick` is the five-minute job: the SANY parse of every
+# specification, the quick tier of formal/MANIFEST.md, the manifest check, the Go tests of the invariant code, the
+# trace proof and the Lean sorry count. `formal-changed` runs, one job per specification, the nightly-tier
+# configurations of the specifications the change touches (a specification file, one of its configurations, or a Go
+# test file mapped to it in the manifest), each with the 30-minute cap, so its timeout is above the sum of the caps.
+# The Lean `lake build` runs in ci.yml (non-gating, pinned elan). Actions are pinned by commit like ci.yml.
+name: formal-quick
+
+on:
+  pull_request:
+    paths:
+      - "formal/**"
+      - "scripts/formal-*.sh"
+      - "scripts/sorry-count.sh"
+      - "internal/formal/**"
+      - "cmd/engramctl/formal*.go"
+      # the packages a specification covers: the Go test files mapped in formal/MANIFEST.md section 2 (the check
+      # scripts/formal-manifest-check.sh fails when one is missing here) and the tier T5 packages (PLAN.md section 8.1)
+      - "internal/outbox/**"
+      - "internal/consolidate/**"
+      - "internal/store/**"
+      - "internal/index/**"
+      - "internal/recall/**"
+      - "internal/expunge/**"
+      - "internal/pages/**"
+      - "internal/intent/**"
+      - "internal/move/**"
+      - "internal/catalog/**"
+      - "internal/router/**"
+      - "internal/workflows/**"
+      - "cmd/engramctl/restore*"
+      - ".github/workflows/formal-quick.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-quick-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formal-quick:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Use the runner's JDK 21
+        run: echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV" && echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+      - name: Cache the TLC jar (pinned by SHA-256 in scripts/formal-jar.sh)
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/engram/tla
+          key: tlatools-1.1.0-fc0a7b69b35076b4aeef54228a62fce9ca035f81a19619f5ed3f023f78c803b3
+      - name: Manifest check (a spec change needs its manifest row and a mapped test change)
+        env:
+          FORMAL_BASE: origin/${{ github.base_ref }}
+          # The `formal-no-test-change` label waives the test coupling; the pull request body must then carry a line
+          # `formal-no-test-change: <justification>`, which the check prints.
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'formal-no-test-change') }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ "$HAS_LABEL" = true ]; then
+            just=$(printf '%s\n' "$PR_BODY" | sed -n 's/^formal-no-test-change: *//p' | head -n1)
+            [ -n "$just" ] || { echo "the label needs a 'formal-no-test-change: <why>' body line"; exit 1; }
+            export FORMAL_NO_TEST_CHANGE=$just
+          fi
+          scripts/formal-manifest-check.sh
+      - name: Go tests of the invariant code and the converter
+        run: go test -count=1 ./internal/formal/... ./cmd/engramctl/...
+      - name: make formal-quick
+        run: make formal-quick
+      - name: Trace converter proof (one counterexample per specification through TraceNext)
+        run: scripts/formal-trace-check.sh proof
+      - name: Lean sorry count
+        run: scripts/sorry-count.sh
+
+  formal-changed:
+    needs: formal-quick
+    runs-on: ubuntu-24.04
+    # 30 minutes per configuration of the specification's nightly tier, plus ten for the set-up
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {spec: Outbox, timeout: 40}
+          - {spec: Consolidation, timeout: 40}
+          - {spec: Storage, timeout: 40}
+          - {spec: Derivation, timeout: 100}
+          - {spec: Durability, timeout: 190}
+          - {spec: ShardMove, timeout: 220}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Use the runner's JDK 21
+        run: echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV" && echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+      - name: Cache the TLC jar (pinned by SHA-256 in scripts/formal-jar.sh)
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/engram/tla
+          key: tlatools-1.1.0-fc0a7b69b35076b4aeef54228a62fce9ca035f81a19619f5ed3f023f78c803b3
+      - name: Nightly-tier configurations of ${{ matrix.spec }}, if this change touches it
+        env:
+          FORMAL_BASE: origin/${{ github.base_ref }}
+          FORMAL_ONLY_SPEC: ${{ matrix.spec }}
+        run: scripts/formal-run.sh changed

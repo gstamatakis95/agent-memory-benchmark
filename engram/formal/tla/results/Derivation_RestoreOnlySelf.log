@@ -1,0 +1,283 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=39693 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 127 and seed 2363045945303817778 with 1 worker on 4 cores with 5461MB heap and 64MB offheap memory [pid: 29941] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/engram-wt/m0.7-formal/formal/tla/Derivation.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Derivation_RestoreOnlySelf/tmp/Naturals.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Derivation_RestoreOnlySelf/tmp/Sequences.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Derivation_RestoreOnlySelf/tmp/FiniteSets.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Derivation_RestoreOnlySelf/tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Derivation
+Starting... (2026-10-09 14:18:09)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-09 14:18:09.
+Error: Invariant RestoreExact is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
+/\ ms = [d1 |-> "none", d2 |-> "none"]
+/\ nDel = 0
+/\ matOwe = {}
+/\ matDocs = {}
+/\ sig = FALSE
+/\ cv = (o1 :> 0)
+/\ matSnap = {}
+/\ ginv = {}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
+/\ itag = <<0, 0, 0, 0>>
+/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "idle"
+/\ mat = {}
+/\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {}
+/\ matV0 = {}
+/\ matTodo = {}
+/\ wr = ( w1 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] )
+/\ budget = 1
+
+State 2: <Ingest line 180, col 3 to line 183, col 60 of module Derivation>
+/\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
+/\ ms = [d1 |-> "none", d2 |-> "none"]
+/\ nDel = 0
+/\ matOwe = {}
+/\ matDocs = {}
+/\ sig = FALSE
+/\ cv = (o1 :> 0)
+/\ matSnap = {}
+/\ ginv = {}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {}
+/\ nRet = 0
+/\ itag = <<0, 0, 0, 0>>
+/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "idle"
+/\ mat = {}
+/\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {1}
+/\ matV0 = {}
+/\ matTodo = {}
+/\ wr = ( w1 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] )
+/\ budget = 1
+
+State 3: <Reextract line 236, col 3 to line 240, col 54 of module Derivation>
+/\ nCur = 0
+/\ lz = [f |-> 0, tag |-> 0]
+/\ ms = [d1 |-> "none", d2 |-> "none"]
+/\ nDel = 0
+/\ matOwe = {}
+/\ matDocs = {}
+/\ sig = FALSE
+/\ cv = (o1 :> 0)
+/\ matSnap = {}
+/\ ginv = {}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {1}
+/\ nRet = 1
+/\ itag = <<0, 0, 0, 0>>
+/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ hidden = {}
+/\ matPhase = "idle"
+/\ mat = {}
+/\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
+/\ clog = << [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {1, 4}
+/\ matV0 = {}
+/\ matTodo = {}
+/\ wr = ( w1 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] )
+/\ budget = 1
+
+State 4: <Invalidate line 195, col 3 to line 205, col 69 of module Derivation>
+/\ nCur = 1
+/\ lz = [f |-> 0, tag |-> 0]
+/\ ms = [d1 |-> "none", d2 |-> "none"]
+/\ nDel = 0
+/\ matOwe = {}
+/\ matDocs = {}
+/\ sig = FALSE
+/\ cv = (o1 :> 0)
+/\ matSnap = {}
+/\ ginv = {1, 4}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {1}
+/\ nRet = 1
+/\ itag = <<1, 0, 0, 1>>
+/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ hidden = {1, 4}
+/\ matPhase = "idle"
+/\ mat = {}
+/\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
+/\ clog = << [tag |-> 1, act |-> "inv"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {1, 4}
+/\ matV0 = {}
+/\ matTodo = {}
+/\ wr = ( w1 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] )
+/\ budget = 1
+
+State 5: <Restore line 212, col 3 to line 225, col 61 of module Derivation>
+/\ nCur = 2
+/\ lz = [f |-> 0, tag |-> 0]
+/\ ms = [d1 |-> "none", d2 |-> "none"]
+/\ nDel = 0
+/\ matOwe = {}
+/\ matDocs = {}
+/\ sig = FALSE
+/\ cv = (o1 :> 0)
+/\ matSnap = {}
+/\ ginv = {4}
+/\ gone = {}
+/\ dh = {}
+/\ ctomb = {}
+/\ vers = (o1 :> <<>>)
+/\ hidRe = {1}
+/\ nRet = 1
+/\ itag = <<0, 0, 0, 1>>
+/\ tomb = [d1 |-> 0, d2 |-> 0]
+/\ hidden = {4}
+/\ matPhase = "idle"
+/\ mat = {}
+/\ lockX = FALSE
+/\ hw = (o1 :> 0)
+/\ props = {}
+/\ clog = << [tag |-> 0, act |-> "res"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"],
+   [tag |-> 0, act |-> "none"] >>
+/\ born = {1, 4}
+/\ matV0 = {}
+/\ matTodo = {}
+/\ wr = ( w1 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] @@
+  w2 :>
+      [ ph |-> "idle",
+        p |->
+            [ n |-> o1,
+              mode |-> "root",
+              cf |-> {},
+              co |-> {},
+              base |-> 0,
+              exp |-> 0 ] ] )
+/\ budget = 1
+
+129 states generated, 85 distinct states found, 58 states left on queue.
+The depth of the complete state graph search is 5.
+The average outdegree of the complete state graph is 3 (minimum is 1, the maximum 6 and the 95th percentile is 6).
+Finished in 02s at (2026-10-09 14:18:10)
+@@ engram-formal config=Derivation_RestoreOnlySelf expect="violates RestoreExact" outcome=violates:RestoreExact verdict=OK wall_seconds=3 workers=1 heap=6g cap_seconds=1800 jar=fc0a7b69b35076b4aeef54228a62fce9ca035f81a19619f5ed3f023f78c803b3

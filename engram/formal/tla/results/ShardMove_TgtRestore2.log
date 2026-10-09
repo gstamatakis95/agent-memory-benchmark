@@ -1,0 +1,52 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=41777 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+TLC2 Version 2026.10.06.014338 (rev: 94d0c50)
+Running breadth-first search Model-Checking with fp 7 and seed 8985096187696241758 with 4 workers on 4 cores with 5461MB heap and 64MB offheap memory [pid: 29963] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.12.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/engram-wt/m0.7-formal/formal/tla/ShardMove.tla
+Parsing file /tmp/tlc-11054811822746936441/Integers.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-11054811822746936441/FiniteSets.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-11054811822746936441/TLC.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-11054811822746936441/Naturals.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-11054811822746936441/Sequences.tla (jar:file:/root/tools/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module ShardMove
+Linting of module ShardMove
+Starting... (2026-10-09 11:24:03)
+Warning: The set Clients has been defined to be a symmetry set but contains less than two elements.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-09 11:24:04.
+Progress(12) at 2026-10-09 11:24:07: 82,312 states generated (82,312 s/min), 22,924 distinct states found (22,924 ds/min), 11,972 states left on queue.
+Progress(21) at 2026-10-09 11:25:07: 8,335,953 states generated (8,253,641 s/min), 2,118,443 distinct states found (2,095,519 ds/min), 463,316 states left on queue.
+Progress(24) at 2026-10-09 11:26:07: 13,726,474 states generated (5,390,521 s/min), 3,410,404 distinct states found (1,291,961 ds/min), 458,719 states left on queue.
+Progress(27) at 2026-10-09 11:27:07: 21,208,410 states generated (7,481,936 s/min), 5,274,042 distinct states found (1,863,638 ds/min), 710,673 states left on queue.
+Progress(29) at 2026-10-09 11:28:07: 29,881,415 states generated (8,673,005 s/min), 7,583,751 distinct states found (2,309,709 ds/min), 1,465,336 states left on queue.
+Progress(30) at 2026-10-09 11:29:07: 39,583,460 states generated (9,702,045 s/min), 10,173,158 distinct states found (2,589,407 ds/min), 2,339,502 states left on queue.
+Progress(31) at 2026-10-09 11:30:07: 49,362,753 states generated (9,779,293 s/min), 12,707,805 distinct states found (2,534,647 ds/min), 3,091,454 states left on queue.
+Progress(31) at 2026-10-09 11:31:07: 57,145,891 states generated (7,783,138 s/min), 14,732,038 distinct states found (2,024,233 ds/min), 3,734,420 states left on queue.
+Progress(32) at 2026-10-09 11:32:07: 61,522,336 states generated (4,376,445 s/min), 15,880,935 distinct states found (1,148,897 ds/min), 4,026,041 states left on queue.
+Progress(32) at 2026-10-09 11:33:07: 69,813,180 states generated (8,290,844 s/min), 18,000,401 distinct states found (2,119,466 ds/min), 4,549,055 states left on queue.
+Progress(32) at 2026-10-09 11:34:07: 78,451,662 states generated (8,638,482 s/min), 20,164,923 distinct states found (2,164,522 ds/min), 5,118,485 states left on queue.
+Progress(33) at 2026-10-09 11:35:07: 88,856,371 states generated (10,404,709 s/min), 22,777,957 distinct states found (2,613,034 ds/min), 5,564,081 states left on queue.
+Progress(33) at 2026-10-09 11:36:07: 99,244,989 states generated (10,388,618 s/min), 25,310,180 distinct states found (2,532,223 ds/min), 6,106,259 states left on queue.
+Progress(33) at 2026-10-09 11:37:07: 104,508,900 states generated (5,263,911 s/min), 26,632,015 distinct states found (1,321,835 ds/min), 6,361,224 states left on queue.
+Progress(34) at 2026-10-09 11:38:07: 111,065,707 states generated (6,556,807 s/min), 28,147,467 distinct states found (1,515,452 ds/min), 6,395,198 states left on queue.
+Progress(34) at 2026-10-09 11:39:07: 117,797,414 states generated (6,731,707 s/min), 29,920,030 distinct states found (1,772,563 ds/min), 6,710,825 states left on queue.
+Progress(34) at 2026-10-09 11:40:07: 123,858,386 states generated (6,060,972 s/min), 31,345,069 distinct states found (1,425,039 ds/min), 6,899,219 states left on queue.
+Progress(34) at 2026-10-09 11:41:07: 132,714,480 states generated (8,856,094 s/min), 33,426,996 distinct states found (2,081,927 ds/min), 7,133,881 states left on queue.
+Progress(35) at 2026-10-09 11:42:07: 143,382,394 states generated (10,667,914 s/min), 35,924,876 distinct states found (2,497,880 ds/min), 7,186,765 states left on queue.
+Progress(35) at 2026-10-09 11:43:07: 153,363,110 states generated (9,980,716 s/min), 38,396,640 distinct states found (2,471,764 ds/min), 7,345,554 states left on queue.
+Progress(35) at 2026-10-09 11:44:07: 163,457,988 states generated (10,094,878 s/min), 40,666,139 distinct states found (2,269,499 ds/min), 7,404,609 states left on queue.
+Progress(36) at 2026-10-09 11:45:07: 172,153,483 states generated (8,695,495 s/min), 42,701,386 distinct states found (2,035,247 ds/min), 7,277,600 states left on queue.
+Progress(36) at 2026-10-09 11:46:07: 181,041,030 states generated (8,887,547 s/min), 44,879,069 distinct states found (2,177,683 ds/min), 7,263,619 states left on queue.
+Progress(36) at 2026-10-09 11:47:07: 187,042,869 states generated (6,001,839 s/min), 46,197,305 distinct states found (1,318,236 ds/min), 7,211,263 states left on queue.
+Progress(37) at 2026-10-09 11:48:07: 197,702,995 states generated (10,660,126 s/min), 48,678,646 distinct states found (2,481,341 ds/min), 7,056,324 states left on queue.
+Progress(37) at 2026-10-09 11:49:07: 208,074,978 states generated (10,371,983 s/min), 51,075,740 distinct states found (2,397,094 ds/min), 6,701,938 states left on queue.
+Progress(37) at 2026-10-09 11:50:07: 218,087,842 states generated (10,012,864 s/min), 53,220,169 distinct states found (2,144,429 ds/min), 6,396,496 states left on queue.
+Progress(38) at 2026-10-09 11:51:07: 227,902,469 states generated (9,814,627 s/min), 55,419,205 distinct states found (2,199,036 ds/min), 5,940,009 states left on queue.
+Progress(38) at 2026-10-09 11:52:07: 238,788,438 states generated (10,885,969 s/min), 57,872,873 distinct states found (2,453,668 ds/min), 5,442,298 states left on queue.
+Progress(39) at 2026-10-09 11:53:07: 248,521,491 states generated (9,733,053 s/min), 60,002,243 distinct states found (2,129,370 ds/min), 4,908,744 states left on queue.
+@@ engram-formal config=ShardMove_TgtRestore2 expect="pass" outcome=incomplete verdict=INCOMPLETE wall_seconds=1801 workers=4 heap=6g cap_seconds=1800

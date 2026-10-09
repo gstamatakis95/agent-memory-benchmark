@@ -785,6 +785,21 @@ linters:
           deny:
             - pkg: github.com/gstamatakis95/engram/internal
               desc: "adapters import only gen/go, authz (scope names) and the leaf errs (PLAN.md section 2.1)"
+        layer_formal:
+          files:
+            - "**/internal/formal/**"
+          list-mode: lax
+          allow:
+            - $gostd
+            - github.com/gstamatakis95/engram/internal/formal
+            - github.com/gstamatakis95/engram/internal/id
+            - github.com/gstamatakis95/engram/internal/errs
+            - github.com/gstamatakis95/engram/internal/pipeline
+            - github.com/gstamatakis95/engram/internal/fsm
+            - github.com/gstamatakis95/engram/internal/txn
+          deny:
+            - pkg: github.com/gstamatakis95/engram/internal
+              desc: "internal/formal imports the leaves and itself only (M0.7, PLAN.md section 7.4)"
         default_internal:
           files:
             - "**/internal/**"
@@ -819,6 +834,7 @@ linters:
             - "!**/internal/link/**"
             - "!**/internal/extract/**"
             - "!**/internal/chunk/**"
+            - "!**/internal/formal/**"
           list-mode: lax
           allow:
             - $gostd

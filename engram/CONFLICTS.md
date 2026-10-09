@@ -345,7 +345,65 @@ table). The
 - What: the plan pins TLC 2.18 by the SHA-256 of `tla2tools.jar`. The GitHub release asset `v1.8.0/tla2tools.jar` is
   republished nightly (MANIFEST.MF `Implementation-Version: 2.0 2026-10-06`, master rev 94d0c50), so once upstream
   republishes, a runner without the cache refuses the jar and formal CI breaks with no source for the pinned bytes.
-- Resolution: M0.7 pins an immutable artifact (a Maven Central TLC 2.18 build if one reproduces the shipped design
-  state counts) or vendors the verified jar under `formal/tools/`; the hash check stays. Recorded here because the
+- Resolution (applied): the pin is Maven Central `de.hhu.stups:tlatools:1.1.0` ("TLC2 Version 2.18 of 20 March 2023",
+  sha256 fc0a7b69b35076b4aeef54228a62fce9ca035f81a19619f5ed3f023f78c803b3), which reproduces the shipped design state
+  counts exactly; the hash check stays. TLC 2.18 error traces carry action names without parameters, so the converter
+  gained a state-level replay mode; the six action-level fixtures were produced by the earlier build and are kept.
+Recorded here because the
   plan's "TLC 2.18" names a version the nightly asset no longer identifies as such.
 - Register rows: §7.6, N46.
+
+## #27 Temporal peak on the measurement rig: ≈ 300 events/s against the 5,800 events/s target — open (escalation)
+
+- What (M0.4, `bench/results/phase0/m0.4-temporal-load.md`): on this shared 4-vCPU VM (≈ 5 % steal, 15 GB, Postgres,
+  Temporal and the driver co-located, load average 8–30 from other workers), Temporal 1.31.3 with split services, 512
+  history shards and the payload codec sustained 275–370 events/s at the 8-chunk `RetainDocument` shape (≈ 183
+events
+  per workflow) with persistence p99 17–35 ms and history at 32–40 % of its 2 CPUs; above ≈ 2 workflows/s the
+cluster
+  collapsed rather than plateaued. `synchronous_commit = off` reached 411 events/s and codec-off 528 events/s once, so
+  neither disk nor codec is the ceiling; `INSERT INTO executions_visibility` costs 8–9 ms against 0.3 ms for other
+  statements. The target is 5,800 events/s (580 lower bound); §10.2 M0.4's "or" branch writes the lower peak into §9
+  and caps `RetainBackfill` to it (N139). The orchestrator prompt lists "the Temporal peak below 5,800 events/s" as an
+  escalation item.
+- Readings: (a) the rig is far below the §9.1 production sizing and the number says nothing about 512 shards: re-run
+  `LADDER=10,20,30,40 STEP=120s HISTORY_CPUS=4 bench/temporal-load/ladder.sh` on a production-class host before
+  freezing; (b) one co-located Postgres cannot reach the peak on any host and a dedicated visibility store is needed.
+- Proposed resolution: (a); until then §9 says "tested to ≈ 300 events/s on a 4-vCPU shared rig", `RetainBackfill`
+  concurrency is capped to 300 events/s (≈ 13 chunks/s per cell), 512 history shards stay configured but are not yet
+  frozen. The reviewer is asked to rule out a configuration error first.
+- Register rows: N71, N139, §9.1, §11.2 Q24, R22.
+
+## #28 §9.1 and §9.5 defects found while building the dev stack — noted (handled in M0.4)
+
+1. `postgres -c include_dir=…` is invalid (`include_dir` is a postgresql.conf directive); the shard image builds the
+   `-c` list from the generated GUC table (`deploy/postgres/engram-postgres.sh`).
+2. The pinned ParadeDB image's bootstrap runs `CREATE EXTENSION pg_cron` and fails unless it is preloaded; the shard
+   keeps `shared_preload_libraries = pg_search,pg_cron,pg_stat_statements` and sets `PDB_TUNE=false`. Open: drop
+pg_cron?
+3. `plan_cache_mode = force_custom_plan` for `engram_app` is in the §9.1 table but in no migration and not in the
+   reference DDL; `gucs.yaml` carries it and a test records the gap. Needs an M0.8 migration row or a dropped table row.
+4. `minio/minio` is no longer pullable anonymously; the dev stack pins `cgr.dev/chainguard/minio` by digest (a rolling
+   tag). CI needs a durable source and authenticated Docker Hub pulls (rate limits hit here; `pull-images.sh` falls back
+   to `mirror.gcr.io`).
+5. pgBackRest to MinIO needs TLS (self-signed, `repo1-storage-verify-tls=n` in dev); a service's first boot runs with
+   `archive_mode = off` until `stanza-create`, then restarts (§9.5 step 3 should say so).
+6. §8.3 homes `TestIso_Temporal_PayloadsEncrypted` in `internal/isolation`, which has no depguard rule; it lives in
+   `/e2e` until E3 adds the rule.
+7. No Retain/Recall round trip exists yet (api, worker and the DeterministicClient gateway are M1.x); the smoke proves
+   the stack, the codec, the Temporal namespace and Envoy's listener.
+8. The M0.4 load tables' event-count estimate was one low (+7 → +8), ≈ 0.5 %.
+9. The ParadeDB bootstrap also installs postgis, tiger_geocoder, postgis_topology, pg_ivm and fuzzystrmatch into the
+   shard database (review m10); Temporal's pool ceilings must stay below `max_connections` (review m15).
+
+## #29 Codec key scope: N59 "per-shard key" vs the namespace-keyed §2.2.17 signature — noted (reviewer to confirm
+fix)
+
+- What (M0.4 review M1): N59 names a per-shard codec key; §2.2.17 gives `KeyProvider`/`DataConverter` a namespace,
+not a
+  shard. M0.4's first version wrapped every namespace's data key with one cell-wide key.
+- Resolution: the provider selects the wrapping key by shard through an injected namespace → shard lookup (static map
+  in the one-shard dev stack, the catalog resolver from M1.x); a move re-wraps the moved namespace's data key under the
+  target shard's key (M1.5 item). Failure payloads are encrypted under the namespace key too (review B1), so `Shred`
+  covers them.
+- Register rows: N59, N99, §2.2.17, §8.3.

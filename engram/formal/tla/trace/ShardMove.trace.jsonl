@@ -1,0 +1,5 @@
+{"v":1,"spec":"ShardMove","seq":1,"action":"Plan"}
+{"v":1,"spec":"ShardMove","seq":2,"action":"Freeze"}
+{"v":1,"spec":"ShardMove","seq":3,"action":"CopyEx"}
+{"v":1,"spec":"ShardMove","seq":4,"action":"VerifyFrozen"}
+{"v":1,"spec":"ShardMove","seq":5,"action":"MakeReady"}

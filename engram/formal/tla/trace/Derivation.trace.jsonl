@@ -1,0 +1,5 @@
+{"v":1,"spec":"Derivation","seq":1,"action":"Ingest","args":[1]}
+{"v":1,"spec":"Derivation","seq":2,"action":"Propose"}
+{"v":1,"spec":"Derivation","seq":3,"action":"Reextract","args":[1]}
+{"v":1,"spec":"Derivation","seq":4,"action":"Invalidate","args":[1]}
+{"v":1,"spec":"Derivation","seq":5,"action":"Restore","args":[4]}

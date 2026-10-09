@@ -9,6 +9,10 @@ go.work.sum
 /formal/tla/*.log
 /formal/lean/.lake/
 /bench/results/**/*.raw
+/formal/tla/*_TTrace_*
+/formal/tla/*.bin
+/formal/tla/results/states/
+/formal/tla/trace/*.out
 /engramctl
 /engram-api
 /engram-worker

@@ -1,0 +1,6 @@
+{"v":1,"spec":"Storage","seq":1,"action":"Insert","args":[1]}
+{"v":1,"spec":"Storage","seq":2,"action":"Mark","args":[1]}
+{"v":1,"spec":"Storage","seq":3,"action":"EmbedRow","args":[1,1]}
+{"v":1,"spec":"Storage","seq":4,"action":"IndexAdd","args":[[1,1]]}
+{"v":1,"spec":"Storage","seq":5,"action":"Purge","args":[1]}
+{"v":1,"spec":"Storage","seq":6,"action":"AutoRepairDrop","args":[[1,1]]}

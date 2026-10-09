@@ -1,0 +1,6 @@
+{"v":1,"spec":"Outbox","seq":1,"action":"Draw","args":["@w1","@a"]}
+{"v":1,"spec":"Outbox","seq":2,"action":"Draw","args":["@w2","@a"]}
+{"v":1,"spec":"Outbox","seq":3,"action":"Commit","args":["@w2"]}
+{"v":1,"spec":"Outbox","seq":4,"action":"WatchGap"}
+{"v":1,"spec":"Outbox","seq":5,"action":"DeclareAborted"}
+{"v":1,"spec":"Outbox","seq":6,"action":"Commit","args":["@w1"]}

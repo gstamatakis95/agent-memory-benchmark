@@ -1,0 +1,149 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=39693 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 64 and seed -627511394657779088 with 4 workers on 4 cores with 5461MB heap and 64MB offheap memory [pid: 31094] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/engram-wt/m0.7-formal/formal/tla/Outbox.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Outbox_Watch1x/tmp/Naturals.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Outbox_Watch1x/tmp/Sequences.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Outbox_Watch1x/tmp/FiniteSets.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Outbox_Watch1x/tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Outbox
+Starting... (2026-10-09 14:19:09)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-09 14:19:10.
+Error: Invariant NoLossSafety is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<NoNs, NoNs, NoNs, NoNs, NoNs>>
+/\ declared = {}
+/\ cursor = 0
+/\ committed = {}
+/\ crashes = 0
+/\ nextSeq = 1
+/\ watch = <<>>
+/\ wr = ( w1 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] @@
+  w2 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+State 2: <Draw line 86, col 3 to line 91, col 76 of module Outbox>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<b, NoNs, NoNs, NoNs, NoNs>>
+/\ declared = {}
+/\ cursor = 0
+/\ committed = {}
+/\ crashes = 0
+/\ nextSeq = 2
+/\ watch = <<>>
+/\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+State 3: <Draw line 86, col 3 to line 91, col 76 of module Outbox>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<b, b, NoNs, NoNs, NoNs>>
+/\ declared = {}
+/\ cursor = 0
+/\ committed = {}
+/\ crashes = 0
+/\ nextSeq = 3
+/\ watch = <<>>
+/\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "holding", seq |-> 2, ns |-> b, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+State 4: <Commit line 95, col 3 to line 99, col 80 of module Outbox>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<b, b, NoNs, NoNs, NoNs>>
+/\ declared = {}
+/\ cursor = 0
+/\ committed = {2}
+/\ crashes = 0
+/\ nextSeq = 3
+/\ watch = <<>>
+/\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+State 5: <WatchGap line 154, col 3 to line 157, col 88 of module Outbox>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<b, b, NoNs, NoNs, NoNs>>
+/\ declared = {}
+/\ cursor = 0
+/\ committed = {2}
+/\ crashes = 0
+/\ nextSeq = 3
+/\ watch = <<0>>
+/\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> b, age |-> 0] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+State 6: <Tick line 116, col 3 to line 122, col 75 of module Outbox>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<b, b, NoNs, NoNs, NoNs>>
+/\ declared = {}
+/\ cursor = 0
+/\ committed = {2}
+/\ crashes = 0
+/\ nextSeq = 3
+/\ watch = <<1>>
+/\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> b, age |-> 1] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+State 7: <Tick line 116, col 3 to line 122, col 75 of module Outbox>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<b, b, NoNs, NoNs, NoNs>>
+/\ declared = {}
+/\ cursor = 0
+/\ committed = {2}
+/\ crashes = 0
+/\ nextSeq = 3
+/\ watch = <<2>>
+/\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> b, age |-> 2] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+State 8: <DeclareAborted line 162, col 3 to line 168, col 70 of module Outbox>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<b, b, NoNs, NoNs, NoNs>>
+/\ declared = {1}
+/\ cursor = 1
+/\ committed = {2}
+/\ crashes = 0
+/\ nextSeq = 3
+/\ watch = << >>
+/\ wr = ( w1 :> [st |-> "holding", seq |-> 1, ns |-> b, age |-> 2] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+State 9: <Commit line 95, col 3 to line 99, col 80 of module Outbox>
+/\ aborted = {}
+/\ log = (index :> <<>> @@ kafka :> <<>>)
+/\ nsOf = <<b, b, NoNs, NoNs, NoNs>>
+/\ declared = {1}
+/\ cursor = 1
+/\ committed = {1, 2}
+/\ crashes = 0
+/\ nextSeq = 3
+/\ watch = << >>
+/\ wr = ( w1 :> [st |-> "idle", seq |-> 1, ns |-> b, age |-> 2] @@
+  w2 :> [st |-> "idle", seq |-> 2, ns |-> b, age |-> 0] @@
+  w3 :> [st |-> "idle", seq |-> 0, ns |-> NoNs, age |-> 0] )
+
+241709 states generated, 119133 distinct states found, 88724 states left on queue.
+The depth of the complete state graph search is 9.
+The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 9 and the 95th percentile is 8).
+Finished in 02s at (2026-10-09 14:19:11)
+@@ engram-formal config=Outbox_Watch1x expect="violates NoLossSafety" outcome=violates:NoLossSafety verdict=OK wall_seconds=3 workers=4 heap=6g cap_seconds=1800 jar=fc0a7b69b35076b4aeef54228a62fce9ca035f81a19619f5ed3f023f78c803b3

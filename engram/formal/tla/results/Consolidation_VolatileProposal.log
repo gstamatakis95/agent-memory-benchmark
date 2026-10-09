@@ -1,0 +1,472 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=39693 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+TLC2 Version 2.18 of 20 March 2023
+Running breadth-first search Model-Checking with fp 54 and seed -7731843393517000172 with 1 worker on 4 cores with 5461MB heap and 64MB offheap memory [pid: 29210] (Linux 6.18.44-fc-v80 amd64, Ubuntu 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/engram-wt/m0.7-formal/formal/tla/Consolidation.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Consolidation_VolatileProposal/tmp/Naturals.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Consolidation_VolatileProposal/tmp/Sequences.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Consolidation_VolatileProposal/tmp/FiniteSets.tla
+Parsing file /tmp/tmp.GzsOMjmeC1/Consolidation_VolatileProposal/tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Consolidation
+Starting... (2026-10-09 14:17:54)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-09 14:17:55.
+Progress(5) at 2026-10-09 14:17:58: 52,915 states generated (52,915 s/min), 24,069 distinct states found (24,069 ds/min), 21,121 states left on queue.
+Error: Invariant ExactlyOnceEffect is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ done = {}
+/\ applyCount = ( <<{1}, 1>> :> 0 @@
+  <<{1}, 2>> :> 0 @@
+  <<{2}, 1>> :> 0 @@
+  <<{2}, 2>> :> 0 @@
+  <<{3}, 1>> :> 0 @@
+  <<{3}, 2>> :> 0 @@
+  <<{4}, 1>> :> 0 @@
+  <<{4}, 2>> :> 0 @@
+  <<{1, 2}, 1>> :> 0 @@
+  <<{1, 2}, 2>> :> 0 @@
+  <<{1, 3}, 1>> :> 0 @@
+  <<{1, 3}, 2>> :> 0 @@
+  <<{1, 4}, 1>> :> 0 @@
+  <<{1, 4}, 2>> :> 0 @@
+  <<{2, 3}, 1>> :> 0 @@
+  <<{2, 3}, 2>> :> 0 @@
+  <<{2, 4}, 1>> :> 0 @@
+  <<{2, 4}, 2>> :> 0 @@
+  <<{3, 4}, 1>> :> 0 @@
+  <<{3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3}, 1>> :> 0 @@
+  <<{1, 2, 3}, 2>> :> 0 @@
+  <<{1, 2, 4}, 1>> :> 0 @@
+  <<{1, 2, 4}, 2>> :> 0 @@
+  <<{1, 3, 4}, 1>> :> 0 @@
+  <<{1, 3, 4}, 2>> :> 0 @@
+  <<{2, 3, 4}, 1>> :> 0 @@
+  <<{2, 3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3, 4}, 1>> :> 0 @@
+  <<{1, 2, 3, 4}, 2>> :> 0 )
+/\ finalProp = <<>>
+/\ deletes = 0
+/\ effectOf = ( <<{1}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
+/\ applied = {}
+/\ pending = {}
+/\ stored = <<>>
+/\ queue = {1..4}
+/\ crashes = 0
+/\ failed = {}
+/\ obs = (o1 :> [st |-> "absent", src |-> {}] @@ o2 :> [st |-> "absent", src |-> {}])
+/\ live = 1..4
+/\ mem = <<>>
+
+State 2: <ProposeOk line 110, col 3 to line 113, col 118 of module Consolidation>
+/\ done = {}
+/\ applyCount = ( <<{1}, 1>> :> 0 @@
+  <<{1}, 2>> :> 0 @@
+  <<{2}, 1>> :> 0 @@
+  <<{2}, 2>> :> 0 @@
+  <<{3}, 1>> :> 0 @@
+  <<{3}, 2>> :> 0 @@
+  <<{4}, 1>> :> 0 @@
+  <<{4}, 2>> :> 0 @@
+  <<{1, 2}, 1>> :> 0 @@
+  <<{1, 2}, 2>> :> 0 @@
+  <<{1, 3}, 1>> :> 0 @@
+  <<{1, 3}, 2>> :> 0 @@
+  <<{1, 4}, 1>> :> 0 @@
+  <<{1, 4}, 2>> :> 0 @@
+  <<{2, 3}, 1>> :> 0 @@
+  <<{2, 3}, 2>> :> 0 @@
+  <<{2, 4}, 1>> :> 0 @@
+  <<{2, 4}, 2>> :> 0 @@
+  <<{3, 4}, 1>> :> 0 @@
+  <<{3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3}, 1>> :> 0 @@
+  <<{1, 2, 3}, 2>> :> 0 @@
+  <<{1, 2, 4}, 1>> :> 0 @@
+  <<{1, 2, 4}, 2>> :> 0 @@
+  <<{1, 3, 4}, 1>> :> 0 @@
+  <<{1, 3, 4}, 2>> :> 0 @@
+  <<{2, 3, 4}, 1>> :> 0 @@
+  <<{2, 3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3, 4}, 1>> :> 0 @@
+  <<{1, 2, 3, 4}, 2>> :> 0 )
+/\ finalProp = <<>>
+/\ deletes = 0
+/\ effectOf = ( <<{1}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
+/\ applied = {}
+/\ pending = {}
+/\ stored = <<>>
+/\ queue = {1..4}
+/\ crashes = 0
+/\ failed = {}
+/\ obs = (o1 :> [st |-> "absent", src |-> {}] @@ o2 :> [st |-> "absent", src |-> {}])
+/\ live = 1..4
+/\ mem = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o1]>>)
+
+State 3: <ApplyAtomic line 146, col 3 to line 153, col 95 of module Consolidation>
+/\ done = {}
+/\ applyCount = ( <<{1}, 1>> :> 0 @@
+  <<{1}, 2>> :> 0 @@
+  <<{2}, 1>> :> 0 @@
+  <<{2}, 2>> :> 0 @@
+  <<{3}, 1>> :> 0 @@
+  <<{3}, 2>> :> 0 @@
+  <<{4}, 1>> :> 0 @@
+  <<{4}, 2>> :> 0 @@
+  <<{1, 2}, 1>> :> 0 @@
+  <<{1, 2}, 2>> :> 0 @@
+  <<{1, 3}, 1>> :> 0 @@
+  <<{1, 3}, 2>> :> 0 @@
+  <<{1, 4}, 1>> :> 0 @@
+  <<{1, 4}, 2>> :> 0 @@
+  <<{2, 3}, 1>> :> 0 @@
+  <<{2, 3}, 2>> :> 0 @@
+  <<{2, 4}, 1>> :> 0 @@
+  <<{2, 4}, 2>> :> 0 @@
+  <<{3, 4}, 1>> :> 0 @@
+  <<{3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3}, 1>> :> 0 @@
+  <<{1, 2, 3}, 2>> :> 0 @@
+  <<{1, 2, 4}, 1>> :> 0 @@
+  <<{1, 2, 4}, 2>> :> 0 @@
+  <<{1, 3, 4}, 1>> :> 0 @@
+  <<{1, 3, 4}, 2>> :> 0 @@
+  <<{2, 3, 4}, 1>> :> 0 @@
+  <<{2, 3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3, 4}, 1>> :> 1 @@
+  <<{1, 2, 3, 4}, 2>> :> 0 )
+/\ finalProp = <<>>
+/\ deletes = 0
+/\ effectOf = ( <<{1}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o1] @@
+  <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
+/\ applied = {<<{1, 2, 3, 4}, 1>>}
+/\ pending = {}
+/\ stored = <<>>
+/\ queue = {1..4}
+/\ crashes = 0
+/\ failed = {}
+/\ obs = ( o1 :> [st |-> "live", src |-> {1, 2, 3, 4}] @@
+  o2 :> [st |-> "absent", src |-> {}] )
+/\ live = 1..4
+/\ mem = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o1]>>)
+
+State 4: <Crash line 187, col 3 to line 191, col 108 of module Consolidation>
+/\ done = {}
+/\ applyCount = ( <<{1}, 1>> :> 0 @@
+  <<{1}, 2>> :> 0 @@
+  <<{2}, 1>> :> 0 @@
+  <<{2}, 2>> :> 0 @@
+  <<{3}, 1>> :> 0 @@
+  <<{3}, 2>> :> 0 @@
+  <<{4}, 1>> :> 0 @@
+  <<{4}, 2>> :> 0 @@
+  <<{1, 2}, 1>> :> 0 @@
+  <<{1, 2}, 2>> :> 0 @@
+  <<{1, 3}, 1>> :> 0 @@
+  <<{1, 3}, 2>> :> 0 @@
+  <<{1, 4}, 1>> :> 0 @@
+  <<{1, 4}, 2>> :> 0 @@
+  <<{2, 3}, 1>> :> 0 @@
+  <<{2, 3}, 2>> :> 0 @@
+  <<{2, 4}, 1>> :> 0 @@
+  <<{2, 4}, 2>> :> 0 @@
+  <<{3, 4}, 1>> :> 0 @@
+  <<{3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3}, 1>> :> 0 @@
+  <<{1, 2, 3}, 2>> :> 0 @@
+  <<{1, 2, 4}, 1>> :> 0 @@
+  <<{1, 2, 4}, 2>> :> 0 @@
+  <<{1, 3, 4}, 1>> :> 0 @@
+  <<{1, 3, 4}, 2>> :> 0 @@
+  <<{2, 3, 4}, 1>> :> 0 @@
+  <<{2, 3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3, 4}, 1>> :> 1 @@
+  <<{1, 2, 3, 4}, 2>> :> 0 )
+/\ finalProp = <<>>
+/\ deletes = 0
+/\ effectOf = ( <<{1}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o1] @@
+  <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
+/\ applied = {<<{1, 2, 3, 4}, 1>>}
+/\ pending = {}
+/\ stored = <<>>
+/\ queue = {1..4}
+/\ crashes = 1
+/\ failed = {}
+/\ obs = ( o1 :> [st |-> "live", src |-> {1, 2, 3, 4}] @@
+  o2 :> [st |-> "absent", src |-> {}] )
+/\ live = 1..4
+/\ mem = <<>>
+
+State 5: <ProposeOk line 110, col 3 to line 113, col 118 of module Consolidation>
+/\ done = {}
+/\ applyCount = ( <<{1}, 1>> :> 0 @@
+  <<{1}, 2>> :> 0 @@
+  <<{2}, 1>> :> 0 @@
+  <<{2}, 2>> :> 0 @@
+  <<{3}, 1>> :> 0 @@
+  <<{3}, 2>> :> 0 @@
+  <<{4}, 1>> :> 0 @@
+  <<{4}, 2>> :> 0 @@
+  <<{1, 2}, 1>> :> 0 @@
+  <<{1, 2}, 2>> :> 0 @@
+  <<{1, 3}, 1>> :> 0 @@
+  <<{1, 3}, 2>> :> 0 @@
+  <<{1, 4}, 1>> :> 0 @@
+  <<{1, 4}, 2>> :> 0 @@
+  <<{2, 3}, 1>> :> 0 @@
+  <<{2, 3}, 2>> :> 0 @@
+  <<{2, 4}, 1>> :> 0 @@
+  <<{2, 4}, 2>> :> 0 @@
+  <<{3, 4}, 1>> :> 0 @@
+  <<{3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3}, 1>> :> 0 @@
+  <<{1, 2, 3}, 2>> :> 0 @@
+  <<{1, 2, 4}, 1>> :> 0 @@
+  <<{1, 2, 4}, 2>> :> 0 @@
+  <<{1, 3, 4}, 1>> :> 0 @@
+  <<{1, 3, 4}, 2>> :> 0 @@
+  <<{2, 3, 4}, 1>> :> 0 @@
+  <<{2, 3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3, 4}, 1>> :> 1 @@
+  <<{1, 2, 3, 4}, 2>> :> 0 )
+/\ finalProp = <<>>
+/\ deletes = 0
+/\ effectOf = ( <<{1}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o1] @@
+  <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
+/\ applied = {<<{1, 2, 3, 4}, 1>>}
+/\ pending = {}
+/\ stored = <<>>
+/\ queue = {1..4}
+/\ crashes = 1
+/\ failed = {}
+/\ obs = ( o1 :> [st |-> "live", src |-> {1, 2, 3, 4}] @@
+  o2 :> [st |-> "absent", src |-> {}] )
+/\ live = 1..4
+/\ mem = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o2]>>)
+
+State 6: <MarkDone line 175, col 3 to line 179, col 107 of module Consolidation>
+/\ done = {{1, 2, 3, 4}}
+/\ applyCount = ( <<{1}, 1>> :> 0 @@
+  <<{1}, 2>> :> 0 @@
+  <<{2}, 1>> :> 0 @@
+  <<{2}, 2>> :> 0 @@
+  <<{3}, 1>> :> 0 @@
+  <<{3}, 2>> :> 0 @@
+  <<{4}, 1>> :> 0 @@
+  <<{4}, 2>> :> 0 @@
+  <<{1, 2}, 1>> :> 0 @@
+  <<{1, 2}, 2>> :> 0 @@
+  <<{1, 3}, 1>> :> 0 @@
+  <<{1, 3}, 2>> :> 0 @@
+  <<{1, 4}, 1>> :> 0 @@
+  <<{1, 4}, 2>> :> 0 @@
+  <<{2, 3}, 1>> :> 0 @@
+  <<{2, 3}, 2>> :> 0 @@
+  <<{2, 4}, 1>> :> 0 @@
+  <<{2, 4}, 2>> :> 0 @@
+  <<{3, 4}, 1>> :> 0 @@
+  <<{3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3}, 1>> :> 0 @@
+  <<{1, 2, 3}, 2>> :> 0 @@
+  <<{1, 2, 4}, 1>> :> 0 @@
+  <<{1, 2, 4}, 2>> :> 0 @@
+  <<{1, 3, 4}, 1>> :> 0 @@
+  <<{1, 3, 4}, 2>> :> 0 @@
+  <<{2, 3, 4}, 1>> :> 0 @@
+  <<{2, 3, 4}, 2>> :> 0 @@
+  <<{1, 2, 3, 4}, 1>> :> 1 @@
+  <<{1, 2, 3, 4}, 2>> :> 0 )
+/\ finalProp = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o2]>>)
+/\ deletes = 0
+/\ effectOf = ( <<{1}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 1>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] @@
+  <<{1, 2, 3, 4}, 1>> :> [kind |-> "create", o |-> o1] @@
+  <<{1, 2, 3, 4}, 2>> :> [kind |-> "none", o |-> NoObs] )
+/\ applied = {<<{1, 2, 3, 4}, 1>>}
+/\ pending = {}
+/\ stored = <<>>
+/\ queue = {}
+/\ crashes = 1
+/\ failed = {}
+/\ obs = ( o1 :> [st |-> "live", src |-> {1, 2, 3, 4}] @@
+  o2 :> [st |-> "absent", src |-> {}] )
+/\ live = 1..4
+/\ mem = ({1, 2, 3, 4} :> <<[kind |-> "create", o |-> o2]>>)
+
+73714 states generated, 30520 distinct states found, 27048 states left on queue.
+The depth of the complete state graph search is 6.
+The average outdegree of the complete state graph is 6 (minimum is 0, the maximum 31 and the 95th percentile is 31).
+Finished in 05s at (2026-10-09 14:17:58)
+@@ engram-formal config=Consolidation_VolatileProposal expect="violates ExactlyOnceEffect" outcome=violates:ExactlyOnceEffect verdict=OK wall_seconds=6 workers=1 heap=6g cap_seconds=1800 jar=fc0a7b69b35076b4aeef54228a62fce9ca035f81a19619f5ed3f023f78c803b3

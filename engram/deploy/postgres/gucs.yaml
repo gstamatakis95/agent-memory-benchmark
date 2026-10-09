@@ -1,0 +1,96 @@
+# The Postgres settings of PLAN.md section 9.1 as data (N131). One table feeds three consumers: the `postgres -c`
+# include file (`go run ./deploy/postgres/gucsgen`), the ALTER ROLE statements (checked against migrations/shard/0001
+# by the gucsgen test) and, in M1.7, `engramctl config lint` (drift between this table, a live shard and the container
+# limits). `prod` is the value on a 128 GB / 8 vCPU shard host; `dev` is the same setting scaled for the single-host dev
+# compose (a 4-core, 15 GB machine runs a shard, a catalog pair, Temporal and its Postgres at once). A setting without
+# `dev` has the same value in both profiles. `plain` is the value on the plain-PostgreSQL servers (catalog,
+# standby and temporal-postgres), which carry no pg_search; `kinds` overrides one server kind (shard, catalog, standby,
+# temporal) and `only` restricts a setting to some kinds. `${STANZA}` in a value is replaced by the stanza of the
+# server (shard-1, catalog, temporal).
+#
+# scope: server  = postgresql.conf (the generated include file)
+#        role    = ALTER ROLE <role> SET ... (applied by migration 0001; listed here for the drift check)
+#        storage = per-table storage parameter set by the migrations on content partitions (not emitted)
+#        txn     = SET LOCAL inside a transaction by engramctl (not emitted; kept so the constants come from one table)
+container:
+  prod: { cpus: "8", memory: 112g, shm_size: 32g }
+  dev: { cpus: "2", memory: 2g, shm_size: 1g }
+# UNSIZED SERVERS (review M0.4 m18): the plan sizes the shard (section 9.1 and D3) and nothing else. The catalog, its
+# standby and temporal-postgres therefore get no prod value for the settings listed under `unsized`: they run on the
+# Postgres defaults until someone sizes them (CONFLICTS proposal in the M0.4 report). autovacuum_freeze_max_age
+# matters most: at about one transaction per Temporal history event, 10^9 would be reached in about two days at 5 800
+# events/s, and a raised limit on a server that is not sized for it is how wraparound vacuums arrive without a plan.
+# The dev profile still applies its dev values to every kind (dev machines are small).
+unsized:
+  kinds: [catalog, standby, temporal]
+  settings: [shared_buffers, effective_cache_size, maintenance_work_mem, max_parallel_maintenance_workers, work_mem,
+             max_wal_size, autovacuum_max_workers, autovacuum_freeze_max_age, max_parallel_workers_per_gather,
+             effective_io_concurrency, random_page_cost]
+settings:
+  - { name: shared_buffers, prod: 32GB, dev: 256MB, scope: server, ref: "N114: hot set 74 GB at 5.5 M facts" }
+  - { name: effective_cache_size, prod: 96GB, dev: 768MB, scope: server, ref: "N114" }
+  - { name: maintenance_work_mem, prod: 1GB, dev: 128MB, scope: server, ref: "N138: the index runner raises it" }
+  - { name: max_parallel_maintenance_workers, prod: "4", dev: "2", scope: server, ref: "N138, N173" }
+  - { name: max_connections, prod: "100", kinds: { temporal: "400" }, scope: server,
+      ref: "N164: 63 at P = 4 API processes; temporal-postgres: the pools of the four Temporal services sum to 260" }
+  - { name: work_mem, prod: 64MB, dev: 16MB, scope: server, ref: "section 9.1" }
+  - { name: synchronous_commit, prod: local, kinds: { catalog: "on", standby: "on", temporal: "on" }, scope: server,
+      ref: "N122: no synchronous standby of a shard; N163: the catalog is on locally with an asynchronous standby" }
+  - { name: synchronous_standby_names, prod: "", only: [catalog], scope: server, ref: "N163: asynchronous standby" }
+  - { name: hot_standby, prod: "on", only: [catalog, standby], scope: server, ref: "N163" }
+  - { name: max_wal_senders, prod: "5", only: [catalog, standby], scope: server, ref: "N163 (standby >= primary)" }
+  - { name: max_replication_slots, prod: "5", only: [catalog, standby], scope: server,
+      ref: "N163 (standby >= primary)" }
+  # a physical slot pins WAL on the primary for as long as the standby is away: capped, a lost standby is rebuilt
+  # (pg_basebackup, N163) instead of filling the primary's disk. The values are ours, not the plan's.
+  - { name: max_slot_wal_keep_size, prod: 64GB, dev: 2GB, only: [catalog, standby], scope: server,
+      ref: "review M0.4 m7" }
+  - { name: checkpoint_timeout, prod: 30min, scope: server, ref: "N166" }
+  - { name: max_wal_size, prod: 16GB, dev: 2GB, scope: server, ref: "N166" }
+  - { name: checkpoint_completion_target, prod: "0.9", scope: server, ref: "N166" }
+  - { name: wal_compression, prod: zstd, scope: server, ref: "N166" }
+  - { name: tcp_keepalives_idle, prod: "10", scope: server, ref: "N167, C-10: a vanished host releases advisory locks" }
+  - { name: tcp_keepalives_interval, prod: "5", scope: server, ref: "N167" }
+  - { name: tcp_keepalives_count, prod: "3", scope: server, ref: "N167" }
+  - { name: tcp_user_timeout, prod: 30s, scope: server, ref: "N167: direct connections (leases, relay, mover)" }
+  - { name: wal_level, prod: replica, scope: server, ref: "RPO <= 60 s" }
+  - { name: archive_mode, prod: "on", scope: server, ref: "RPO <= 60 s (on a standby: archives after a promotion)" }
+  - { name: archive_timeout, prod: 60s, scope: server, ref: "RPO <= 60 s" }
+  - { name: archive_command, prod: "pgbackrest --stanza=${STANZA} archive-push %p", scope: server, ref: "N131" }
+  - { name: autovacuum_max_workers, prod: "6", dev: "3", scope: server, ref: "P-11" }
+  # Postgres ignores a per-table autovacuum_freeze_max_age above the server setting, so this one is a server setting
+  # (review m5); the migrations lower the freeze MIN age per content partition (autovacuum_freeze_min_age, 0002).
+  - { name: autovacuum_freeze_max_age, prod: "1000000000", scope: server, ref: "P-11" }
+  - { name: autovacuum_freeze_min_age, prod: "10000000", scope: storage,
+      ref: "P-11: content partitions, migration 0002" }
+  - { name: vacuum_index_cleanup, prod: "off", scope: storage, ref: "N138, N152: vector partitions, permanently" }
+  - { name: random_page_cost, prod: "1.1", scope: server, ref: "NVMe" }
+  - { name: effective_io_concurrency, prod: "200", scope: server, ref: "NVMe" }
+  - { name: max_parallel_workers_per_gather, prod: "4", dev: "2", scope: server, ref: "NVMe" }
+  # section 9.1 lists pg_search and pg_stat_statements; the ParadeDB image's own bootstrap script runs CREATE EXTENSION
+  # pg_cron and fails unless pg_cron is preloaded, and it also installs postgis, postgis_tiger_geocoder,
+  # postgis_topology, pg_ivm and fuzzystrmatch into the shard database (CONFLICTS proposal)
+  - { name: shared_preload_libraries, prod: "pg_search,pg_cron,pg_stat_statements", plain: pg_stat_statements,
+      scope: server, ref: "section 9.1 (+ pg_cron of the ParadeDB bootstrap)" }
+  - { name: log_min_duration_statement, prod: 500ms, scope: server, ref: "section 9.1" }
+  - { name: log_lock_waits, prod: "on", scope: server, ref: "section 9.1" }
+  - { name: lock_timeout_exclusive, prod: 35s, scope: txn, ref: "N82, N120, N124, N139: one attempt, SET LOCAL" }
+roles:
+  engram_app:
+    synchronous_commit: local
+    plan_cache_mode: force_custom_plan
+    lock_timeout: 2s
+    statement_timeout: 30s
+    idle_in_transaction_session_timeout: 30s
+  engram_relay:
+    synchronous_commit: local
+  engram_move:
+    synchronous_commit: local
+    lock_timeout: 10s
+    statement_timeout: 30s
+    idle_in_transaction_session_timeout: 30s
+  engram_admin:
+    synchronous_commit: local
+    lock_timeout: 10s
+    statement_timeout: 30s
+    idle_in_transaction_session_timeout: 30s

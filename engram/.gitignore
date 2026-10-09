@@ -17,3 +17,5 @@ go.work.sum
 /engram-api
 /engram-worker
 /engram-mcp
+/deploy/compose/secrets/
+/deploy/compose/gucs/

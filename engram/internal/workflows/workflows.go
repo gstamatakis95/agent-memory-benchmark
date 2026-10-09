@@ -16,6 +16,7 @@ import (
 
 	workflowv1 "github.com/gstamatakis95/engram/gen/go/engram/private/workflow/v1"
 	"github.com/gstamatakis95/engram/internal/id"
+	"github.com/gstamatakis95/engram/internal/workflows/codec"
 )
 
 // MaxInlineResultBytes is the largest activity result that travels inline; anything above goes by blob key (N59).
@@ -164,13 +165,16 @@ type Waiter interface {
 	WaitResult(ctx context.Context, wf id.WorkflowID, timeout time.Duration) (done bool, err error)
 }
 
-// DataConverter is the AES-256-GCM codec, per-namespace data key wrapped by the shard key (N59, N99).
-func DataConverter(keys KeyProvider) converter.DataConverter { panic("stub") }
+// DataConverter is the AES-256-GCM codec, per-namespace data key wrapped by the shard key (N59, N99). It is only the
+// data half: error messages and stack traces travel through the failure converter, so clients and workers should
+// install Converters, which returns both.
+func DataConverter(keys KeyProvider) converter.DataConverter { return codec.NewDataConverter(keys) }
 
-// KeyProvider supplies the per-namespace data keys.
-type KeyProvider interface {
-	DataKey(ctx context.Context, ns id.NamespaceID, keyID string) ([]byte, error)
-	CurrentKeyID(ns id.NamespaceID) string
-	// Shred is the shredding step of a namespace or tenant delete.
-	Shred(ctx context.Context, ns id.NamespaceID) error
-}
+// Converters returns the encrypting data converter and the failure converter that seals failures under the same
+// namespace key; set both on every Temporal client and worker (Converters.Apply). Decoding is strict unless
+// codec.Options.AllowPlaintext is set, which only dev tools do.
+func Converters(keys KeyProvider, o codec.Options) codec.Converters { return codec.New(keys, o) }
+
+// KeyProvider supplies the per-namespace data keys: DataKey(ctx, ns, keyID), CurrentKeyID(ns) and Shred(ctx, ns), the
+// shredding step of a namespace or tenant delete. It lives in internal/workflows/codec, which this package imports.
+type KeyProvider = codec.KeyProvider

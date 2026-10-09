@@ -13,5 +13,5 @@ while IFS= read -r -d '' f; do
   grep -n -E '^.{121,}' "$f" | cut -d: -f1 | sed "s|^|  $f:|" >&2
   rc=1
 done < <(git ls-files -z -- '*.sql' '*.tla' '*.cfg' '*.lean' '*.yaml' '*.yml' '*.proto' '*.sh' '*.md' 'Makefile' \
-  ':!docs/plan/**' ':!gen/**')
+  '*Dockerfile' '*.conf' '*.tmpl' '*.env' ':!docs/plan/**' ':!gen/**')
 exit $rc

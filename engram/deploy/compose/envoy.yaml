@@ -1,0 +1,108 @@
+# Envoy in front of engram-api (PLAN.md section 9.1): HTTP/2 end to end, ONE port for gRPC and Connect, per-request
+# round robin over the engram-api endpoints, gRPC health checking (engram-api answers NOT_SERVING on SIGTERM), outlier
+# detection and a hard maximum stream duration equal to the API's largest deadline cap. The dev stack runs one API
+# replica on 127.0.0.1:17000 (host networking); production lists the replicas by A record (STRICT_DNS).
+#
+# Read-only RPCs retry twice on connect-level failures only (host rotation) and cap the client deadline at the
+# WaitOperation maximum (65 s, N75); everything else never retries (clients retry with request_id / operation_id,
+# ND-12) and caps at 600 s. The headers engram-forward-hops and engram-forward-cell are stripped from every client
+# (N71).
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 19901 } }
+static_resources:
+  listeners:
+    - name: engram_public
+      address: { socket_address: { address: 127.0.0.1, port_value: 18080 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.\
+                  HttpConnectionManager"
+                stat_prefix: engram_public
+                codec_type: AUTO
+                # 600 s: the largest deadline cap (StreamSnapshot); the stream is cut here whatever the client asked
+                stream_idle_timeout: 600s
+                common_http_protocol_options: { max_stream_duration: 600s }
+                http2_protocol_options: { max_concurrent_streams: 1000 }
+                route_config:
+                  name: engram
+                  request_headers_to_remove: [engram-forward-hops, engram-forward-cell]
+                  virtual_hosts:
+                    - name: engram
+                      domains: ["*"]
+                      routes:
+                        # liveness of the listener itself, answered without an upstream (used by scripts/e2e.sh)
+                        - match: { path: /__envoy/ready }
+                          direct_response: { status: 200, body: { inline_string: "envoy listener up\n" } }
+                        # the read-only RPCs of the plan table, one route each (RE2 limits the size of a regex)
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/GetMemory$" } }
+                          route: &read_route
+                            cluster: engram_api
+                            timeout: 0s
+                            # the cap holds for Connect clients too (their deadline is the connect-timeout-ms header
+                            # or none): max_stream_duration is the absolute cut, grpc_timeout_header_max the gRPC clamp
+                            max_stream_duration: { max_stream_duration: 65s, grpc_timeout_header_max: 65s }
+                            retry_policy:
+                              num_retries: 2
+                              # `unavailable` is the gRPC status; a Connect server answers UNAVAILABLE with HTTP 503
+                              retry_on: >-
+                                connect-failure,refused-stream,reset-before-request,unavailable,retriable-status-codes
+                              retriable_status_codes: [503]
+                              host_selection_retry_max_attempts: 3
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/ListMemories$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/Recall$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/GetDocument$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/ListDocuments$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/GetOperation$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/ListOperations$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/WaitOperation$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/GetNamespace$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/ListNamespaces$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/GetPage$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/ListPages$" } }
+                          route: *read_route
+                        - match: { safe_regex: { regex: "^/memory\\.v1\\.[A-Za-z]+Service/GetSnapshot$" } }
+                          route: *read_route
+                        - match: { prefix: / }
+                          route:
+                            cluster: engram_api
+                            timeout: 0s
+                            max_stream_duration: { max_stream_duration: 600s, grpc_timeout_header_max: 600s }
+                            retry_policy: { num_retries: 0 }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: engram_api
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      connect_timeout: 2s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          common_http_protocol_options: { max_requests_per_connection: 10000 }
+          explicit_http_config: { http2_protocol_options: {} }
+      health_checks:
+        - timeout: 2s
+          interval: 5s
+          unhealthy_threshold: 2
+          healthy_threshold: 1
+          grpc_health_check: {}
+      outlier_detection: { consecutive_5xx: 5, interval: 10s, base_ejection_time: 30s, max_ejection_percent: 50 }
+      load_assignment:
+        cluster_name: engram_api
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 17000 } } }

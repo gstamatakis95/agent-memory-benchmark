@@ -395,6 +395,9 @@ pg_cron?
 8. The M0.4 load tables' event-count estimate was one low (+7 → +8), ≈ 0.5 %.
 9. The ParadeDB bootstrap also installs postgis, tiger_geocoder, postgis_topology, pg_ivm and fuzzystrmatch into the
    shard database (review m10); Temporal's pool ceilings must stay below `max_connections` (review m15).
+10. The plan sizes only the shard server; the catalog, its standby and `temporal-postgres` have no §9.1 sizing, so
+   their prod GUCs are left at Postgres defaults (`gucs.yaml` `unsized` block) until an owner sizes them (review m18).
+   `max_slot_wal_keep_size` (64 GB prod / 2 GB dev) is a worker choice the plan does not give.
 
 ## #29 Codec key scope: N59 "per-shard key" vs the namespace-keyed §2.2.17 signature — noted (reviewer to confirm
 fix)

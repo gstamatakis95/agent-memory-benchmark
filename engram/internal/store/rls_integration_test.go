@@ -93,11 +93,24 @@ func TestEveryTableHasRLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = sup.Close(ctx) }()
-	// roles are cluster-wide: the BYPASSRLS tamper is undone before anything else can run against engram_app
+	// roles are cluster-wide, so the helper role is unique per run (parallel packages share one server) and the
+	// BYPASSRLS tamper is undone before anything else can run against engram_app; the undo uses a fresh connection
+	// because sup is already closed when t.Cleanup runs
+	// Known limit (M0.4 review n4): unique names remove the CREATE ROLE collision, but this test still grants its
+	// helper role to the shared engram_relay (and sets engram_app BYPASSRLS) for the length of the test. A concurrent
+	// migrate.Up on the SAME server (one ENGRAM_TEST_PG_DSN shared by packages run with -p 4) can fail its self-check
+	// 4 inside that window. With one container per package, the default, that cannot happen; on a shared server run
+	// these two packages with -p 1.
+	mid := pgtest.RoleName("engram_test_mid")
 	revert := func() error {
-		for _, q := range []string{`ALTER ROLE engram_app NOBYPASSRLS`, `REVOKE engram_test_mid FROM engram_relay`,
-			`DROP ROLE IF EXISTS engram_test_mid`} {
-			if _, err := sup.Exec(context.Background(), q); err != nil {
+		fresh, err := pgx.Connect(context.Background(), db.DSN(pgtest.Super))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = fresh.Close(context.Background()) }()
+		for _, q := range []string{`ALTER ROLE engram_app NOBYPASSRLS`, `REVOKE ` + mid + ` FROM engram_relay`,
+			`DROP ROLE IF EXISTS ` + mid} {
+			if _, err := fresh.Exec(context.Background(), q); err != nil {
 				return err
 			}
 		}
@@ -112,9 +125,9 @@ func TestEveryTableHasRLS(t *testing.T) {
 		`CREATE TABLE stray_without_namespace (x int)`,
 		`ALTER ROLE engram_app BYPASSRLS`,
 		// F3: transitive membership of a BYPASSRLS role (relay -> mid -> admin) and a definer view past RLS
-		`CREATE ROLE engram_test_mid NOLOGIN`,
-		`GRANT engram_admin TO engram_test_mid`,
-		`GRANT engram_test_mid TO engram_relay`,
+		`CREATE ROLE ` + mid + ` NOLOGIN`,
+		`GRANT engram_admin TO ` + mid,
+		`GRANT ` + mid + ` TO engram_relay`,
 		`CREATE VIEW leak2 AS SELECT * FROM ingest_ledger`,
 		`ALTER VIEW leak2 OWNER TO engram_migrate`,
 		`GRANT SELECT ON leak2 TO engram_app`,

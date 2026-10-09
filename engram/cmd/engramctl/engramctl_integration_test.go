@@ -72,6 +72,11 @@ func TestEngramctlMigrate(t *testing.T) {
 	}
 	// roles are cluster-wide: undo the membership plant on a fresh connection (c is closed by its defer before
 	// t.Cleanup runs) before anything else uses the server
+	// Known limit (M0.4 review n4): unique names remove the CREATE ROLE collision, but this test still grants its
+	// helper role to the shared engram_relay for the length of the test. A concurrent migrate.Up on the SAME server
+	// (one ENGRAM_TEST_PG_DSN shared by packages run with -p 4) can fail its self-check 4 inside that window. With one
+	// container per package, the default, that cannot happen; on a shared server run these two packages with -p 1.
+	mid := pgtest.RoleName("engram_test_mid")
 	t.Cleanup(func() {
 		fresh, err := pgx.Connect(context.Background(), dsn)
 		if err != nil {
@@ -79,7 +84,7 @@ func TestEngramctlMigrate(t *testing.T) {
 			return
 		}
 		defer func() { _ = fresh.Close(context.Background()) }()
-		for _, q := range []string{"REVOKE engram_test_mid FROM engram_relay", "DROP ROLE IF EXISTS engram_test_mid"} {
+		for _, q := range []string{"REVOKE " + mid + " FROM engram_relay", "DROP ROLE IF EXISTS " + mid} {
 			if _, err := fresh.Exec(context.Background(), q); err != nil {
 				t.Errorf("revert %s: %v", q, err)
 			}
@@ -88,8 +93,8 @@ func TestEngramctlMigrate(t *testing.T) {
 	for _, q := range []string{
 		"ALTER TABLE operations NO FORCE ROW LEVEL SECURITY",
 		// transitive membership of a BYPASSRLS role, and a view owned by the BYPASSRLS owner that app can read
-		"CREATE ROLE engram_test_mid NOLOGIN", "GRANT engram_admin TO engram_test_mid",
-		"GRANT engram_test_mid TO engram_relay",
+		"CREATE ROLE " + mid + " NOLOGIN", "GRANT engram_admin TO " + mid,
+		"GRANT " + mid + " TO engram_relay",
 		"CREATE VIEW leak2 AS SELECT * FROM ingest_ledger", "ALTER VIEW leak2 OWNER TO engram_migrate",
 		"GRANT SELECT ON leak2 TO engram_app",
 	} {

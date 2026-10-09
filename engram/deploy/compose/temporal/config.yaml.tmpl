@@ -1,0 +1,77 @@
+# Static configuration of the per-cell Temporal cluster (PLAN.md section 9.1, N71): split services, numHistoryShards
+# fixed at 512 (it cannot change once history exists), the cell's own Postgres. Rendered by start.sh, which fills
+# @PG_PASSWORD@ from /run/secrets and the metrics port and the two connection pools of the service being started. The
+# pools of the four services sum to 260 (history 130, frontend 70, matching 30, worker 30), under the 400
+# max_connections of temporal-postgres (deploy/postgres/gucs.yaml).
+log:
+  stdout: true
+  level: info
+persistence:
+  numHistoryShards: 512
+  defaultStore: default
+  visibilityStore: visibility
+  datastores:
+    default:
+      sql:
+        pluginName: postgres12
+        databaseName: temporal
+        connectAddr: 127.0.0.1:15521
+        connectProtocol: tcp
+        user: temporal
+        password: "@PG_PASSWORD@"
+        maxConns: @MAX_CONNS@
+        maxIdleConns: @MAX_CONNS@
+        maxConnLifetime: 1h
+    visibility:
+      sql:
+        pluginName: postgres12
+        databaseName: temporal_visibility
+        connectAddr: 127.0.0.1:15521
+        connectProtocol: tcp
+        user: temporal
+        password: "@PG_PASSWORD@"
+        maxConns: @VIS_CONNS@
+        maxIdleConns: @VIS_CONNS@
+        maxConnLifetime: 1h
+global:
+  membership:
+    maxJoinDuration: 30s
+    broadcastAddress: 127.0.0.1
+  metrics:
+    prometheus:
+      framework: tally
+      timerType: histogram
+      listenAddress: 127.0.0.1:@METRICS_PORT@
+services:
+  frontend:
+    rpc: { grpcPort: 17233, membershipPort: 16933, bindOnIP: 127.0.0.1, httpPort: 17243 }
+  history:
+    rpc: { grpcPort: 17234, membershipPort: 16934, bindOnIP: 127.0.0.1 }
+  matching:
+    rpc: { grpcPort: 17235, membershipPort: 16935, bindOnIP: 127.0.0.1 }
+  worker:
+    rpc: { grpcPort: 17239, membershipPort: 16939, bindOnIP: 127.0.0.1 }
+clusterMetadata:
+  enableGlobalNamespace: false
+  failoverVersionIncrement: 10
+  masterClusterName: active
+  currentClusterName: active
+  clusterInformation:
+    active:
+      enabled: true
+      initialFailoverVersion: 1
+      rpcName: frontend
+      rpcAddress: 127.0.0.1:17233
+      httpAddress: 127.0.0.1:17243
+dcRedirectionPolicy:
+  policy: noop
+archival:
+  history: { state: disabled }
+  visibility: { state: disabled }
+namespaceDefaults:
+  archival:
+    history: { state: disabled }
+    visibility: { state: disabled }
+dynamicConfigClient:
+  filepath: /etc/temporal/dynamicconfig.yaml
+  pollInterval: 10s

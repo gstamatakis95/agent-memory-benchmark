@@ -29,7 +29,9 @@ Major (F2 BM25 p95 not gated), 9 Minor; fix round 1 sent incl. merge of main; re
 running; Q18/Q9 → CONFLICTS #12/#13; DDL defects #14; bootstrap role #15 |
 | M0.3 Catalog, Resolver, authz | in progress (E3 half) | m0.3-catalog-authz | — | E3 worker running on
 docs/briefs/M0.3-E3.md; E1 half after M0.4 |
-| M0.4 Compose, Temporal, codec | in review | m0.4-compose | T4 smoke (89 s cold), S + T0 | review round 1: 1 Blocker
+| M0.4 Compose, Temporal, codec | done (Temporal-peak clause pending ruling #27) | m0.4-compose (squash-merged) | T4
+smoke (95 s cold), restore drill, S + T0 | review-3 merge-ready; nit n9 (schedule-name suffix) → M1.x; quiet-host
+Temporal re-run needs dedicated hardware | review round 1: 1 Blocker
 (failure payloads under the cell key survive Shred), 2 Major (no per-shard key; failover agent promotes unfenced), 16
 Minor; fix round sent | Opus review round 1
 running; Temporal peak ≈ 300 events/s → CONFLICTS #27 (escalation); §9.1 defects #28 |
@@ -113,3 +115,5 @@ orchestrator
 started.
 - 2026-10-09 M0.7 merged (squash) after review round 2: 0 Blocker, 0 Major. main: lint+unit 64 s, manifest check ok,
   trace proof 24 ok. M0.8-E2 started.
+- 2026-10-09 M0.4 merged (squash) after review round 3: 0 Blocker, 0 Major. main: lint+unit 61 s, make e2e 95 s cold.
+  M0.3-E1 started.

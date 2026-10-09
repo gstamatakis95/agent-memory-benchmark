@@ -1,0 +1,277 @@
+# Dev compose of one Engram cell (PLAN.md section 9.1, M0.4): one shard, the catalog primary with its asynchronous
+# standby and failover agent, Temporal with SPLIT services (frontend, history, matching, worker; numHistoryShards = 512)
+# on its own Postgres with a pgBackRest stanza, MinIO as the blob and backup store, and Envoy in front of the API port.
+#
+# Every service runs with `network_mode: host` and a port of its own (the table below), which is the only way this
+# stack runs on a Docker daemon without a bridge network (CONFLICTS.md #3) and costs nothing in CI on Linux. The ports
+# are fixed constants here and in the files next to this one; to move one, change it in all of them:
+#
+#   15501 shard-1-postgres   15511 catalog-primary   15512 catalog-standby   15521 temporal-postgres
+#   17233 temporal frontend (gRPC; HTTP 17243, membership 16933)   17234 history (membership 16934)
+#   17235 matching (16935)   17239 worker (16939)   metrics 18001..18004 (frontend, history, matching, worker)
+#   19000 minio S3   19001 minio console   18080 envoy (gRPC + Connect)   19901 envoy admin   17000 engram-api (M1.x)
+#
+# engram-api, engram-worker and the DeterministicClient gateway are stubs until M1.x (cmd/engram-api prints "not
+# wired"), so this file starts the infrastructure they will sit on; Envoy already routes to the engram-api port.
+# Generate the secrets and the settings files first: deploy/compose/render.sh (scripts/e2e.sh does it).
+#
+#   docker compose -f deploy/compose/compose.yml up -d --wait          # everything
+#   docker compose -f deploy/compose/compose.yml --profile core up -d   # Temporal + its Postgres + MinIO only
+name: engram-dev
+
+x-defaults: &defaults
+  network_mode: host
+  restart: "no"
+  stop_grace_period: 20s
+
+# Plain PostgreSQL + pgBackRest (catalog, temporal-postgres): deploy/postgres/Dockerfile on the pinned Alpine base.
+x-pg-plain: &pg-plain
+  <<: *defaults
+  image: engram/postgres-pgbackrest:dev
+  build:
+    context: ../postgres
+    dockerfile: Dockerfile
+    network: host
+    args:
+      BASE_IMAGE: ${PG_PLAIN_BASE}
+      APK_SCHEME: ${APK_SCHEME}
+      PGBACKREST_VERSION: ${PLAIN_PGBACKREST_VERSION}
+  entrypoint: ["/usr/local/bin/engram-postgres"]
+
+x-temporal: &temporal
+  <<: *defaults
+  image: ${TEMPORAL_SERVER_IMAGE}
+  entrypoint: ["/bin/sh", "/etc/temporal/start.sh"]
+  volumes:
+    - ./temporal/start.sh:/etc/temporal/start.sh:ro
+    - ./temporal/config.yaml.tmpl:/etc/temporal/config.yaml.tmpl:ro
+    - ./temporal/dynamicconfig.yaml:/etc/temporal/dynamicconfig.yaml:ro
+  secrets: [temporal_pg_pw]
+  depends_on:
+    temporal-schema: { condition: service_completed_successfully }
+
+services:
+  # ---------------------------------------------------------------------------------------------------- the shard
+  # ParadeDB (pg_search, pgvector) + pgBackRest, built by us (N131); one shard of the cell.
+  shard-1-postgres:
+    <<: *defaults
+    image: engram/shard-pg:dev
+    profiles: [shard]
+    build:
+      context: ../postgres
+      dockerfile: Dockerfile
+      network: host
+      args:
+        BASE_IMAGE: ${SHARD_PG_BASE}
+        PGBACKREST_VERSION: ${SHARD_PGBACKREST_VERSION}
+    # cpus, mem_limit and shm_size come from the settings table (gucsgen -limits, written by render.sh)
+    extends: { file: gucs/limits.yml, service: shard-1-postgres }
+    entrypoint: ["/usr/local/bin/engram-postgres"]
+    command: ["-c", "port=15501", "-c", "listen_addresses=127.0.0.1"]
+    environment: { POSTGRES_DB: engram, POSTGRES_USER: engram, POSTGRES_PASSWORD_FILE: /run/secrets/shard_1_pw,
+                   PGPORT: "15501", STANZA: shard-1, PGBACKREST_CONFIG_INCLUDE_PATH: /run/secrets/pgbackrest.d,
+                   PDB_TUNE: "false" } # the settings table, not the image's autotuning, governs
+    secrets:
+      - shard_1_pw
+      - { source: pgbackrest_shard_1, target: /run/secrets/pgbackrest.d/secret.conf }
+    volumes:
+      - shard-1-data:/var/lib/postgresql/data
+      - ../postgres/engram-postgres.sh:/usr/local/bin/engram-postgres:ro
+      - ./gucs/shard-1.conf:/etc/postgresql/engram.conf:ro
+      - ./pgbackrest/shard-1.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 15501 -U engram -d engram"], interval: 5s,
+                   timeout: 3s, retries: 24, start_period: 20s }
+
+  # ------------------------------------------------------------------------------------- catalog, standby, agent
+  catalog-primary:
+    <<: *pg-plain
+    profiles: [catalog]
+    command: ["-c", "port=15511", "-c", "listen_addresses=127.0.0.1"]
+    environment: { POSTGRES_DB: engram_catalog, POSTGRES_USER: engram, POSTGRES_PASSWORD_FILE: /run/secrets/catalog_pw,
+                   PGPORT: "15511", STANZA: catalog, REPLICATOR_PASSWORD_FILE: /run/secrets/catalog_replicator_pw,
+                   PGBACKREST_CONFIG_INCLUDE_PATH: /run/secrets/pgbackrest.d }
+    secrets:
+      - catalog_pw
+      - catalog_replicator_pw
+      - { source: pgbackrest_catalog, target: /run/secrets/pgbackrest.d/secret.conf }
+    volumes:
+      - catalog-primary-data:/var/lib/postgresql/data
+      - ../postgres/engram-postgres.sh:/usr/local/bin/engram-postgres:ro
+      - ./postgres/catalog-init.sh:/docker-entrypoint-initdb.d/10-replicator.sh:ro
+      - ./gucs/catalog.conf:/etc/postgresql/engram.conf:ro
+      - ./pgbackrest/catalog.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 15511 -U engram -d engram_catalog"], interval: 3s,
+                   timeout: 3s, retries: 30, start_period: 5s }
+
+  # One asynchronous streaming hot standby (N163): synchronous_standby_names stays empty on the primary. The standby
+  # runs the same wrapper, settings table and stanza configuration as the primary (kind standby), so after a
+  # promotion it archives to the catalog stanza like the old primary did.
+  catalog-standby:
+    <<: *pg-plain
+    profiles: [catalog]
+    entrypoint: ["/bin/sh", "/usr/local/bin/catalog-standby.sh"]
+    environment: { PGPORT: "15512", PRIMARY_PORT: "15511", STANZA: catalog,
+                   REPLICATOR_PASSWORD_FILE: /run/secrets/catalog_replicator_pw,
+                   PGBACKREST_CONFIG_INCLUDE_PATH: /run/secrets/pgbackrest.d }
+    secrets:
+      - catalog_replicator_pw
+      - { source: pgbackrest_catalog, target: /run/secrets/pgbackrest.d/secret.conf }
+    volumes:
+      - catalog-standby-data:/var/lib/postgresql/data
+      - ../postgres/engram-postgres.sh:/usr/local/bin/engram-postgres:ro
+      - ./postgres/catalog-standby.sh:/usr/local/bin/catalog-standby.sh:ro
+      - ./gucs/standby.conf:/etc/postgresql/engram.conf:ro
+      - ./pgbackrest/catalog.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    depends_on:
+      catalog-primary: { condition: service_healthy }
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 15512 -U engram -d engram_catalog"], interval: 3s,
+                   timeout: 3s, retries: 30, start_period: 5s }
+
+  # Watches the primary and alerts after FAILOVER_AFTER seconds of silence. It never promotes: a promotion needs the
+  # fence of the old primary and `engramctl catalog reconcile --from-shards` (M1.7, N163); FAILOVER_PROMOTE=1 is
+  # refused.
+  catalog-failover-agent:
+    <<: *pg-plain
+    profiles: [catalog]
+    entrypoint: ["/bin/sh", "/usr/local/bin/failover-agent.sh"]
+    environment: { PRIMARY_PORT: "15511", STANDBY_PORT: "15512", FAILOVER_AFTER: "${FAILOVER_AFTER:-30}",
+                   FAILOVER_PROMOTE: "${FAILOVER_PROMOTE:-0}" }
+    volumes: [./postgres/failover-agent.sh:/usr/local/bin/failover-agent.sh:ro]
+    depends_on:
+      catalog-standby: { condition: service_healthy }
+    healthcheck: { test: ["CMD-SHELL", "test $$(( $$(date +%s) - $$(cat /tmp/agent-heartbeat) )) -lt 15"],
+                   interval: 5s, timeout: 3s, retries: 6, start_period: 10s }
+
+  # ----------------------------------------------------------------------------------------------------- Temporal
+  temporal-postgres:
+    <<: *pg-plain
+    profiles: [core]
+    # the two -c overrides after the port are the load test's durability knobs (bench/temporal-load/ladder.sh); every
+    # other setting comes from the table
+    command: ["-c", "port=15521", "-c", "listen_addresses=127.0.0.1",
+              "-c", "synchronous_commit=${TEMPORAL_PG_SYNC_COMMIT:-on}", "-c", "fsync=${TEMPORAL_PG_FSYNC:-on}"]
+    # PGBACKREST_REPO1_* override the S3 repository of pgbackrest/temporal.conf for a host that cannot run MinIO
+    # (REPO1_TYPE=posix REPO1_PATH=/repo, scripts/temporal-restore-drill.sh REPO=posix); the default is S3 on MinIO
+    environment: { POSTGRES_DB: temporal, POSTGRES_USER: temporal, POSTGRES_PASSWORD_FILE: /run/secrets/temporal_pg_pw,
+                   PGPORT: "15521", STANZA: temporal, PGBACKREST_REPO1_TYPE: "${REPO1_TYPE:-s3}",
+                   PGBACKREST_REPO1_PATH: "${REPO1_PATH:-/_backups/temporal-1}",
+                   PGBACKREST_CONFIG_INCLUDE_PATH: /run/secrets/pgbackrest.d }
+    secrets:
+      - temporal_pg_pw
+      - { source: pgbackrest_temporal, target: /run/secrets/pgbackrest.d/secret.conf }
+    volumes:
+      - temporal-pg-data:/var/lib/postgresql/data
+      - temporal-pg-repo:/repo
+      - ../postgres/engram-postgres.sh:/usr/local/bin/engram-postgres:ro
+      - ./gucs/temporal.conf:/etc/postgresql/engram.conf:ro
+      - ./pgbackrest/temporal.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 15521 -U temporal -d temporal"], interval: 3s,
+                   timeout: 3s, retries: 30, start_period: 5s }
+
+  # One-shot: create the visibility database and apply both Temporal schemas (idempotent).
+  temporal-schema:
+    <<: *defaults
+    profiles: [core]
+    image: ${TEMPORAL_ADMIN_IMAGE}
+    entrypoint: ["/bin/sh", "/etc/temporal/schema.sh"]
+    environment: { SQL_PORT: "15521", SQL_USER: temporal, SQL_PASSWORD_FILE: /run/secrets/temporal_pg_pw }
+    secrets: [temporal_pg_pw]
+    volumes: [./temporal/schema.sh:/etc/temporal/schema.sh:ro]
+    depends_on:
+      temporal-postgres: { condition: service_healthy }
+
+  temporal-history:
+    <<: *temporal
+    profiles: [core]
+    cpus: ${TEMPORAL_HISTORY_CPUS:-2}  # the capacity the load test's history CPU percentage is measured against
+    environment: { SERVICE: history, METRICS_PORT: "18002", MAX_CONNS: "100", VIS_CONNS: "30" }
+    healthcheck: { test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:18002/metrics"], interval: 3s,
+                   timeout: 3s, retries: 30, start_period: 5s }
+
+  temporal-matching:
+    <<: *temporal
+    profiles: [core]
+    environment: { SERVICE: matching, METRICS_PORT: "18003", MAX_CONNS: "20", VIS_CONNS: "10" }
+    healthcheck: { test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:18003/metrics"], interval: 3s,
+                   timeout: 3s, retries: 30, start_period: 5s }
+
+  temporal-frontend:
+    <<: *temporal
+    profiles: [core]
+    environment: { SERVICE: frontend, METRICS_PORT: "18001", MAX_CONNS: "40", VIS_CONNS: "30" }
+    healthcheck: { test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:18001/metrics"], interval: 3s,
+                   timeout: 3s, retries: 30, start_period: 5s }
+
+  temporal-worker:
+    <<: *temporal
+    profiles: [core]
+    environment: { SERVICE: worker, METRICS_PORT: "18004", MAX_CONNS: "20", VIS_CONNS: "10" }
+    healthcheck: { test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:18004/metrics"], interval: 3s,
+                   timeout: 3s, retries: 30, start_period: 5s }
+
+  # One-shot: the namespace `engram` with 7 days of retention (PLAN.md section 9.1).
+  temporal-namespace:
+    <<: *defaults
+    profiles: [core]
+    image: ${TEMPORAL_ADMIN_IMAGE}
+    entrypoint: ["/bin/sh", "/etc/temporal/namespace.sh"]
+    environment: { TEMPORAL_ADDRESS: "127.0.0.1:17233" }
+    volumes: [./temporal/namespace.sh:/etc/temporal/namespace.sh:ro]
+    depends_on:
+      temporal-frontend: { condition: service_healthy }
+      temporal-history: { condition: service_healthy }
+      temporal-matching: { condition: service_healthy }
+      temporal-worker: { condition: service_healthy }
+
+  # ---------------------------------------------------------------------------------------------- MinIO and Envoy
+  # Blob store of the dev stack and the pgBackRest repository (_backups/...). The chainguard image is shell-less: the
+  # buckets are created from outside (scripts/e2e.sh) and health is probed over HTTP.
+  minio:
+    <<: *defaults
+    profiles: [core]
+    image: ${MINIO_IMAGE}
+    command: ["server", "/data", "--address", "127.0.0.1:19000", "--console-address", "127.0.0.1:19001",
+              "--certs-dir", "/certs"]
+    environment: { MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user,
+                   MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password }
+    secrets: [minio_root_user, minio_root_password]
+    volumes: [minio-data:/data, ./secrets/minio_certs:/certs:ro]
+
+  envoy:
+    <<: *defaults
+    profiles: [edge]
+    image: ${ENVOY_IMAGE}
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+    volumes: [./envoy.yaml:/etc/envoy/envoy.yaml:ro]
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/19901;
+          printf 'GET /ready HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' >&3;
+          grep -q LIVE <&3
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+secrets:
+  shard_1_pw: { file: ./secrets/shard_1_pw }
+  catalog_pw: { file: ./secrets/catalog_pw }
+  catalog_replicator_pw: { file: ./secrets/catalog_replicator_pw }
+  pgbackrest_shard_1: { file: ./secrets/pgbackrest_shard_1.conf }
+  pgbackrest_catalog: { file: ./secrets/pgbackrest_catalog.conf }
+  pgbackrest_temporal: { file: ./secrets/pgbackrest_temporal.conf }
+  temporal_pg_pw: { file: ./secrets/temporal_pg_pw }
+  minio_root_user: { file: ./secrets/minio_root_user }
+  minio_root_password: { file: ./secrets/minio_root_password }
+
+volumes:
+  shard-1-data:
+  catalog-primary-data:
+  catalog-standby-data:
+  temporal-pg-data:
+  temporal-pg-repo:
+  minio-data:

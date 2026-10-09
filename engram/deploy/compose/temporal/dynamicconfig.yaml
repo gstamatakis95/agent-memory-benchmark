@@ -1,0 +1,16 @@
+# Dynamic configuration of the dev/load-test Temporal cluster. Only values that differ from the server defaults are
+# listed, each with the reason (the M0.4 load test records which of them mattered, bench/results/phase0/).
+# A workflow's history may grow to 50 MB / 51 200 events before the server terminates it; Engram stays far below
+# (RetainDocument continues-as-new at 100 chunks or 20 MB, N59), so the limits are left at the defaults.
+frontend.namespaceCount:
+  - value: 1000000
+    constraints: {}
+frontend.namespaceRPS:
+  - value: 20000
+    constraints: {}
+frontend.namespaceBurstRatioPerInstance:
+  - value: 2
+    constraints: {}
+system.enableNexus:
+  - value: false
+    constraints: {}

@@ -93,11 +93,12 @@ func (s *server) dsn(role Role, db string) string {
 }
 
 var (
-	srv     *server
-	pkgDB   string
-	dbCount atomic.Int64
-	poolsMu sync.Mutex
-	pools   = map[Role]*pgxpool.Pool{}
+	srv       *server
+	pkgDB     string
+	dbCount   atomic.Int64
+	roleCount atomic.Int64
+	poolsMu   sync.Mutex
+	pools     = map[Role]*pgxpool.Pool{}
 )
 
 // Main starts the package's server, builds its database and runs the tests; it returns the exit code for os.Exit.
@@ -336,6 +337,13 @@ func DSN(role Role) string { return srv.dsn(role, pkgDB) }
 
 // Addr returns the host and port the package server listens on (for tools that sit in front of it, such as pgbouncer).
 func Addr() (host, port string) { return srv.host, srv.port }
+
+// RoleName returns a cluster-wide-unique name for a helper role a test creates: roles are shared by every database of
+// a server, and packages run in parallel (-p 4) against one ENGRAM_TEST_PG_DSN server, so a fixed name would collide.
+// The suffix carries the process id and a per-process counter.
+func RoleName(prefix string) string {
+	return fmt.Sprintf("%s_%d_%d", prefix, os.Getpid(), roleCount.Add(1))
+}
 
 // DatabaseName is the name of the package database.
 func DatabaseName() string { return pkgDB }

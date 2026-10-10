@@ -1,0 +1,56 @@
+// engram/internal/errors/v1/errors.proto
+//
+// Error details that travel between the shard store, the workflow activities and `engram-api`, and never to a public
+// caller (decision N128, review A-12). They are packed into `google.rpc.Status.details` (or a Temporal
+// ApplicationError) with type URL `type.googleapis.com/engram.internal.errors.v1.<Name>` and are consumed by the router
+// or the retry policy; the API interceptor drops any detail of this package before a response leaves the process.
+syntax = "proto3";
+
+package engram.internal.errors.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/gstamatakis95/engram/gen/go/engram/internal/errors/v1;errorsv1";
+
+// MovedOutHint → attached to WrongShardOrEpoch{MOVED_OUT}. The shard's
+// permanent `moved_out` ownership row stores the target shard and epoch (decision N93), so the API routes the call to
+// the new owner using only this detail, without reading the catalog (a catalog failover takes ≥ 30 s). The target's own
+// fence still verifies ownership.
+message MovedOutHint {
+  string namespace_id = 1;
+  // Shard that owns the namespace after the move.
+  int32 target_shard_id = 2;
+  // Epoch the namespace holds there (the move's e + 1).
+  int64 next_epoch = 3;
+}
+
+// FenceBusy → retryable. A writer's `pg_try_advisory_xact_lock_shared` on the
+// namespace fence was refused because an exclusive taker (freeze, restore) is queued behind it (decision N82). The API
+// surfaces it publicly as NamespaceFrozen with an unspecified reason and `retry_after` = 200 ms.
+message FenceBusy {
+  string namespace_id = 1;
+  google.protobuf.Duration retry_after = 2;
+}
+
+// DocumentBusy → ABORTED (retryable). CommitChunk could not take the shared
+// per-document advisory lock because FinalizeVersion or the delete marker transaction holds, or is queued for, the
+// exclusive form (decision N83). The activity retries with a 100 ms backoff.
+message DocumentBusy {
+  string document_id = 1;
+  google.protobuf.Duration retry_after = 2;
+}
+
+// InputBlobMissing → retryable chunk-level activity error (decision N100),
+// Temporal ApplicationError type "InputBlobMissing". CommitChunk found an input blob (extraction cache entry, staging
+// vectors, entities or links result) purged by a concurrent expunge. The RetainDocument chunk sub-pipeline re-runs
+// ExtractChunk and EmbedChunk for that chunk, at most twice; the third failure records `chunk_failed`.
+message InputBlobMissing {
+  // Full blob key that was not found.
+  string blob_key = 1;
+  // Which input: "extraction", "embeddings", "entities" or "links".
+  string input = 2;
+  // Hex SHA-256 of the chunk text the activity was committing.
+  string content_hash = 3;
+  // Re-runs of the extract/embed pair already spent (0, 1 or 2).
+  int32 attempt = 4;
+}

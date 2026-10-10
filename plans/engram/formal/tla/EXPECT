@@ -1,0 +1,84 @@
+# Expected outcome of every TLC configuration (read by the nightly job and by `formal-quick`).
+# pass                 : TLC must end with 'No error has been found' (design configurations and experiments).
+# violates <Invariant> : TLC must end with exactly that invariant violated (must-fail configurations).
+# A timeout is INCOMPLETE: neither pass nor fail.
+
+Outbox.cfg	pass
+Outbox_Live.cfg	pass
+Outbox_NoWatch.cfg	violates NoLossSafety
+Outbox_Watch1x.cfg	violates NoLossSafety
+Consolidation.cfg	pass
+Consolidation_Live.cfg	pass
+Consolidation_VolatileProposal.cfg	violates ExactlyOnceEffect
+Consolidation_NonAtomicKey.cfg	violates ExactlyOnceEffect
+Storage.cfg	pass
+Storage_Gens.cfg	pass
+Storage_Update.cfg	violates ContentImmutable
+Storage_FlipEarly.cfg	violates VectorGenerationConsistent
+Storage_PurgeUnmarked.cfg	violates PurgeNeedsMarker
+Storage_AutoRepair.cfg	violates RebuildBeforeRepair
+Storage_PerIndexHygiene.cfg	violates RebuildBeforeRepair
+Storage_PurgeDuringRebuildSet.cfg	violates RebuildBeforeRepair
+Derivation.cfg	pass
+Derivation_Page.cfg	pass
+Derivation_Retire.cfg	pass
+Derivation_Live.cfg	pass
+Derivation_NoLock.cfg	violates NoDeletedDerivationServed
+Derivation_CascadeEvidence.cfg	violates NoDeletedDerivationServed
+Derivation_PageNoVerify.cfg	violates NoDeletedDerivationServed
+Derivation_StaleProposal.cfg	violates NoDeletedDerivationServed
+Derivation_ReextractHides.cfg	violates ReextractKeepsDerivedVisible
+Derivation_RestoreNoLock.cfg	violates RestoreExact
+Derivation_MatOnce.cfg	violates RestoreExact
+Derivation_PurgeDropsStub.cfg	violates FailClosed
+Derivation_EffCited.cfg	violates AsOfNoLeak
+Derivation_TombByDocId.cfg	violates NoOverHiding
+Derivation_CasBeforeIdem.cfg	violates NoPhantomVersion
+Derivation_CascadeHidden.cfg	violates NoGhostInvalidatedServed
+Derivation_MatSignalOnly.cfg	violates MaterializeComplete
+Derivation_RestoreOnlySelf.cfg	violates RestoreExact
+Derivation_RestoreByVisibleTwin.cfg	violates RestoreExact
+Derivation_LazyTwinNoLock.cfg	violates RestoreExact
+Derivation_LazyTagFromLastLog.cfg	violates RestoreExact
+Durability.cfg	pass
+Durability_Chain.cfg	pass
+Durability_IntentBeforeCommit.cfg	violates NoUnackedEffectOnLaterAck
+Durability_RaiseOnReopen.cfg	violates AckedDeleteSurvives
+Durability_RetargetRestore.cfg	violates AckedDeleteSurvives
+Durability_DupNoReput.cfg	violates AckedDeleteSurvives
+Durability_AckNoRecheck.cfg	violates AckedDeleteSurvives
+Durability_ReopenEarly.cfg	violates AckedDeleteSurvives
+Durability_NarrowWindow.cfg	violates AckedDeleteSurvives
+Durability_AckBeforeIntent.cfg	violates AckImpliesIntent
+Durability_ClockOrder.cfg	violates IntentOrderLastWins
+Durability_UnorderedReplay.cfg	violates IntentOrderLastWins
+Durability_NoEpochGuard.cfg	violates IntentOrderLastWins
+Durability_CatalogLossNoBlobFloor.cfg	violates AckedDeleteSurvives
+Durability_ReplayStampsCurrentEpoch.cfg	violates IntentOrderLastWins
+Durability_NoSubjectLock.cfg	violates IntentOrderLastWins
+Durability_NoHelpPrev.cfg	violates IntentOrderLastWins
+Durability_CatalogRestoreInFenceWindow.cfg	violates AckedDeleteSurvives
+ShardMove.cfg	pass
+ShardMove_Live.cfg	pass
+ShardMove_ActiveWriters.cfg	pass
+ShardMove_Twice.cfg	pass
+ShardMove_TgtRestore.cfg	pass
+ShardMove_TgtRestore2.cfg	pass
+ShardMove_UnfencedSteps.cfg	violates NoLossNoDup
+ShardMove_NoReady.cfg	violates RollbackPossibleBeforeC
+ShardMove_RestoreNoReconcile.cfg	violates RestoreReconciles
+ShardMove_NoVerify.cfg	violates NoLossNoDup
+ShardMove_StampAfterCut.cfg	violates OneOwner
+ShardMove_SweepNotPaused.cfg	violates SourceStaticUnderFreeze
+ShardMove_NoSeqAdvance.cfg	violates CopiedBelowTargetSeq
+ShardMove_CatalogLossNoShardTruth.cfg	violates NoLossNoDup
+ShardMove_UnionRepair.cfg	violates NoResurrect
+ShardMove_CopyBeforeFreeze.cfg	violates NoLossNoDup
+ShardMove_ReadyBeforeIndex.cfg	violates ServedFromIndex
+ShardMove_CutOnUnreplicatedCommit.cfg	violates NoLossNoDup
+ShardMove_NoFloor.cfg	violates NoLossNoDup
+ShardMove_LaggingFailover.cfg	violates NoLossNoDup
+ShardMove_RestoreKeepsMove.cfg	violates MoveClosedWhenFinal
+ShardMove_EndOnRouting.cfg	violates OneOwner
+ShardMove_ThawOnUnreplicatedAbort.cfg	violates NoLossNoDup
+ShardMove_CatalogLossDuringFreeze.cfg	violates CatalogNamesOwnerAfterDone

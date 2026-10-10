@@ -1,0 +1,20 @@
+# `buf generate` is run from this directory (proto/ in the real repository).
+# Output goes to <repo>/gen/go as fixed by decision D14. go_package is set
+# explicitly in every file, so managed mode is not needed.
+version: v2
+inputs:
+  - directory: .
+plugins:
+  - local: protoc-gen-go
+    out: ../gen/go
+    opt:
+      - paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: ../gen/go
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=true
+  - local: protoc-gen-connect-go
+    out: ../gen/go
+    opt:
+      - paths=source_relative
